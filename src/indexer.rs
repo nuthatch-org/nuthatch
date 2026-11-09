@@ -1580,11 +1580,20 @@ async fn recover_over_cap_static(
 /// One nest's work on the shared cursor, with a panic in it made that nest's terminal fault
 /// (RFC-0073 FR6). Unwound, the cursor task died and took every co-tenant on the chain with it.
 async fn contained<T>(work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    contained_during("ingest", work).await
+}
+
+/// [`contained`], naming the step. A build is not an ingest, and a panic in it has the same blast
+/// radius if it unwinds through the boot (#2745).
+async fn contained_during<T>(
+    during: &'static str,
+    work: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
     use futures::FutureExt;
     std::panic::AssertUnwindSafe(work)
         .catch_unwind()
         .await
-        .unwrap_or_else(|payload| Err(panicked(payload)))
+        .unwrap_or_else(|payload| Err(fault_from_panic(during, payload)))
 }
 
 /// [`contained`] for the synchronous per-nest steps.
@@ -1594,6 +1603,10 @@ fn contained_sync<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
 }
 
 fn panicked(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
+    fault_from_panic("ingest", payload)
+}
+
+fn fault_from_panic(during: &str, payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
     let message = payload
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
@@ -1602,7 +1615,7 @@ fn panicked(payload: Box<dyn std::any::Any + Send>) -> anyhow::Error {
     // Terminal: the nest's in-memory state stopped wherever the panic left it, so it must not index again
     // until a restart rebuilds that state from the store.
     anyhow::Error::new(TerminalFault(format!(
-        "this nest's ingest panicked: {message}"
+        "this nest's {during} panicked: {message}"
     )))
 }
 
@@ -2932,15 +2945,19 @@ async fn spawn_cursor(
     let runtime_dir = nests.iter().find_map(|(_, _, c)| c.runtime_dir.clone());
     for (name, dir, mut config) in nests {
         config.route = Some(name.clone());
-        let (nest, state, worker, w) = match build_nest(
-            &source,
-            dir,
-            &config,
-            window_override,
-            admin_enabled,
-            admin_token.clone(),
-            None,
-            sql_gate.clone(),
+        // A panic is this nest's failure. Unwound, it used to stop every co-tenant's boot (#2745).
+        let (nest, state, worker, w) = match contained_during(
+            "build",
+            build_nest(
+                &source,
+                dir,
+                &config,
+                window_override,
+                admin_enabled,
+                admin_token.clone(),
+                None,
+                sql_gate.clone(),
+            ),
         )
         .await
         {
@@ -3243,6 +3260,8 @@ async fn build_nest(
     Option<tokio::task::JoinHandle<()>>,
     u64,
 )> {
+    #[cfg(test)]
+    panic_if_build_armed(&dir);
     // RFC-0063: an address-history nest runs only as a solo `dev`; mounted or served, it would get an
     // event nest's machinery and none of its own.
     if config.address_history.is_some() {
@@ -9014,6 +9033,26 @@ impl FaultPoints for NodeFaults {
 #[cfg(test)]
 pub(crate) fn panic_in_windows_of(dir: &Path) {
     panicking_nests().lock().unwrap().push(dir.to_path_buf());
+}
+
+/// `build_nest` for the nest at `dir` panics from now on (#2745).
+#[cfg(test)]
+pub(crate) fn panic_while_building(dir: &Path) {
+    builds_that_panic().lock().unwrap().push(dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn builds_that_panic() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static DIRS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn panic_if_build_armed(dir: &Path) {
+    let armed = builds_that_panic().lock().unwrap().iter().any(|d| d == dir);
+    if armed {
+        panic!("injected build panic in {}", dir.display());
+    }
 }
 
 #[cfg(test)]

@@ -12599,6 +12599,72 @@ mod tests {
         drop(handles);
         cursor.shutdown().await.unwrap();
     }
+
+    /// #2745: a panic while building one nest is that nest's quarantine. It used to unwind the boot
+    /// and stop every co-tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_build_panic_quarantines_one_nest_and_its_co_tenant_boots() {
+        let root = tempfile::tempdir().unwrap();
+        let (doomed, healthy) = ("build-panics", "build-survives");
+        let nests = two_nests(root.path(), doomed, healthy);
+        indexer::panic_while_building(&nests[0].1);
+        let mut handles = idle_handles(root.path());
+        for name in [doomed, healthy] {
+            handles.health.register(name, "ethereum");
+        }
+        let chain = Arc::new(RisingChain(std::sync::atomic::AtomicU64::new(1_000)));
+        let cursor = indexer::spawn_runtime_at_boot(
+            chain.clone(),
+            nests,
+            Some(20),
+            false,
+            1,
+            Some(5),
+            false,
+            None,
+            handles.health.clone(),
+            false,
+            None,
+        )
+        .await
+        .expect("one nest's build panic failed the cursor");
+        assert_eq!(
+            cursor
+                .failed
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            vec![doomed]
+        );
+        assert!(indexed_through(&cursor.states, healthy, 1_000).await);
+        chain.0.store(1_040, std::sync::atomic::Ordering::SeqCst);
+        assert!(indexed_through(&cursor.states, healthy, 1_040).await);
+
+        let q = handles.health.status(doomed).expect("not quarantined");
+        assert_eq!(q.class, "terminal");
+        assert!(q.reason.contains("injected build panic"), "{}", q.reason);
+        assert!(handles.health.status(healthy).is_none());
+
+        handles.roster["nests"] = serde_json::json!([{"name": healthy}]);
+        handles.states = cursor.states.clone();
+        handles.failed = cursor.failed.iter().cloned().collect();
+        let router = handles.compose().unwrap();
+        let (status, body) = get_body(&router, &format!("/{doomed}/ready")).await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "{body}"
+        );
+        assert!(body.contains("injected build panic"), "{body}");
+        let (status, body) = get_body(&router, &format!("/{healthy}/sql?q=select%201")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let (status, body) = get_body(&router, &format!("/{healthy}/ready")).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        drop(router);
+        handles.states.clear();
+        drop(handles);
+        cursor.shutdown().await.unwrap();
+    }
 }
 
 #[cfg(test)]
