@@ -339,7 +339,10 @@ mod tests {
         let files = files(&nest).unwrap();
         let ignore = String::from_utf8(files[".gitignore"].clone()).unwrap();
         for entry in ["data/", ".admin-token"] {
-            assert!(ignore.lines().any(|l| l == entry), "{ignore:?} lacks {entry}");
+            assert!(
+                ignore.lines().any(|l| l == entry),
+                "{ignore:?} lacks {entry}"
+            );
         }
     }
 }
