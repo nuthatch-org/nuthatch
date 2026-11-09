@@ -135,7 +135,16 @@ async function filesOf(nest) {
       // `checkpoints` in any case: a bundle refuses that root name in any case (`names_derived_state`).
       if (!rel && e.isDirectory() && (NOT_INPUT_AT_ROOT.includes(e.name) || e.name.toLowerCase() === "checkpoints")) continue;
       if (e.isDirectory()) walk(p);
-      else if (e.isFile()) out[p] = readFileSync(`${nest}/${p}`, "utf8");
+      else if (e.isFile()) {
+        // Same refusal as the node's manifest: lossy UTF-8 would hash other bytes (#2739).
+        const bytes = readFileSync(`${nest}/${p}`);
+        try {
+          // ignoreBOM: the default decoder drops a leading EF BB BF, and the node hashes it (#2739).
+          out[p] = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+        } catch {
+          throw new Error(`${p} is not UTF-8`);
+        }
+      }
     }
   };
   walk("");
