@@ -24,7 +24,7 @@
 
 use crate::blob;
 use crate::runtime::{
-    adoptable, Mount, MountRef, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR,
+    adoptable, Mount, MountTable, DATA_DIR, LEGACY_ROOST_FILE, MOUNTS_FILE, NESTS_DIR,
 };
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
@@ -137,17 +137,44 @@ pub fn plan(dir: &Path) -> Result<Vec<Plan>> {
     let mut plans = Vec::with_capacity(mounts.runtime.nests.len());
     // Identity -> the first alias that claimed it, for merge detection within this run.
     let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
     // `mount_refs()`, **not** `mounts.nests`: once a directory is migrated the mount records are
     // authoritative and `nests` is empty, so iterating the list would see nothing on a second run and
     // then write an empty mount table - turning "migrate twice" from a no-op into data loss.
-    for MountRef { tenant, alias } in mounts.mount_refs() {
-        let (tenant, alias) = (&tenant, &alias);
+    let refs = mounts.mount_refs();
+    // A staged directory is `nests/<alias>`, with no tenant in the path. Two tenants mounting that
+    // alias would both plan a move of the one directory (#2749).
+    let mut tenants_of: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for r in &refs {
+        let slot = tenants_of.entry(r.alias.clone()).or_default();
+        if !slot.iter().any(|t| t == &r.tenant) {
+            slot.push(r.tenant.clone());
+        }
+    }
+    for slot in tenants_of.values_mut() {
+        slot.sort();
+    }
+
+    for r in &refs {
+        let (tenant, alias) = (&r.tenant, &r.alias);
         let recorded = mounts
             .mounts
             .iter()
             .find(|m| &m.tenant == tenant && &m.alias == alias);
         let legacy = dir.join(NESTS_DIR).join(alias);
+        if let Some(tenants) = tenants_of.get(alias.as_str()).filter(|t| t.len() > 1) {
+            if legacy.is_dir() {
+                plans.push(Plan::Refuse {
+                    tenant: tenant.clone(),
+                    alias: alias.clone(),
+                    why: format!(
+                        "nests/{alias} is staged, and tenants {} all mount '{alias}'",
+                        tenants.join(", ")
+                    ),
+                });
+                continue;
+            }
+        }
 
         // Already migrated: a record exists, its dataset is on disk, and **nothing is staged**.
         //
@@ -965,6 +992,64 @@ mod tests {
         run(d.path(), false, false).unwrap();
 
         assert_eq!(MountTable::load(d.path()).unwrap().mounts, before);
+    }
+
+    /// #2749: `nests/<alias>` has no tenant. A staged copy must not be planned twice when two
+    /// tenants mount that alias.
+    #[test]
+    fn a_staged_alias_shared_by_two_tenants_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        write_roost(
+            root,
+            &[
+                ("a", "0x0000000000000000000000000000000000000001"),
+                ("b", "0x0000000000000000000000000000000000000002"),
+            ],
+        );
+        run(root, false, false).unwrap();
+        let mut mounts = MountTable::load(root).unwrap();
+        mounts.mounts[0].tenant = "acme".into();
+        mounts.mounts[1].tenant = "globex".into();
+        mounts.mounts[1].alias = "a".into();
+        let before = mounts.mounts.clone();
+        std::fs::write(
+            root.join(MOUNTS_FILE),
+            toml::to_string_pretty(&mounts).unwrap(),
+        )
+        .unwrap();
+
+        let staged = root.join(NESTS_DIR).join("a");
+        crate::project::copy_dir(&root.join(DATA_DIR).join(&before[0].nid), &staged).unwrap();
+        let cfg = std::fs::read_to_string(staged.join("nuthatch.toml")).unwrap();
+        std::fs::write(
+            staged.join("nuthatch.toml"),
+            cfg.replace(
+                "0x0000000000000000000000000000000000000001",
+                "0x0000000000000000000000000000000000000003",
+            ),
+        )
+        .unwrap();
+
+        let plans = plan(root).unwrap();
+        assert!(
+            plans.len() == 2 && plans.iter().all(|p| matches!(p, Plan::Refuse { .. })),
+            "{plans:?}"
+        );
+        for p in &plans {
+            let Plan::Refuse { why, .. } = p else {
+                unreachable!()
+            };
+            assert!(why.contains("acme") && why.contains("globex"), "{why}");
+        }
+
+        let err = run(root, false, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refused"),
+            "the run must refuse rather than move the directory twice: {err:#}"
+        );
+        assert!(staged.is_dir(), "the staged directory must stay put");
+        assert_eq!(MountTable::load(root).unwrap().mounts, before);
     }
 
     /// An upgrade through a staged `nests/<alias>` changes the identity and nothing else on the record.
