@@ -2471,6 +2471,10 @@ fn address_mode_order(mut row: Row) -> Row {
     row
 }
 
+/// Bits of a token row's position that hold the element within one log. The log index takes the
+/// rest. A TransferBatch of 65,537 ids fits in a block, so sixteen was not enough (#2747).
+const ELEMENT_BITS: u32 = 32;
+
 /// One log's Etherscan rows: an ERC-20 `Transfer` (three topics) goes to `tokentx`, an ERC-721
 /// `Transfer` (four, the token id indexed) to `tokennfttx`, an ERC-1155 transfer to `token1155tx`
 /// with one row per id. Rows sort by log index, then by element within a batch.
@@ -2497,7 +2501,7 @@ fn transfer_rows(
     let block = hex_u64(log.get("blockNumber").unwrap_or(&Value::Null))?;
     let tx_index = hex_u64(log.get("transactionIndex").unwrap_or(&Value::Null))?;
     let log_index = hex_u64(log.get("logIndex").unwrap_or(&Value::Null))?;
-    if log_index >= 1 << 47 {
+    if log_index >= 1u64 << (u64::BITS - ELEMENT_BITS) {
         bail!("log index {log_index} is past the row key's room");
     }
     let ts = timestamps
@@ -2540,7 +2544,7 @@ fn transfer_rows(
     let row = |record, element: u64| Row {
         block,
         tx_index,
-        position: (log_index << 16) | element,
+        position: (log_index << ELEMENT_BITS) | element,
         record,
     };
     let party = |t: &str| topic_address(t).map(Value::String);
@@ -2580,7 +2584,7 @@ fn transfer_rows(
             let Some((ids, values)) = batch_arrays(data)? else {
                 return Ok(skip("an undecodable"));
             };
-            if ids.len() > 1 << 16 {
+            if ids.len() as u64 >= 1u64 << ELEMENT_BITS {
                 bail!(
                     "a TransferBatch of {} ids is past the row key's room",
                     ids.len()
@@ -3955,6 +3959,73 @@ mod tests {
         assert_eq!(found[B].tokentx.len(), 1);
         assert!(found[B].token1155tx.is_empty());
         assert_eq!(d.skipped_logs.load(Ordering::Relaxed), 1);
+    }
+
+    /// A TransferBatch of 65,537 ids fits in a block. The row key used to keep sixteen bits for the
+    /// element, so that log failed the window and the plain transfer beside it was never recorded (#2747).
+    #[tokio::test]
+    async fn a_transfer_batch_of_65537_ids_is_recorded_beside_a_plain_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let n = 65_537u64;
+        let mut data = String::with_capacity(2 + (4 + 2 * n as usize) * 64);
+        data.push_str("0x");
+        {
+            let mut push = |v: u64| {
+                let hex = format!("{v:x}");
+                data.extend(std::iter::repeat_n('0', 64 - hex.len()));
+                data.push_str(&hex);
+            };
+            push(64);
+            push(32 * (3 + n));
+            push(n);
+            for i in 1..=n {
+                push(i);
+            }
+            push(n);
+            for _ in 0..n {
+                push(1);
+            }
+        }
+        let log = |topics: Value, data: String, index: u64| {
+            json!({"address": "0xT0KEN", "topics": topics, "data": data,
+                "blockNumber": "0x10", "blockTimestamp": "0x20",
+                "transactionHash": "0xHH", "transactionIndex": "0x1",
+                "logIndex": format!("0x{index:x}"), "blockHash": "0xBB", "removed": false})
+        };
+        let logs = json!([
+            log(
+                json!([TRANSFER_BATCH, padded(A), padded(A), padded(A)]),
+                data,
+                1
+            ),
+            log(
+                json!([TRANSFER, padded(A), padded(A)]),
+                format!("0x{:0>64}", "9"),
+                2
+            ),
+        ]);
+        let (main, trace) = chain(false);
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => Ok(logs.clone()),
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let found = d.discover_now(&h, A, 0, 63).await.unwrap();
+        assert_eq!(found.tokentx.len(), 1, "{:?}", found.tokentx);
+        assert_eq!(found.tokentx[0].record["value"], "9");
+        assert_eq!(found.tokentx[0].position, 2u64 << ELEMENT_BITS);
+        assert_eq!(found.token1155tx.len(), n as usize);
+        assert_eq!(found.token1155tx[0].record["tokenID"], "1");
+        assert_eq!(
+            found.token1155tx[n as usize - 1].record["tokenID"],
+            n.to_string()
+        );
+        assert_eq!(
+            found.token1155tx[n as usize - 1].position,
+            (1u64 << ELEMENT_BITS) | (n - 1)
+        );
+        assert_eq!(d.skipped_logs.load(Ordering::Relaxed), 0);
     }
 
     /// A traced sweep finds value a contract sends a watched address from inside a call, which no
