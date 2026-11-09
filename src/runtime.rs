@@ -1668,6 +1668,16 @@ fn declared_chain(dataset: &Path) -> Option<String> {
     Some(table.get("nest")?.get("chain")?.as_str()?.to_string())
 }
 
+/// Chain label for a mount that did not load (#2755).
+///
+/// The dataset's `[nest].chain` when that file can be read, otherwise the runtime's only
+/// `[[chains]]` entry. Empty when neither is available, so the scrape does not grow a cursor.
+fn unloaded_chain(declared: Option<String>, sole_chain: Option<&str>) -> String {
+    declared
+        .or_else(|| sole_chain.map(str::to_string))
+        .unwrap_or_default()
+}
+
 /// Each dataset's window deadline at boot (RFC-0076 §3.2): its indexing mount's, the first in serving
 /// order. No other mount's record is read, so an alias cannot change or clear it.
 pub(crate) fn boot_window_deadlines(
@@ -2693,17 +2703,18 @@ pub async fn dev(
     let health = Arc::new(crate::health::RuntimeHealth::new());
     let mut failed: std::collections::BTreeMap<String, String> = Default::default();
     let mut failed_chain: std::collections::HashMap<String, String> = Default::default();
+    let sole_chain = (endpoints.len() == 1).then(|| endpoints[0].chain.as_str());
     let unloaded = unloaded.into_iter().map(|(name, reason)| {
         let ds = datasets
             .iter()
             .find(|d| d.canonical().route_key(default_tenant) == name);
-        let chain = ds.and_then(|d| declared_chain(&d.dir));
-        (name, chain.unwrap_or_else(|| "unknown".to_string()), reason)
+        let chain = unloaded_chain(ds.and_then(|d| declared_chain(&d.dir)), sole_chain);
+        (name, chain, reason)
     });
     for (name, chain, reason) in unloaded.chain(undeclared) {
         let reason = format!("did not load at boot: {reason}");
         tracing::error!("nest '{name}' {reason}");
-        health.register(&name, &chain);
+        health.register_without_cursor(&name, &chain);
         health.quarantine_nest(&name, reason.clone(), 0, None);
         failed_chain.insert(name.clone(), chain);
         failed.insert(name, reason);
@@ -8107,6 +8118,16 @@ impl RuntimeHandles {
 mod tests {
     use super::*;
     use crate::config::CONFIG_FILE;
+
+    #[test]
+    fn an_unloaded_mount_borrows_the_only_declared_chain_and_names_no_other() {
+        assert_eq!(
+            unloaded_chain(Some("base".into()), Some("ethereum")),
+            "base"
+        );
+        assert_eq!(unloaded_chain(None, Some("ethereum")), "ethereum");
+        assert_eq!(unloaded_chain(None, None), "");
+    }
 
     fn mounts_with(publish: &str) -> MountTable {
         toml::from_str(&format!(

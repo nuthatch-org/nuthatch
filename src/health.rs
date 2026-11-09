@@ -10,7 +10,7 @@
 //! if healthy*; it does not forbid serving it.
 
 use crate::metrics::now_unix;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// Why a unit is out of service, and whether it is coming back on its own.
@@ -53,6 +53,9 @@ pub struct RuntimeHealth {
     cursors: RwLock<HashMap<String, QuarantineInfo>>,
     /// Nest name → the chain whose cursor drives it.
     chain_of: RwLock<HashMap<String, String>>,
+    /// Nests that were registered with no cursor behind them. Their chain must not appear as
+    /// `nuthatch_cursor_live` (#2755).
+    uncursored: RwLock<HashSet<String>>,
     /// Nest name → how many times it has ever been quarantined. A monotonic counter, so a nest that
     /// flaps in and out is visible on a graph even though its *current* state keeps reading healthy.
     quarantine_count: RwLock<HashMap<String, u64>>,
@@ -73,12 +76,24 @@ impl RuntimeHealth {
             .write()
             .unwrap()
             .insert(nest.to_string(), chain.to_string());
+        self.uncursored.write().unwrap().remove(nest);
+    }
+
+    /// Record `nest` for quarantine without standing up a cursor for `chain` (#2755). An empty
+    /// `chain` means the mount named none, and the scrape must not invent one.
+    pub fn register_without_cursor(&self, nest: &str, chain: &str) {
+        self.register(nest, chain);
+        self.uncursored.write().unwrap().insert(nest.to_string());
     }
 
     /// Record that `alias` serves the same dataset as `canonical` (RFC-0032 §4), so it reports that
     /// dataset's health rather than a private, permanently-cheerful one of its own.
     pub fn register_alias(&self, alias: &str, canonical: &str, chain: &str) {
+        let follows = self.uncursored.read().unwrap().contains(canonical);
         self.register(alias, chain);
+        if follows {
+            self.uncursored.write().unwrap().insert(alias.to_string());
+        }
         self.shares
             .write()
             .unwrap()
@@ -88,6 +103,7 @@ impl RuntimeHealth {
     /// Forget a mount that is gone, so `/metrics` stops describing it (#1648).
     pub fn unregister(&self, nest: &str) {
         self.chain_of.write().unwrap().remove(nest);
+        self.uncursored.write().unwrap().remove(nest);
         self.shares.write().unwrap().remove(nest);
     }
 
@@ -257,15 +273,24 @@ impl RuntimeHealth {
         let counts = self.quarantine_count.read().unwrap();
 
         let mut s = String::new();
-        s.push_str(
-            "# HELP nuthatch_nest_health 1 when the nest is indexing, 0 when quarantined.\n\
-             # TYPE nuthatch_nest_health gauge\n",
-        );
-        for (nest, chain) in &nests {
-            let up = u8::from(self.status(nest).is_none());
-            s.push_str(&format!(
-                "nuthatch_nest_health{{nest=\"{nest}\",chain=\"{chain}\"}} {up}\n"
-            ));
+        // This series always carries a chain label, so a mount that named no chain is counted
+        // below and left off it (#2755).
+        let health_lines: Vec<String> = nests
+            .iter()
+            .filter(|(_, chain)| !chain.is_empty())
+            .map(|(nest, chain)| {
+                let up = u8::from(self.status(nest).is_none());
+                format!("nuthatch_nest_health{{nest=\"{nest}\",chain=\"{chain}\"}} {up}\n")
+            })
+            .collect();
+        if !health_lines.is_empty() {
+            s.push_str(
+                "# HELP nuthatch_nest_health 1 when the nest is indexing, 0 when quarantined.\n\
+                 # TYPE nuthatch_nest_health gauge\n",
+            );
+            for line in health_lines {
+                s.push_str(&line);
+            }
         }
         s.push_str(
             "# HELP nuthatch_nest_quarantine_total Times this nest has been quarantined since start.\n\
@@ -279,9 +304,22 @@ impl RuntimeHealth {
         }
 
         let cursors = self.cursors.read().unwrap();
-        let mut chains: Vec<&String> = nests.iter().map(|(_, c)| *c).collect();
+        let uncursored = self.uncursored.read().unwrap();
+        // A chain with no cursor is left out of this gauge (#2755).
+        let mut chains: Vec<&String> = nests
+            .iter()
+            .filter(|(nest, chain)| !chain.is_empty() && !uncursored.contains(*nest))
+            .map(|(_, chain)| *chain)
+            .collect();
+        for chain in cursors.keys() {
+            chains.push(chain);
+        }
+        drop(uncursored);
         chains.sort();
         chains.dedup();
+        if chains.is_empty() {
+            return s;
+        }
         s.push_str(
             "# HELP nuthatch_cursor_live 1 while the chain's cursor is running, 0 once it has died.\n\
              # TYPE nuthatch_cursor_live gauge\n",
@@ -419,6 +457,55 @@ mod tests {
             m.contains("nuthatch_nest_health{nest=\"gamma\",chain=\"arbitrum-one\"} 1"),
             "{m}"
         );
+    }
+
+    /// A mount that never got a cursor must not show one as live, including under a made-up chain
+    /// name (#2755).
+    #[test]
+    fn a_nest_with_no_cursor_does_not_invent_a_live_cursor() {
+        let h = RuntimeHealth::new();
+        h.register("alpha", "base");
+        h.register_without_cursor("gone", "base");
+        h.quarantine_nest("gone", "did not load at boot".into(), 0, None);
+        let m = h.render_metrics();
+        assert!(m.contains("nuthatch_cursor_live{chain=\"base\"} 1"), "{m}");
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"gone\",chain=\"base\"} 0"),
+            "{m}"
+        );
+        assert!(!m.contains("unknown"), "{m}");
+
+        let only = RuntimeHealth::new();
+        only.register_without_cursor("gone", "base");
+        only.quarantine_nest("gone", "did not load at boot".into(), 0, None);
+        let m = only.render_metrics();
+        assert!(!m.contains("nuthatch_cursor_live"), "{m}");
+        assert!(
+            m.contains("nuthatch_nest_health{nest=\"gone\",chain=\"base\"} 0"),
+            "{m}"
+        );
+        assert!(
+            m.contains("nuthatch_nest_quarantine_total{nest=\"gone\"} 1"),
+            "{m}"
+        );
+
+        let blank = RuntimeHealth::new();
+        blank.register_without_cursor("gone", "");
+        blank.quarantine_nest("gone", "did not load at boot".into(), 0, None);
+        blank.register_alias("gone-alias", "gone", "");
+        let m = blank.render_metrics();
+        assert!(!m.contains("nuthatch_cursor_live"), "{m}");
+        assert!(!m.contains("nuthatch_nest_health"), "{m}");
+        assert!(
+            m.contains("nuthatch_nest_quarantine_total{nest=\"gone\"} 1"),
+            "{m}"
+        );
+        assert_eq!(blank.json_for("gone-alias").0, "quarantined");
+
+        // A cursor that did start, and then died, still reports down.
+        only.quarantine_cursor("base", "cursor gone".into());
+        let m = only.render_metrics();
+        assert!(m.contains("nuthatch_cursor_live{chain=\"base\"} 0"), "{m}");
     }
 
     /// A nest's own fault outranks its cursor's for reporting: it is the more specific cause, and the
