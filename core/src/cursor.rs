@@ -392,33 +392,48 @@ async fn within<F: std::future::Future>(
     .await
 }
 
-/// A pinned read above `final_through` whose block hash is empty or is not the chain's now (#2754).
+/// A pinned read above `final_through` whose header hash is not the chain's now (#2754).
+///
+/// A read that carried no hash had no header to disagree with. A canonical read is refused
+/// before it becomes a row, so an empty hash here is a number-pinned call with nothing to check.
 async fn read_rows_off_chain(
     source: &dyn Source,
     rows: &[DecodedRow],
     final_through: u64,
 ) -> Option<String> {
-    let expected: Vec<(u64, String)> = rows
+    let rows: Vec<_> = rows
         .iter()
-        .filter(|r| r.block_number > final_through)
-        .map(|r| (r.block_number, r.block_hash.clone()))
+        .filter(|r| r.block_number > final_through && !r.block_hash.is_empty())
         .collect();
-    if expected.is_empty() {
+    if rows.is_empty() {
         return None;
     }
-    if let Some((b, _)) = expected.iter().find(|(_, h)| h.is_empty()) {
-        return Some(format!(
-            "the source gave block {b} no block hash on a pinned read"
-        ));
-    }
-    let mut blocks: Vec<u64> = expected.iter().map(|(b, _)| *b).collect();
+    let mut blocks: Vec<u64> = rows.iter().map(|r| r.block_number).collect();
     blocks.sort_unstable();
     blocks.dedup();
-    match source.block_hashes(&blocks).await {
-        Ok(now) => expected
+    // Same split as the log rows above: a stamped read is checked against the header record,
+    // which is one batch. `block_hashes`'s default is one `block_hash` per block (#720).
+    let now = match rows.iter().any(|r| r.timestamps) {
+        true => source.block_records(&blocks).await.map(|now| {
+            now.into_iter()
+                .map(|(b, (h, _))| (b, h))
+                .collect::<HashMap<_, _>>()
+        }),
+        false => source.block_hashes(&blocks).await,
+    };
+    match now {
+        Ok(now) => rows
             .iter()
-            .find(|(b, h)| !now.get(b).is_some_and(|n| n.eq_ignore_ascii_case(h)))
-            .map(|(b, _)| format!("block {b} is not on the chain the source has now")),
+            .find(|r| {
+                !now.get(&r.block_number)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(&r.block_hash))
+            })
+            .map(|r| {
+                format!(
+                    "block {} is not on the chain the source has now",
+                    r.block_number
+                )
+            }),
         Err(e) => Some(format!("block hashes unavailable: {e:#}")),
     }
 }

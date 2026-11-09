@@ -23778,6 +23778,14 @@ template="pool"
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Some("0xbh".into()))
         }
+        async fn block_hashes(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, String>> {
+            // The hash `block_headers` stamps, in one batch. The window check reads this, as
+            // `RpcClient` does; falling through to `block_hash` would count a call per sample (#720).
+            Ok(blocks.iter().map(|&b| (b, format!("0x{b:064x}"))).collect())
+        }
         async fn logs(
             &self,
             _filter: &crate::source::LogFilter,
