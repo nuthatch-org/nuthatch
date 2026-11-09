@@ -901,6 +901,12 @@ pub(crate) fn test_rows_materialised(dir: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// A catalogue that arrived as text, from a feed rather than this nest's file. The same name rules
+/// as [`load_manifest`] (#2706).
+pub(crate) fn parse_manifest(raw: &str) -> Result<Manifest> {
+    checked(serde_json::from_str(raw).context("the followed catalogue")?)
+}
+
 /// A catalogue is read from the nest's own tree, which a cloned repository supplies, and its names
 /// become paths: each table, hash and file must be one segment under the runtime's rule (#2184).
 fn checked(m: Manifest) -> Result<Manifest> {

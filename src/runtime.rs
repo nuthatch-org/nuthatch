@@ -1923,35 +1923,11 @@ pub fn promote_warm(
         return Ok(false);
     };
     if let Some(catalogue) = catalogue.as_deref() {
-        let manifest: crate::seal::Manifest =
-            serde_json::from_str(catalogue).context("the followed catalogue")?;
         // The follower's copy of the dataset: its cache on another host, the writer's own directory
         // beside it. `segment_path` finds a segment in either.
         let followed = follower.root().join(&key);
-        let to = data.join(crate::seal::SEGMENTS_DIR);
-        std::fs::create_dir_all(&to).with_context(|| format!("creating {}", to.display()))?;
-        for segment in manifest.tables.values().flatten() {
-            anyhow::ensure!(
-                !segment.file.is_empty()
-                    && !segment.file.contains(['/', '\\'])
-                    && segment.file != "..",
-                "the followed catalogue names a segment outside its directory: {:?}",
-                segment.file
-            );
-            let src = crate::seal::segment_path(&followed, &segment.file, &segment.hash);
-            let dst = to.join(&segment.file);
-            std::fs::copy(&src, &dst).with_context(|| {
-                format!(
-                    "copying the followed segment {} for mount '{route}'",
-                    src.display()
-                )
-            })?;
-            // Durable before the catalogue that names it is installed (#2706).
-            std::fs::File::open(&dst)
-                .and_then(|f| f.sync_all())
-                .with_context(|| format!("syncing {}", dst.display()))?;
-        }
-        crate::seal::install_manifest(data, &manifest)?;
+        install_followed_catalogue(&followed, data, catalogue)
+            .with_context(|| format!("promoting the followed segments for mount '{route}'"))?;
     }
     let store = crate::store::Store::open(&db)?;
     crate::store::import_mirrored(&store, &tables)?;
@@ -1966,6 +1942,28 @@ pub fn promote_warm(
             .map_or("none", String::as_str)
     );
     Ok(true)
+}
+
+/// Install a followed catalogue as this dataset's own. Names go through the catalogue check, and
+/// each file is hashed against its entry before it is published, so a torn or retargeted copy is
+/// not what the durable catalogue names (#2706).
+fn install_followed_catalogue(followed: &Path, data: &Path, catalogue: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let manifest = crate::seal::parse_manifest(catalogue)?;
+    let to = data.join(crate::seal::SEGMENTS_DIR);
+    for segment in manifest.tables.values().flatten() {
+        let src = crate::seal::segment_path(followed, &segment.file, &segment.hash);
+        let bytes = std::fs::read(&src).with_context(|| format!("reading {}", src.display()))?;
+        let got = hex::encode(Sha256::digest(&bytes));
+        anyhow::ensure!(
+            got == segment.hash,
+            "followed segment {} hashes to {got}, not {}",
+            segment.file,
+            segment.hash
+        );
+        crate::seal::publish_durable(&to, &segment.file, &bytes)?;
+    }
+    crate::seal::install_manifest(data, &manifest)
 }
 
 /// A writer lease being renewed, and the store it guards once its nest is built. Dropping it stops
@@ -8160,6 +8158,35 @@ mod tests {
                 "{bad}: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn a_followed_segment_that_does_not_hash_is_not_promoted() {
+        use sha2::Digest;
+        let tmp = tempfile::tempdir().unwrap();
+        let followed = tmp.path().join("followed");
+        let data = tmp.path().join("data");
+        let hash = hex::encode(sha2::Sha256::digest(b"the real bytes"));
+        let file = format!("{hash}.parquet");
+        std::fs::create_dir_all(followed.join("segments")).unwrap();
+        std::fs::write(followed.join("segments").join(&file), b"torn").unwrap();
+        let catalogue = format!(
+            r#"{{"tables":{{"transfers":[{{"hash":"{hash}","from_block":1,"to_block":1,"rows":1,"file":"{file}"}}]}}}}"#
+        );
+        let err = install_followed_catalogue(&followed, &data, &catalogue)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hashes to"), "{err}");
+        assert!(!data.join("manifest.json").exists());
+        std::fs::write(followed.join("segments").join(&file), b"the real bytes").unwrap();
+        install_followed_catalogue(&followed, &data, &catalogue).unwrap();
+        assert_eq!(
+            std::fs::read(data.join("segments").join(&file)).unwrap(),
+            b"the real bytes"
+        );
+
+        let outside = r#"{"tables":{"transfers":[{"hash":"abcd","from_block":1,"to_block":1,"rows":1,"file":"../nope.parquet"}]}}"#;
+        assert!(install_followed_catalogue(&followed, &data, outside).is_err());
     }
 
     /// RFC-0073 FR16: `[runtime.publish]` mirrors each dataset once, and never beside a mount's own.
