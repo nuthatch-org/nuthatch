@@ -4877,7 +4877,12 @@ fn decode_bodies(
     call_rows: &mut Vec<crate::registry::DecodedRow>,
 ) -> Result<()> {
     for b in want {
-        let Some(body) = bodies.get(b) else { continue };
+        let Some(body) = bodies.get(b) else {
+            anyhow::bail!(
+                "block {b} was asked for and its body did not come back; refusing the window \
+                 rather than recording it as having no calls"
+            );
+        };
         let bhash = body
             .get("hash")
             .and_then(|h| h.as_str())
@@ -9199,6 +9204,31 @@ fn take_after_commit_failure() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A short body map used to fall through as "this block had no calls" (#2754).
+    #[test]
+    fn a_missing_block_body_refuses_the_window() {
+        let creg = crate::calldata::CallRegistry::build(vec![], &crate::config::Extract::default())
+            .unwrap();
+        let err = decode_bodies(
+            &creg,
+            &[],
+            &[10],
+            &std::collections::HashMap::new(),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("block 10"), "{err}");
+
+        let mut bodies = std::collections::HashMap::new();
+        bodies.insert(
+            10,
+            serde_json::json!({"hash": "0xabc", "timestamp": "0x1", "transactions": []}),
+        );
+        decode_bodies(&creg, &[], &[10], &bodies, false, &mut Vec::new()).unwrap();
+    }
 
     // ---------------------------------------------------------------------------------------
     // #980 - seal boundaries are a function of the data, not of the fetch batching.
