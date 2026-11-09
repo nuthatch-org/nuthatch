@@ -115,7 +115,7 @@ function compile(m) {
 
 /// What a node leaves out of a nest's inputs (`src/blob.rs`), by name at any depth and at the root.
 const NOT_INPUT = ["nuthatch.redb", "segments", ".git", ".DS_Store"];
-const NOT_INPUT_AT_ROOT = ["maintained", "quarantine"];
+const NOT_INPUT_AT_ROOT = ["maintained", "quarantine", "checkpoints"];
 /// A spill directory a node made (`is_spill_dir_name` in `src/spill.rs`): `<prefix><pid>-<seq>`.
 const SPILL_DIR = /^nuthatch-(spill|duckdb)-[0-9]+-[0-9]+$/;
 
@@ -131,8 +131,9 @@ async function filesOf(nest) {
       if (NOT_INPUT.includes(e.name) || e.name === ".admin-token" || e.name.startsWith(".admin-token.")) continue;
       if (SPILL_DIR.test(e.name)) continue;
       const p = rel ? `${rel}/${e.name}` : e.name;
-      if (!rel && NOT_INPUT_AT_ROOT.includes(e.name) && e.isDirectory()) continue;
       if (e.isSymbolicLink()) throw new Error(`${nest}/${p} is a symbolic link; a node refuses one in a nest`);
+      // `checkpoints` in any case: a bundle refuses that root name in any case (`names_derived_state`).
+      if (!rel && e.isDirectory() && (NOT_INPUT_AT_ROOT.includes(e.name) || e.name.toLowerCase() === "checkpoints")) continue;
       if (e.isDirectory()) walk(p);
       else if (e.isFile()) out[p] = readFileSync(`${nest}/${p}`, "utf8");
     }

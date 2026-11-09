@@ -23,21 +23,9 @@ pub use nuthatch_identity::{FileEntry, Manifest, BLOB_FORMAT_VERSION};
 /// Files/dirs never included in a blob: the hot store and sealed data are *derived*, not authored, and
 /// including them would make the hash depend on runtime state instead of inputs. Matched by exact name
 /// at any depth.
-#[cfg(not(feature = "folds"))]
 const EXCLUDE: &[&str] = &[
     DB_FILE,
     "segments",
-    crate::admin_token::FILE,
-    ".git",
-    ".DS_Store",
-];
-/// RFC-0059: fold checkpoints are derived state. Excluded only where folds exist, because a name
-/// matched at any depth would otherwise move the NID of a default-build nest that owns such a directory.
-#[cfg(feature = "folds")]
-const EXCLUDE: &[&str] = &[
-    DB_FILE,
-    "segments",
-    "checkpoints",
     crate::admin_token::FILE,
     ".git",
     ".DS_Store",
@@ -79,11 +67,25 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // RFC-0062's copies and quarantined segments sit beside `segments/`. Only those, at the root,
-            // so a deeper authored directory of either name keeps its place in the identity.
+            let ft = entry.file_type()?;
+            // Before the root skip. `is_dir` follows a link, so a root `checkpoints` link would be
+            // dropped instead of refused, and two nests could share one NID (#2355, #2740).
+            if ft.is_symlink() {
+                bail!(
+                    "{} is a symbolic link: a nest's files must be regular files, because its \
+                     identity is taken from what is in the directory. Replace the link with a copy \
+                     of what it points to",
+                    path.display()
+                );
+            }
+            // Derived directories beside the inputs. Only at the root, so a deeper authored directory
+            // of the same name keeps its place. `checkpoints` is any case, in every build: a bundle
+            // refuses that name in any case (#2740).
             if dir == root
-                && (name == crate::maintained::COPIES_DIR || name == crate::seal::QUARANTINE_DIR)
-                && path.is_dir()
+                && ft.is_dir()
+                && (name == crate::maintained::COPIES_DIR
+                    || name == crate::seal::QUARANTINE_DIR
+                    || name.eq_ignore_ascii_case("checkpoints"))
             {
                 continue;
             }
@@ -92,20 +94,10 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
                     continue;
                 }
             }
-            let ft = entry.file_type()?;
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
                 out.push(path);
-            } else if ft.is_symlink() {
-                // The runtime reads through a link and the identity cannot, so two nests linking to
-                // different configs would share one NID (#2355).
-                bail!(
-                    "{} is a symbolic link: a nest's files must be regular files, because its \
-                     identity is taken from what is in the directory. Replace the link with a copy \
-                     of what it points to",
-                    path.display()
-                );
             }
         }
     }
@@ -800,7 +792,11 @@ pub(crate) fn verify_blob(
 /// then read as the dataset's sealed catalogue, binding any segment in the shared store by its hash.
 fn names_derived_state(rel: &str) -> bool {
     let first = rel.split('/').next().unwrap_or_default();
-    let root_only = [crate::maintained::COPIES_DIR, crate::seal::QUARANTINE_DIR];
+    let root_only = [
+        crate::maintained::COPIES_DIR,
+        crate::seal::QUARANTINE_DIR,
+        "checkpoints",
+    ];
     root_only.iter().any(|d| first.eq_ignore_ascii_case(d))
         || rel.split('/').any(|part| {
             EXCLUDE.iter().any(|x| part.eq_ignore_ascii_case(x))
@@ -1685,6 +1681,55 @@ abi = "abis/c.json"
             declared.nid(),
             "an authored directory of the same name below the root"
         );
+    }
+
+    /// #2740: a `folds` build used to drop every directory named `checkpoints`, so `abis/checkpoints`
+    /// changed the NID of a default build and the engine and not the graph build. The fold log is
+    /// the root directory of that name, in every build. A deeper one is authored.
+    #[test]
+    fn fold_checkpoints_at_the_root_are_not_an_input() {
+        let a = tempfile::tempdir().unwrap();
+        write_nest(a.path());
+        let before = nest_nid(a.path()).unwrap();
+
+        let derived = a.path().join("checkpoints");
+        std::fs::create_dir_all(&derived).unwrap();
+        std::fs::write(derived.join("a.txt"), b"derived").unwrap();
+        assert_eq!(nest_nid(a.path()).unwrap(), before);
+        std::fs::remove_dir_all(&derived).unwrap();
+        let odd = a.path().join("Checkpoints");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("a.txt"), b"derived").unwrap();
+        assert_eq!(
+            nest_nid(a.path()).unwrap(),
+            before,
+            "the root directory in any case"
+        );
+        std::fs::remove_dir_all(&odd).unwrap();
+
+        std::fs::create_dir_all(a.path().join("abis").join("checkpoints")).unwrap();
+        std::fs::write(a.path().join("abis/checkpoints/x.json"), b"kept").unwrap();
+        assert_ne!(
+            nest_nid(a.path()).unwrap(),
+            before,
+            "an authored directory of the same name below the root"
+        );
+        assert!(names_derived_state("checkpoints/a.txt"));
+        assert!(names_derived_state("Checkpoints/a.txt"));
+        assert!(!names_derived_state("abis/checkpoints/x.json"));
+    }
+
+    /// #2740: `is_dir` follows a link, so the root skip must not see a `checkpoints` symlink as a
+    /// directory. The link is refused, as any other input link is (#2355).
+    #[cfg(unix)]
+    #[test]
+    fn a_root_checkpoints_symlink_is_refused() {
+        let (a, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_nest(a.path());
+        std::fs::write(other.path().join("a.txt"), b"elsewhere").unwrap();
+        std::os::unix::fs::symlink(other.path(), a.path().join("checkpoints")).unwrap();
+        let err = format!("{:#}", nest_nid(a.path()).unwrap_err());
+        assert!(err.contains("checkpoints is a symbolic link"), "{err}");
     }
 
     #[test]
