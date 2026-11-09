@@ -67,13 +67,25 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            let ft = entry.file_type()?;
+            // Before the root skip. `is_dir` follows a link, so a root `checkpoints` link would be
+            // dropped instead of refused, and two nests could share one NID (#2355, #2740).
+            if ft.is_symlink() {
+                bail!(
+                    "{} is a symbolic link: a nest's files must be regular files, because its \
+                     identity is taken from what is in the directory. Replace the link with a copy \
+                     of what it points to",
+                    path.display()
+                );
+            }
             // Derived directories beside the inputs. Only at the root, so a deeper authored directory
-            // of the same name keeps its place. `checkpoints` is in every build (#2740).
+            // of the same name keeps its place. `checkpoints` is any case, in every build: a bundle
+            // refuses that name in any case (#2740).
             if dir == root
+                && ft.is_dir()
                 && (name == crate::maintained::COPIES_DIR
                     || name == crate::seal::QUARANTINE_DIR
-                    || name == "checkpoints")
-                && path.is_dir()
+                    || name.eq_ignore_ascii_case("checkpoints"))
             {
                 continue;
             }
@@ -82,20 +94,10 @@ pub(crate) fn collect_files(root: &Path, skip: Option<&Path>) -> Result<Vec<Path
                     continue;
                 }
             }
-            let ft = entry.file_type()?;
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
                 out.push(path);
-            } else if ft.is_symlink() {
-                // The runtime reads through a link and the identity cannot, so two nests linking to
-                // different configs would share one NID (#2355).
-                bail!(
-                    "{} is a symbolic link: a nest's files must be regular files, because its \
-                     identity is taken from what is in the directory. Replace the link with a copy \
-                     of what it points to",
-                    path.display()
-                );
             }
         }
     }
@@ -1694,6 +1696,16 @@ abi = "abis/c.json"
         std::fs::create_dir_all(&derived).unwrap();
         std::fs::write(derived.join("a.txt"), b"derived").unwrap();
         assert_eq!(nest_nid(a.path()).unwrap(), before);
+        std::fs::remove_dir_all(&derived).unwrap();
+        let odd = a.path().join("Checkpoints");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("a.txt"), b"derived").unwrap();
+        assert_eq!(
+            nest_nid(a.path()).unwrap(),
+            before,
+            "the root directory in any case"
+        );
+        std::fs::remove_dir_all(&odd).unwrap();
 
         std::fs::create_dir_all(a.path().join("abis").join("checkpoints")).unwrap();
         std::fs::write(a.path().join("abis/checkpoints/x.json"), b"kept").unwrap();
@@ -1703,7 +1715,21 @@ abi = "abis/c.json"
             "an authored directory of the same name below the root"
         );
         assert!(names_derived_state("checkpoints/a.txt"));
+        assert!(names_derived_state("Checkpoints/a.txt"));
         assert!(!names_derived_state("abis/checkpoints/x.json"));
+    }
+
+    /// #2740: `is_dir` follows a link, so the root skip must not see a `checkpoints` symlink as a
+    /// directory. The link is refused, as any other input link is (#2355).
+    #[cfg(unix)]
+    #[test]
+    fn a_root_checkpoints_symlink_is_refused() {
+        let (a, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_nest(a.path());
+        std::fs::write(other.path().join("a.txt"), b"elsewhere").unwrap();
+        std::os::unix::fs::symlink(other.path(), a.path().join("checkpoints")).unwrap();
+        let err = format!("{:#}", nest_nid(a.path()).unwrap_err());
+        assert!(err.contains("checkpoints is a symbolic link"), "{err}");
     }
 
     #[test]
