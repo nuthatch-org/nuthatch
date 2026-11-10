@@ -311,6 +311,7 @@ impl Config {
         }
         cfg.refuse_tip_finality_webhooks()?;
         cfg.refuse_unknown_since()?;
+        cfg.refuse_another_name_for_a_registered_chain()?;
         refuse_feature_only_files(dir)?;
         refuse_removed_screening(&raw)?;
         Ok(cfg)
@@ -433,6 +434,24 @@ impl Config {
                     w.name
                 ),
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse a chain name the registry does not know over a chain id it does (#2686): it ran on the
+    /// unregistered policy, as a runtime declaration of the same pair is refused for.
+    fn refuse_another_name_for_a_registered_chain(&self) -> Result<()> {
+        let (name, id) = (&self.nest.chain, self.nest.chain_id);
+        if crate::chains::lookup(name).is_some() {
+            return Ok(());
+        }
+        if let Some(known) = crate::chains::lookup_by_id(id) {
+            bail!(
+                "chain_id {id} is '{}' in the built-in registry, not '{name}': set `chain = \"{}\"` \
+                 so the nest keeps the registry's finality and log window (this changes its NID)",
+                known.name,
+                known.name
+            );
         }
         Ok(())
     }
@@ -1034,6 +1053,30 @@ abi = "abis/t.json"
             let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
             assert!(err.contains("is invalid"), "{alias} {template}: {err}");
         }
+    }
+
+    /// #2686: a name the registry does not know, over a chain id it does, ran on the unregistered
+    /// policy. A runtime refuses that chain declaration; a nest's config is refused the same way.
+    #[test]
+    fn another_name_for_a_registered_chain_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |chain: &str, chain_id: u64| {
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!(
+                    "[nest]\nname = \"n\"\nchain = \"{chain}\"\nchain_id = {chain_id}\nrpc_urls = []\n"
+                ),
+            )
+            .unwrap();
+            Config::load(dir.path())
+        };
+        let err = format!("{:#}", load("arbitrum-mainnet", 42161).unwrap_err());
+        assert!(
+            err.contains("'arbitrum-one'"),
+            "name the registry's chain: {err}"
+        );
+        load("arbitrum", 42161).expect("a registry alias");
+        load("avalanche", 43114).expect("an unregistered chain");
     }
 
     /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never
