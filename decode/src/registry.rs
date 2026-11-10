@@ -46,6 +46,9 @@ impl StorageKind {
             StorageKind::Str
         } else if ty == "bytes" {
             StorageKind::Bytes
+        } else if ty == "function" {
+            // An address and a selector: `bytes24` on the wire.
+            StorageKind::FixedBytes
         } else if let Some(bits) = ty.strip_prefix("uint").and_then(parse_bits) {
             uint_kind(bits)
         } else if let Some(bits) = ty.strip_prefix("int").and_then(parse_bits) {
@@ -1376,6 +1379,7 @@ pub fn value_from_dynsol(dv: &DynSolValue, col: &Column) -> Value {
         DynSolValue::FixedBytes(w, n) => Value::Bytes(w.0[..(*n).min(32)].to_vec()),
         DynSolValue::Bytes(b) => Value::Bytes(b.clone()),
         DynSolValue::String(s) => Value::Str(s.clone()),
+        DynSolValue::Function(f) => Value::Bytes(f.0.to_vec()),
         other => Value::Json(dynsol_to_json(other).to_string()),
     }
 }
@@ -1390,11 +1394,11 @@ fn dynsol_to_json(dv: &DynSolValue) -> Json {
         DynSolValue::FixedBytes(w, n) => json!(format!("0x{}", hex::encode(&w.0[..(*n).min(32)]))),
         DynSolValue::Bytes(b) => json!(format!("0x{}", hex::encode(b))),
         DynSolValue::String(s) => json!(s),
+        DynSolValue::Function(f) => json!(format!("0x{}", hex::encode(f.0))),
         DynSolValue::Array(items) | DynSolValue::FixedArray(items) => {
             json!(items.iter().map(dynsol_to_json).collect::<Vec<_>>())
         }
         DynSolValue::Tuple(items) => json!(items.iter().map(dynsol_to_json).collect::<Vec<_>>()),
-        _ => json!(null),
     }
 }
 
@@ -1485,8 +1489,20 @@ fn registry_hash(
                 )
             })
             .collect();
+        // A `function` value was stored as null before #2694. The mark moves the identity, so new rows
+        // never sit beside those, even where a tuple holds the function and its column kind is unchanged.
+        let mark = if d
+            .signature
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .skip(1)
+            .any(|t| t == "function")
+        {
+            "|fn24"
+        } else {
+            ""
+        };
         format!(
-            "{kind}|{}|0x{}|0x{}|{}|{}",
+            "{kind}|{}|0x{}|0x{}|{}|{}{mark}",
             d.alias,
             hex::encode(d.contract),
             hex::encode(d.topic0),
@@ -2772,6 +2788,94 @@ mod tests {
         assert_eq!(j["block_hash"], "0xbh");
         assert_eq!(j["_seq"], json!(7u64 << 20));
         assert_eq!(j["block_timestamp"], json!(1_700_000_000u64));
+    }
+
+    /// #2694: a `function` parameter is an address and a selector, 24 bytes, and is stored as them,
+    /// at the top level and inside a tuple, rather than as null.
+    #[test]
+    fn a_function_parameter_is_stored_as_its_24_bytes() {
+        const C: &str = "0x2222222222222222222222222222222222222222";
+        const ABI: &str = r#"[
+            {"type":"event","name":"Callback","inputs":[
+                {"name":"target","type":"function","indexed":false},
+                {"name":"pair","type":"tuple","indexed":false,"components":[
+                    {"name":"amount","type":"uint256"},
+                    {"name":"hook","type":"function"}]}],"anonymous":false}
+        ]"#;
+        let reg = DecodeRegistry::build(vec![spec("c", C, ABI)]).unwrap();
+        let dec = reg.tables()[0];
+        assert_eq!(dec.columns[0].kind, StorageKind::FixedBytes);
+        let topic0 = format!("0x{}", hex::encode(dec.topic0));
+        let pointer = format!("{}{}", "11".repeat(20), "12345678");
+        let word = format!("{pointer}{}", "00".repeat(8));
+        let data = format!("0x{word}{:064x}{word}", 42u64);
+        let row = reg
+            .decode(&log(C, &[&topic0], &data, 7, 0))
+            .unwrap()
+            .unwrap();
+        let want = hex::decode(&pointer).unwrap();
+        assert_eq!(row.params[0].1, Value::Bytes(want.clone()));
+        let Value::Json(pair) = &row.params[1].1 else {
+            panic!("a tuple is stored as JSON: {:?}", row.params[1].1)
+        };
+        let pair: Json = serde_json::from_str(pair).unwrap();
+        assert_eq!(pair["hook"], json!(format!("0x{pointer}")));
+
+        let schema = reg
+            .schema()
+            .into_iter()
+            .find(|t| t.table == dec.table)
+            .unwrap();
+        let target = schema.columns.iter().find(|c| c.name == "target").unwrap();
+        let stored = row.to_json();
+        assert_eq!(
+            value_from_stored(&stored["target"], target).unwrap(),
+            Value::Bytes(want)
+        );
+    }
+
+    /// #2694: a `function` only inside a tuple leaves the column kind alone, so the mark is what moves
+    /// the identity off the rows that stored it as null. An event without one keeps its old line.
+    #[test]
+    fn a_function_in_a_tuple_moves_the_registry_hash() {
+        const C: &str = "0x2222222222222222222222222222222222222222";
+        let abi = |hook: &str| {
+            format!(
+                r#"[{{"type":"event","name":"Hooked","inputs":[
+                    {{"name":"pair","type":"tuple","indexed":false,"components":[
+                        {{"name":"amount","type":"uint256"}},
+                        {{"name":"hook","type":"{hook}"}}]}}],"anonymous":false}}]"#
+            )
+        };
+        let unmarked = |reg: &DecodeRegistry| {
+            let d = reg.tables()[0];
+            let cols: Vec<String> = d
+                .columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{}:{}{}",
+                        c.name,
+                        c.sol_type,
+                        c.kind.as_str(),
+                        object_shape(c)
+                    )
+                })
+                .collect();
+            let line = format!(
+                "c|{}|0x{}|0x{}|{}|{}",
+                d.alias,
+                hex::encode(d.contract),
+                hex::encode(d.topic0),
+                d.signature,
+                cols.join(",")
+            );
+            <[u8; 32]>::from(Sha256::digest(line.as_bytes()))
+        };
+        let marked = DecodeRegistry::build(vec![spec("c", C, &abi("function"))]).unwrap();
+        assert_ne!(marked.hash(), unmarked(&marked));
+        let plain = DecodeRegistry::build(vec![spec("c", C, &abi("bytes24"))]).unwrap();
+        assert_eq!(plain.hash(), unmarked(&plain));
     }
 
     fn row_at(block: u64, log_index: u64) -> DecodedRow {
