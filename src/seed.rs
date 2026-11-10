@@ -227,7 +227,7 @@ async fn download(
     progress: &(dyn Fn(&SeedProgress) + Sync),
 ) -> Result<(usize, u64)> {
     let segments = dir.join(seal::SEGMENTS_DIR);
-    std::fs::create_dir_all(&segments)
+    seal::create_dir_durable(&segments)
         .with_context(|| format!("creating {}", segments.display()))?;
     // Built before the stream, not inside it: a closure there makes the future too general to be
     // `Send`, and a mount job spawns it.
@@ -269,6 +269,11 @@ async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Want
     let dest = segments.join(&w.segment.file);
     if let Ok(have) = std::fs::read(&dest) {
         if publish::sha256_hex(&have) == w.segment.hash {
+            // An earlier, interrupted seed may have left it unsynced, and the watermark is about to pass it.
+            std::fs::File::open(&dest)
+                .and_then(|f| f.sync_all())
+                .and_then(|()| seal::fsync_dir(segments))
+                .with_context(|| format!("fsyncing {}", dest.display()))?;
             return Ok(0);
         }
     }
@@ -305,7 +310,7 @@ async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Want
     let len = std::fs::metadata(&tmp)
         .with_context(|| format!("reading {}", tmp.display()))?
         .len();
-    std::fs::rename(&tmp, &dest).with_context(|| format!("installing {}", dest.display()))?;
+    seal::install_durable(&tmp, &dest).with_context(|| format!("installing {}", dest.display()))?;
     Ok(len)
 }
 
@@ -417,5 +422,44 @@ mod tests {
         canonical("t", &mut segment(&hash, 1, 6), 5)
             .expect_err("rows above complete_through would be fetched again and counted twice");
         canonical("t", &mut segment(&hash, 6, 5), 9).expect_err("an inverted range");
+    }
+
+    /// #2705: the seed stamps a watermark past every file it fetched, so each one has to be on disk,
+    /// bytes and name, before `fetch_one` returns.
+    #[test]
+    fn a_fetched_segment_is_durable_before_it_is_catalogued() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"segment bytes";
+        let hash = publish::sha256_hex(bytes);
+        std::fs::create_dir_all(root.path().join("d")).unwrap();
+        std::fs::write(root.path().join("d/k.parquet"), bytes).unwrap();
+        let mirror = publish::open_mirror(&root.path().to_string_lossy()).unwrap();
+        let nest = tempfile::tempdir().unwrap();
+        let segments = nest.path().join(seal::SEGMENTS_DIR);
+        std::fs::create_dir_all(&segments).unwrap();
+        let mut seg = segment(&hash, 1, 5);
+        seg.file = "t.parquet".into();
+        let w = Wanted {
+            key: "k.parquet".into(),
+            segment: seg,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let trace = seal::capture_durable(|| {
+            rt.block_on(fetch_one(mirror.as_ref(), &segments, "d", &w))
+                .unwrap();
+        });
+        assert_eq!(std::fs::read(segments.join("t.parquet")).unwrap(), bytes);
+        let synced = trace
+            .iter()
+            .position(|e| matches!(e, seal::Durable::FileSync(p) if p.starts_with(&segments)));
+        let entry = trace
+            .iter()
+            .position(|e| *e == seal::Durable::EntryDir(segments.clone()));
+        assert!(
+            matches!((synced, entry), (Some(s), Some(e)) if s < e),
+            "{trace:?}"
+        );
     }
 }
