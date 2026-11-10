@@ -196,8 +196,8 @@ path: no SQL engine, no sealing, one cursor polling the chain head.
 ```toml
 [address_history]
 addresses = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"]  # the accounts to watch; seeds the stored set
-start_block = 0               # optional: history before it is never fetched, and reads incomplete
-end_block = 20000000          # optional: stop here
+start_block = 0               # optional: history before it is never fetched, and reads unsupported
+end_block = 20000000          # optional: stop here; a range past it reads unsupported
 poll_interval = "5m"          # optional, default 5m; `--poll-interval` overrides it
 mev_relays = false            # optional, default off: ask the MEV-Boost relays, see below
 request_deadline = "8s"       # optional, default 8s: the most a request waits, queue and background work included

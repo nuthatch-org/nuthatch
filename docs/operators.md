@@ -149,7 +149,7 @@ A container image is published per release:
 ```sh
 docker run -d --name nuthatch --restart unless-stopped \
   -v "$PWD/mynest:/nest" -p 127.0.0.1:8288:8288 \
-  ghcr.io/nuthatch-org/nuthatch:5.18.0
+  ghcr.io/nuthatch-org/nuthatch:5.18.1
 ```
 
 > **No admin token, deliberately.** The image's `CMD` binds `0.0.0.0:8288` inside the container, so
@@ -187,7 +187,7 @@ That is deliberate: a subcommand that vanishes from `--help` depending on how th
 harder to diagnose than one that explains itself. Use the scaled artifact and it works:
 
 ```sh
-docker run --rm ghcr.io/nuthatch-org/nuthatch:5.18.0-scaled worker --help
+docker run --rm ghcr.io/nuthatch-org/nuthatch:5.18.1-scaled worker --help
 ```
 
 Two images rather than one because non-negotiable 1 says the primary artifact runs with zero external
@@ -1305,7 +1305,8 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
 
 - **`GET /api`** answers Etherscan-shaped (`module`, `action`, ...), and takes the same parameters as
   a form `POST`. A range the nest has not covered answers `NUTHATCH_INCOMPLETE`, never an empty
-  list, so a client falls through to its next source.
+  list, so a client falls through to its next source. A range before `start_block` or past
+  `end_block`, which it never will cover, answers `NUTHATCH_UNSUPPORTED`.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
   a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Off loopback,
   `proxy/eth_blockNumber` answers the nest's own head and a watched account's balance is still read;

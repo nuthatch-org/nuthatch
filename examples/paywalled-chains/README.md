@@ -57,7 +57,7 @@ Setting `start_block` in a chain's `[address_history]` skips everything before i
 account. A request that starts before it is refused, not answered short:
 
 ```
-{"status":"0","message":"NOTOK","result":"NUTHATCH_INCOMPLETE: history starts at block 49020000; ask from there and use another source before it"}
+{"status":"0","message":"NOTOK","result":"NUTHATCH_UNSUPPORTED: history starts at block 49020000; ask from there and use another source before it"}
 ```
 
 A request without `startblock` asks from block 0, so with `start_block` set a client that omits it
