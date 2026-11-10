@@ -78,6 +78,10 @@ check(
   `a statement within the filters, at block ${r.as_of}: ${s1.verdict}, ${s1.columns.map((c) => `${c.column} ${c.verdict}`).join(", ")} (${one.rows[0].n} transfers)`,
 );
 check(s2.verdict === "outside the filters", `a statement over every transfer: ${s2.verdict}, ${s2.reason}`);
+check(
+  r.mirror_unchecked?.through === r.mirror.complete_through && r.head.includes(`to ${r.mirror.complete_through} are the mirror's, unchecked`),
+  `the hydrated history named as the mirror's: ${r.head}`,
+);
 
 const altered = structuredClone(one);
 altered.rows[0].total = `${one.rows[0].total}7`;

@@ -478,7 +478,8 @@ const hostsOf = (rpc) => Object.values(endpointsOf(rpc)).filter(Boolean).map((u)
 });
 
 /// RFC-0081 S3: hosted answers checked by opening the nest that answered, by its NID, at the block it
-/// answered as of, narrowed by the caller's filters. Equality says the server and this RPC agree.
+/// answered as of, narrowed by the caller's filters. Equality says the server, this RPC and, for
+/// hydrated history, the mirror agree.
 class Verifier {
   constructor(options) {
     if (options.nest === undefined) throw new Error("a verifier needs the nest's files (`nest`), to open the nest an answer names");
@@ -491,11 +492,11 @@ class Verifier {
     const key = JSON.stringify([nid, as_of, filters]);
     if (this.open?.key === key) return this.open;
     this.close();
-    const { module, nest, mirror, rpc, storage, headerBatch, verified, log, onProgress, window, memory_mib, worker, workerUrl } = this.options;
+    const { module, nest, mirror, rpc, storage, headerBatch, verified, complete, max_headers, log, onProgress, window, memory_mib, worker, workerUrl } = this.options;
     const source = mirror && filters.every((f) => f.privacy === "public") ? "mirror+rpc" : "rpc";
     const opened = await Engine.open({
-      module, nest, rpc, storage, headerBatch, verified, log, onProgress, window, memory_mib, worker, workerUrl,
-      filters, until: as_of, expect_nid: nid, source, ...(source === "mirror+rpc" ? { mirror } : {}),
+      module, nest, rpc, storage, headerBatch, verified, complete, max_headers, log, onProgress, window, memory_mib, worker,
+      workerUrl, filters, until: as_of, expect_nid: nid, source, ...(source === "mirror+rpc" ? { mirror } : {}),
     });
     try {
       const followed = await opened.follow();
@@ -561,7 +562,7 @@ class Verifier {
     return {
       nid, as_of, source, filters, dataset: followed.identity?.dataset ?? null,
       rpc: hostsOf(this.options.rpc),
-      ...headOf(this.options.verified, followed, as_of),
+      ...headOf(this.options.verified, followed, as_of, !!this.options.complete),
       mirror: followed.mirror
         ? { base: this.options.mirror.base, ...followed.mirror }
         : null,

@@ -488,10 +488,14 @@ The result names the NID, block, source, filters, the mirror's dataset and end, 
 and says which head it ran under, from what the follow did: `the RPC's, unverified` without
 `verified`; `refused: ` and the reason, also in `unverified`, when the verification was refused; and
 otherwise `verified`, or, when the answer's block is above the verified finalized block
-(`verified_through`), which blocks are still the RPC's. A verified head at or below what the nest has
+(`verified_through`), which blocks are still the RPC's. On a `mirror+rpc` nest the hydrated blocks are
+named as the mirror's, unchecked, in `head` and in `mirror_unchecked`: the mirror's catalogue is checked
+only against its own `seed.json`, and the verified head reaches no block at or below its end. `logs`
+says which blocks were checked for omitted logs, the same verified span, which needs `complete` and
+`verified` passed to the verifier. A verified head at or below what the nest has
 sealed that is not this chain's block at that height (the store's hash where it kept one, the RPC's
 otherwise) is refused, as a light client on another chain. Equality
-says the server and this RPC agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
+says the server, this RPC and, for hydrated history, the mirror agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
 RFC-0077 S7's seven wallets against a hosted nest.
 
 ## The reference hosts and the gate
