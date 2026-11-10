@@ -219,6 +219,10 @@ impl BurrmillSession {
 impl Drop for BurrmillSession {
     fn drop(&mut self) {
         fold_peak(self.dir.as_deref(), self.reader().take_memory_peak() as u64);
+        // A concurrent scrape may hold the engine upgraded, so the weak ref outlives the session.
+        LIVE.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(_, e)| !Weak::ptr_eq(e, &Arc::downgrade(&self.engine)));
     }
 }
 
@@ -1102,6 +1106,24 @@ mod tests {
             after.peak > seen,
             "the larger sort's peak was lost with the session: {after:?}, {seen} before it"
         );
+    }
+
+    /// #2758: a scrape on another thread holding the engine upgraded as the session dropped kept
+    /// it counted after the session was gone.
+    #[test]
+    fn a_dropped_session_is_not_counted_while_a_scrape_holds_its_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = sorting_session(dir.path(), &[("t", 10)]);
+        let held = super::LIVE
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(d, _)| d.as_deref() == Some(dir.path()))
+            .and_then(|(_, e)| e.upgrade())
+            .expect("the session is live");
+        drop(s);
+        assert_eq!(pool_of(dir.path()).engines, 0);
+        drop(held);
     }
 
     /// #1792: a nest's sessions share one pool and each reads that pool's total as its own, so a

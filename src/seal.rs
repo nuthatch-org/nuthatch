@@ -3199,6 +3199,50 @@ mod tests {
         assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
     }
 
+    /// #2758: a startup pass over an intact dataset rewrote its catalogue every time.
+    #[cfg(unix)]
+    #[test]
+    fn verifying_an_intact_dataset_leaves_its_catalogue_alone() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let inode = || std::fs::metadata(manifest_path(dir.path())).unwrap().ino();
+        let before = inode();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert_eq!(inode(), before, "the catalogue was reinstalled");
+    }
+
+    /// #2758: a catalogue that is there but cannot be read is an error, not an empty catalogue.
+    #[test]
+    fn a_pinned_catalogue_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(manifest_path(dir.path())).unwrap();
+        assert!(PinnedCatalogue::take(dir.path()).is_err());
+    }
+
+    /// #2758: inside its grace a replaced segment stays, even once every follower has applied past it.
+    #[test]
+    fn a_retained_segment_is_kept_through_its_grace() {
+        let dataset = PathBuf::from("/nests/a");
+        let mut r = Retention::default();
+        r.windows.insert(
+            dataset.clone(),
+            (Duration::from_secs(600), Duration::from_secs(3600)),
+        );
+        r.followers
+            .entry(dataset.clone())
+            .or_default()
+            .insert(1, Some((1, 5)));
+        let f = Retained {
+            key: PathBuf::from("/segments/x.parquet"),
+            hash: "x".into(),
+            dataset,
+            at: Instant::now(),
+            stopped: Some((1, 5)),
+        };
+        assert!(!r.releasable(&f));
+    }
+
     /// #2363: a quarantined segment changes what a nest holds, never what it is. Every identity is a
     /// function of `collect_files`, so the inputs it sees must be the same either side of the move.
     #[test]
