@@ -116,14 +116,16 @@ pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
 
     let files = collect_files(dir, skip_out)?
         .into_iter()
-        // Local hygiene, not an authored input: a `.gitignore` must not move the nest's identity (#2722).
-        .filter(|path| path.file_name().and_then(|n| n.to_str()) != Some(".gitignore"))
         .map(|path| {
             let rel = path
                 .strip_prefix(dir)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/"); // stable path separator across platforms
+            (path, rel)
+        })
+        .filter(|(_, rel)| nuthatch_identity::is_input(rel))
+        .map(|(path, rel)| {
             let bytes = std::fs::read(&path).with_context(|| format!("reading {rel}"))?;
             // The engine keeps these files as text. A lossy read would hash other bytes and name
             // another nest (#2739).
@@ -1372,6 +1374,41 @@ abi = "abis/c.json"
         assert!(moved.is_empty(), "identities moved:\n{}", moved.join("\n"));
     }
 
+    /// #2822: the engine and the nest builder hand `nuthatch_identity` every file the directory
+    /// holds, so they name the nest the node names only if the identity crate drops `.gitignore`.
+    #[test]
+    fn the_identity_crate_names_the_nest_the_node_names_from_the_whole_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nest(dir.path());
+        std::fs::write(dir.path().join(".gitignore"), b"data/\n.admin-token\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(dir.path().join("views/.gitignore"), b"*.bak\n").unwrap();
+        let node = build_manifest(dir.path(), None).unwrap();
+        let files = collect_files(dir.path(), None)
+            .unwrap()
+            .into_iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, std::fs::read(&p).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert!(files.iter().any(|(p, _)| p == ".gitignore"));
+        let tab = nuthatch_identity::manifest(
+            node.nest_name.clone(),
+            node.schema_version,
+            "tab".into(),
+            node.registry_hash.clone(),
+            files,
+        )
+        .unwrap();
+        assert_eq!(tab.nid(), node.nid());
+        assert_eq!(tab.data_identity(), node.data_identity());
+    }
+
     #[test]
     fn hidden_files_do_not_move_the_data_identity() {
         let a = tempfile::tempdir().unwrap();
@@ -2287,7 +2324,7 @@ cid_column = "cid"
             }
             let config = Config::load(dir.path()).unwrap();
             crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
-            // `build_manifest` is what decides `.gitignore` is not an input (#2722).
+            // `nuthatch_identity::manifest` is what decides `.gitignore` is not an input (#2722).
             std::fs::write(dir.path().join(".gitignore"), b"data/\n").unwrap();
             let m = build_manifest(dir.path(), None).unwrap();
             assert!(
