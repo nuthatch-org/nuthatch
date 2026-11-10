@@ -62,3 +62,39 @@ test("an answer at or below the verified block is verified", () => {
 test("a verified source with no verified block reported is not called verified", () => {
   assert.match(headOf(true, { verified: null }, 150).head, /^refused/);
 });
+
+const hydrated = { dataset: "d6fd", indexed_from: 10, complete_through: 120, pinned: false };
+
+test("history hydrated from a mirror is labelled the mirror's, even under a verified head (#2738)", () => {
+  const h = headOf(true, { verified: { finalized: { number: 200, hash: "0x1" } }, mirror: hydrated }, 150);
+  assert.notEqual(h.head, "verified");
+  assert.match(h.head, /blocks 10 to 120 are the mirror's, unchecked/);
+  assert.match(h.head, /verified for blocks 121 to 150/);
+  assert.deepEqual(h.mirror_unchecked, { from: 10, through: 120 });
+});
+
+test("the mirror's blocks are named beside the RPC's above the verified block (#2738)", () => {
+  const h = headOf(true, { verified: { finalized: { number: 130, hash: "0x1" } }, mirror: hydrated }, 150);
+  assert.match(h.head, /verified for blocks 121 to 130/);
+  assert.match(h.head, /131 to 150 are the RPC's/);
+  assert.match(h.head, /10 to 120 are the mirror's/);
+});
+
+test("without a verified head a mirror's history is still named as the mirror's (#2738)", () => {
+  const h = headOf(undefined, { mirror: hydrated }, 150);
+  assert.match(h.head, /^the RPC's, unverified/);
+  assert.match(h.head, /blocks 10 to 120 are the mirror's/);
+  assert.deepEqual(h.mirror_unchecked, { from: 10, through: 120 });
+});
+
+test("a mirror that held no sealed block leaves the label alone (#2738)", () => {
+  const h = headOf(true, { verified: { finalized: { number: 200, hash: "0x1" } }, mirror: { ...hydrated, complete_through: 0 } }, 150);
+  assert.equal(h.head, "verified");
+  assert.equal(h.mirror_unchecked, undefined);
+});
+
+test("a verified block below the mirror's end verifies nothing past it (#2738)", () => {
+  const h = headOf(true, { verified: { finalized: { number: 100, hash: "0x1" } }, mirror: hydrated }, 150);
+  assert.doesNotMatch(h.head, /verified for/);
+  assert.match(h.head, /10 to 120 are the mirror's, unchecked; blocks 121 to 150 are the RPC's/);
+});

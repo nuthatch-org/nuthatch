@@ -52,15 +52,28 @@ export function statementVerdict(c) {
 }
 
 /// The head a check ran under, from what the follow did rather than what was asked (RFC-0081 §7.2,
-/// #2615). Only blocks at or below the verified finalized block are checked against it.
+/// #2615). Only blocks past the mirror's end and at or below the verified finalized block are checked
+/// against it: hydrated history is the mirror's word for itself (#2738).
 export function headOf(verified, followed, as_of) {
-  if (!verified) return { head: "the RPC's, unverified" };
-  if (followed.unverified) return { head: `refused: ${followed.unverified}`, unverified: followed.unverified };
+  const m = followed.mirror;
+  const hydrated = m && m.complete_through > 0 ? { from: m.indexed_from, through: m.complete_through } : null;
+  const mirrors = hydrated ? `blocks ${hydrated.from} to ${hydrated.through} are the mirror's, unchecked` : null;
+  const labelled = (head, rest) => ({ head, ...rest, ...(hydrated ? { mirror_unchecked: hydrated } : {}) });
+  if (!verified) return labelled(mirrors ? `the RPC's, unverified; ${mirrors}` : "the RPC's, unverified");
+  if (followed.unverified) return labelled(`refused: ${followed.unverified}`, { unverified: followed.unverified });
   const n = followed.verified?.finalized?.number;
   if (!Number.isSafeInteger(n)) {
     const why = "the module reported no verified finalized block";
-    return { head: `refused: ${why}`, unverified: why };
+    return labelled(`refused: ${why}`, { unverified: why });
   }
-  if (as_of <= n) return { head: "verified", verified_through: n };
-  return { head: `verified through block ${n}; blocks ${n + 1} to ${as_of} are the RPC's`, verified_through: n };
+  if (!hydrated) {
+    return { head: as_of <= n ? "verified" : `verified through block ${n}; blocks ${n + 1} to ${as_of} are the RPC's`, verified_through: n };
+  }
+  const top = Math.min(n, as_of);
+  const parts = [
+    top > hydrated.through ? `verified for blocks ${hydrated.through + 1} to ${top}` : null,
+    mirrors,
+    as_of > Math.max(n, hydrated.through) ? `blocks ${Math.max(n, hydrated.through) + 1} to ${as_of} are the RPC's` : null,
+  ];
+  return labelled(parts.filter(Boolean).join("; "), { verified_through: n });
 }

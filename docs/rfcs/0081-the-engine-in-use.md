@@ -66,6 +66,9 @@ narrowed tail from the RPC from that dataset's `sealed_through` to `until`. S4 r
 `filters` (§18); this lifts the refusal for the case where the mirror dataset's data identity matches
 the nest's and the filter applies to what was hydrated as a query predicate, not a fetch.
 
+*(Annotated 2026-11-10, #2738: as built, `mirror+rpc` refuses a postcard (§12), so its history is pinned
+by nothing but the mirror's own `seed.json`. `verify` names those blocks as the mirror's, unchecked.)*
+
 **The privacy rule, which is the reason this is safe to offer to rotki-shaped users.** The module never
 puts a value from a private filter into a `get` request. A filter is marked `private` (the default for
 any value the host says came from the user) or `public`. A `mirror` or `mirror+rpc` nest may be
@@ -132,8 +135,9 @@ Two limits that are the design and not a gap:
   honest reason. The caller declares the filters, and the result says which ones it ran under. A
   network-wide statement is the shared-view case and is not verifiable in a tab at all; that is what
   running the binary is for (RFC-0077 §1a).
-- **Equality with a server is not truth.** It says the server and the visitor's RPC agree. It becomes
-  more than that only where §3.5 and §3.6 apply.
+- **Equality with a server is not truth.** It says the server and the visitor's RPC agree, and on a
+  `mirror+rpc` nest the mirror too, for the history it hydrated. It becomes more than that only where
+  §3.5 and §3.6 apply.
 
 Nothing changes in the binary or the platform: `provenance` is already in every `/sql` answer. A hosted
 operator who wants to say "check this yourself" links to a page that calls `verify`.
