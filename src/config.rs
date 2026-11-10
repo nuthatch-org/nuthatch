@@ -511,8 +511,10 @@ impl Config {
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(CONFIG_FILE);
         let raw = toml::to_string_pretty(self).context("failed to serialise config")?;
-        std::fs::write(&path, raw)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
 
@@ -663,6 +665,28 @@ fn one_edit_away(word: &str) -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2688: `save` truncated the live file, so a full disk or a kill mid-write left it empty. A
+    /// replaced file leaves the old bytes whole under any other link to them.
+    #[test]
+    fn save_replaces_the_file_rather_than_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n";
+        std::fs::write(dir.path().join(CONFIG_FILE), raw).unwrap();
+        let mut cfg = Config::load(dir.path()).unwrap();
+        std::fs::hard_link(dir.path().join(CONFIG_FILE), dir.path().join("held.toml")).unwrap();
+
+        cfg.nest.name = "renamed".into();
+        cfg.save(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("held.toml")).unwrap(),
+            raw,
+            "save wrote into the live file"
+        );
+        assert_eq!(Config::load(dir.path()).unwrap().nest.name, "renamed");
+        assert!(!dir.path().join(format!("{CONFIG_FILE}.tmp")).exists());
+    }
 
     /// #1582: a misspelt key is reported, and nothing a real config says, or a parsed one writes
     /// back, is. A false positive would make every nest warn and `check` fail.
