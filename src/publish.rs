@@ -131,18 +131,15 @@ impl FsMirror {
     ) -> Result<()> {
         let path = self.path(key);
         let parent = path.parent().unwrap_or(&self.root);
-        std::fs::create_dir_all(parent)
+        crate::seal::create_dir_durable(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         sweep_stale_partials(parent, &name);
         let mut tag = [0u8; 6];
         let _ = getrandom::fill(&mut tag);
         let partial = parent.join(format!(".{name}.{}{PARTIAL_SUFFIX}", hex::encode(tag)));
-        let written = std::fs::File::create(&partial).and_then(|mut f| {
-            fill(&mut f)?;
-            f.sync_all()
-        });
-        if let Err(e) = written.and_then(|()| std::fs::rename(&partial, &path)) {
+        let written = std::fs::File::create(&partial).and_then(|mut f| fill(&mut f));
+        if let Err(e) = written.and_then(|()| crate::seal::install_durable(&partial, &path)) {
             let _ = std::fs::remove_file(&partial);
             return Err(e).with_context(|| format!("writing {key}"));
         }
@@ -2962,6 +2959,35 @@ abi = "abis/usdc.json"
             m.list("ds").await.unwrap(),
             vec!["ds/seed.json".to_string()]
         );
+    }
+
+    /// #2710: the catalogue's rename must not outlive a power cut that loses the segment it names.
+    #[test]
+    fn a_mirror_write_is_durable_before_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let m = FsMirror { root: root.clone() };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let trace = crate::seal::capture_durable(|| {
+            rt.block_on(m.put("ds/new/seg.parquet", b"bytes")).unwrap();
+        });
+        use crate::seal::Durable;
+        let leaf = root.join("ds/new");
+        let at = |want: &Durable| trace.iter().position(|e| e == want);
+        let synced = trace
+            .iter()
+            .position(|e| matches!(e, Durable::FileSync(p) if p.starts_with(&leaf)));
+        let (Some(top), Some(mid), Some(synced), Some(entry)) = (
+            at(&Durable::ParentDir(root.clone())),
+            at(&Durable::ParentDir(root.join("ds"))),
+            synced,
+            at(&Durable::EntryDir(leaf.clone())),
+        ) else {
+            panic!("{trace:?}");
+        };
+        assert!(top < entry && mid < entry && synced < entry, "{trace:?}");
     }
 
     #[tokio::test]

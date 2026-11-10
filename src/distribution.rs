@@ -196,10 +196,11 @@ pub trait BundleStore: Send + Sync {
     async fn list_nid_refs(&self) -> Result<Vec<(String, String)>>;
     /// Remove a blob; an absent one is not an error.
     async fn delete_blob(&self, hash: &str) -> Result<()>;
-    /// Remove a `name@version` ref; an absent one is not an error.
-    async fn delete_ref(&self, name: &str, version: &str) -> Result<()>;
-    /// Remove a NID entry; an absent one is not an error.
-    async fn delete_nid_ref(&self, nid: &str) -> Result<()>;
+    /// Remove a `name@version` ref only while it still names `hash`. False when it did not, or was
+    /// already gone.
+    async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool>;
+    /// Remove a NID entry only while it still names `hash`, as [`BundleStore::delete_ref_if`].
+    async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool>;
     /// Fetch a blob's bytes by content address.
     async fn get_blob(&self, hash: &str) -> Result<Vec<u8>>;
     /// Point `name@version` at a hash (the caller advances `latest` separately). The only mutation.
@@ -241,8 +242,9 @@ impl FsStore {
         self.root.join("nids").join(nid)
     }
 
-    /// Written whole or not at all: a prune listing refs beside a publish must never read a ref
-    /// half-written. Staged outside `index/`, whose every entry is a ref.
+    /// Written whole or not at all, and durable before this returns: a prune listing refs beside a
+    /// publish must never read a ref half-written, and a ref must never outlive its blob (#2711).
+    /// Staged outside `index/`, whose every entry is a ref.
     fn write_atomic(&self, path: &Path, bytes: &[u8], subject: &str) -> Result<()> {
         use std::io::Write;
         let staging = self.root.join(".staging");
@@ -250,15 +252,49 @@ impl FsStore {
             .into_iter()
             .flatten()
         {
-            std::fs::create_dir_all(dir).map_err(|e| map_write_err(e, subject, dir))?;
+            crate::seal::create_dir_durable(dir).map_err(|e| map_write_err(e, subject, dir))?;
         }
         let mut tmp = tempfile::NamedTempFile::new_in(&staging)
             .map_err(|e| map_write_err(e, subject, &staging))?;
         tmp.write_all(bytes)
             .map_err(|e| map_write_err(e, subject, path))?;
-        tmp.persist(path)
-            .map_err(|e| map_write_err(e.error, subject, path))?;
+        let tmp = tmp.into_temp_path();
+        crate::seal::install_durable(&tmp, path).map_err(|e| map_write_err(e, subject, path))?;
+        // Renamed away, so there is nothing left for the guard to remove.
+        let _ = tmp.keep();
         Ok(())
+    }
+
+    /// Held by every ref write and conditional delete, so a prune's compare and remove is one step
+    /// to any other process writing this registry (#2712).
+    fn lock_refs(&self) -> Result<std::fs::File> {
+        let path = self.root.join(".refs.lock");
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| map_write_err(e, "the registry lock", &self.root))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| map_write_err(e, "the registry lock", &path))?;
+        file.lock()
+            .map_err(|e| map_write_err(e, "the registry lock", &path))?;
+        Ok(file)
+    }
+
+    fn remove_if_naming(&self, path: &Path, hash: &str, subject: &str) -> Result<bool> {
+        let _lock = self.lock_refs()?;
+        match Self::read_hash(path, subject) {
+            Ok(now) if now == hash => {}
+            Ok(_) => return Ok(false),
+            Err(e) if is_not_found(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        remove_if_present(path, subject)?;
+        // Before the prune deletes the blob, or a power cut could bring back a ref to nothing.
+        let dir = path.parent().unwrap_or(&self.root);
+        crate::seal::fsync_dir(dir).map_err(|e| map_write_err(e, subject, dir))?;
+        Ok(true)
     }
 
     fn list_dir(&self, dir: &Path) -> Result<Vec<(String, PathBuf)>> {
@@ -355,15 +391,16 @@ impl BundleStore for FsStore {
         remove_if_present(&self.blob_path(hash), &format!("blob {hash}"))
     }
 
-    async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
-        remove_if_present(
+    async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool> {
+        self.remove_if_naming(
             &self.ref_path(name, version),
+            hash,
             &format!("nest '{name}@{version}'"),
         )
     }
 
-    async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
-        remove_if_present(&self.nid_path(nid), &format!("nid {nid}"))
+    async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool> {
+        self.remove_if_naming(&self.nid_path(nid), hash, &format!("nid {nid}"))
     }
 
     async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -373,6 +410,7 @@ impl BundleStore for FsStore {
 
     async fn set_ref(&self, name: &str, version: &str, hash: &str) -> Result<()> {
         let path = self.ref_path(name, version);
+        let _lock = self.lock_refs()?;
         self.write_atomic(&path, hash.as_bytes(), &format!("nest '{name}@{version}'"))
     }
 
@@ -385,6 +423,7 @@ impl BundleStore for FsStore {
 
     async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
         let path = self.nid_path(nid);
+        let _lock = self.lock_refs()?;
         self.write_atomic(&path, hash.as_bytes(), &format!("nid {nid}"))
     }
 
@@ -583,14 +622,9 @@ pub async fn prune(
         if kept.contains(hash) {
             continue;
         }
-        if !dry_run {
-            // Re-read: a publish may have re-pointed it at a blob that is kept.
-            match store.get_ref(name, version).await {
-                Ok(now) if now == *hash => store.delete_ref(name, version).await?,
-                Ok(_) => continue,
-                Err(e) if is_not_found(&e) => continue,
-                Err(e) => return Err(e),
-            }
+        // Only if unchanged: a publish may have re-pointed it at a blob that is kept.
+        if !dry_run && !store.delete_ref_if(name, version, hash).await? {
+            continue;
         }
         report.deleted_refs.push(format!("{name}@{version}"));
     }
@@ -598,13 +632,8 @@ pub async fn prune(
         if reachable.contains(nid) {
             continue;
         }
-        if !dry_run {
-            match store.get_nid_ref(nid).await {
-                Ok(now) if now == *hash => store.delete_nid_ref(nid).await?,
-                Ok(_) => continue,
-                Err(e) if is_not_found(&e) => continue,
-                Err(e) => return Err(e),
-            }
+        if !dry_run && !store.delete_nid_ref_if(nid, hash).await? {
+            continue;
         }
         report.deleted_nids.push(nid.clone());
     }
@@ -994,17 +1023,33 @@ mod object_store_impl {
                 .await
         }
 
-        async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+        // object_store has no conditional delete, so another writer can still re-point the ref
+        // between this read and the delete. A filesystem registry closes that window with a lock.
+        async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool> {
+            match self.get_ref(name, version).await {
+                Ok(now) if now == hash => {}
+                Ok(_) => return Ok(false),
+                Err(e) if is_not_found(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            }
             self.delete_key(
                 &self.ref_key(name, version),
                 &format!("nest '{name}@{version}'"),
             )
-            .await
+            .await?;
+            Ok(true)
         }
 
-        async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
+        async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool> {
+            match self.get_nid_ref(nid).await {
+                Ok(now) if now == hash => {}
+                Ok(_) => return Ok(false),
+                Err(e) if is_not_found(&e) => return Ok(false),
+                Err(e) => return Err(e),
+            }
             self.delete_key(&self.nid_key(nid), &format!("nid {nid}"))
-                .await
+                .await?;
+            Ok(true)
         }
 
         async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -1764,7 +1809,7 @@ abi = "abis/c.json"
         let store = FsStore::new(reg.path());
         let dir = tempfile::tempdir().unwrap();
         let ((ha, na), _) = two_published(&store, dir.path()).await;
-        store.delete_nid_ref(&na).await.unwrap();
+        assert!(store.delete_nid_ref_if(&na, &ha).await.unwrap());
         let keep = std::collections::BTreeSet::from([na]);
         let report = prune(&store, &keep, std::time::Duration::ZERO, false)
             .await
@@ -1781,6 +1826,8 @@ abi = "abis/c.json"
         inner: FsStore,
         grace: std::time::Duration,
         late: Option<String>,
+        /// A prune's first ref delete finds that ref re-pointed at this hash by another process.
+        repoint: Option<String>,
         fired: std::sync::atomic::AtomicBool,
     }
 
@@ -1810,16 +1857,21 @@ abi = "abis/c.json"
         async fn delete_blob(&self, hash: &str) -> Result<()> {
             self.inner.delete_blob(hash).await
         }
-        async fn delete_ref(&self, name: &str, version: &str) -> Result<()> {
+        async fn delete_ref_if(&self, name: &str, version: &str, expect: &str) -> Result<bool> {
+            if let Some(hash) = &self.repoint {
+                if self.first() {
+                    self.inner.set_ref(name, version, hash).await?;
+                }
+            }
             if let Some(hash) = &self.late {
                 if self.first() {
                     self.inner.set_ref("late", "1", hash).await?;
                 }
             }
-            self.inner.delete_ref(name, version).await
+            self.inner.delete_ref_if(name, version, expect).await
         }
-        async fn delete_nid_ref(&self, nid: &str) -> Result<()> {
-            self.inner.delete_nid_ref(nid).await
+        async fn delete_nid_ref_if(&self, nid: &str, expect: &str) -> Result<bool> {
+            self.inner.delete_nid_ref_if(nid, expect).await
         }
         async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
             self.inner.get_blob(hash).await
@@ -1856,6 +1908,7 @@ abi = "abis/c.json"
                 inner: FsStore::new(reg.path()),
                 grace,
                 late: None,
+                repoint: None,
                 fired: Default::default(),
             };
             publish(&store, &file, Some("a"), Some("1")).await.unwrap();
@@ -1876,6 +1929,7 @@ abi = "abis/c.json"
             inner: FsStore::new(reg.path()),
             grace: std::time::Duration::ZERO,
             late: Some(ha.clone()),
+            repoint: None,
             fired: Default::default(),
         };
         let report = prune(
@@ -1890,6 +1944,102 @@ abi = "abis/c.json"
         assert!(!report.deleted_blobs.contains(&ha), "{report:?}");
         assert_eq!(store.get_ref("late", "1").await.unwrap(), ha);
         no_ref_dangles(&store).await;
+    }
+
+    /// #2712: a ref re-pointed at a kept blob after the prune's last read of it survives.
+    #[tokio::test]
+    async fn a_ref_repointed_as_a_prune_deletes_it_survives() {
+        let reg = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ((ha, na), _) = two_published(&FsStore::new(reg.path()), dir.path()).await;
+        let store = Interleaved {
+            inner: FsStore::new(reg.path()),
+            grace: std::time::Duration::ZERO,
+            late: None,
+            repoint: Some(ha.clone()),
+            fired: Default::default(),
+        };
+        let keep = std::collections::BTreeSet::from([na]);
+        let report = prune(&store, &keep, std::time::Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert!(store.fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.get_ref("b", "1").await.unwrap(), ha);
+        assert!(
+            !report.deleted_refs.contains(&"b@1".to_string()),
+            "{report:?}"
+        );
+    }
+
+    /// The compare happens under the lock a ref write holds, so a write mid-flight in another
+    /// process is either seen or has not started.
+    #[test]
+    fn a_conditional_delete_waits_for_a_ref_write_in_flight() {
+        let reg = tempfile::tempdir().unwrap();
+        let store = FsStore::new(reg.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(store.set_ref("a", "1", "old")).unwrap();
+        let held = store.lock_refs().unwrap();
+        let root = reg.path().to_path_buf();
+        let deleting = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(FsStore::new(root).delete_ref_if("a", "1", "old"))
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !deleting.is_finished(),
+            "the delete did not wait for the lock"
+        );
+        std::fs::write(reg.path().join("index/a/1"), "new").unwrap();
+        drop(held);
+        assert!(!deleting.join().unwrap());
+        assert_eq!(rt.block_on(store.get_ref("a", "1")).unwrap(), "new");
+    }
+
+    /// #2711: a blob and the ref naming it are each on disk, bytes and name, before the next write,
+    /// and the blob before its ref.
+    #[test]
+    fn a_registry_write_is_durable_blob_first() {
+        use crate::seal::{capture_durable, Durable};
+        let reg = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.bundle");
+        write_bundle_fixture(&file, "a");
+        let store = FsStore::new(reg.path());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let trace = capture_durable(|| {
+            rt.block_on(publish(&store, &file, Some("a"), Some("1")))
+                .unwrap();
+        });
+        let staging = reg.path().join(".staging");
+        let entry = |dir: PathBuf| {
+            trace
+                .iter()
+                .position(|e| *e == Durable::EntryDir(dir.clone()))
+                .unwrap_or_else(|| panic!("{} not synced: {trace:?}", dir.display()))
+        };
+        let (blob, refs) = (
+            entry(reg.path().join("blobs")),
+            entry(reg.path().join("index/a")),
+        );
+        assert!(blob < refs, "{trace:?}");
+        assert!(
+            trace[..blob]
+                .iter()
+                .any(|e| matches!(e, Durable::FileSync(p) if p.starts_with(&staging))),
+            "{trace:?}"
+        );
+        assert!(
+            trace.contains(&Durable::ParentDir(reg.path().join("index"))),
+            "index/a is new: {trace:?}"
+        );
     }
 
     /// A ref or NID entry another runtime's prune deletes after this listing saw it and before its
