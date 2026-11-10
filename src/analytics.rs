@@ -11,6 +11,7 @@
 use crate::engine::{Collected, Died, Engine, Interrupt, Session};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use sqlparser::tokenizer::Token;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1997,34 +1998,21 @@ const FORBIDDEN_FNS: &[&str] = &[
     "getenv",
 ];
 
-/// Strip all SQL comments (line `--…` and block `/* … */`) so a function call can't be split or hidden
-/// by a comment before the denylist scan. Deliberately naive about string literals - over-stripping a
-/// query with `--`/`/*` inside a string just makes it invalid (rejected), which is the safe direction.
-fn strip_all_sql_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let b = sql.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'-' && i + 1 < b.len() && b[i + 1] == b'-' {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-            out.push(' ');
-        } else {
-            // Whole characters: a byte pushed as a char turns `é` into two, and every byte offset the
-            // checks downstream take stops lining up with the text.
-            let c = sql[i..].chars().next().expect("i is on a char boundary");
-            out.push(c);
-            i += c.len_utf8();
-        }
-    }
-    out
+/// The statement as the engine's tokenizer reads it, comments and whitespace dropped, so that a gate
+/// sees a `--` or `/*` inside a string as part of the string (#2728). Burrmill tokenizes with this
+/// dialect too. A statement that will not tokenize is refused: the engine could not run it either.
+fn sql_tokens(sql: &str) -> Result<Vec<Token>> {
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&sqlparser::dialect::DuckDbDialect {}, sql)
+        .tokenize()
+        .map_err(|e| anyhow::anyhow!("the statement does not tokenize: {e}"))?;
+    Ok(tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect())
+}
+
+fn is_keyword(t: &Token, kw: sqlparser::keywords::Keyword) -> bool {
+    matches!(t, Token::Word(w) if w.quote_style.is_none() && w.keyword == kw)
 }
 
 /// Refuse `WITH cte AS (…) INSERT/UPDATE/DELETE/COPY …` (SEC-7).
@@ -2034,24 +2022,23 @@ fn strip_all_sql_comments(sql: &str) -> String {
 /// (or VALUES / TABLE, which SQL treats as a query). Anything else is DML or DDL riding a
 /// prefix the keyword gate already blessed.
 ///
-/// String-literal and identifier aware, same as [`reject_statement_stacking`]: `WITH t AS
-/// (SELECT 'INSERT') SELECT 1` is a query, `WITH t AS (SELECT 1) INSERT INTO t SELECT 1` is not.
-/// Comments are stripped first. A CTE list we cannot parse is refused rather than handed to
-/// the engine - fail closed, the same direction as a `;` inside an unparsed `$$` block.
+/// Read over tokens, so `WITH t AS (SELECT 'INSERT') SELECT 1` is a query and `WITH t AS (SELECT 1)
+/// INSERT INTO t SELECT 1` is not. A CTE list we cannot follow is refused rather than handed to the
+/// engine.
 fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
-    let cleaned = strip_all_sql_comments(sql);
-    let head = cleaned.trim_start();
-    if !sql_keyword_at(head, "with") {
+    use sqlparser::keywords::Keyword;
+    let tokens = sql_tokens(sql)?;
+    if !tokens.first().is_some_and(|t| is_keyword(t, Keyword::WITH)) {
         return Ok(());
     }
-    let Some(rest) = skip_ctes(head) else {
+    let Some(rest) = skip_ctes(&tokens) else {
         bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
     };
-    let rest = rest.trim_start();
-    if sql_keyword_at(rest, "select")
-        || sql_keyword_at(rest, "values")
-        || sql_keyword_at(rest, "table")
-    {
+    if tokens.get(rest).is_some_and(|t| {
+        is_keyword(t, Keyword::SELECT)
+            || is_keyword(t, Keyword::VALUES)
+            || is_keyword(t, Keyword::TABLE)
+    }) {
         return Ok(());
     }
     bail!(
@@ -2060,116 +2047,61 @@ fn reject_with_prefixed_dml(sql: &str) -> Result<()> {
     )
 }
 
-/// True when `s` opens with `kw` as a whole SQL word (case-insensitive, not `without` for `with`).
-fn sql_keyword_at(s: &str, kw: &str) -> bool {
-    let s = s.trim_start();
-    match s.get(..kw.len()) {
-        Some(head) if head.eq_ignore_ascii_case(kw) => {}
-        _ => return false,
+/// Consume `WITH [RECURSIVE] name [(…)] AS [[NOT] MATERIALIZED] (…) [, …]*` and return the index of
+/// the token after it.
+fn skip_ctes(t: &[Token]) -> Option<usize> {
+    use sqlparser::keywords::Keyword;
+    let kw = |i: usize, k| t.get(i).is_some_and(|x| is_keyword(x, k));
+    let mut i = 1;
+    if kw(i, Keyword::RECURSIVE) {
+        i += 1;
     }
-    match s[kw.len()..].chars().next() {
-        None => true,
-        Some(c) => !sql_ident_cont(c),
-    }
-}
-
-fn sql_ident_cont(c: char) -> bool {
-    // The DuckDB dialect the engine parses takes unquoted non-ASCII identifiers (`abéé`), so this
-    // must too.
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Consume `WITH [RECURSIVE] name AS [(…)] [, name AS (…)]*` and return the remainder.
-fn skip_ctes(sql: &str) -> Option<&str> {
-    let s = strip_sql_keyword(sql, "with")?;
-    let s = strip_sql_keyword(s, "recursive").unwrap_or(s);
-    let mut s = s;
     loop {
-        let (_, rest) = next_sql_ident(s)?;
-        s = rest.trim_start();
-        if s.starts_with('(') {
-            s = skip_balanced_parens(s)?.trim_start();
-        }
-        s = strip_sql_keyword(s, "as")?.trim_start();
-        if let Some(rest) = strip_sql_keyword(s, "not") {
-            s = strip_sql_keyword(rest.trim_start(), "materialized")?.trim_start();
-        } else if let Some(rest) = strip_sql_keyword(s, "materialized") {
-            s = rest.trim_start();
-        }
-        if !s.starts_with('(') {
+        if !matches!(t.get(i), Some(Token::Word(_))) {
             return None;
         }
-        s = skip_balanced_parens(s)?.trim_start();
-        if s.starts_with(',') {
-            s = s[1..].trim_start();
-            continue;
+        i += 1;
+        if t.get(i) == Some(&Token::LParen) {
+            i = after_parens(t, i)?;
         }
-        return Some(s);
-    }
-}
-
-fn strip_sql_keyword<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
-    let s = s.trim_start();
-    if !sql_keyword_at(s, kw) {
-        return None;
-    }
-    Some(&s[kw.len()..])
-}
-
-/// Next SQL identifier: a quoted `"name"` (with `""` escapes) or a bare `[A-Za-z0-9_]+`.
-fn next_sql_ident(s: &str) -> Option<(&str, &str)> {
-    let s = s.trim_start();
-    let b = s.as_bytes();
-    if b.first() == Some(&b'"') {
-        let mut i = 1;
-        while i < b.len() {
-            if b[i] == b'"' {
-                if i + 1 < b.len() && b[i + 1] == b'"' {
-                    i += 2;
-                    continue;
-                }
-                return Some((&s[..=i], &s[i + 1..]));
+        if !kw(i, Keyword::AS) {
+            return None;
+        }
+        i += 1;
+        if kw(i, Keyword::NOT) {
+            if !kw(i + 1, Keyword::MATERIALIZED) {
+                return None;
             }
+            i += 2;
+        } else if kw(i, Keyword::MATERIALIZED) {
             i += 1;
         }
-        return None;
+        if t.get(i) != Some(&Token::LParen) {
+            return None;
+        }
+        i = after_parens(t, i)?;
+        if t.get(i) == Some(&Token::Comma) {
+            i += 1;
+            continue;
+        }
+        return Some(i);
     }
-    let end = s.find(|c: char| !sql_ident_cont(c)).unwrap_or(s.len());
-    if end == 0 {
-        return None;
-    }
-    Some((&s[..end], &s[end..]))
 }
 
-/// `s` starts with `(`. Return the suffix after the matching `)`, string-aware.
-fn skip_balanced_parens(s: &str) -> Option<&str> {
-    let b = s.as_bytes();
-    if b.first() != Some(&b'(') {
-        return None;
-    }
-    let mut i = 0;
-    let mut depth = 0;
-    let (mut in_single, mut in_double) = (false, false);
-    while i < b.len() {
-        match b[i] {
-            b'\'' if !in_double => {
-                if in_single && i + 1 < b.len() && b[i + 1] == b'\'' {
-                    i += 1;
-                } else {
-                    in_single = !in_single;
-                }
-            }
-            b'"' if !in_single => in_double = !in_double,
-            b'(' if !in_single && !in_double => depth += 1,
-            b')' if !in_single && !in_double => {
+/// `t[open]` is `(`: the index after its matching `)`.
+fn after_parens(t: &[Token], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, tok) in t.iter().enumerate().skip(open) {
+        match tok {
+            Token::LParen => depth += 1,
+            Token::RParen => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some(&s[i + 1..]);
+                    return Some(i + 1);
                 }
             }
             _ => {}
         }
-        i += 1;
     }
     None
 }
@@ -2189,41 +2121,19 @@ fn skip_balanced_parens(s: &str) -> Option<&str> {
 ///
 /// So statement stacking is rejected here, in our own code, rather than delegated to an engine
 /// behaviour we do not control; Burrmill also refuses a second statement, and this does not rely on
-/// it. A trailing `;` (with only whitespace after it) is fine - that is how people habitually end a
-/// query - but anything following one is refused.
-///
-/// String-literal aware, because `SELECT ';'` is a perfectly legal query. Single quotes with `''`
-/// escaping and double-quoted identifiers are both tracked. Dollar-quoting is NOT parsed: a `;` inside
-/// a `$$…$$` block is treated as a statement separator and refused, which fails safe.
+/// it. A trailing `;` (with only whitespace or comments after it) is fine - that is how people
+/// habitually end a query - but any token following one is refused. A `;` inside a string or a quoted
+/// identifier is a token of its own kind, not a separator.
 fn reject_statement_stacking(sql: &str) -> Result<()> {
-    let cleaned = strip_all_sql_comments(sql);
-    let b = cleaned.as_bytes();
-    let mut i = 0;
-    let (mut in_single, mut in_double) = (false, false);
-    while i < b.len() {
-        match b[i] {
-            b'\'' if !in_double => {
-                // `''` inside a literal is an escaped quote, not a terminator.
-                if in_single && i + 1 < b.len() && b[i + 1] == b'\'' {
-                    i += 1;
-                } else {
-                    in_single = !in_single;
-                }
-            }
-            b'"' if !in_single => in_double = !in_double,
-            b';' if !in_single && !in_double => {
-                if cleaned[i + 1..].trim().is_empty() {
-                    return Ok(()); // a trailing semicolon, nothing behind it
-                }
-                bail!(
-                    "the read-only SQL surface accepts a single statement; `;`-stacking is refused \
-                     (only the first statement is checked for read-only-ness, so a stacked second one \
-                     could write files)"
-                );
-            }
-            _ => {}
+    let tokens = sql_tokens(sql)?;
+    if let Some(at) = tokens.iter().position(|t| *t == Token::SemiColon) {
+        if at + 1 < tokens.len() {
+            bail!(
+                "the read-only SQL surface accepts a single statement; `;`-stacking is refused \
+                 (only the first statement is checked for read-only-ness, so a stacked second one \
+                 could write files)"
+            );
         }
-        i += 1;
     }
     Ok(())
 }
@@ -2466,77 +2376,101 @@ fn table_refs_in(
     })
 }
 
-/// Refuse a query that *calls* any [`FORBIDDEN_FNS`] function. Comments are stripped first, then each
-/// name is matched only when it's a real call: a word boundary before it and (after optional
-/// whitespace) a `(` after it - so a table or column merely *named* like one (e.g. `pool__glob`) is
-/// fine, while `read_text/**/('…')` and `READ_TEXT (…)` are both caught. (SEC-2, primary control.)
+/// Refuse a query that *calls* any [`FORBIDDEN_FNS`] function: the name as a word, quoted or not and
+/// in any case, directly followed by `(`. A table or column merely *named* like one (`pool__glob`) is
+/// fine, and so is the name inside a string. (SEC-2, primary control.)
+///
+/// Quoting collapses in the tokenizer: `"read_csv"(…)` is the word `read_csv`, which once executed
+/// under DuckDB while a text scan looked for `(` after whitespace and found a quote.
 pub(crate) fn reject_file_access(sql: &str) -> Result<()> {
-    // **Double quotes are removed before scanning.** SQL resolves a quoted function name as the bare
-    // form, so `"read_csv"('/etc/passwd')` executed while sailing past a check that looked for `(`
-    // after optional *whitespace* - a quote is not whitespace. Verified against a live DuckDB during
-    // the pre-1.0 adversary pass: the quoted form returned the file's contents.
-    //
-    // Stripping is the robust fix rather than "also skip quotes when seeking `(`", because it
-    // normalises every placement at once - `"read_csv"(`, `read"_"csv(`, and anything else quoting can
-    // do to break a name into pieces. It can only ever make the denylist match *more*, and a denylist
-    // that over-refuses is the safe direction: the cost is a rejected query with a bizarre quoted
-    // identifier, and the alternative cost is reading /etc/passwd.
-    let cleaned = strip_all_sql_comments(sql)
-        .to_ascii_lowercase()
-        .replace('"', "");
-    let b = cleaned.as_bytes();
-    let is_ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
-    for name in FORBIDDEN_FNS {
-        let mut from = 0;
-        while let Some(pos) = cleaned[from..].find(name) {
-            let start = from + pos;
-            let end = start + name.len();
-            let boundary_before = start == 0 || !is_ident(b[start - 1]);
-            let mut j = end;
-            while j < b.len() && b[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let is_call = j < b.len() && b[j] == b'(';
-            if boundary_before && is_call {
-                bail!("query uses forbidden filesystem/network function `{name}` - refused");
-            }
-            from = end;
+    let tokens = sql_tokens(sql)?;
+    for pair in tokens.windows(2) {
+        let (Token::Word(w), Token::LParen) = (&pair[0], &pair[1]) else {
+            continue;
+        };
+        let called = w.value.to_ascii_lowercase();
+        if let Some(name) = FORBIDDEN_FNS.iter().find(|f| **f == called) {
+            bail!("query uses forbidden filesystem/network function `{name}` - refused");
         }
     }
     Ok(())
 }
 
 /// Refuse a **replacement scan**: under DuckDB a bare string literal in table position (`FROM
-/// '/x.parquet'`, `JOIN '…'`) read that file with *no function name* for [`reject_file_access`] to
-/// match, bypassing the denylist entirely. Burrmill reads it as an unknown table; this does not rely on
-/// that. A legitimate query names a view or a subquery after FROM/JOIN, never
-/// a single-quoted string (a double-quoted identifier is fine and untouched) - so rejecting a
-/// single-quote as the first non-space token after a word-bounded FROM/JOIN closes the bypass without
-/// affecting real queries. Comments are stripped first, mirroring the denylist scan.
+/// '/x.parquet'`, `JOIN '…'`, `FROM t, '…'`) read that file with *no function name* for
+/// [`reject_file_access`] to match. Burrmill reads it as an unknown table; this does not rely on that.
+/// A legitimate query names a view or a subquery there, never a string.
+///
+/// Table position is the token after `FROM` or `JOIN`, or after a comma in a FROM list at the same
+/// parenthesis depth. `IS DISTINCT FROM` is a comparison, not a FROM list.
 pub(crate) fn reject_replacement_scan(sql: &str) -> Result<()> {
-    let cleaned = strip_all_sql_comments(sql).to_ascii_lowercase();
-    let b = cleaned.as_bytes();
-    let is_ident = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
-    for kw in ["from", "join"] {
-        let mut from = 0;
-        while let Some(pos) = cleaned[from..].find(kw) {
-            let start = from + pos;
-            let end = start + kw.len();
-            let boundary_before = start == 0 || !is_ident(b[start - 1]);
-            let mut j = end;
-            while j < b.len() && b[j].is_ascii_whitespace() {
-                j += 1;
+    use sqlparser::keywords::Keyword;
+    let tokens = sql_tokens(sql)?;
+    let mut in_from = vec![false];
+    for (i, t) in tokens.iter().enumerate() {
+        let next_is_string = tokens.get(i + 1).is_some_and(is_string_literal);
+        match t {
+            Token::LParen => in_from.push(false),
+            Token::RParen if in_from.len() > 1 => {
+                in_from.pop();
             }
-            // A single-quote as the first token after a word-bounded FROM/JOIN is a file replacement
-            // scan. (If the keyword is part of a larger identifier, the next char is an ident char, not a
-            // quote, so this never false-positives on e.g. `fromage`.)
-            if boundary_before && j < b.len() && b[j] == b'\'' {
-                bail!("query reads a file via a `{kw} '…'` replacement scan - refused");
+            Token::Comma if *in_from.last().expect("never empty") && next_is_string => {
+                bail!("query reads a file via a `FROM …, '…'` replacement scan - refused");
             }
-            from = end;
+            Token::Word(w) if w.quote_style.is_none() => match w.keyword {
+                Keyword::FROM | Keyword::JOIN => {
+                    let distinct = i > 0 && is_keyword(&tokens[i - 1], Keyword::DISTINCT);
+                    if !distinct {
+                        if next_is_string {
+                            let kw = w.value.to_ascii_lowercase();
+                            bail!("query reads a file via a `{kw} '…'` replacement scan - refused");
+                        }
+                        *in_from.last_mut().expect("never empty") = true;
+                    }
+                }
+                Keyword::SELECT
+                | Keyword::WHERE
+                | Keyword::GROUP
+                | Keyword::HAVING
+                | Keyword::QUALIFY
+                | Keyword::WINDOW
+                | Keyword::ORDER
+                | Keyword::LIMIT
+                | Keyword::OFFSET
+                | Keyword::UNION
+                | Keyword::EXCEPT
+                | Keyword::INTERSECT => *in_from.last_mut().expect("never empty") = false,
+                _ => {}
+            },
+            _ => {}
         }
     }
     Ok(())
+}
+
+fn is_string_literal(t: &Token) -> bool {
+    matches!(
+        t,
+        Token::SingleQuotedString(_)
+            | Token::DoubleQuotedString(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::TripleDoubleQuotedString(_)
+            | Token::DollarQuotedString(_)
+            | Token::SingleQuotedByteStringLiteral(_)
+            | Token::DoubleQuotedByteStringLiteral(_)
+            | Token::TripleSingleQuotedByteStringLiteral(_)
+            | Token::TripleDoubleQuotedByteStringLiteral(_)
+            | Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+            | Token::TripleSingleQuotedRawStringLiteral(_)
+            | Token::TripleDoubleQuotedRawStringLiteral(_)
+            | Token::NationalStringLiteral(_)
+            | Token::QuoteDelimitedStringLiteral(_)
+            | Token::NationalQuoteDelimitedStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::HexStringLiteral(_)
+    )
 }
 
 /// Net balance per address for one sealed transfer table, summed as i128. This is
@@ -9532,8 +9466,6 @@ events = ["Transfer"]
             "SELECT * FROM read_csv('/etc/passwd')",
             r#"SELECT * FROM "read_csv"('/etc/passwd')"#,
             r#"SELECT * FROM "READ_CSV"('/etc/passwd')"#,
-            // Quoting a *fragment* of the name is the same trick with a smaller hammer.
-            r#"SELECT * FROM read"_"csv('/etc/passwd')"#,
             "SELECT * FROM main.read_csv('/etc/passwd')",
             "SELECT * FROM read_csv\n('/etc/passwd')",
             "SELECT * FROM READ_CSV('/etc/passwd')",
@@ -9563,6 +9495,44 @@ events = ["Transfer"]
             assert!(reject_file_access(q).is_ok(), "must be allowed: {q}");
             assert!(reject_replacement_scan(q).is_ok(), "must be allowed: {q}");
         }
+    }
+
+    /// #2728: the gates stripped comments without seeing strings, so a `--` inside a literal hid the
+    /// rest of the statement from them, and a path after a comma in FROM was never looked at.
+    #[test]
+    fn a_comment_marker_in_a_string_or_a_comma_join_does_not_pass_the_text_gates() {
+        assert!(reject_file_access("SELECT '--', getenv('HOME')").is_err());
+        assert!(reject_file_access("SELECT '/*', read_text('/etc/passwd') -- */").is_err());
+        assert!(reject_statement_stacking("SELECT '--'; SELECT 2").is_err());
+        assert!(reject_statement_stacking("SELECT '/*'; SELECT 2 /* */").is_err());
+        assert!(reject_replacement_scan("SELECT * FROM t, '/x.parquet'").is_err());
+        assert!(
+            reject_replacement_scan("SELECT * FROM t AS a JOIN u ON a.x = u.x, '/x.parquet'")
+                .is_err()
+        );
+        assert!(reject_replacement_scan("SELECT '--' FROM '/x.parquet'").is_err());
+        assert!(reject_with_prefixed_dml(
+            "WITH t AS (SELECT '/*') INSERT INTO x SELECT 1 WHERE 'a' <> '*/') SELECT 1"
+        )
+        .is_err());
+
+        for ok in [
+            "SELECT '--', 1",
+            "SELECT 'getenv(' AS s",
+            "SELECT a, 'x' FROM t",
+            "SELECT a FROM t WHERE b IN ('x', 'y') ORDER BY a, 'z'",
+            "SELECT EXTRACT(year FROM d), 'x' FROM t, u",
+            "SELECT a IS DISTINCT FROM b, 'label' FROM t",
+            "SELECT (SELECT 1 FROM t), 'x'",
+        ] {
+            assert!(reject_file_access(ok).is_ok(), "must be allowed: {ok}");
+            assert!(
+                reject_statement_stacking(ok).is_ok(),
+                "must be allowed: {ok}"
+            );
+            assert!(reject_replacement_scan(ok).is_ok(), "must be allowed: {ok}");
+        }
+        assert!(reject_statement_stacking("SELECT 'unterminated").is_err());
     }
 
     /// **Audit finding 5: the allowlist must refuse what the denylist has never heard of.**
