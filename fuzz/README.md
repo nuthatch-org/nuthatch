@@ -29,7 +29,7 @@ built on the pinned stable with `-s none`, as CI's `fuzz-sql` and `fuzz-embed` j
 - **`fuzz/sql`**: `sql_confinement` (RFC-0073 FR8), `cid_car` (IPFS CAR bodies, CID text and
   `cid::verify`) and `subgraph_manifest` (`parse_manifest`).
 - **`fuzz/embed`**: `header_chain` (the verified follow's header RLP and `verify_chain`) and
-  `attach_ipc` (`attach`'s Arrow IPC stream, which CI does not run until #2811).
+  `attach_ipc` (`attach`'s Arrow IPC stream).
 
 ```sh
 cargo fuzz run --fuzz-dir fuzz/sql -s none -O cid_car

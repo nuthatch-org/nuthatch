@@ -1982,9 +1982,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # attach_ipc is built but not run here until #2811: arrow-ipc panics on a malformed schema.
-      - name: fuzz header chains
+      - name: fuzz header chains and attach
         run: |
           cargo fuzz build --fuzz-dir fuzz/embed -s none -O
-          cargo fuzz run --fuzz-dir fuzz/embed -s none -O header_chain -- \
-            -runs=300000 -max_total_time=120 -print_final_stats=1
+          for target in header_chain attach_ipc; do
+            cargo fuzz run --fuzz-dir fuzz/embed -s none -O "$target" -- \
+              -runs=300000 -max_total_time=120 -print_final_stats=1
+          done
