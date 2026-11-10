@@ -16194,7 +16194,16 @@ template = "pool"
         };
         assert!(rename("c", "c2").await.unwrap(), "a free name is taken");
         assert!(!rename("a", "b").await.unwrap(), "a name in use is refused");
-        drop(rename("c2", "c3"));
+        // Drop the receiver before sending: dropped after, a worker may already have applied and
+        // acked the rename, which is not an abandoned one.
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        drop(acked);
+        tx.send(CursorCommand::Rename {
+            from: "c2".into(),
+            to: "c3".into(),
+            ack: Some(ack),
+        })
+        .unwrap();
         assert!(
             rename("c2", "c4").await.unwrap(),
             "an abandoned rename is not applied (#2716)"
