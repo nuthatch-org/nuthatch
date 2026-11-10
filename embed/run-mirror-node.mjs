@@ -3,7 +3,7 @@
 // asked `mirror.mjs`'s requests. Writes the report `hosts/node/mirror.mjs --expect` compares with.
 // Usage: node run-mirror-node.mjs <nuthatch> <nest-dir> <mirror: url or directory> --out <report.json>
 //          [--rpc <url> --tip <block>]
-import { cpSync, mkdtempSync, rmSync, writeFileSync, openSync } from "node:fs";
+import { cpSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -48,15 +48,19 @@ if (seeded.status !== 0) {
 const ms_seed = performance.now() - t0;
 console.error(seeded.stdout.trim());
 
-const port = 20000 + Math.floor(Math.random() * 20000);
-const api = `http://127.0.0.1:${port}`;
 const rpc = flag("--rpc");
+// Port 0, read back from the log: a port picked here can be taken before the node binds it.
+const listen = ["--listen", "127.0.0.1:0"];
 const args = rpc
-  ? ["dev", "--dir", dir, "--listen", `127.0.0.1:${port}`, "--rpc", rpc, "--poll-interval", "1s"]
-  : ["serve", "--dir", dir, "--listen", `127.0.0.1:${port}`];
-const log = openSync(path.join(work, "node.log"), "w");
+  ? ["dev", "--dir", dir, ...listen, "--rpc", rpc, "--poll-interval", "1s"]
+  : ["serve", "--dir", dir, ...listen];
+const logPath = path.join(work, "node.log");
+const log = openSync(logPath, "w");
 const node = spawn(bin, args, { stdio: ["ignore", log, log] });
-const stop = (code) => {
+let exited;
+node.on("exit", (code, signal) => (exited = signal ?? code));
+const stop = (code, why) => {
+  if (why) console.error(`${why}\n--- node.log ---\n${readFileSync(logPath, "utf8")}`);
   node.kill("SIGKILL");
   served?.server.close();
   if (code === 0) rmSync(work, { recursive: true, force: true });
@@ -64,21 +68,27 @@ const stop = (code) => {
   process.exit(code);
 };
 
+const deadline = Date.now() + 300_000;
+let api;
+while (!api) {
+  if (exited !== undefined) stop(1, `the node exited (${exited}) before it was listening`);
+  if (Date.now() > deadline) stop(1, "the node never said where it was listening");
+  api = readFileSync(logPath, "utf8").match(/API live on (http:\/\/127\.0\.0\.1:[1-9]\d*)/)?.[1];
+  await new Promise((r) => setTimeout(r, 100));
+}
+
 const get = async (target) => {
-  const res = await fetch(api + target);
+  const res = await fetch(api + target, { signal: AbortSignal.timeout(30_000) });
   return { status: res.status, body: await res.text() };
 };
 const want = flag("--tip") ? Number(flag("--tip")) : undefined;
-const deadline = Date.now() + 300_000;
 for (;;) {
+  if (exited !== undefined) stop(1, `the node exited (${exited}) before it answered`);
   try {
     const p = JSON.parse((await get(`/sql?q=${encodeURIComponent("SELECT 1")}`)).body).provenance;
     if (want === undefined || p?.as_of === want) break;
   } catch {}
-  if (Date.now() > deadline) {
-    console.error("the node never answered at the head it was asked for");
-    stop(1);
-  }
+  if (Date.now() > deadline) stop(1, "the node never answered at the head it was asked for");
   await new Promise((r) => setTimeout(r, 250));
 }
 
