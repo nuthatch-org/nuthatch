@@ -11085,6 +11085,130 @@ mod tests {
         assert!(err.contains("block 42 alone exceeds"), "got: {err}");
     }
 
+    /// An `eth_getLogs` endpoint that answers a range no wider than `answers_up_to` blocks, one log
+    /// per block, and sends nothing at all for a wider one, as GraphOps does for a dense range (#2671).
+    /// Returns its URL and the count of requests it has seen.
+    async fn slow_on_wide_ranges(
+        answers_up_to: u64,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = l.accept().await {
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let body = loop {
+                        let mut buf = [0u8; 4096];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        req.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&req).to_string();
+                        let Some(end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let len: usize = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse().ok())?
+                            })
+                            .unwrap_or(0);
+                        if req.len() >= end + 4 + len {
+                            break serde_json::from_slice::<serde_json::Value>(&req[end + 4..])
+                                .unwrap();
+                        }
+                    };
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let hex = |k: &str| {
+                        let s = body["params"][0][k].as_str().unwrap();
+                        u64::from_str_radix(s.trim_start_matches("0x"), 16).unwrap()
+                    };
+                    let (from, to) = (hex("fromBlock"), hex("toBlock"));
+                    if to - from + 1 > answers_up_to {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        return;
+                    }
+                    let logs: Vec<_> = (from..=to)
+                        .map(|b| {
+                            serde_json::json!({"address": "0xabc", "topics": [], "data": "0x",
+                                "blockNumber": format!("0x{b:x}"), "blockHash": "0x",
+                                "transactionHash": "0x", "logIndex": "0x0"})
+                        })
+                        .collect();
+                    let reply =
+                        serde_json::json!({"jsonrpc": "2.0", "id": body["id"], "result": logs})
+                            .to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// #2671: a range too dense to answer within the client timeout narrows past one level until it
+    /// answers, rather than taking one speculative split and retrying the halves at the same width.
+    #[tokio::test]
+    async fn a_getlogs_range_with_no_answer_in_time_narrows_until_it_answers() {
+        let (url, seen) = slow_on_wide_ranges(4).await;
+        let rpc =
+            crate::rpc::RpcClient::with_timeout(vec![url], std::time::Duration::from_millis(300))
+                .unwrap();
+        let filter = LogFilter::new(&["0xabc".to_string()], &[]).expect("non-empty filter");
+        let logs = fetch_logs_splitting(&rpc, &filter, 1, 16).await.unwrap();
+        assert_eq!(
+            logs.iter().map(|l| l.block_number).collect::<Vec<_>>(),
+            (1..=16).collect::<Vec<_>>()
+        );
+        // 16, two 8s, four 4s.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 7);
+    }
+
+    /// #2671 and #2693: an endpoint that never answers, a dead one or a slow refusal, is asked once per
+    /// width down to one block and then stops, covering nothing, with that block's own timeout rather
+    /// than a verdict that the block is over the cap.
+    #[tokio::test]
+    async fn a_getlogs_answer_that_never_comes_stops_after_one_descent() {
+        let (url, seen) = slow_on_wide_ranges(0).await;
+        let rpc =
+            crate::rpc::RpcClient::with_timeout(vec![url], std::time::Duration::from_millis(300))
+                .unwrap();
+        let filter = LogFilter::new(&["0xabc".to_string()], &[]).expect("non-empty filter");
+        let started = std::time::Instant::now();
+        let err = fetch_logs_splitting(&rpc, &filter, 1, 16)
+            .await
+            .expect_err("nothing ever answered");
+        // 16, 8, 4, 2, 1: the left half fails at every width, so the right is never asked.
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 5);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("getLogs 1..=1") && text.contains("timed out"),
+            "{text}"
+        );
+        assert!(!text.contains("alone exceeds"), "{text}");
+        assert!(
+            matches!(
+                crate::rpc::class_of(&err),
+                Some(crate::rpc::FailureClass::Transient)
+            ),
+            "{text}"
+        );
+    }
+
     /// RFC-0028 §3b: a provider that refuses an oversized range **without saying so in words we
     /// recognise** must still get split.
     ///

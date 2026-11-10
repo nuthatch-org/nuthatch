@@ -2142,15 +2142,16 @@ mod tests {
             format!("http://{addr}")
         }
 
-        // The stalling case: the client gives up mid-body. That is a size signal.
-        let url = serve(true).await;
-        let c = RpcClient::new(vec![url]).unwrap();
-        let err = c
-            .post_one_for_test(
-                &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}),
-            )
-            .await
-            .expect_err("a stalled body must fail");
+        let stalled = |from, to| async move {
+            let url = serve(true).await;
+            let c = RpcClient::with_timeout(vec![url], std::time::Duration::from_secs(1)).unwrap();
+            c.get_logs(&[], &[], from, to)
+                .await
+                .expect_err("a stalled body must fail")
+        };
+
+        // The stalling case: the client gives up mid-body. Over a range, that is a size signal.
+        let err = stalled(1, 2).await;
         assert!(
             matches!(class_of(&err), Some(FailureClass::Narrowable { .. })),
             "a body-read timeout must be narrowable so the *unbounded* classified split handles it, \
@@ -2160,6 +2161,14 @@ mod tests {
             crate::chunker::is_result_too_large(&err),
             "…and the chunker must agree, since that is what actually triggers the split"
         );
+
+        // #2693: one block has nothing to halve, so its stall is retried, not called over the cap.
+        let err = stalled(1, 1).await;
+        assert!(
+            matches!(class_of(&err), Some(FailureClass::Transient)),
+            "{err:#}"
+        );
+        assert!(!crate::chunker::is_result_too_large(&err), "{err:#}");
 
         // The malformed case: halving buys nothing, so it stays transient.
         let url = serve(false).await;
