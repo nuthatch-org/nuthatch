@@ -521,15 +521,18 @@ manifest computes to it. An invalid NID in `keep` is `400`. The answer lists `de
 `deleted_nids`, `deleted_blobs`, `kept_blobs` and `skipped_blobs`, each skip with why, and `reachable`,
 the NIDs the prune kept. A `latest` whose version was pruned is deleted, not moved to an older one.
 
-Prune never leaves a ref naming a missing blob. It deletes refs first and blobs after, re-reading each
-ref before deleting it and listing every ref again before each blob; a publish writes its blob before
-its refs, and checks its blob is still there after them. A blob younger than 15 minutes is skipped,
-because it may be one whose publisher has not written its refs yet; a publisher stalled longer than
-that between its blob and its refs finds its blob gone and writes it again. Within one runtime, publishes and
-prunes take turns. Against a second runtime or `nest publish` sharing the registry, one window remains:
-a publish of a blob that already exists, landing entirely between this prune's last check of that blob
-and its delete, a few milliseconds, leaves its refs naming nothing. Publishing again repairs it. A ref
-re-pointed in the same instant may be deleted rather than kept; it never dangles.
+Prune never leaves a ref naming a missing blob. It deletes refs first and blobs after, deleting a ref
+only while it still names what the prune listed and listing every ref again before each blob; a
+publish writes its blob before its refs, and checks its blob is still there after them. A blob
+younger than 15 minutes is skipped, because it may be one whose publisher has not written its refs
+yet; a publisher stalled longer than that between its blob and its refs finds its blob gone and
+writes it again. Within one runtime, publishes and prunes take turns. Against a second runtime or
+`nest publish` sharing the registry, one window remains: a publish of a blob that already exists,
+landing entirely between this prune's last check of that blob and its delete, a few milliseconds,
+leaves its refs naming nothing. Publishing again repairs it. A ref a publish re-points while the
+prune deletes it is kept. On S3 or R2 that rests on a conditional put (`If-Match`): a removed ref is
+overwritten with an empty object, which reads as absent until a publish writes it again, and a store
+configured without conditional writes fails the prune at the first ref it would remove.
 
 Publish and prune answer synchronously. Neither dials an RPC, a bundle is bounded by the size limit,
 and both are safe to repeat, so a caller whose request timed out sends it again.

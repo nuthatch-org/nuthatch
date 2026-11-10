@@ -270,3 +270,65 @@ impl Drop for Killed {
         let _ = self.0.wait();
     }
 }
+
+/// #2712: against a real S3 server, a prune removes a ref by a put conditional on the ETag it read,
+/// so a removed ref reads as absent, and a write that lands after the read is not overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_s3_registry_prune_removes_a_ref_only_while_unchanged() {
+    use object_store::{path::Path as ObjPath, ObjectStore, PutMode};
+    let Some(_) = endpoint() else { return };
+    let bucket = bucket();
+    let prefix = format!(
+        "prune-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let registry = format!("s3://{bucket}/{prefix}");
+    let (kept, kept_hash) = publish(&registry, "usdc", USDC);
+    let (gone, _) = publish(&registry, "arb", ARB);
+
+    let store = nuthatch::distribution::open(&registry).unwrap();
+    let keep = std::collections::BTreeSet::from([kept.clone()]);
+    let report =
+        nuthatch::distribution::prune(store.as_ref(), &keep, std::time::Duration::ZERO, false)
+            .await
+            .unwrap();
+    assert!(report.deleted_nids.contains(&gone), "{report:?}");
+    assert!(store.get_nid_ref(&gone).await.is_err());
+    assert_eq!(store.get_nid_ref(&kept).await.unwrap(), kept_hash);
+    assert!(
+        store
+            .list_refs()
+            .await
+            .unwrap()
+            .iter()
+            .all(|(n, _, _)| n == "usdc"),
+        "{report:?}"
+    );
+
+    let raw = object_store::aws::AmazonS3Builder::from_env()
+        .with_url(format!("s3://{bucket}"))
+        .build()
+        .unwrap();
+    let key = ObjPath::from(format!("{prefix}/nids/{kept}"));
+    let read = raw.get(&key).await.unwrap().meta;
+    // The same hash in other bytes: an S3 ETag is the body's MD5, so identical bytes would match.
+    raw.put(&key, format!("{kept_hash}\n").into_bytes().into())
+        .await
+        .unwrap();
+    let stale = object_store::UpdateVersion {
+        e_tag: read.e_tag,
+        version: read.version,
+    };
+    let err = raw
+        .put_opts(&key, Vec::new().into(), PutMode::Update(stale).into())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, object_store::Error::Precondition { .. }),
+        "{err}"
+    );
+    assert_eq!(store.get_nid_ref(&kept).await.unwrap(), kept_hash);
+}
