@@ -269,15 +269,54 @@ fn held_pin_covers(store: &dyn HotStore, from: u64, ceiling: u64) -> Result<bool
 /// Checkpoint `block` with the source's hash before the watermark may move to it (#1665). `false`
 /// when the source could not answer; the watermark then stays where it is until a later poll.
 pub async fn pin_checkpoint(store: &dyn HotStore, source: &dyn Source, block: u64) -> Result<bool> {
-    match source.block_hash(block).await {
-        Ok(Some(hash)) => {
+    match pin_hash(store, source, block).await? {
+        Some(hash) => {
             store.set_block_hash(block, &hash)?;
             Ok(true)
         }
-        Ok(None) | Err(_) => {
-            tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
-            Ok(false)
+        None => Ok(false),
+    }
+}
+
+/// The source's hash for `block`, unless it has none or it contradicts the checkpoint already
+/// stored there. Overwriting that would hide a reorg from the next poll's walk (#2708).
+async fn pin_hash(store: &dyn HotStore, source: &dyn Source, block: u64) -> Result<Option<String>> {
+    let Ok(Some(hash)) = source.block_hash(block).await else {
+        tracing::debug!("no hash for block {block}; the sealed watermark waits for one");
+        return Ok(None);
+    };
+    if let Some(held) = store.get_block_hash(block)? {
+        if !held.eq_ignore_ascii_case(&hash) {
+            tracing::warn!(
+                "block {block} is checkpointed as {held} but the source now has {hash}; not \
+                 sealing until the reorg is rolled back"
+            );
+            return Ok(None);
         }
+    }
+    Ok(Some(hash))
+}
+
+/// Whether the newest row in `rows` that carries a block hash is on the source's chain. A reorg
+/// finalized after the window committed leaves fork rows below any checkpoint (#2708).
+async fn rows_on_chain(source: &dyn Source, rows: &[String]) -> bool {
+    let Some((block, hash)) = rows.iter().rev().find_map(|json| {
+        let v: Value = serde_json::from_str(json).ok()?;
+        let hash = v.get("block_hash")?.as_str().filter(|h| !h.is_empty())?;
+        Some((v.get("block_number")?.as_u64()?, hash.to_string()))
+    }) else {
+        return true;
+    };
+    match source.block_hash(block).await {
+        Ok(Some(now)) if now.eq_ignore_ascii_case(&hash) => true,
+        Ok(Some(now)) => {
+            tracing::warn!(
+                "the row at block {block} was stored under {hash} but the source now has {now}; \
+                 not sealing until the reorg is rolled back"
+            );
+            false
+        }
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -430,7 +469,7 @@ async fn try_seal(
                 // One pin serves until the watermark moves (#1495). The walk needs a final
                 // checkpoint at or above the watermark, not a new one per window.
                 if !held_pin_covers(store, from, ceiling)? {
-                    if let Ok(Some(hash)) = source.block_hash(ceiling).await {
+                    if let Some(hash) = pin_hash(store, source, ceiling).await? {
                         store.set_block_hash(ceiling, &hash)?;
                         store.set_meta(SEAL_PIN_KEY, &format!("{ceiling}:{hash}"))?;
                     }
@@ -447,11 +486,10 @@ async fn try_seal(
             Some(cut) => cut,
         };
 
-        if !pin_checkpoint(store, source, cut).await? {
+        let to_seal = store.entities_in_range(from, cut)?;
+        if !rows_on_chain(source, &to_seal).await || !pin_checkpoint(store, source, cut).await? {
             return Ok(());
         }
-
-        let to_seal = store.entities_in_range(from, cut)?;
         let sealed = seal_range(&mut *sinks.open(), &to_seal, from, cut, registry_snapshot)?;
         match sealed {
             Some(summary) => {
