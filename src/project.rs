@@ -1,5 +1,5 @@
 //! `nuthatch init` - resolve each contract's ABI and scaffold a nest (RFC-0001: N contracts).
-//! `nuthatch add` - resolve one more contract's ABI and grow an existing nest, no re-init.
+//! `nuthatch add` - resolve one more contract's ABI and grow a nest that has not indexed yet.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -197,8 +197,8 @@ async fn scaffold(args: InitArgs) -> Result<()> {
 /// the natural "one or many contracts" flow (RFC-0001): the chain, RPC endpoints and the rest of the
 /// config are already settled by `init`, so `add` only resolves each new contract's ABI, vendors it,
 /// appends it to `nuthatch.toml`, and regenerates the derived artifacts (schema.json + the AI
-/// surface). The next `dev` backfills the new contract from its own deployment block - the existing
-/// contracts resume from their stored cursor, untouched.
+/// surface). A new contract changes the decode registry, so `add` refuses a nest that has already
+/// indexed rather than leave `dev` to refuse its data (#2685).
 pub async fn add(args: AddArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir).with_context(|| {
@@ -234,6 +234,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
             new_addresses.len()
         );
     }
+    refuse_an_indexed_nest(&dir, &config, &args.addresses)?;
 
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.iter().cloned());
     let rpc = RpcClient::new(rpc_urls)?;
@@ -313,11 +314,33 @@ pub async fn add(args: AddArgs) -> Result<()> {
         table_count,
     );
     println!(
-        "next:  nuthatch dev{}   (backfills the new contract(s) from deployment)",
+        "next:  nuthatch dev{}   (backfills every contract from deployment)",
         dir_hint(&args.dir)
     );
     print_undetected_start_blocks(&undetected);
     Ok(())
+}
+
+fn refuse_an_indexed_nest(dir: &Path, config: &Config, addresses: &[String]) -> Result<()> {
+    let db = dir.join(crate::config::DB_FILE);
+    if !db.exists() {
+        return Ok(());
+    }
+    let store = crate::store::Store::open_existing(&db)
+        .with_context(|| format!("is `nuthatch dev` running on {}?", dir.display()))?;
+    if store.get_meta(crate::store::REGISTRY_KEY)?.is_none() {
+        return Ok(());
+    }
+    bail!(
+        "this nest has already indexed, and a new contract changes what it decodes, so `nuthatch \
+         dev` would refuse the stored data. Either re-index every contract: remove `{db}` and \
+         `segments/` from {dir}, then run `add` again. Or index the new contract as a nest of its \
+         own: `nuthatch init {addrs} --chain {chain} --dir <new dir>`.",
+        db = crate::config::DB_FILE,
+        dir = dir.display(),
+        addrs = addresses.join(" "),
+        chain = config.nest.chain,
+    )
 }
 
 /// `nuthatch schema` - regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml`
@@ -2258,6 +2281,41 @@ mod tests {
             "the ABI the config names is gone"
         );
         assert!(!abis.join("gns.json").exists());
+    }
+
+    /// #2685: `add` grew an indexed nest and promised a backfill, and `dev` then refused the store.
+    #[tokio::test]
+    async fn add_refuses_a_nest_that_has_indexed_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n";
+        std::fs::write(dir.path().join("nuthatch.toml"), raw).unwrap();
+        let store = crate::store::Store::open(&dir.path().join(crate::config::DB_FILE)).unwrap();
+        store.set_meta(crate::store::REGISTRY_KEY, "ab").unwrap();
+        drop(store);
+
+        let err = add(AddArgs {
+            explorer: None,
+            addresses: vec!["0x0000000000000000000000000000000000000002".into()],
+            alias: Vec::new(),
+            abi: Vec::new(),
+            start_block: Vec::new(),
+            dir: dir.path().display().to_string(),
+            rpc: vec!["http://127.0.0.1:1".into()],
+        })
+        .await
+        .unwrap_err();
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already indexed"), "{msg}");
+        assert!(
+            msg.contains("nuthatch init 0x0000000000000000000000000000000000000002"),
+            "{msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nuthatch.toml")).unwrap(),
+            raw
+        );
+        assert!(!dir.path().join("abis").exists());
     }
 
     /// A clone under `core.autocrlf=true` reports the publisher's NID (#2199).

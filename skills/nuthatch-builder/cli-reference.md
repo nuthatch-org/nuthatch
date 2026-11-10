@@ -10,7 +10,7 @@ Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthat
 
 ## `nuthatch add`
 
-Add another contract to an existing nest - resolve its ABI and grow the config, no re-init
+Add another contract to a nest that has not indexed yet - resolve its ABI and grow the config
 
 - `--explorer <EXPLORER>` - Blockscout instance to resolve ABIs from, for a chain with no keyless root we have verified
 - `<ADDRESSES>` - One or more contract addresses to add to the nest, e.g. 0xC02a…6Cc2 (WETH)

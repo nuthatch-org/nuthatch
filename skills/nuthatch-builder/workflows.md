@@ -21,7 +21,7 @@ from deployment: `nuthatch dev --backfill 100000` (last 100k blocks). Point at y
 
 ## Index several contracts together
 
-Pass multiple addresses to `init`, or grow an existing nest with `add` (no re-init):
+Pass multiple addresses to `init`, or grow a nest that has not indexed yet with `add`:
 
 ```sh
 nuthatch init 0xUSDC 0xWETH --alias usdc,weth
@@ -30,10 +30,10 @@ nuthatch add 0xDAI --alias dai        # resolves the ABI, appends to nuthatch.to
 ```
 
 `add` never re-detects the chain (a nest is one chain) and refuses an address already present. It
-changes the nest's decode registry, so the next `dev` on an existing store **refuses to start** rather
-than resume: the stored rows were decoded under the old registry. Re-index to adopt it. Moving
-`nuthatch.redb` and `segments/` aside works; on a nest that is serving, build a copy to tip on a spare
-port, compare it, then swap the directories, which keeps the outage to a restart.
+changes the nest's decode registry, so it **refuses a nest that has already indexed**: `dev` could not
+resume the stored rows, which were decoded under the old registry. Re-index to adopt it. Moving
+`nuthatch.redb` and `segments/` aside, then running `add`, works; on a nest that is serving, build a
+copy to tip on a spare port, compare it, then swap the directories, which keeps the outage to a restart.
 
 ## Fast backfill of a long history
 
