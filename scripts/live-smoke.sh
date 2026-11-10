@@ -77,11 +77,12 @@ fetch_release() {
     exit 1
   fi
   echo "sha256 ok: $got"
-  if ! gh attestation verify "$WORK/rel/$tarball" --repo "$REPO"; then
-    err "$tarball has no provenance attestation from $REPO that verifies"
+  if ! gh attestation verify "$WORK/rel/$tarball" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" --source-ref "refs/tags/$tag"; then
+    err "$tarball has no provenance attestation from $REPO's release workflow at $tag that verifies"
     exit 1
   fi
-  echo "attestation ok: built by $REPO"
+  echo "attestation ok: built by $REPO's release workflow at $tag"
   tar -xzf "$WORK/rel/$tarball" -C "$WORK/rel"
   NUTHATCH_BIN="$WORK/rel/nuthatch"
 }

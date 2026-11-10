@@ -289,3 +289,86 @@ fn images_go_public_only_past_the_publish_gate() {
          move :latest, and only then undraft (#2735)"
     );
 }
+
+/// #2741: `--repo` alone accepts an attestation any workflow on any ref of the repository signed, so a
+/// branch's workflow could attest a file and pass. Every verify, the workflow's and the documented
+/// ones, names the release workflow and the tag it ran on.
+#[test]
+fn every_verify_names_the_release_workflow_and_its_tag() {
+    const SIGNER: &str = "--signer-workflow nuthatch-org/nuthatch/.github/workflows/release.yml";
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let read = |p: &str| {
+        std::fs::read_to_string(root.join(p)).unwrap_or_else(|e| panic!("cannot read {p}: {e}"))
+    };
+    let mut unbound = Vec::new();
+    let mut seen = 0;
+    for (name, text, signer) in [
+        (
+            "release.yml",
+            release_yml(),
+            "--signer-workflow \"$GITHUB_REPOSITORY/.github/workflows/release.yml\"",
+        ),
+        ("README.md", read("README.md"), SIGNER),
+        ("docs/install.md", read("docs/install.md"), SIGNER),
+        (
+            "scripts/live-smoke.sh",
+            read("scripts/live-smoke.sh"),
+            "--signer-workflow \"$REPO/.github/workflows/release.yml\"",
+        ),
+    ] {
+        let text = text.replace("\\\n", " ");
+        for line in text
+            .lines()
+            .filter(|l| l.contains("gh attestation verify "))
+        {
+            seen += 1;
+            if !(line.contains(signer) && line.contains("--source-ref")) {
+                unbound.push(format!("{name}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(
+        seen >= 6,
+        "found only {seen} verify commands; the scan has stopped matching"
+    );
+    assert!(
+        unbound.is_empty(),
+        "these verify commands accept an attestation from any workflow or ref of the repository \
+         (#2741): {unbound:#?}"
+    );
+}
+
+/// #2741: a `v*` tag runs the workflow file of the commit it names, so a tag on an unmerged commit
+/// skips main's required checks. The first job refuses a commit that is on neither `main` nor the
+/// tag's own `release/<major>.<minor>` branch (docs/releases/README.md), before any release exists.
+#[test]
+fn a_tag_off_main_and_its_release_branch_is_refused_first() {
+    let s = release_yml();
+    let notes = s
+        .split_once("\n  release-notes:")
+        .expect("release.yml has no `release-notes:` job")
+        .1
+        .split_once("\n  build:")
+        .expect("release.yml has no `build:` job after release-notes")
+        .0;
+    let check = notes
+        .find("git merge-base --is-ancestor \"$GITHUB_SHA\" origin/main")
+        .unwrap_or_else(|| {
+            panic!("release-notes does not check the tag is on main (#2741)\n{notes}")
+        });
+    assert!(
+        notes.contains("git merge-base --is-ancestor \"$GITHUB_SHA\" \"origin/release/"),
+        "release-notes does not accept a tag on its release branch, which is how a patch is cut"
+    );
+    assert!(
+        notes.contains("fetch-depth: 0"),
+        "the checkout is shallow, so `merge-base --is-ancestor` cannot see main's history"
+    );
+    let draft = notes
+        .find("softprops/action-gh-release")
+        .expect("release-notes no longer creates the draft");
+    assert!(
+        check < draft,
+        "the reachability check runs after the draft release is created"
+    );
+}
