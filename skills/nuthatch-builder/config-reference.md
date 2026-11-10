@@ -250,11 +250,11 @@ nest reading the environment can leave out; a chain with neither is refused at s
 transfers as movements of the chain's own currency, beside their token transfers, from the nest
 directory or from `GET /diff` on a solo `nuthatch dev`. A directory of chains serves no `/diff`.
 
-`getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise by
-searching the nest's own RPC, proving the answer against its neighbour block by parent hash and,
-above the finalized head, linking it by parent hashes to the head the search began from. It refuses a
-timestamp newer than the chain head, and refuses on chains whose blocks can share a second
-(Arbitrum, BNB Chain).
+`getblocknobytime` answers from verified headers where they bracket the timestamp, and otherwise,
+on a loopback bind only, by searching the nest's own RPC, proving the answer against its neighbour
+block by parent hash and, above the finalized head, linking it by parent hashes to the head the
+search began from. It refuses a timestamp newer than the chain head, and refuses on chains whose
+blocks can share a second (Arbitrum, BNB Chain).
 
 For a large, growing set of accounts, a deposit watcher's custody addresses say, the nest can read
 each block once for the whole set instead of discovering each account on its own (RFC-0064). Its cost
