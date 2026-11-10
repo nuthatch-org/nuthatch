@@ -1715,10 +1715,14 @@ pub fn spawn_publishers(
         let first = std::ptr::eq(canonical, m);
         if let Some(publish) = mirror_of(m, mounts, default, first) {
             let cursor_key = mount_route(canonical, default_tenant);
+            // The lease lives on the failover mirror; a publisher to another one has no fence to check.
+            let leased = failover_mirror(canonical, mounts, default, &cursor_key)?
+                .is_some_and(|f| f.target == publish.target);
             let fence = leases
                 .iter()
                 .find(|l| l.route == cursor_key)
-                .and_then(HeldLease::fence);
+                .and_then(HeldLease::fence)
+                .filter(|_| leased);
             out.push(spawn_publisher(
                 dir,
                 m,
@@ -1755,6 +1759,31 @@ fn mirror_for<'a>(
         let own = mounts.iter().any(|s| s.nid == nid && s.publish.is_some());
         default.filter(|_| first && !own)
     })
+}
+
+/// The mirror holding the writer lease of `canonical`'s dataset, which any of its mounts may ask
+/// for (#2707). `route` is the cursor's key, under which the lease is held.
+fn failover_mirror<'a>(
+    canonical: &'a Mount,
+    mounts: &'a [Mount],
+    default: Option<&'a MountPublish>,
+    route: &str,
+) -> Result<Option<&'a MountPublish>> {
+    let mut asking = mounts
+        .iter()
+        .filter(|s| s.nid == canonical.nid)
+        .filter_map(|s| mirror_of(s, mounts, default, std::ptr::eq(s, canonical)))
+        .filter(|p| p.failover.is_some());
+    let Some(publish) = asking.next() else {
+        return Ok(None);
+    };
+    if asking.any(|p| p.target != publish.target) {
+        bail!(
+            "the mounts of '{route}''s dataset ask for failover at two different mirrors, and a \
+             dataset has one writer lease: give them one failover target"
+        );
+    }
+    Ok(Some(publish))
 }
 
 fn mount_route(m: &Mount, default_tenant: &str) -> String {
@@ -1815,13 +1844,13 @@ pub async fn take_writer_leases(
         if !std::ptr::eq(canonical, m) {
             continue;
         }
-        let Some(publish) = mirror_of(m, mounts, default, true) else {
+        let route = mount_route(m, default_tenant);
+        let Some(publish) = failover_mirror(m, mounts, default, &route)? else {
             continue;
         };
         let Some(failover) = &publish.failover else {
             continue;
         };
-        let route = mount_route(m, default_tenant);
         let term = failover.term()?;
         let (identity, ..) = crate::publish::identity_of(&MountTable::data_dir(dir, &m.nid))
             .with_context(|| format!("the data identity of mount '{route}'"))?;
@@ -8439,6 +8468,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.leases[0].fence(), Some(2), "taken over once it lapsed");
+    }
+
+    /// #2707: failover asked by the second mount of a shared dataset takes the dataset's lease, and
+    /// its publisher starts under it.
+    #[tokio::test(start_paused = true)]
+    async fn failover_on_a_shared_datasets_second_mount_takes_the_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let nid = "c".repeat(64);
+        leased_dataset(root.path(), &nid, "leased");
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let mut table = mounts_with("");
+        table.mounts[0].nid = nid.clone();
+        let mut second = table.mounts[0].clone();
+        second.alias = "second".into();
+        second.publish = failover_publish(&target, false);
+        table.mounts.push(second);
+
+        let held = take_writer_leases(root.path(), &table.mounts, None, "default", &health())
+            .await
+            .unwrap();
+        assert_eq!(held.leases.len(), 1);
+        assert_eq!(
+            held.leases[0].route, "usdc",
+            "held where the cursor indexes"
+        );
+        let publishers =
+            spawn_publishers(root.path(), &table.mounts, None, "default", &held.leases).unwrap();
+        let keys: Vec<&str> = publishers.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["second"]);
+        drop(publishers);
+        drop(held);
+
+        let other = tempfile::tempdir().unwrap();
+        table.mounts[0].publish = failover_publish(other.path().to_str().unwrap(), false);
+        let refused = take_writer_leases(root.path(), &table.mounts, None, "default", &health())
+            .await
+            .err()
+            .expect("two failover mirrors for one dataset");
+        assert!(
+            refused.to_string().contains("one writer lease"),
+            "{refused:#}"
+        );
     }
 
     /// #2713: a live mount asking for failover is refused before it mounts or writes a record.
