@@ -38,7 +38,7 @@ pub enum Command {
     // --- CORE: the happy path, init -> dev -> sql -> mcp. ---
     /// Scaffold an indexer for a contract: resolve its ABI and write a project here.
     Init(InitArgs),
-    /// Add another contract to an existing nest - resolve its ABI and grow the config, no re-init.
+    /// Add another contract to a nest that has not indexed yet - resolve its ABI and grow the config.
     Add(AddArgs),
     /// Run the indexer: poll logs, store entities, and serve the API.
     Dev(DevArgs),
