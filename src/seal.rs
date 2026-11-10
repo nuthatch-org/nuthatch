@@ -1987,9 +1987,9 @@ pub(crate) fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for created in missing.into_iter().rev() {
         let parent = parent_dir(created);
+        fsync_dir(parent)?;
         #[cfg(test)]
         note_durable(Durable::ParentDir(parent.to_path_buf()));
-        fsync_dir(parent)?;
     }
     Ok(())
 }
@@ -2002,9 +2002,10 @@ pub(crate) fn install_durable(tmp: &Path, path: &Path) -> std::io::Result<()> {
     note_durable(Durable::FileSync(tmp.to_path_buf()));
     std::fs::rename(tmp, path)?;
     let dir = parent_dir(path);
+    fsync_dir(dir)?;
     #[cfg(test)]
     note_durable(Durable::EntryDir(dir.to_path_buf()));
-    fsync_dir(dir)
+    Ok(())
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -2045,19 +2046,28 @@ pub(crate) fn replace_durable(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sync_segment_dir(dir: &Path) -> Result<()> {
-    #[cfg(test)]
-    note_durable(Durable::SegmentDir(dir.to_path_buf()));
-    sync_dir(dir)
+    sync_dir(
+        dir,
+        #[cfg(test)]
+        Durable::SegmentDir,
+    )
 }
 
 fn sync_manifest_dir(dir: &Path) -> Result<()> {
-    #[cfg(test)]
-    note_durable(Durable::ManifestDir(dir.to_path_buf()));
-    sync_dir(dir)
+    sync_dir(
+        dir,
+        #[cfg(test)]
+        Durable::ManifestDir,
+    )
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
-    fsync_dir(dir).with_context(|| format!("fsyncing {}", dir.display()))
+/// Noted after the fsync and inside the call that makes it, so the trace records a sync that
+/// happened rather than one a caller asked for (#2758).
+fn sync_dir(dir: &Path, #[cfg(test)] role: fn(PathBuf) -> Durable) -> Result<()> {
+    fsync_dir(dir).with_context(|| format!("fsyncing {}", dir.display()))?;
+    #[cfg(test)]
+    note_durable(role(dir.to_path_buf()));
+    Ok(())
 }
 
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
