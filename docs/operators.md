@@ -1305,7 +1305,8 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
 
 - **`GET /api`** answers Etherscan-shaped (`module`, `action`, ...), and takes the same parameters as
   a form `POST`. A range the nest has not covered answers `NUTHATCH_INCOMPLETE`, never an empty
-  list, so a client falls through to its next source.
+  list, so a client falls through to its next source. A range before `start_block` or past
+  `end_block`, which it never will cover, answers `NUTHATCH_UNSUPPORTED`.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
   a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Off loopback,
   `proxy/eth_blockNumber` answers the nest's own head and a watched account's balance is still read;
