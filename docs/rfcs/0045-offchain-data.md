@@ -1,7 +1,8 @@
 # RFC-0045: Offchain data - what Dune actually does, and what nuthatch has already answered twice
 
-- Status: **Implemented: stage 1.** The file drop (#1215) shipped 2026-09-09. Stage 2, one pull connector
-  for prices (#1216), is open. Tracking #1206.
+- Status: **Implemented: stages 1 and 2.** The file drop (#1215) shipped 2026-09-09; the scheduled
+  pull, `nuthatch offchain pull` (#1216, #1448), shipped 2026-09-23. Stage 3 (§8) is deferred and
+  unfiled; not reopened on 2026-11-10 (Chief). Tracker #1206 is closed.
 - Author: Jenny
 - Date: 2026-08-29
 - Origin: a research report on offchain ingestion (Dune, Goldsky, The Graph, Ponder, Allium,
