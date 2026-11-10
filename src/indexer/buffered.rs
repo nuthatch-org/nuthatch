@@ -876,22 +876,32 @@ fn apply_command(
             }
         }
         CursorCommand::Rename { from, to, ack } => {
-            let applied = match (find_slot(shared, &from), find_slot(shared, &to)) {
+            // The runtime gave up waiting and kept its records on `from` (#2716).
+            if ack.as_ref().is_some_and(|a| a.is_closed()) {
+                tracing::warn!("rename of '{from}' to '{to}' was abandoned; keeping '{from}'");
+                return;
+            }
+            let renamed = match (find_slot(shared, &from), find_slot(shared, &to)) {
                 (Some(slot), None) => {
                     *slot.name.lock().unwrap() = to.clone();
                     crate::metrics::METRICS.rename_nest(&from, &to);
                     tracing::info!("nest '{from}' is now '{to}' on this cursor");
                     shared.bump();
-                    true
+                    Some(slot)
                 }
                 (_, Some(_)) => {
                     tracing::warn!("cannot rename '{from}' to '{to}': '{to}' is on this cursor");
-                    false
+                    None
                 }
-                (None, _) => false,
+                (None, _) => None,
             };
             if let Some(ack) = ack {
-                let _ = ack.send(applied);
+                if let (Err(_), Some(slot)) = (ack.send(renamed.is_some()), renamed) {
+                    // The receiver went away between the check and the rename.
+                    *slot.name.lock().unwrap() = from.clone();
+                    crate::metrics::METRICS.rename_nest(&to, &from);
+                    shared.bump();
+                }
             }
         }
     }
