@@ -41,6 +41,8 @@ const MAX_ENTRY_SHARE: usize = 4;
 /// statement a memo hit and nothing else.
 const VOLATILE: &[&str] = &[
     "random",
+    // The engine registers this alias of `random` (#2725).
+    "rand",
     "setseed",
     "uuid",
     "gen_random_uuid",
@@ -633,6 +635,10 @@ mod tests {
     #[test]
     fn a_statement_calling_a_volatile_function_is_not_deterministic() {
         assert!(!is_deterministic("SELECT random()"));
+        assert!(!is_deterministic("SELECT rand() AS r"));
+        assert!(!is_deterministic(
+            "SELECT id FROM t ORDER BY rand() LIMIT 10"
+        ));
         assert!(!is_deterministic("SELECT RANDOM() * 2 AS r"));
         assert!(!is_deterministic("SELECT current_timestamp"));
         assert!(!is_deterministic(
