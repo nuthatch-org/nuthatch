@@ -53,27 +53,30 @@ export function statementVerdict(c) {
 
 /// The head a check ran under, from what the follow did rather than what was asked (RFC-0081 §7.2,
 /// #2615). Only blocks past the mirror's end and at or below the verified finalized block are checked
-/// against it: hydrated history is the mirror's word for itself (#2738).
-export function headOf(verified, followed, as_of) {
+/// against it, by the head and by `complete`'s search for omitted logs: hydrated history is the
+/// mirror's word for itself (#2738).
+export function headOf(verified, followed, as_of, complete = false) {
   const m = followed.mirror;
   const hydrated = m && m.complete_through > 0 ? { from: m.indexed_from, through: m.complete_through } : null;
   const mirrors = hydrated ? `blocks ${hydrated.from} to ${hydrated.through} are the mirror's, unchecked` : null;
-  const labelled = (head, rest) => ({ head, ...rest, ...(hydrated ? { mirror_unchecked: hydrated } : {}) });
-  if (!verified) return labelled(mirrors ? `the RPC's, unverified; ${mirrors}` : "the RPC's, unverified");
-  if (followed.unverified) return labelled(`refused: ${followed.unverified}`, { unverified: followed.unverified });
+  const result = (parts, rest, logs = "not checked: an omitted log is not caught") => ({
+    head: parts.filter(Boolean).join("; "), ...rest, logs, ...(hydrated ? { mirror_unchecked: hydrated } : {}),
+  });
+  if (!verified) return result(["the RPC's, unverified", mirrors]);
+  if (followed.unverified) return result([`refused: ${followed.unverified}`, mirrors], { unverified: followed.unverified });
   const n = followed.verified?.finalized?.number;
   if (!Number.isSafeInteger(n)) {
     const why = "the module reported no verified finalized block";
-    return labelled(`refused: ${why}`, { unverified: why });
-  }
-  if (!hydrated) {
-    return { head: as_of <= n ? "verified" : `verified through block ${n}; blocks ${n + 1} to ${as_of} are the RPC's`, verified_through: n };
+    return result([`refused: ${why}`, mirrors], { unverified: why });
   }
   const top = Math.min(n, as_of);
-  const parts = [
-    top > hydrated.through ? `verified for blocks ${hydrated.through + 1} to ${top}` : null,
-    mirrors,
-    as_of > Math.max(n, hydrated.through) ? `blocks ${Math.max(n, hydrated.through) + 1} to ${as_of} are the RPC's` : null,
-  ];
-  return labelled(parts.filter(Boolean).join("; "), { verified_through: n });
+  const above = Math.max(n, hydrated?.through ?? 0) + 1;
+  const rpcs = as_of >= above ? `blocks ${above} to ${as_of} are the RPC's` : null;
+  if (!hydrated) {
+    const logs = complete ? `checked complete through block ${top}${rpcs ? `; blocks ${above} to ${as_of} not checked` : ""}` : undefined;
+    return result([rpcs ? `verified through block ${n}` : "verified", rpcs], { verified_through: n }, logs);
+  }
+  const span = top > hydrated.through ? `blocks ${hydrated.through + 1} to ${top}` : null;
+  const logs = complete && span ? `checked complete for ${span}; the mirror's${rpcs ? " and the RPC's unverified" : ""} blocks not checked` : undefined;
+  return result([span && `verified for ${span}`, mirrors, rpcs], { verified_through: n }, logs);
 }

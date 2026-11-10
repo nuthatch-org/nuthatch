@@ -98,3 +98,18 @@ test("a verified block below the mirror's end verifies nothing past it (#2738)",
   assert.doesNotMatch(h.head, /verified for/);
   assert.match(h.head, /10 to 120 are the mirror's, unchecked; blocks 121 to 150 are the RPC's/);
 });
+
+test("logs are called complete only for the blocks the verified head covers past the mirror (#2738)", () => {
+  const f = { verified: { finalized: { number: 130, hash: "0x1" } }, mirror: hydrated };
+  assert.match(headOf(true, f, 150).logs, /^not checked/);
+  const h = headOf(true, f, 150, true);
+  assert.match(h.logs, /^checked complete for blocks 121 to 130; the mirror's and the RPC's unverified blocks not checked/);
+  assert.match(headOf(true, { verified: { finalized: { number: 200, hash: "0x1" } } }, 150, true).logs, /^checked complete through block 150$/);
+});
+
+test("a refused verification checks no logs and still names the mirror's blocks (#2738)", () => {
+  const h = headOf(true, { unverified: "block 7's parent is 0xab", mirror: hydrated }, 150, true);
+  assert.match(h.head, /^refused: block 7's parent is 0xab; blocks 10 to 120 are the mirror's, unchecked$/);
+  assert.match(h.logs, /^not checked/);
+  assert.match(headOf(undefined, { mirror: hydrated }, 150, true).logs, /^not checked/);
+});

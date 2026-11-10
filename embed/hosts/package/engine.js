@@ -562,8 +562,7 @@ class Verifier {
     return {
       nid, as_of, source, filters, dataset: followed.identity?.dataset ?? null,
       rpc: hostsOf(this.options.rpc),
-      ...headOf(this.options.verified, followed, as_of),
-      logs: this.options.complete ? "checked complete against the verified headers" : "the RPC's; an omitted log is not caught",
+      ...headOf(this.options.verified, followed, as_of, !!this.options.complete),
       mirror: followed.mirror
         ? { base: this.options.mirror.base, ...followed.mirror }
         : null,

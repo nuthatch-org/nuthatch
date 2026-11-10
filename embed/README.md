@@ -491,8 +491,8 @@ otherwise `verified`, or, when the answer's block is above the verified finalize
 (`verified_through`), which blocks are still the RPC's. On a `mirror+rpc` nest the hydrated blocks are
 named as the mirror's, unchecked, in `head` and in `mirror_unchecked`: the mirror's catalogue is checked
 only against its own `seed.json`, and the verified head reaches no block at or below its end. `logs`
-says whether the tail was checked for omitted logs, which needs `complete` (and `verified`) passed to
-the verifier. A verified head at or below what the nest has
+says which blocks were checked for omitted logs, the same verified span, which needs `complete` and
+`verified` passed to the verifier. A verified head at or below what the nest has
 sealed that is not this chain's block at that height (the store's hash where it kept one, the RPC's
 otherwise) is refused, as a light client on another chain. Equality
 says the server, this RPC and, for hydrated history, the mirror agree, nothing more. `hosts/package/verify-fixture.mjs` is its gate in CI; `verify-gate.mjs` runs
