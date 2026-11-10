@@ -665,3 +665,37 @@ fn the_budget_follows_the_runtimes_ceiling() {
     app.apply(&read(now - 20, "/nests", 200, &nests.to_string()));
     assert_eq!(app.budget_bytes(), Some(4.0 * gib * cursors));
 }
+
+/// #2691: piped `watch --ssh` never supervised its forward, so a dropped ssh stayed dropped. The
+/// stand-in ssh serves one connection and exits, as a forward does when the network goes.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn line_mode_reopens_a_forward_whose_ssh_exited() {
+    use std::os::unix::fs::PermissionsExt;
+    if std::process::Command::new("nc").arg("-h").output().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let ssh = dir.path().join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\necho x >> {}\nwhile [ \"$1\" != -L ]; do shift; done\n\
+             port=$(echo \"$2\" | cut -d: -f2)\nexec nc -l 127.0.0.1 \"$port\"\n",
+            spawns.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut tunnel =
+        super::tunnel::Tunnel::open(ssh.to_str().unwrap(), "box", "http://10.0.0.5:8288").unwrap();
+    let base = tunnel.local_url.clone();
+
+    super::run_lines(&base, Some(1), None, Some(&mut tunnel), Some(4))
+        .await
+        .unwrap();
+
+    let opened = std::fs::read_to_string(&spawns).unwrap().lines().count();
+    assert!(opened >= 2, "the forward was opened {opened} time(s)");
+}

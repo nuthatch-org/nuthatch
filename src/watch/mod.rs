@@ -125,7 +125,14 @@ pub async fn run(args: WatchArgs) -> Result<()> {
         )
         .await
     } else {
-        run_lines(&base, args.interval, recorder, args.exit_after).await
+        run_lines(
+            &base,
+            args.interval,
+            recorder,
+            tunnel.as_mut(),
+            args.exit_after,
+        )
+        .await
     }
 }
 
@@ -220,6 +227,7 @@ async fn run_lines(
     base: &str,
     interval: Option<u64>,
     mut recorder: Option<std::fs::File>,
+    mut tunnel: Option<&mut tunnel::Tunnel>,
     exit_after: Option<u64>,
 ) -> Result<()> {
     let client = client()?;
@@ -228,6 +236,9 @@ async fn run_lines(
     let mut stdout = std::io::stdout().lock();
     for cycle in 1.. {
         let began = Instant::now();
+        if let Some(note) = tunnel.as_mut().and_then(|t| t.supervise()) {
+            eprintln!("{note}");
+        }
         for read in read_cycle(&client, base, cycle).await {
             if let Some(file) = recorder.as_mut() {
                 writeln!(file, "{}", serde_json::to_string(&read)?)?;
