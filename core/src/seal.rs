@@ -316,7 +316,12 @@ async fn rows_on_chain(source: &dyn Source, rows: &[String]) -> bool {
             );
             false
         }
-        Ok(None) | Err(_) => false,
+        Ok(None) | Err(_) => {
+            tracing::debug!(
+                "no hash for block {block}; the seal waits until its row can be checked"
+            );
+            false
+        }
     }
 }
 
