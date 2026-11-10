@@ -1293,7 +1293,10 @@ pub async fn bind_and_serve(
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
-    tracing::info!("API live on http://{listen}  (try GET /  and  /metrics)");
+    tracing::info!(
+        "API live on http://{}  (try GET /  and  /metrics)",
+        listener.local_addr()?
+    );
     // A loud one-liner when bound off-localhost: the guards bound *how much*, but *who* is the
     // operator's gateway's job - never expose this straight to the internet without one.
     if !is_localhost(listen) {
