@@ -1938,6 +1938,32 @@ mod tests {
         );
     }
 
+    /// #2695: a log outside `[fromBlock, toBlock]`, or one the filter does not match, is not
+    /// returned; the next window would otherwise store and fold it a second time.
+    #[tokio::test]
+    async fn a_log_outside_the_request_is_not_returned() {
+        let log = |block: u64, li: u64, address: &str, topic0: &str| {
+            serde_json::json!({"address":address,"topics":[topic0],"data":"0x",
+                "blockNumber":format!("0x{block:x}"),"blockHash":"0xbh","transactionHash":"0xtx",
+                "logIndex":format!("0x{li:x}")})
+        };
+        let (url, h) = canned_rpc(serde_json::json!({"jsonrpc":"2.0","id":1, "result":[
+            log(9, 0, "0xaa", "0x01"),
+            log(10, 1, "0xAA", "0x01"),
+            log(10, 2, "0xbb", "0x01"),
+            log(10, 3, "0xaa", "0x02"),
+            log(11, 4, "0xaa", "0x01"),
+        ]}))
+        .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let got = c
+            .get_logs(&["0xaa".into()], &["0x01".into()], 10, 10)
+            .await
+            .unwrap();
+        h.abort();
+        assert_eq!(got.iter().map(|l| l.log_index).collect::<Vec<_>>(), vec![1]);
+    }
+
     /// #2155: one endpoint refusing our key is not the pool refusing it. The verdict of a call that
     /// another endpoint failed for a passing reason must not read as terminal, or a retry site that
     /// stops on terminal gives up on a pool that will recover (#538).
