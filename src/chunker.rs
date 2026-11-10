@@ -240,11 +240,12 @@ impl AdaptiveWindow {
 
     /// A tip loop's window of `width` came back (#2700). Its halving is [`too_large`](Self::too_large),
     /// not a splitter, so a window served after one is a split's evidence. A window the tip cut short
-    /// says nothing about the cap.
+    /// says nothing about the cap, and leaves the lesson for the next full window.
     pub fn served(&mut self, width: u64) {
-        if !std::mem::take(&mut self.halved) {
+        if !self.halved {
             self.served_whole(width);
         } else if width == self.window {
+            self.halved = false;
             self.served_by_splitting(width);
         }
     }
@@ -771,5 +772,15 @@ mod tests {
             10,
             "one window at the learnt ceiling doubled it: the ones at the lower cap were counted"
         );
+    }
+
+    /// #2700 review: a window the tip cut short after a refusal must not spend the refusal's lesson.
+    #[test]
+    fn a_tip_cut_window_keeps_the_halving_for_the_next_full_one() {
+        let mut w = AdaptiveWindow::new(16_000, 2_000, 1, 100_000);
+        w.too_large();
+        w.served(3_000);
+        w.served(8_000);
+        assert_eq!(w.ceiling(), 8_000);
     }
 }
