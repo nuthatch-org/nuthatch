@@ -1190,7 +1190,8 @@ mod tests {
             unreachable!()
         }
         fn checkpoints_desc(&self) -> Result<Vec<(u64, String)>> {
-            unreachable!()
+            let hashes = self.hashes.lock().unwrap();
+            Ok(hashes.iter().rev().map(|(b, h)| (*b, h.clone())).collect())
         }
         async fn commit_window_blocking(
             &self,
@@ -1951,5 +1952,128 @@ mod tests {
 
         assert_eq!(processed, Processed::Refused);
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// Fork A until the window asks for the finalized block, then fork B from block 11 on, final
+    /// through `finalized`: a reorg finalized inside one window (#2708).
+    struct FinalizedFlip {
+        finalized: u64,
+        flipped: std::sync::atomic::AtomicBool,
+    }
+
+    impl FinalizedFlip {
+        fn hash(&self, n: u64) -> String {
+            if n >= 11 && self.flipped.load(std::sync::atomic::Ordering::SeqCst) {
+                format!("0xb{n:063x}")
+            } else {
+                hash_of(n)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Source for FinalizedFlip {
+        async fn tip(&self) -> Result<u64> {
+            unreachable!()
+        }
+        async fn block_hash(&self, number: u64) -> Result<Option<String>> {
+            Ok(Some(self.hash(number)))
+        }
+        async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
+            Ok(blocks.iter().map(|&b| (b, stamp_of(b))).collect())
+        }
+        async fn finalized(&self) -> Result<Option<u64>> {
+            self.flipped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.finalized))
+        }
+        async fn logs(&self, _: &crate::source::LogFilter, _: u64, _: u64) -> Result<Vec<Log>> {
+            unreachable!()
+        }
+    }
+
+    /// Fork A's rows at 10 and 12 commit in window 10..=14; fork B is final through `finalized`
+    /// before the seal runs. Fork A's row at 12 must not be sealed, whether the cut lands on the
+    /// window's checkpoint (14) or below it (12).
+    #[test]
+    fn a_reorg_finalized_inside_a_window_is_not_sealed() {
+        for finalized in [12, 14] {
+            let store = Mem::default();
+            store.set(START_BLOCK_KEY, 10);
+            let registry = token();
+            let schema = registry.schema();
+            let balances = BalanceView::start(Driver::Inline).unwrap();
+            let exposure = ExposureView::start(Driver::Inline, false).unwrap();
+            let velocity = VelocityView::start(Driver::Inline, false).unwrap();
+            let labels = LabelSet::default();
+            let entities: Vec<Recorder> = Vec::new();
+            let router = AlertRouter::new(Vec::<alerts::AlertSink>::new());
+            let shelf = Shelf::default();
+            let source = FinalizedFlip {
+                finalized,
+                flipped: Default::default(),
+            };
+            let logs = [
+                transfer_log(10, 0, ZERO, ALICE, 100),
+                transfer_log(12, 0, ALICE, BOB, 40),
+            ];
+            let window = Window {
+                nest: Nest {
+                    name: "tok",
+                    store: &store,
+                    schema: &schema,
+                    balances: &balances,
+                    exposure: &exposure,
+                    velocity: &velocity,
+                    labels: &labels,
+                    velocity_flag: None,
+                    entities: &entities,
+                    children: None,
+                    router: &router,
+                    metrics: &NoMetrics,
+                },
+                registry: &registry,
+                factory: None,
+                threshold: None,
+                finality: Finality::FinalizedTag { fallback_depth: 64 },
+                seal_span: 1,
+                sinks: &shelf,
+                extra: &crate::extra::NoExtraRows,
+                hooks: &crate::hooks::NoHooks,
+                faults: &crate::fault::NoFaults,
+                clock: &NoWait,
+                deadline: None,
+            };
+            // A tip above the window, or a finalized tag at 14 is distrusted as `latest` (#1667).
+            let processed = block_on(process_window(window, &source, &logs, 10, 14, 15)).unwrap();
+
+            assert_eq!(processed, Processed::Stored(2));
+            let sealed_to: u64 = shelf
+                .manifest
+                .lock()
+                .unwrap()
+                .tables
+                .values()
+                .flatten()
+                .map(|s| s.to_block)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                store.sealed_through() < 12 && sealed_to < 12,
+                "finalized {finalized}: fork A's row at 12 was sealed (watermark {}, segments to \
+                 {sealed_to}) under fork B's checkpoint",
+                store.sealed_through()
+            );
+            assert_eq!(
+                store.get_block_hash(14).unwrap(),
+                Some(hash_of(14)),
+                "finalized {finalized}: the window's checkpoint was overwritten with fork B's"
+            );
+            let ancestor = block_on(detect_reorg(&source, &store, 14)).unwrap();
+            assert!(
+                ancestor.is_some_and(|a| a >= store.sealed_through() && a < 12),
+                "finalized {finalized}: the next poll's walk found {ancestor:?}"
+            );
+        }
     }
 }
