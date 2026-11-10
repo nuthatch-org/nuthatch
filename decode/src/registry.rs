@@ -2834,6 +2834,50 @@ mod tests {
         );
     }
 
+    /// #2694: a `function` only inside a tuple leaves the column kind alone, so the mark is what moves
+    /// the identity off the rows that stored it as null. An event without one keeps its old line.
+    #[test]
+    fn a_function_in_a_tuple_moves_the_registry_hash() {
+        const C: &str = "0x2222222222222222222222222222222222222222";
+        let abi = |hook: &str| {
+            format!(
+                r#"[{{"type":"event","name":"Hooked","inputs":[
+                    {{"name":"pair","type":"tuple","indexed":false,"components":[
+                        {{"name":"amount","type":"uint256"}},
+                        {{"name":"hook","type":"{hook}"}}]}}],"anonymous":false}}]"#
+            )
+        };
+        let unmarked = |reg: &DecodeRegistry| {
+            let d = reg.tables()[0];
+            let cols: Vec<String> = d
+                .columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{}:{}{}",
+                        c.name,
+                        c.sol_type,
+                        c.kind.as_str(),
+                        object_shape(c)
+                    )
+                })
+                .collect();
+            let line = format!(
+                "c|{}|0x{}|0x{}|{}|{}",
+                d.alias,
+                hex::encode(d.contract),
+                hex::encode(d.topic0),
+                d.signature,
+                cols.join(",")
+            );
+            <[u8; 32]>::from(Sha256::digest(line.as_bytes()))
+        };
+        let marked = DecodeRegistry::build(vec![spec("c", C, &abi("function"))]).unwrap();
+        assert_ne!(marked.hash(), unmarked(&marked));
+        let plain = DecodeRegistry::build(vec![spec("c", C, &abi("bytes24"))]).unwrap();
+        assert_eq!(plain.hash(), unmarked(&plain));
+    }
+
     fn row_at(block: u64, log_index: u64) -> DecodedRow {
         DecodedRow {
             table: "t".into(),
