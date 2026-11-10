@@ -1671,6 +1671,11 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     if let Some((_, health)) = &s.runtime_health {
         body.push_str(&health.render_metrics());
     }
+    // A strict mount answers its own tenant, so it carries only the samples labelled with itself
+    // (#2714). The root `/metrics` keeps the whole runtime for the operator.
+    if let (Some(_), Some((own, _))) = (&s.isolation, &s.runtime_health) {
+        body = own_series(&body, own);
+    }
     body.push_str(&entity_metrics(&s));
     body.push_str(&snapshot_metrics(&s));
     (
@@ -1680,6 +1685,36 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         )],
         body,
     )
+}
+
+/// The samples of a text exposition labelled `nest="<nest>"`, each with its family's `# HELP` and
+/// `# TYPE`. An allow-list: an unlabelled, chain- or tenant-labelled sample is dropped.
+fn own_series(exposition: &str, nest: &str) -> String {
+    let label = format!("nest=\"{nest}\"");
+    let (opened, joined) = (format!("{{{label}"), format!(",{label}"));
+    let mut out = String::new();
+    let mut header = String::new();
+    let mut in_samples = false;
+    for line in exposition.lines() {
+        if line.starts_with('#') {
+            if in_samples {
+                header.clear();
+                in_samples = false;
+            }
+            header.push_str(line);
+            header.push('\n');
+            continue;
+        }
+        in_samples = true;
+        let labels = line.rsplit_once(' ').map_or(line, |(series, _)| series);
+        if labels.contains(&opened) || labels.contains(&joined) {
+            out.push_str(&header);
+            header.clear();
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// The authored-entity series (RFC-0041). Everything here is already computed for `/ready`; this is
@@ -9056,6 +9091,40 @@ mod tests {
 
         let (_code, body) = get(router, "/ready").await;
         serde_json::from_slice(&body).unwrap()
+    }
+
+    /// #2714: a strict mount's `/metrics` answers its own tenant, so another mount's series, and
+    /// the runtime-wide ones that would name it, are not in it. A shared mount still sees the lot.
+    #[tokio::test]
+    async fn a_strict_mounts_metrics_carry_only_its_own_series() {
+        let (own, other) = ("acme/metrics-2714", "globex/metrics-2714");
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register(own, "mainnet");
+        health.register(other, "base");
+        crate::metrics::METRICS.nest(own).set_tip(7);
+        crate::metrics::METRICS.nest(other).set_tip(9);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        st.runtime_health = Some((own.to_string(), health));
+        let (_, shared) = get(router(SharedNest::new(st.clone())), "/metrics").await;
+        let shared = String::from_utf8(shared.to_vec()).unwrap();
+        assert!(
+            shared.contains(other),
+            "premise: a shared mount sees the runtime"
+        );
+
+        st.isolation = Some(Arc::from("acme"));
+        let (_, strict) = get(router(SharedNest::new(st)), "/metrics").await;
+        let strict = String::from_utf8(strict.to_vec()).unwrap();
+        assert!(!strict.contains("globex"), "{strict}");
+        assert!(
+            strict.contains(&format!(
+                "nuthatch_nest_health{{nest=\"{own}\",chain=\"mainnet\"}} 1"
+            )),
+            "{strict}"
+        );
+        assert!(strict.contains("# TYPE nuthatch_nest_health"), "{strict}");
     }
 
     #[tokio::test]
