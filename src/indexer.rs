@@ -2768,6 +2768,7 @@ async fn runtime_index_loop(
         };
         match fetched {
             Ok(logs) => {
+                chunker.served(to - global_next + 1);
                 chunker.observed(logs.len() as u64);
                 fan_out_window(
                     source.as_ref(),
@@ -7508,6 +7509,7 @@ impl NestIngest {
             let from = overlap_from(next, range_floor);
             match self.fetch_window_with_overlap(source, next, from, to).await {
                 Ok(logs) => {
+                    chunker.served(to - next + 1);
                     chunker.observed(logs.len() as u64);
                     let n = logs.len() as u64;
                     match self.process_window(source, &logs, next, to, tip).await {
@@ -8224,6 +8226,7 @@ async fn index_loop(
             .await;
         match fetched {
             Ok(logs) => {
+                chunker.served(to - next + 1);
                 chunker.observed(logs.len() as u64);
                 let n = logs.len() as u64;
                 match nest
@@ -20623,6 +20626,83 @@ template="pool"
             .unwrap();
         assert_eq!(next, 30);
         assert_eq!(nest.store.entities_in_range(12, 29).unwrap().len(), 36);
+    }
+
+    /// Refuses any range wider than `cap` blocks as over the result cap, counting each answer.
+    struct WidthCapped {
+        inner: MockSource,
+        cap: u64,
+        served: std::sync::atomic::AtomicUsize,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for WidthCapped {
+        async fn tip(&self) -> Result<u64> {
+            self.inner.tip().await
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.inner.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if to - from + 1 > self.cap {
+                self.refused.fetch_add(1, SeqCst);
+                anyhow::bail!("query returned more than 10000 results");
+            }
+            self.served.fetch_add(1, SeqCst);
+            self.inner.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.inner.block_timestamps(blocks).await
+        }
+    }
+
+    /// #2700: the solo tip loop learns a range cap from its own halving, as the pipelined backfill
+    /// does from its splitter (#672), instead of growing back into it after every window.
+    #[tokio::test]
+    async fn the_tip_loop_learns_a_range_cap_from_its_own_halving() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap();
+        let nest = build_test_nest(d.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        let store = nest.store.clone();
+        let source = Arc::new(WidthCapped {
+            inner: MockSource {
+                logs: vec![transfer_log(200_000, 0)],
+            },
+            cap: 10_000,
+            served: Default::default(),
+            refused: Default::default(),
+        });
+        let task = tokio::spawn(index_loop(
+            source.clone(),
+            nest,
+            Some(200_000),
+            false,
+            1,
+            1_000,
+        ));
+        wait_for(
+            "block 200000's row",
+            std::time::Duration::from_secs(60),
+            || task.is_finished() || store.entities_in_range(200_000, 200_000).unwrap().len() == 1,
+        )
+        .await;
+        assert!(!task.is_finished(), "{:?}", task.await);
+        task.abort();
+        let (served, refused) = (source.served.load(SeqCst), source.refused.load(SeqCst));
+        assert!(
+            refused * 4 <= served,
+            "{refused} refusals for {served} windows served"
+        );
     }
 
     /// #1169 / #1170. What the pipelined backfill tells its caller: every progress tick carries the
