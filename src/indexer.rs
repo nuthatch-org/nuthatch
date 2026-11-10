@@ -9969,7 +9969,7 @@ mod tests {
             .map(|i| (Store::entity_key(i, 0), entity_json(i, 0)))
             .collect();
         store
-            .commit_window(&entities, Some((n - 1, "aa")), n - 1)
+            .commit_window(&entities, Some((n - 1, &format!("{:064x}", n - 1))), n - 1)
             .unwrap();
     }
 
@@ -10121,7 +10121,7 @@ mod tests {
         let range_bytes: usize = entities.iter().map(|(_, j)| j.len()).sum();
         assert!(range_bytes > SEAL_DIRECT_BYTES + 8 * row);
         store
-            .commit_window(&entities, Some((n - 1, "aa")), n - 1)
+            .commit_window(&entities, Some((n - 1, &format!("{:064x}", n - 1))), n - 1)
             .unwrap();
         drop(entities);
 
@@ -10246,7 +10246,11 @@ mod tests {
             .collect();
         let ceiling = 1_000 + far - 1;
         store
-            .commit_window(&entities, Some((ceiling, "aa")), ceiling)
+            .commit_window(
+                &entities,
+                Some((ceiling, &format!("{ceiling:064x}"))),
+                ceiling,
+            )
             .unwrap();
 
         let metrics = crate::metrics::NestMetrics::default();
@@ -10339,7 +10343,7 @@ mod tests {
         // `index_loop` does.
         for ceiling in [100_000u64, 300_000, 500_000, 800_000] {
             store
-                .commit_window(&[], Some((ceiling, "bb")), ceiling)
+                .commit_window(&[], Some((ceiling, &format!("{ceiling:064x}"))), ceiling)
                 .unwrap();
             maybe_seal(
                 tmp.path(),
@@ -10402,7 +10406,7 @@ mod tests {
             .collect();
         store.commit_window(&early, Some((99, "aa")), 99).unwrap();
         store
-            .commit_window(&[], Some((10_799, "bb")), 10_799)
+            .commit_window(&[], Some((10_799, &format!("{:064x}", 10_799))), 10_799)
             .unwrap();
         maybe_seal(
             tmp.path(),
@@ -10473,7 +10477,7 @@ mod tests {
         let store = Store::open(&tmp.path().join("t.redb")).unwrap();
         let metrics = crate::metrics::NestMetrics::default();
         store
-            .commit_window(&[], Some((800_000, "bb")), 800_000)
+            .commit_window(&[], Some((800_000, &format!("{:064x}", 800_000))), 800_000)
             .unwrap();
         maybe_seal(
             tmp.path(),
