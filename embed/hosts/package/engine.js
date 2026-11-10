@@ -543,6 +543,12 @@ class Verifier {
         results.push({ name, verdict: "not computable", reason: `this nest answered as of ${here.provenance?.as_of}, not ${as_of}` });
         continue;
       }
+      // A statement this parser cannot read has `read: null`. Comparing it would treat an unseen
+      // table as empty (#2737).
+      if (here.provenance?.narrowed && here.provenance.narrowed.read == null) {
+        results.push({ name, verdict: "not computable", reason: "this nest cannot see which tables the statement reads, so the answer cannot be compared" });
+        continue;
+      }
       const outside = await this.outside(nest, p.statement, here, followed);
       if (outside) {
         results.push({ name, verdict: "outside the filters", reason: outside });
