@@ -389,7 +389,7 @@ impl ModeState {
     /// Hand `make(deadline, reply)` to the cursor and wait for it, no later than `deadline`: the
     /// request's own, set when it arrived, so queue time counts against it. `Err` says why it was not
     /// done; nothing is partly answered.
-    async fn ask(
+    pub(crate) async fn ask(
         &self,
         deadline: Instant,
         make: impl FnOnce(Instant, Reply) -> Request,
@@ -1924,14 +1924,18 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                         .map(|c| c.iter().map(|(f, t)| t - f + 1).sum::<u64>())
                 };
                 let (before, started) = (through(&state.history), Instant::now());
-                let more = crate::address_mev::mev_step(
-                    d,
-                    relays,
-                    &state.history,
-                    a,
-                    state.start_block,
-                    to,
-                    now,
+                // A relay may be slow and still answer: requests and polls are served meanwhile.
+                let more = while_serving(
+                    crate::address_mev::mev_step(
+                        d,
+                        relays,
+                        &state.history,
+                        a,
+                        state.start_block,
+                        to,
+                        now,
+                    ),
+                    &|| Box::pin(yield_cursor(state, d)),
                 )
                 .await?;
                 if !more {
@@ -1968,8 +1972,11 @@ async fn mev_passes<M: Rpc, T: Rpc>(
             let produced = state
                 .history
                 .accounts_with(&[Action::ProducedBlocks], false)?;
-            let more =
-                crate::address_mev::reask_pass(d, relays, &state.history, &produced, now).await?;
+            let more = while_serving(
+                crate::address_mev::reask_pass(d, relays, &state.history, &produced, now),
+                &|| Box::pin(yield_cursor(state, d)),
+            )
+            .await?;
             if !more {
                 break;
             }
