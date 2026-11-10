@@ -1270,7 +1270,8 @@ neither JDBC nor DBeaver has been run against it.
 
 **Runtime root routes:** `GET /nests` (roster with live per-nest health), `GET /ready` (runtime-wide),
 `GET /health`, and `GET /metrics` (the whole runtime's exposition, served before anything is mounted;
-each mount's `/metrics` serves the same).
+each mount's `/metrics` serves the same, except under `isolation = "strict"`, where it carries
+only the series labelled with that mount).
 
 **Runtime admin routes** (3.13.0), token-gated off-localhost like the admin UI and removed by
 `--no-admin`. The full request and response shapes are in [admin-api.md](admin-api.md).
