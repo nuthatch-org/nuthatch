@@ -270,4 +270,32 @@ mod tests {
             format!("http://127.0.0.1:{}", tunnel.local_port)
         );
     }
+
+    /// #2691: piped `watch --ssh` never supervised its forward, so a dropped ssh stayed dropped. The
+    /// stand-in serves one connection and exits, as a forward does when the network goes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn line_mode_reopens_a_forward_whose_ssh_exited() {
+        if Command::new("nc").arg("-h").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(dir.path(), false);
+        let spawns = dir.path().join("spawns");
+        let body = std::fs::read_to_string(&ssh).unwrap().replacen(
+            "#!/bin/sh\n",
+            &format!("#!/bin/sh\necho x >> {}\n", spawns.display()),
+            1,
+        );
+        std::fs::write(&ssh, body).unwrap();
+        let mut tunnel = open(&ssh, "http://10.0.0.5:8288").unwrap();
+        let base = tunnel.local_url.clone();
+
+        crate::watch::run_lines(&base, Some(1), None, Some(&mut tunnel), Some(4))
+            .await
+            .unwrap();
+
+        let opened = std::fs::read_to_string(&spawns).unwrap().lines().count();
+        assert!(opened >= 2, "the forward was opened {opened} time(s)");
+    }
 }
