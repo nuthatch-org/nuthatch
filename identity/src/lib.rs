@@ -14,6 +14,12 @@ pub const BLOB_FORMAT_VERSION: u32 = 1;
 /// The nest's config, the one input whose bytes the identity does not take verbatim.
 pub const CONFIG_FILE: &str = "nuthatch.toml";
 
+/// Whether the file at `path` (relative, `/`-separated) counts toward the identity. A `.gitignore`,
+/// at any depth, is local hygiene and must not move it (#2722).
+pub fn is_input(path: &str) -> bool {
+    path.rsplit('/').next() != Some(".gitignore")
+}
+
 /// One packed input file: its path relative to the nest root and the hash of its bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
@@ -50,6 +56,7 @@ pub fn manifest(
 ) -> Result<Manifest> {
     let mut files = files
         .into_iter()
+        .filter(|(path, _)| is_input(path))
         .map(|(path, bytes)| {
             let bytes = input_bytes(&path, bytes)?;
             Ok(FileEntry {
@@ -341,6 +348,28 @@ mod tests {
         };
         assert_eq!(hash(&with), hash(&format!("{plain}\n")));
         assert_ne!(hash(&with), hash(plain));
+    }
+
+    /// #2822: every caller, the node and the tab alike, leaves `.gitignore` out, at any depth.
+    #[test]
+    fn a_gitignore_is_not_an_input() {
+        let nid = |files: Vec<(String, Vec<u8>)>| {
+            manifest("n".into(), 1, "0".into(), "00".into(), files)
+                .unwrap()
+                .nid()
+        };
+        assert_eq!(
+            nid(vec![
+                file("views/a.sql"),
+                file(".gitignore"),
+                file("views/.gitignore")
+            ]),
+            nid(vec![file("views/a.sql")])
+        );
+        assert_ne!(
+            nid(vec![file("views/a.sql"), file("gitignore")]),
+            nid(vec![file("views/a.sql")])
+        );
     }
 
     /// The documented `[address_history.sweep]` and `.mirror` sub-tables are part of the table (#2188).

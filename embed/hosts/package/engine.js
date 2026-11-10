@@ -114,6 +114,7 @@ function compile(m) {
 }
 
 /// What a node leaves out of a nest's inputs (`src/blob.rs`), by name at any depth and at the root.
+/// `.gitignore` is not here: `nuthatch_identity` leaves it out for every caller (#2822).
 const NOT_INPUT = ["nuthatch.redb", "segments", ".git", ".DS_Store"];
 const NOT_INPUT_AT_ROOT = ["maintained", "quarantine", "checkpoints"];
 /// A spill directory a node made (`is_spill_dir_name` in `src/spill.rs`): `<prefix><pid>-<seq>`.
