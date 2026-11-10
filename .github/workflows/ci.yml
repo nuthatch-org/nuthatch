@@ -1954,3 +1954,37 @@ jobs:
         run: |
           cargo fuzz run --fuzz-dir fuzz/sql -s none -O sql_confinement -- \
             -runs=200000 -max_total_time=300 -print_final_stats=1
+      # #2743: the engine crate's parsers that take a gateway's bytes, on the build above.
+      - name: fuzz IPFS CAR and subgraph manifest parsing
+        run: |
+          for target in cid_car subgraph_manifest; do
+            echo "::group::$target"
+            cargo fuzz run --fuzz-dir fuzz/sql -s none -O "$target" -- \
+              -runs=300000 -max_total_time=120 -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+  fuzz-embed:
+    name: fuzz smoke (engine input)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
+    runs-on: ubuntu-latest
+    # #2743: the embeddable engine's verified-follow headers and `attach`'s Arrow IPC, both from
+    # outside. Its own crate because `embed/` builds on patched dbsp; stable with `-s none`, as above.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: fuzz/embed -> target
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # attach_ipc is built but not run here until #2811: arrow-ipc panics on a malformed schema.
+      - name: fuzz header chains
+        run: |
+          cargo fuzz build --fuzz-dir fuzz/embed -s none -O
+          cargo fuzz run --fuzz-dir fuzz/embed -s none -O header_chain -- \
+            -runs=300000 -max_total_time=120 -print_final_stats=1

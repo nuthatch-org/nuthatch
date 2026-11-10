@@ -23,6 +23,19 @@ finding.
   it's resolved ahead of time by whoever built the registry, not something a byzantine RPC response
   or a malicious log actually controls.
 
+Two more crates hold targets that link more than the decode path (#2743), each its own workspace and
+built on the pinned stable with `-s none`, as CI's `fuzz-sql` and `fuzz-embed` jobs run them:
+
+- **`fuzz/sql`**: `sql_confinement` (RFC-0073 FR8), `cid_car` (IPFS CAR bodies, CID text and
+  `cid::verify`) and `subgraph_manifest` (`parse_manifest`).
+- **`fuzz/embed`**: `header_chain` (the verified follow's header RLP and `verify_chain`) and
+  `attach_ipc` (`attach`'s Arrow IPC stream, which CI does not run until #2811).
+
+```sh
+cargo fuzz run --fuzz-dir fuzz/sql -s none -O cid_car
+cargo fuzz run --fuzz-dir fuzz/embed -s none -O header_chain
+```
+
 ## Running
 
 ```sh
