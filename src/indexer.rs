@@ -3363,6 +3363,9 @@ async fn build_nest(
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);
+    let formula_2 = hex::encode(crate::project::decode_identity_formula_2(
+        &dir, config, &registry,
+    )?);
     // Only the ingestion owner records what a store was indexed under. A `serve` role or query FE reads a
     // store it does not own, so it compares and refuses a mismatch but never writes (#1423 review).
     if store.get_meta(crate::seed::SEED_PENDING_KEY)?.is_some() {
@@ -3376,6 +3379,7 @@ async fn build_nest(
     guard_registry_identity(
         store.as_ref(),
         &identity,
+        &formula_2,
         &hex::encode(registry.hash()),
         config.extract.top_level_calls,
         owner,
@@ -4305,6 +4309,7 @@ fn drain_all_sealable(
 fn guard_registry_identity(
     store: &dyn crate::store::HotStore,
     registry_hash: &str,
+    formula_2_hash: &str,
     legacy_hash: &str,
     top_level_calls: bool,
     owner: bool,
@@ -4312,7 +4317,20 @@ fn guard_registry_identity(
     let formula = store.get_meta(IDENTITY_FORMULA_KEY)?;
     match store.get_meta(REGISTRY_KEY)? {
         Some(found) if found == registry_hash => {
-            if owner && formula.is_none() {
+            if owner && formula.as_deref() != Some(IDENTITY_FORMULA) {
+                store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
+            }
+            Ok(())
+        }
+        Some(found) if formula.as_deref() == Some("2") && found == formula_2_hash => {
+            if owner {
+                tracing::warn!(
+                    "adopting decode identity 0x{registry_hash} for a store recorded before \
+                     [[calls]] covered what a row-driven call reads (0x{found}). If a call's `args`, \
+                     `signature`, `on`, `on_any`, `contract_column` or `canonical` changed since the \
+                     data was written, re-index it."
+                );
+                store.set_meta(REGISTRY_KEY, registry_hash)?;
                 store.set_meta(IDENTITY_FORMULA_KEY, IDENTITY_FORMULA)?;
             }
             Ok(())
@@ -4574,10 +4592,14 @@ pub(crate) fn stamp_fresh_store(
 ) -> Result<()> {
     let registry = crate::registry::from_nest(dir, config)?;
     let identity = hex::encode(crate::project::decode_identity(dir, config, &registry)?);
+    let formula_2 = hex::encode(crate::project::decode_identity_formula_2(
+        dir, config, &registry,
+    )?);
     guard_timestamp_policy(store, config.nest.block_timestamps, true)?;
     guard_registry_identity(
         store,
         &identity,
+        &formula_2,
         &hex::encode(registry.hash()),
         config.extract.top_level_calls,
         true,
@@ -19579,7 +19601,8 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
 
         // 1. Fresh store: adopts, and records what it adopted.
-        guard_registry_identity(&store, "aaaa", "aaaa", false, true).expect("a fresh store adopts");
+        guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, true)
+            .expect("a fresh store adopts");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("aaaa"),
@@ -19587,12 +19610,12 @@ template = "pool"
         );
 
         // 2. Same registry: still fine.
-        guard_registry_identity(&store, "aaaa", "aaaa", false, true)
+        guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, true)
             .expect("an unchanged registry must be accepted");
 
         // 3. Different registry: refused, and the message must name both hashes - a refusal that
         //    does not say what changed sends the operator to the source to find out.
-        let err = guard_registry_identity(&store, "bbbb", "bbbb", false, true)
+        let err = guard_registry_identity(&store, "bbbb", "bbbb", "bbbb", false, true)
             .expect_err("a changed registry must be refused, not adopted");
         let msg = format!("{err:#}");
         assert!(msg.contains("aaaa"), "must name the stored hash: {msg}");
@@ -19610,14 +19633,14 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "12345").unwrap();
         assert_eq!(store.get_meta(REGISTRY_KEY).unwrap(), None, "premise");
 
-        guard_registry_identity(&store, "cccc", "cccc", false, true)
+        guard_registry_identity(&store, "cccc", "cccc", "cccc", false, true)
             .expect("an older store must not be refused");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
             Some("cccc")
         );
         // And having adopted, it is now held to it.
-        guard_registry_identity(&store, "dddd", "dddd", false, true)
+        guard_registry_identity(&store, "dddd", "dddd", "dddd", false, true)
             .expect_err("once adopted, a later change must be refused");
     }
 
@@ -19629,14 +19652,14 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         store.set_meta(REGISTRY_KEY, "events").unwrap();
         store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
-        let err = guard_registry_identity(&store, "full", "events", true, true)
+        let err = guard_registry_identity(&store, "full", "full", "events", true, true)
             .expect_err("indexed call rows without a sender must not be adopted");
         assert!(format!("{err:#}").contains("tx_from"), "{err:#}");
 
         let empty = tempfile::tempdir().unwrap();
         let empty = Store::open(&empty.path().join("t.redb")).unwrap();
         empty.set_meta(REGISTRY_KEY, "events").unwrap();
-        guard_registry_identity(&empty, "full", "events", true, true)
+        guard_registry_identity(&empty, "full", "full", "events", true, true)
             .expect("a store that never indexed a call has nothing to re-index");
     }
 
@@ -19860,7 +19883,7 @@ template = "pool"
         let config = covering("n", "http://a", ADDRESS, 100);
         let untouched = store.write_generation();
         guard_timestamp_policy(&store, true, false).unwrap();
-        guard_registry_identity(&store, "aaaa", "aaaa", false, false).unwrap();
+        guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, false).unwrap();
         guard_coverage(&store, &config, false).unwrap();
         assert_eq!(
             store.write_generation(),
@@ -19872,12 +19895,12 @@ template = "pool"
         }
 
         guard_coverage(&store, &config, true).unwrap();
-        guard_registry_identity(&store, "aaaa", "aaaa", false, true).unwrap();
+        guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, true).unwrap();
         guard_timestamp_policy(&store, true, true).unwrap();
         let recorded = store.write_generation();
         guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), false)
             .expect_err("a reader refuses a coverage mismatch it can prove");
-        guard_registry_identity(&store, "bbbb", "bbbb", false, false)
+        guard_registry_identity(&store, "bbbb", "bbbb", "bbbb", false, false)
             .expect_err("and a registry mismatch");
         guard_timestamp_policy(&store, false, false).expect_err("and a timestamp switch");
         assert_eq!(store.write_generation(), recorded);
@@ -20104,7 +20127,7 @@ template = "pool"
         let store = Store::open(&dir.path().join("t.redb")).unwrap();
         guard_timestamp_policy(&store, config.nest.block_timestamps, true).unwrap();
         let events = hex::encode(registry.hash());
-        guard_registry_identity(&store, &identity, &events, false, true).unwrap();
+        guard_registry_identity(&store, &identity, &identity, &events, false, true).unwrap();
         guard_coverage(&store, &config, true).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
         assert_eq!(store.get_meta(INDEXED_LAYOUT_KEY).unwrap(), None, "premise");
@@ -20148,9 +20171,9 @@ template = "pool"
         );
 
         let store = Store::open(&indexer.path().join("t.redb")).unwrap();
-        guard_registry_identity(&store, &a, &a_events, true, true).unwrap();
+        guard_registry_identity(&store, &a, &a, &a_events, true, true).unwrap();
         store.set_meta(LAST_BLOCK_KEY, "48231985").unwrap();
-        guard_registry_identity(&store, &b, &b_events, true, true)
+        guard_registry_identity(&store, &b, &b, &b_events, true, true)
             .expect_err("a store indexed under one [[ipfs]] declaration must refuse another");
     }
 
@@ -20164,7 +20187,7 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
         store.set_meta(REGISTRY_KEY, "events").unwrap();
 
-        guard_registry_identity(&store, "full", "events", false, true)
+        guard_registry_identity(&store, "full", "full", "events", false, true)
             .expect("a store matching the old formula adopts the new one");
         assert_eq!(
             store.get_meta(REGISTRY_KEY).unwrap().as_deref(),
@@ -20173,11 +20196,41 @@ template = "pool"
 
         let fresh = tempfile::tempdir().unwrap();
         let fresh = Store::open(&fresh.path().join("t.redb")).unwrap();
-        guard_registry_identity(&fresh, "events", "events", false, true).unwrap();
+        guard_registry_identity(&fresh, "events", "events", "events", false, true).unwrap();
         fresh.set_meta(LAST_BLOCK_KEY, "100").unwrap();
-        guard_registry_identity(&fresh, "events+ipfs", "events", false, true).expect_err(
+        guard_registry_identity(&fresh, "events+ipfs", "events+ipfs", "events", false, true)
+            .expect_err(
             "a store recorded under the full formula must refuse a declaration added afterwards",
         );
+    }
+
+    /// #2697: a store recorded under formula 2 adopts formula 3 once, by the hash formula 2 would give
+    /// today's config. After that, an edit to what a row-driven call reads is refused.
+    #[test]
+    fn a_store_recorded_under_formula_2_adopts_what_a_call_reads_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        store.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        store.set_meta(REGISTRY_KEY, "f2").unwrap();
+        store.set_meta(IDENTITY_FORMULA_KEY, "2").unwrap();
+
+        guard_registry_identity(&store, "f3", "f2", "events", false, true)
+            .expect("a formula 2 store matching today's config adopts formula 3");
+        assert_eq!(store.get_meta(REGISTRY_KEY).unwrap().as_deref(), Some("f3"));
+        assert_eq!(
+            store.get_meta(IDENTITY_FORMULA_KEY).unwrap().as_deref(),
+            Some(IDENTITY_FORMULA)
+        );
+        guard_registry_identity(&store, "f3-edited", "f2", "events", false, true)
+            .expect_err("once adopted, the formula 2 hash is no longer a pass");
+
+        let other = tempfile::tempdir().unwrap();
+        let other = Store::open(&other.path().join("t.redb")).unwrap();
+        other.set_meta(LAST_BLOCK_KEY, "100").unwrap();
+        other.set_meta(REGISTRY_KEY, "f2").unwrap();
+        other.set_meta(IDENTITY_FORMULA_KEY, "2").unwrap();
+        guard_registry_identity(&other, "f3", "f2-edited", "events", false, true)
+            .expect_err("a formula 2 store whose config changed is still refused");
     }
 
     #[async_trait::async_trait]

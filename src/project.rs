@@ -912,6 +912,25 @@ pub fn decode_identity(
     config: &Config,
     registry: &crate::registry::DecodeRegistry,
 ) -> Result<[u8; 32]> {
+    identity_under(dir, config, registry, crate::calls::decl_hash)
+}
+
+/// [`decode_identity`] as identity formula 2 computed it, before `[[calls]]` covered what a
+/// row-driven call reads (#2697). A store recorded under it is adopted once, not refused.
+pub fn decode_identity_formula_2(
+    dir: &Path,
+    config: &Config,
+    registry: &crate::registry::DecodeRegistry,
+) -> Result<[u8; 32]> {
+    identity_under(dir, config, registry, crate::calls::decl_hash_formula_2)
+}
+
+fn identity_under(
+    dir: &Path,
+    config: &Config,
+    registry: &crate::registry::DecodeRegistry,
+    calls_hash: fn(&[crate::calls::CallDecl]) -> [u8; 32],
+) -> Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let fold = |hash: [u8; 32], part: [u8; 32]| -> [u8; 32] {
         let mut h = Sha256::new();
@@ -932,7 +951,7 @@ pub fn decode_identity(
     }
     // RFC-0023 tier 3: a declared read is a table too, and moves the identity for the same reason.
     if !config.calls.is_empty() {
-        hash = fold(hash, crate::calls::decl_hash(&config.calls));
+        hash = fold(hash, calls_hash(&config.calls));
     }
     Ok(hash)
 }
