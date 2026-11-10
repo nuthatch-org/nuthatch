@@ -220,7 +220,7 @@ pub struct Window {
 /// Successes at one span before it is tried doubled.
 const REGROW_AFTER: u64 = 32;
 /// Times one span is asked while the provider is rate-limiting, at the same width (#2730).
-const RATE_LIMIT_ATTEMPTS: u32 = 3;
+pub(crate) const RATE_LIMIT_ATTEMPTS: u32 = 3;
 /// Pause when a rate limit names none. The RPC client's first 429 rest is the same length.
 const RATE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Spans in flight at once on one provider. GraphOps refused hydration with 403s past eight.
@@ -295,10 +295,10 @@ impl Window {
 /// How a span's error should be answered. A classified failure comes first. The text of an
 /// unclassified one is the fallback (#2730).
 pub(crate) enum SpanAnswer {
-    /// The span was too wide. A smaller one may be accepted. `throttle` is a pool-wide rate limit
-    /// that was escalated: at one block there is nothing left to split, so the caller waits.
-    Narrow { throttle: bool },
-    /// A rate limit. The width stays, and the caller waits `retry_after` when the provider named one.
+    /// The span was too wide. A smaller one may be accepted.
+    Narrow,
+    /// A rate limit, including a pool-wide 429 the client escalated. The width stays, and the
+    /// caller waits `retry_after` when the provider named one.
     Limited(Option<std::time::Duration>),
     /// The endpoint will not serve a topic-only `eth_getLogs`.
     Filter,
@@ -310,20 +310,18 @@ pub(crate) fn span_answer(err: &anyhow::Error) -> SpanAnswer {
     use nuthatch_core::rpc::{class_of, FailureClass};
     match class_of(err) {
         Some(FailureClass::RateLimited { retry_after }) => SpanAnswer::Limited(retry_after),
-        // A pool-wide throttle is marked narrowable so a wide span is split. At one block there is
-        // nothing to split, and waiting is what a throttle needs (#916, #2730).
+        // A pool-wide 429 is still a rate limit. Shrinking it spends the same quota (#916).
         Some(FailureClass::Narrowable {
-            escalated_from_rate_limit,
+            escalated_from_rate_limit: true,
             ..
-        }) => SpanAnswer::Narrow {
-            throttle: escalated_from_rate_limit,
-        },
+        }) => SpanAnswer::Limited(None),
+        Some(FailureClass::Narrowable { .. }) => SpanAnswer::Narrow,
         Some(FailureClass::FilterRefused) => SpanAnswer::Filter,
         Some(_) => SpanAnswer::Fatal,
         None => {
             let why = format!("{err:#}");
             if stated_limit(&why).is_some_and(|n| n >= 1) || range_shaped(&why) {
-                SpanAnswer::Narrow { throttle: false }
+                SpanAnswer::Narrow
             } else {
                 SpanAnswer::Fatal
             }
@@ -555,11 +553,8 @@ fn judge(method: &str, s: u64, e: u64, answer: Result<Value>) -> Result<Judged> 
             let span = e - s + 1;
             match span_answer(&err) {
                 SpanAnswer::Limited(wait) => Ok(Judged::Limited { why, wait }),
-                SpanAnswer::Narrow { throttle: true } if span == 1 => {
-                    Ok(Judged::Limited { why, wait: None })
-                }
-                SpanAnswer::Narrow { .. } if span > 1 => Ok(Judged::Smaller(why)),
-                SpanAnswer::Narrow { .. } => Ok(Judged::Overfull(
+                SpanAnswer::Narrow if span > 1 => Ok(Judged::Smaller(why)),
+                SpanAnswer::Narrow => Ok(Judged::Overfull(
                     err.context(format!("{method} at block {s}")),
                 )),
                 SpanAnswer::Filter => bail!(
@@ -2062,33 +2057,55 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 let mut answered = None;
                 let mut refused = None;
                 for probe in [from + (to - from) / 2, from, to] {
-                    match self
-                        .main
-                        .call(
-                            "eth_getLogs",
-                            json!([{ "fromBlock": format!("0x{probe:x}"), "toBlock": format!("0x{probe:x}"), "topics": [sig] }]),
-                        )
-                        .await
-                    {
-                        Ok(got) => {
-                            let got = got
-                                .as_array()
-                                .cloned()
-                                .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
-                            answered = Some((probe, got));
-                            break;
-                        }
-                        Err(e) if matches!(span_answer(&e), SpanAnswer::Narrow { .. }) => {
-                            refused = Some(e)
-                        }
-                        Err(e) if matches!(span_answer(&e), SpanAnswer::Filter) => {
-                            return Err(e).context(
-                                "eth_getLogs, checking an empty positional filter: this RPC cannot serve topic-only getLogs",
+                    let mut attempts = 0u32;
+                    loop {
+                        match self
+                            .main
+                            .call(
+                                "eth_getLogs",
+                                json!([{ "fromBlock": format!("0x{probe:x}"), "toBlock": format!("0x{probe:x}"), "topics": [sig] }]),
                             )
+                            .await
+                        {
+                            Ok(got) => {
+                                let got = got
+                                    .as_array()
+                                    .cloned()
+                                    .ok_or_else(|| anyhow!("eth_getLogs answered a non-list"))?;
+                                answered = Some((probe, got));
+                                break;
+                            }
+                            Err(e) => match span_answer(&e) {
+                                // A size refusal may be this block's body. Another block can answer.
+                                SpanAnswer::Narrow => {
+                                    refused = Some(e);
+                                    break;
+                                }
+                                // A 429 is pacing. Another block would spend the same quota.
+                                SpanAnswer::Limited(wait) => {
+                                    attempts += 1;
+                                    if attempts >= RATE_LIMIT_ATTEMPTS {
+                                        return Err(e).context(
+                                            "eth_getLogs, checking an empty positional filter, stayed rate limited",
+                                        );
+                                    }
+                                    tokio::time::sleep(rate_wait(wait)).await;
+                                }
+                                SpanAnswer::Filter => {
+                                    return Err(e).context(
+                                        "eth_getLogs, checking an empty positional filter: this RPC cannot serve topic-only getLogs",
+                                    )
+                                }
+                                SpanAnswer::Fatal => {
+                                    return Err(e).context(
+                                        "eth_getLogs, checking an empty positional filter",
+                                    )
+                                }
+                            },
                         }
-                        Err(e) => {
-                            return Err(e).context("eth_getLogs, checking an empty positional filter")
-                        }
+                    }
+                    if answered.is_some() {
+                        break;
                     }
                 }
                 match answered {
@@ -3153,6 +3170,66 @@ mod tests {
         ranged(&rpc, &w, 4, 4, "eth_getLogs", blocks).await.unwrap();
         assert_eq!(w.get(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A pool-wide throttle over a wide span waits at that width. It is still a 429 (#916).
+    #[tokio::test]
+    async fn a_pool_wide_throttle_keeps_a_wide_window() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let n = calls.clone();
+        let rpc = script(move |_, _| {
+            if n.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(classified(
+                    nuthatch_core::rpc::FailureClass::Narrowable {
+                        suggested: None,
+                        escalated_from_rate_limit: true,
+                    },
+                    "the pool asked us to wait",
+                ))
+            } else {
+                Ok(json!([]))
+            }
+        });
+        let w = Window::new(100_000);
+        ranged(&rpc, &w, 0, 99_999, "eth_getLogs", blocks)
+            .await
+            .unwrap();
+        assert_eq!(w.get(), 100_000);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// An empty positional filter's probe is asked again after a 429, on the same block.
+    #[tokio::test]
+    async fn a_rate_limited_empty_filter_probe_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let probes = Arc::new(AtomicU64::new(0));
+        let n = probes.clone();
+        let main = script(move |m, p| {
+            if m != "eth_getLogs" {
+                bail!("unexpected {m}");
+            }
+            let topics = p[0]["topics"]
+                .as_array()
+                .ok_or_else(|| anyhow!("topics are not a list"))?;
+            if topics.len() == 1 && n.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(classified(
+                    nuthatch_core::rpc::FailureClass::RateLimited {
+                        retry_after: Some(std::time::Duration::from_millis(1)),
+                    },
+                    "HTTP 429 Too Many Requests",
+                ));
+            }
+            Ok(json!([]))
+        });
+        let d = Discoverer::new(main, script(|m, _| bail!("unexpected {m}")));
+        let pending = Pending::begin(&h).unwrap();
+        d.discover(&h, A, 0, 10, &TOKENS, &pending).await.unwrap();
+        assert!(
+            probes.load(Ordering::SeqCst) >= 2,
+            "the probe was asked again"
+        );
+        assert_eq!(d.log_window.get(), 100_000);
     }
 
     /// An error that says nothing about the range still fails the whole range, concurrent or not.

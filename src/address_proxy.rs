@@ -244,6 +244,8 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
     // needs: whatever lies beyond it a caller asks for next.
     let mut logs = Vec::new();
     let (mut start, mut span, mut calls) = (from, FIRST_SPAN, 0);
+    // Rate limits on one span start. Three and the request fails, same as discovery (#2730).
+    let mut limited: BTreeMap<u64, u32> = BTreeMap::new();
     while start <= to && logs.len() < need {
         if calls == MAX_LOG_CALLS {
             return Ok(Answer::Incomplete(format!(
@@ -272,16 +274,17 @@ async fn logs(q: &HashMap<String, String>, forward: &Forward) -> Result<Answer> 
                 start = end + 1;
             }
             Err(e) => match crate::address_discovery::span_answer(&e) {
-                crate::address_discovery::SpanAnswer::Narrow { .. } if end > start => {
+                crate::address_discovery::SpanAnswer::Narrow if end > start => {
                     let stated = crate::address_discovery::stated_limit(&format!("{e:#}"));
                     span = stated.filter(|n| *n < span).unwrap_or(span / 2).max(1);
                 }
                 crate::address_discovery::SpanAnswer::Limited(wait) => {
+                    let n = limited.entry(start).or_insert(0);
+                    *n += 1;
+                    if *n >= crate::address_discovery::RATE_LIMIT_ATTEMPTS {
+                        bail!("eth_getLogs [{start}, {end}] stayed rate limited: {e:#}");
+                    }
                     tokio::time::sleep(crate::address_discovery::rate_wait(wait)).await;
-                }
-                // A pool-wide throttle at one block has nothing left to split.
-                crate::address_discovery::SpanAnswer::Narrow { throttle: true } => {
-                    tokio::time::sleep(crate::address_discovery::rate_wait(None)).await;
                 }
                 crate::address_discovery::SpanAnswer::Filter => {
                     bail!("this RPC cannot serve topic-only getLogs: {e:#}")
@@ -1090,6 +1093,46 @@ mod tests {
         .unwrap();
         assert_eq!(got["status"], "1", "{got}");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A provider that keeps answering 429 fails the page after three asks of the same span.
+    #[tokio::test]
+    async fn a_rate_limited_getlogs_span_stops_after_three_attempts() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let n = calls.clone();
+        let forward: Forward = Arc::new(move |m: String, _: Value| {
+            let n = n.clone();
+            Box::pin(async move {
+                if m != "eth_getLogs" {
+                    return Ok(json!({"effectiveGasPrice": "0x1", "gasUsed": "0x1"}));
+                }
+                n.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::Error::new(nuthatch_core::rpc::ClassifiedError {
+                    class: nuthatch_core::rpc::FailureClass::RateLimited {
+                        retry_after: Some(Duration::from_millis(1)),
+                    },
+                    detail: "HTTP 429 Too Many Requests".into(),
+                }))
+            })
+        });
+        let got = answer(
+            &q(&[
+                ("module", "logs"),
+                ("action", "getLogs"),
+                ("fromBlock", "1"),
+                ("toBlock", "16"),
+            ]),
+            1,
+            &forward,
+        )
+        .await
+        .unwrap();
+        let result = got["result"].as_str().unwrap();
+        assert!(result.contains("stayed rate limited"), "{got}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            crate::address_discovery::RATE_LIMIT_ATTEMPTS as u64
+        );
     }
 
     /// A topic-only refusal is the reason the page comes back incomplete.
