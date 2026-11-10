@@ -1740,8 +1740,19 @@ fn mirror_of<'a>(
     default: Option<&'a MountPublish>,
     first: bool,
 ) -> Option<&'a MountPublish> {
-    m.publish.as_ref().or_else(|| {
-        let own = mounts.iter().any(|s| s.nid == m.nid && s.publish.is_some());
+    mirror_for(m.publish.as_ref(), &m.nid, mounts, default, first)
+}
+
+/// [`mirror_of`] for a mount that may have no record yet: `own` is its `[mounts.publish]`.
+fn mirror_for<'a>(
+    own: Option<&'a MountPublish>,
+    nid: &str,
+    mounts: &[Mount],
+    default: Option<&'a MountPublish>,
+    first: bool,
+) -> Option<&'a MountPublish> {
+    own.or_else(|| {
+        let own = mounts.iter().any(|s| s.nid == nid && s.publish.is_some());
         default.filter(|_| first && !own)
     })
 }
@@ -3403,6 +3414,15 @@ pub fn lifecycle_routes(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("invalid publish: {e:#}")})),
+            );
+        }
+        if body.publish.as_ref().is_some_and(|p| p.failover.is_some()) {
+            let e = anyhow::Error::from(MountRefusal::FailoverNeedsRestart {
+                nest: body.name.clone(),
+            });
+            return (
+                status_for(&e),
+                Json(serde_json::json!({"error": format!("{e:#}")})),
             );
         }
         if body.seed && q.wait {
@@ -5227,6 +5247,8 @@ pub enum MountRefusal {
     SealDirectEntities { nest: String },
     /// Another mount of this name or dataset is still catching up (RFC-0027 §4).
     Joining { nest: String, by: String },
+    /// The mount would mirror with failover, whose writer lease only boot takes (RFC-0078).
+    FailoverNeedsRestart { nest: String },
 }
 
 impl std::fmt::Display for MountRefusal {
@@ -5256,6 +5278,11 @@ impl std::fmt::Display for MountRefusal {
                 f,
                 "'{nest}' cannot mount while '{by}' is still catching up on that name or dataset; \
                  retry once it is live or has failed"
+            ),
+            MountRefusal::FailoverNeedsRestart { nest } => write!(
+                f,
+                "'{nest}' would mirror with failover, and the writer lease is only taken at boot: \
+                 declare it in mounts.toml and restart the runtime"
             ),
             MountRefusal::Suspended { name, nid } => write!(
                 f,
@@ -5303,6 +5330,7 @@ impl MountRefusal {
             MountRefusal::AlreadyMounted(_)
             | MountRefusal::Suspended { .. }
             | MountRefusal::Joining { .. }
+            | MountRefusal::FailoverNeedsRestart { .. }
             | MountRefusal::UndeclaredChain { .. }
             | MountRefusal::CursorStopped { .. }
             | MountRefusal::SealDirectEntities { .. } => 409,
@@ -6904,6 +6932,23 @@ impl RuntimeHandles {
         self.plan(name, nid, false)
     }
 
+    /// Whether a live mount of `nid` asking for `own` would get a failover mirror, chosen as
+    /// `publish_mount` chooses it. Only boot takes a writer lease, so such a mount is refused.
+    fn mirrors_with_failover(&self, own: Option<&MountPublish>, nid: &str) -> bool {
+        let first = !self
+            .states
+            .iter()
+            .any(|(_, s)| s.nid.as_deref() == Some(nid));
+        mirror_for(
+            own,
+            nid,
+            &self.mount_ctx.mounts,
+            self.mount_ctx.publish.as_ref(),
+            first,
+        )
+        .is_some_and(|p| p.failover.is_some())
+    }
+
     /// `carried`: the caller holds the nest itself, as a bundle's dry run does, so a NID the runtime
     /// does not hold needs no fetch and is no refusal.
     fn plan(&self, name: &str, nid: Option<&Nid>, carried: bool) -> Result<MountPlan> {
@@ -6958,6 +7003,21 @@ impl RuntimeHandles {
                 .find(|m| mount_route(m, &self.default_tenant) == name)
                 .map(|m| m.nid.clone())
         });
+        if let Some(nid) = &nid {
+            let owner = name.strip_suffix(STAGING_SUFFIX).unwrap_or(name);
+            let own = self
+                .mount_ctx
+                .mounts
+                .iter()
+                .find(|m| mount_route(m, &self.default_tenant) == owner)
+                .and_then(|m| m.publish.as_ref());
+            if self.mirrors_with_failover(own, nid) {
+                return Err(MountRefusal::FailoverNeedsRestart {
+                    nest: name.to_string(),
+                }
+                .into());
+            }
+        }
         let dir = match &nid {
             Some(nid) => MountTable::data_dir(&self.mount_ctx.dir, nid),
             None => MountTable::nest_dir(&self.mount_ctx.dir, alias),
@@ -7450,6 +7510,12 @@ impl RuntimeHandles {
 
     /// Mirror a live mount to `publish` (RFC-0073 FR16): its record, its publisher and `mounts.toml`.
     pub fn set_publish(&mut self, name: &str, publish: &MountPublish) -> Result<()> {
+        if publish.failover.is_some() {
+            return Err(MountRefusal::FailoverNeedsRestart {
+                nest: name.to_string(),
+            }
+            .into());
+        }
         let default_tenant = self.default_tenant.clone();
         let Some(state) = self.states.iter().find(|(n, _)| n == name).map(|(_, s)| s) else {
             bail!("'{name}' is not mounted");
@@ -8329,6 +8395,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next.leases[0].fence(), Some(2), "taken over once it lapsed");
+    }
+
+    /// #2713: a live mount asking for failover is refused before it mounts or writes a record.
+    #[tokio::test]
+    async fn a_live_mount_asking_for_failover_is_refused_up_front() {
+        use tower::ServiceExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let nid = "c".repeat(64);
+        leased_dataset(root.path(), &nid, "leased");
+        let mirror = tempfile::tempdir().unwrap();
+        let publish = failover_publish(mirror.path().to_str().unwrap(), false).unwrap();
+        let handles = Arc::new(tokio::sync::Mutex::new(idle_handles(root.path())));
+        let jobs = Arc::new(crate::mount_jobs::MountJobs::load(root.path()));
+        let routes = lifecycle_routes(handles.clone(), jobs.clone(), true, Some("t".into()));
+        for uri in ["/_admin/nests?wait=true", "/_admin/nests"] {
+            let body = serde_json::json!({"name": "usdc", "nid": nid, "publish": publish});
+            let req = axum::http::Request::post(uri)
+                .header("authorization", "Bearer t")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            let resp = routes.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT, "{uri}");
+            let text = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&text).contains("restart the runtime"),
+                "{uri}"
+            );
+        }
+        assert!(jobs.get("usdc").is_none());
+        let h = handles.lock().await;
+        assert!(h.states.is_empty() && h.publishers.is_empty());
+        assert!(!root.path().join(MOUNTS_FILE).exists());
+    }
+
+    /// #2713: so is one whose record, or the runtime's default mirror, already carries failover.
+    #[test]
+    fn a_live_mount_whose_mirror_carries_failover_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let nid = "c".repeat(64);
+        leased_dataset(root.path(), &nid, "leased");
+        let target = root.path().join("mirror");
+        let publish = failover_publish(target.to_str().unwrap(), false);
+        let parsed = Nid::parse(&nid).unwrap();
+
+        let mut h = idle_handles(root.path());
+        let mut table = mounts_with("");
+        table.mounts[0].nid = nid.clone();
+        table.mounts[0].publish = publish.clone();
+        let name = mount_route(&table.mounts[0], DEFAULT_TENANT);
+        h.mount_ctx.mounts = table.mounts.clone();
+        let refused = h.plan_mount(&name, Some(&parsed)).unwrap_err();
+        assert_eq!(
+            refused
+                .downcast_ref::<MountRefusal>()
+                .map(MountRefusal::status),
+            Some(409),
+            "{refused:#}"
+        );
+
+        let mut h = idle_handles(root.path());
+        h.mount_ctx.publish = publish.clone();
+        assert!(h.plan_mount("fresh", Some(&parsed)).is_err());
+
+        let mut quiet = publish.unwrap();
+        quiet.failover = None;
+        h.mount_ctx.publish = Some(quiet);
+        h.plan_mount("fresh", Some(&parsed))
+            .expect("a mirror without failover still mounts live");
     }
 
     /// The local mirror at `root`, whose seed reads take `seed` to answer.
