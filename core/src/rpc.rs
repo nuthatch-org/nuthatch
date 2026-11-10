@@ -2269,13 +2269,17 @@ impl<T: Transport> RpcClient<T> {
         };
         let mut out = HashMap::new();
         let mut first_item_error: Option<FailureClass> = None;
+        let mut seen = vec![false; blocks.len()];
         for item in resp.as_array_mut().into_iter().flatten() {
             let Some(idx) = item.get("id").and_then(Value::as_u64) else {
                 continue;
             };
-            let Some(&block) = blocks.get(idx as usize) else {
-                continue;
-            };
+            let idx = usize::try_from(idx).unwrap_or(usize::MAX);
+            if idx >= blocks.len() || seen[idx] {
+                bail!("eth_getBlockByNumber batch contains an unexpected or duplicate id {idx}");
+            }
+            seen[idx] = true;
+            let block = blocks[idx];
             // The whole header, not just `timestamp`: `block_timestamps` projects the field it
             // needs, and RFC-0036's `blocks` table keeps the rest. A `null` result (archive-vs-full
             // load-balancer split) is skipped, and the caller's total-count check turns that into an

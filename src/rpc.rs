@@ -2152,6 +2152,23 @@ mod tests {
         assert!(!crate::chunker::is_result_too_large(&err));
     }
 
+    /// #2702: a header batch answering one id twice is refused, not settled by whichever came last.
+    #[tokio::test]
+    async fn a_header_batch_with_a_duplicate_id_is_refused() {
+        let header =
+            |ts: u64| serde_json::json!({"number": "0x64", "timestamp": format!("0x{ts:x}")});
+        let (url, server) = canned_rpc(serde_json::json!([
+            {"jsonrpc": "2.0", "id": 0, "result": header(100)},
+            {"jsonrpc": "2.0", "id": 0, "result": header(200)},
+        ]))
+        .await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let got = c.block_timestamps(&[100]).await;
+        server.abort();
+        let err = got.expect_err("two answers for one block");
+        assert!(format!("{err:#}").contains("duplicate id"), "{err:#}");
+    }
+
     /// **RFC-0029 §6h.** A timestamp batch too large to read must be *halved*, not reissued at the
     /// same size until the attempts run out.
     ///
