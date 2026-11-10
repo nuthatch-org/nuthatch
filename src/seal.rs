@@ -3452,6 +3452,14 @@ mod tests {
         );
     }
 
+    /// A bare relative name's parent is the empty path, which cannot be opened to fsync: its entry
+    /// lives in the current directory (#2758).
+    #[test]
+    fn a_bare_name_is_synced_in_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("segments")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("data/nid0")), Path::new("data"));
+    }
+
     /// #1632: the watermark is fsynced after `seal_range` returns. The segment bytes and the
     /// manifest's directory entry have to be durable already. The entry lives in `segments/`.
     #[test]

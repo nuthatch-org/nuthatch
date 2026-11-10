@@ -217,10 +217,8 @@ impl AdaptiveWindow {
     /// intended direction, because too low is slow and too high does not terminate.
     pub fn served_by_splitting(&mut self, narrowest_served: u64) {
         let w = narrowest_served.max(self.min);
-        if w < self.max {
-            self.max = w;
-            self.window = self.window.min(self.max);
-        }
+        self.max = self.max.min(w);
+        self.window = self.window.min(self.max);
         self.learned = Some(self.learned.map_or(w, |l| l.min(w)));
         // A refusal is fresh evidence the ceiling is real; the recovery count starts again (#1170).
         self.whole_streak = 0;
