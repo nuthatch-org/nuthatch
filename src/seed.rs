@@ -269,6 +269,11 @@ async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Want
     let dest = segments.join(&w.segment.file);
     if let Ok(have) = std::fs::read(&dest) {
         if publish::sha256_hex(&have) == w.segment.hash {
+            // An earlier, interrupted seed may have left it unsynced, and the watermark is about to pass it.
+            std::fs::File::open(&dest)
+                .and_then(|f| f.sync_all())
+                .and_then(|()| seal::fsync_dir(segments))
+                .with_context(|| format!("fsyncing {}", dest.display()))?;
             return Ok(0);
         }
     }

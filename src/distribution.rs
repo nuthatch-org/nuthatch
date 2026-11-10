@@ -197,7 +197,8 @@ pub trait BundleStore: Send + Sync {
     /// Remove a blob; an absent one is not an error.
     async fn delete_blob(&self, hash: &str) -> Result<()>;
     /// Remove a `name@version` ref only while it still names `hash`. False when it did not, or was
-    /// already gone.
+    /// already gone. The filesystem registry compares under its ref lock; an object store, which has
+    /// no conditional delete, reads then deletes, so a re-point between the two is still lost there.
     async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool>;
     /// Remove a NID entry only while it still names `hash`, as [`BundleStore::delete_ref_if`].
     async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool>;
