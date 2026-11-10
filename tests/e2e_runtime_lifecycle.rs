@@ -2261,6 +2261,50 @@ async fn an_unmounted_nest_leaves_the_health_series() {
     }
 }
 
+/// #2715: unmounting the mount that publishes a shared dataset under `[runtime.publish]` passes the
+/// mirror to the mount left on it, rather than stopping it until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_mirror_passes_to_the_mount_left_on_a_shared_dataset() {
+    const FIRST: &str = "mirror-first";
+    const ALIAS: &str = "mirror-alias";
+    let roost = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    let nid = "6e".repeat(32);
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &nid).await;
+    handles.mount_ctx.publish = Some(runtime::MountPublish {
+        target: mirror.path().to_str().unwrap().to_string(),
+        interval: "1h".into(),
+        parallelism: 2,
+        followers: false,
+        failover: None,
+    });
+    for name in [FIRST, ALIAS] {
+        handles
+            .mount(name, Some(runtime::Nid::parse(&nid).unwrap()))
+            .await
+            .expect("mount");
+    }
+    let mirrored = |h: &runtime::RuntimeHandles| -> Vec<String> {
+        h.publishers.iter().map(|(n, _)| n.clone()).collect()
+    };
+    assert_eq!(mirrored(&handles), [FIRST], "premise: published once");
+
+    handles
+        .unmount(FIRST)
+        .await
+        .expect("unmount the first mount");
+    assert_eq!(
+        mirrored(&handles),
+        [ALIAS],
+        "the dataset is still indexed and no longer mirrored"
+    );
+}
+
 /// #1673: `/_admin/…` belongs to the lifecycle routes, so a mount whose route would start there is
 /// refused over the API, and boot refuses a record that names one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
