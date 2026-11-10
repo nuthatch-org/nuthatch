@@ -18,6 +18,7 @@
 use crate::store::HotStore;
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Duration;
 
 pub use nuthatch_core::alerts::{enqueue, payloads, trim, AlertRouter, OUTBOX_MAX};
@@ -68,90 +69,189 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// throttle the others - the drain is bounded by the slowest single request, not the sum.
 const DELIVERY_CONCURRENCY: usize = 8;
 
-/// Drain up to [`DELIVERY_BATCH`] pending deliveries once, POSTing the exact stored payload bytes to
-/// its URL (so an HMAC signature covers what's actually sent). A payload whose `webhook` names a
-/// secret in `secrets` gets an `X-Nuthatch-Signature: sha256=<hmac>` header (RFC-0010 Part B). A
-/// delivered entry (2xx) is removed; a failure is left for retry (at-least-once) and doesn't stop the
-/// drain. Returns how many were delivered.
+/// Drain the outbox once, POSTing the exact stored payload bytes to its URL (so an HMAC signature
+/// covers what's actually sent). A payload whose `webhook` names a secret in `secrets` gets an
+/// `X-Nuthatch-Signature: sha256=<hmac>` header (RFC-0010 Part B). A delivered entry (2xx) is
+/// removed; a failure is left for retry (at-least-once) and doesn't stop the drain. Returns how many
+/// were delivered.
+///
+/// Each sink drains on its own: its oldest entry goes first as a probe, and the rest of its
+/// [`DELIVERY_BATCH`] follow only if the probe found the sink up. A dead or hung sink costs one
+/// request a drain and holds up no other sink (#2718).
 pub async fn deliver_pending(
     store: &dyn HotStore,
     client: &reqwest::Client,
     secrets: &std::collections::HashMap<String, String>,
 ) -> usize {
-    use futures::stream::StreamExt;
-    let pending = store.outbox_pending(DELIVERY_BATCH).unwrap_or_default();
+    let (sinks, mut to_remove) = pending_by_sink(store).await;
 
-    // Phase 1: send all POSTs concurrently (SEC-8), each independent. The store is NOT touched here -
-    // redb is single-writer, so mutations are applied afterwards in phase 2, on this task alone.
-    let outcomes: Vec<(u64, Outcome)> = futures::stream::iter(pending)
-        .map(|(seq, payload_str)| {
-            let client = client.clone();
-            async move {
-                let Ok(payload) = serde_json::from_str::<Value>(&payload_str) else {
-                    return (seq, Outcome::Shed); // corrupt entry - drop it
-                };
-                let url = payload.get("url").and_then(Value::as_str).unwrap_or("");
-                // Send the stored bytes verbatim so a signature matches - except where the sink will
-                // not accept them. A Discord webhook answers our own payload `400 Cannot send an
-                // empty message` and `{"content": …}` with `204`, and a non-success is retried
-                // forever, so a raw body there is an outbox that never drains. The signature is
-                // computed over whatever is actually sent, which is the only thing a receiver can
-                // verify.
-                let body = match payload.get("format").and_then(Value::as_str) {
-                    Some("discord") => json!({ "content": discord_line(&payload) }).to_string(),
-                    _ => payload_str.clone(),
-                };
-                let mut req = client
-                    .post(url)
-                    .header("content-type", "application/json")
-                    .header("X-Nuthatch-Delivery", seq.to_string())
-                    .body(body.clone());
-                if let Some(secret) = payload
-                    .get("webhook")
-                    .and_then(Value::as_str)
-                    .and_then(|n| secrets.get(n))
-                {
-                    let sig = crate::webhooks::hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
-                    req = req.header("X-Nuthatch-Signature", format!("sha256={sig}"));
-                }
-                match req.send().await {
-                    Ok(resp) if resp.status().is_success() => (seq, Outcome::Delivered),
-                    Ok(resp) => {
-                        tracing::warn!(
-                            "{}",
-                            retry_line(url, &format!("returned {}", resp.status()))
-                        );
-                        (seq, Outcome::Retry)
-                    }
-                    Err(e) => {
-                        let e = e.without_url();
-                        tracing::warn!("{}", retry_line(url, &format!("delivery failed: {e}")));
-                        (seq, Outcome::Retry)
-                    }
-                }
-            }
-        })
-        .buffer_unordered(DELIVERY_CONCURRENCY)
-        .collect()
-        .await;
+    // Phase 1: send (SEC-8), at most DELIVERY_CONCURRENCY at once across every sink. The store is NOT
+    // touched here - redb is single-writer, so mutations are applied afterwards in phase 2.
+    let permits = tokio::sync::Semaphore::new(DELIVERY_CONCURRENCY);
+    let outcomes = futures::future::join_all(
+        sinks
+            .into_iter()
+            .map(|q| drain_sink(q, client, secrets, &permits)),
+    )
+    .await;
 
     // Phase 2: apply the store mutations. Remove delivered + corrupt; leave retries to be picked up on
     // the next pass. Batched into ONE `spawn_blocking` (audit F-C3): each removal fsyncs, so draining a
     // burst inline parked a tokio worker for one fsync per delivered alert.
     let mut delivered = 0usize;
-    let mut to_remove = Vec::new();
-    for (seq, outcome) in outcomes {
+    for (seq, outcome) in outcomes.into_iter().flatten() {
         match outcome {
             Outcome::Delivered => {
                 to_remove.push(seq);
                 delivered += 1;
             }
             Outcome::Shed => to_remove.push(seq),
-            Outcome::Retry => {}
+            Outcome::Refused | Outcome::Retry => {}
         }
     }
     let _ = store.outbox_remove_batch_blocking(to_remove).await;
     delivered
+}
+
+/// One sink's queue: the probe, then, unless it found the sink down, the rest.
+async fn drain_sink(
+    queue: Vec<(u64, String)>,
+    client: &reqwest::Client,
+    secrets: &HashMap<String, String>,
+    permits: &tokio::sync::Semaphore,
+) -> Vec<(u64, Outcome)> {
+    use futures::stream::StreamExt;
+    let send = |(seq, payload): (u64, String)| async move {
+        let _permit = permits.acquire().await;
+        deliver_one(client, secrets, seq, payload).await
+    };
+    let mut queue = queue.into_iter();
+    let Some(head) = queue.next() else {
+        return Vec::new();
+    };
+    let probe = send(head).await;
+    let up = !matches!(probe.1, Outcome::Retry);
+    let mut out = vec![probe];
+    if up {
+        out.extend(
+            futures::stream::iter(queue)
+                .map(send)
+                .buffer_unordered(DELIVERY_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await,
+        );
+    }
+    out
+}
+
+/// The outbox grouped by destination URL, each sink holding at most [`DELIVERY_BATCH`] entries in
+/// enqueue order. Also returns the corrupt entries to shed.
+///
+/// The whole outbox is read, because a healthy sink's entries may sit behind any number of a dead
+/// one's; [`OUTBOX_MAX`] bounds it. Only the URL is parsed here, and the scan yields between pages.
+async fn pending_by_sink(store: &dyn HotStore) -> (Vec<Vec<(u64, String)>>, Vec<u64>) {
+    #[derive(serde::Deserialize)]
+    struct Dest<'a> {
+        #[serde(default, borrow)]
+        url: Option<std::borrow::Cow<'a, str>>,
+    }
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut sinks: Vec<Vec<(u64, String)>> = Vec::new();
+    let mut corrupt = Vec::new();
+    let mut from = 0;
+    loop {
+        let page = store
+            .outbox_pending_from(from, DELIVERY_BATCH)
+            .unwrap_or_default();
+        let full = page.len() == DELIVERY_BATCH;
+        let Some(&(last, _)) = page.last() else {
+            break;
+        };
+        for (seq, payload) in page {
+            let Ok(dest) = serde_json::from_str::<Dest>(&payload) else {
+                corrupt.push(seq);
+                continue;
+            };
+            let url = dest.url.as_deref().unwrap_or("");
+            let i = match index.get(url) {
+                Some(&i) => i,
+                None => {
+                    index.insert(url.to_string(), sinks.len());
+                    sinks.push(Vec::new());
+                    sinks.len() - 1
+                }
+            };
+            if sinks[i].len() < DELIVERY_BATCH {
+                sinks[i].push((seq, payload));
+            }
+        }
+        if !full {
+            break;
+        }
+        from = last + 1;
+        tokio::task::yield_now().await;
+    }
+    (sinks, corrupt)
+}
+
+/// POST one outbox entry and report its fate.
+async fn deliver_one(
+    client: &reqwest::Client,
+    secrets: &HashMap<String, String>,
+    seq: u64,
+    payload_str: String,
+) -> (u64, Outcome) {
+    let Ok(payload) = serde_json::from_str::<Value>(&payload_str) else {
+        return (seq, Outcome::Shed); // corrupt entry - drop it
+    };
+    let url = payload.get("url").and_then(Value::as_str).unwrap_or("");
+    // Send the stored bytes verbatim so a signature matches - except where the sink will
+    // not accept them. A Discord webhook answers our own payload `400 Cannot send an
+    // empty message` and `{"content": …}` with `204`, and a non-success is retried
+    // forever, so a raw body there is an outbox that never drains. The signature is
+    // computed over whatever is actually sent, which is the only thing a receiver can
+    // verify.
+    let body = match payload.get("format").and_then(Value::as_str) {
+        Some("discord") => json!({ "content": discord_line(&payload) }).to_string(),
+        _ => payload_str.clone(),
+    };
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("X-Nuthatch-Delivery", seq.to_string())
+        .body(body.clone());
+    if let Some(secret) = payload
+        .get("webhook")
+        .and_then(Value::as_str)
+        .and_then(|n| secrets.get(n))
+    {
+        let sig = crate::webhooks::hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
+        req = req.header("X-Nuthatch-Signature", format!("sha256={sig}"));
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => (seq, Outcome::Delivered),
+        Ok(resp) => {
+            tracing::warn!(
+                "{}",
+                retry_line(url, &format!("returned {}", resp.status()))
+            );
+            // These answer the body, not the sink: the sink is up, so its other entries still go.
+            let refused = matches!(resp.status().as_u16(), 400 | 413 | 422);
+            (
+                seq,
+                if refused {
+                    Outcome::Refused
+                } else {
+                    Outcome::Retry
+                },
+            )
+        }
+        Err(e) => {
+            let e = e.without_url();
+            tracing::warn!("{}", retry_line(url, &format!("delivery failed: {e}")));
+            (seq, Outcome::Retry)
+        }
+    }
 }
 
 /// The fate of one outbox entry after a delivery attempt.
@@ -160,7 +260,9 @@ enum Outcome {
     Delivered,
     /// Corrupt/unparseable - remove it (never deliverable).
     Shed,
-    /// Transient failure - leave it for the next drain (at-least-once).
+    /// The sink refused this entry but is up - leave it for the next drain (at-least-once).
+    Refused,
+    /// The sink is down or unreachable - leave it for the next drain (at-least-once).
     Retry,
 }
 
@@ -642,6 +744,167 @@ mod tests {
             ["0", "0"].map(str::to_string).to_vec(),
             "the refused delivery and its retry carry one id"
         );
+    }
+
+    /// #2718: a dead sink with a full batch queued ahead of a healthy one delays only itself, and
+    /// costs one request a drain rather than one per queued alert.
+    #[tokio::test]
+    async fn a_dead_sink_does_not_starve_a_healthy_one() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dead_hits = Arc::new(AtomicUsize::new(0));
+        let live_hits = Arc::new(AtomicUsize::new(0));
+        let (dead, live) = (dead_hits.clone(), live_hits.clone());
+        let app = Router::new()
+            .route(
+                "/dead",
+                post(move || {
+                    dead.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::INTERNAL_SERVER_ERROR }
+                }),
+            )
+            .route(
+                "/live",
+                post(move || {
+                    live.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::OK }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let dead_url = format!("http://{addr}/dead");
+        for _ in 0..DELIVERY_BATCH {
+            store
+                .outbox_push(&json!({ "event": "e", "url": dead_url }).to_string())
+                .unwrap();
+        }
+        let live_url = format!("http://{addr}/live");
+        store
+            .outbox_push(&json!({ "event": "e", "url": live_url }).to_string())
+            .unwrap();
+
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap();
+        let none = std::collections::HashMap::new();
+        assert_eq!(deliver_pending(&store, &client, &none).await, 1);
+        assert_eq!(deliver_pending(&store, &client, &none).await, 0);
+        assert_eq!(live_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dead_hits.load(Ordering::SeqCst),
+            2,
+            "one probe a drain, not the whole batch"
+        );
+        assert_eq!(store.outbox_len(), DELIVERY_BATCH as u64);
+    }
+
+    /// #2718: an entry the sink refuses (400) does not hold back that sink's later entries; it stays
+    /// for retry and the rest go.
+    #[tokio::test]
+    async fn a_refused_entry_does_not_block_its_sinks_later_ones() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route(
+            "/s",
+            post(|body: String| async move {
+                if body.contains("\"bad\"") {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let url = format!("http://{addr}/s");
+        for event in ["bad", "a", "b", "c"] {
+            store
+                .outbox_push(&json!({ "event": event, "url": url }).to_string())
+                .unwrap();
+        }
+        let client = reqwest::Client::new();
+        let none = std::collections::HashMap::new();
+        assert_eq!(deliver_pending(&store, &client, &none).await, 3);
+        assert_eq!(store.outbox_len(), 1, "the refused entry stays for retry");
+    }
+
+    /// #2718: a sink that accepts and never answers holds up only itself, not the entries of a
+    /// healthy sink drained alongside it.
+    #[tokio::test]
+    async fn a_hung_sink_does_not_hold_up_a_healthy_one() {
+        use axum::{http::StatusCode, routing::post, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let live_hits = Arc::new(AtomicUsize::new(0));
+        let live = live_hits.clone();
+        let app = Router::new()
+            .route(
+                "/hung",
+                post(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/live",
+                post(move || {
+                    live.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::OK }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let hung = format!("http://{addr}/hung");
+        store
+            .outbox_push(&json!({ "event": "e", "url": hung }).to_string())
+            .unwrap();
+        let live_url = format!("http://{addr}/live");
+        for _ in 0..20 {
+            store
+                .outbox_push(&json!({ "event": "e", "url": live_url }).to_string())
+                .unwrap();
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let none = std::collections::HashMap::new();
+        let drain = deliver_pending(&store, &client, &none);
+        let watch = async {
+            while live_hits.load(Ordering::SeqCst) < 20 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::pin!(drain);
+        tokio::select! {
+            _ = &mut drain => panic!("the drain ended before the healthy sink was served"),
+            r = tokio::time::timeout(Duration::from_secs(3), watch) => {
+                r.expect("the healthy sink waited on the hung one's probe");
+            }
+        }
+        assert_eq!(drain.await, 20);
+        assert_eq!(store.outbox_len(), 1);
     }
 
     /// A dead endpoint leaves the alert in the outbox for retry - at-least-once, never dropped on the

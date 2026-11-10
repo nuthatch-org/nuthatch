@@ -436,6 +436,7 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
         "the proposer catalogue manifest a publisher writes, not nest config",
     ),
     ("src/tape.rs", "RFC-0039 tape bytes, not nest config"),
+    ("src/alerts.rs", "an outbox entry's URL, not nest config"),
     ("core/src/answer.rs", "the /sql and /explain request body, not nest config"),
     ("src/feed.rs", "the hot-state feed's wire format (RFC-0073 FR1), not nest config"),
     ("src/lease.rs", "the writer lease the mirror holds (RFC-0078), not nest config"),

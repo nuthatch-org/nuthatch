@@ -325,6 +325,13 @@ pub trait HotStore: Send + Sync {
     // ---- delivery outbox --------------------------------------------------------------------
     fn outbox_push(&self, payload: &str) -> Result<u64>;
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>>;
+    /// [`Self::outbox_pending`] from `seq` on, so a drain can page past entries it is not sending.
+    fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
+        let mut all = self.outbox_pending(usize::MAX)?;
+        all.retain(|(s, _)| *s >= seq);
+        all.truncate(limit);
+        Ok(all)
+    }
     fn outbox_remove(&self, seq: u64) -> Result<()>;
     async fn outbox_remove_batch_blocking(&self, seqs: Vec<u64>) -> Result<()>;
     fn outbox_len(&self) -> u64;
@@ -543,6 +550,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
         (**self).outbox_pending(limit)
+    }
+    fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
+        (**self).outbox_pending_from(seq, limit)
     }
     fn outbox_remove(&self, seq: u64) -> Result<()> {
         (**self).outbox_remove(seq)
