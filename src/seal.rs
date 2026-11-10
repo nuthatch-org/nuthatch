@@ -1844,6 +1844,16 @@ fn temp_name(file_name: &str) -> String {
 /// Install `bytes` as `dir/file_name`. The bytes are fsynced before the name exists, and that
 /// directory entry is fsynced before this returns (#1632). A watermark is written only afterwards.
 pub(crate) fn publish_durable(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<()> {
+    // A file already there that is not these bytes has rotted. Replacing it heals every dataset
+    // that names it; keeping it would let this caller catalogue it and prune hot (#2704).
+    let target = dir.join(file_name);
+    if target.is_file() && hash_file(&target).ok() != Some(hex::encode(Sha256::digest(bytes))) {
+        tracing::warn!(
+            "{} does not hold the bytes it should; replacing it",
+            target.display()
+        );
+        return replace_durable(&target, bytes);
+    }
     stage_durable(dir, file_name, |out, tmp| {
         use std::io::Write;
         out.write_all(bytes)
@@ -3844,6 +3854,35 @@ mod tests {
             load_manifest(&dir).unwrap().tables["usdc__transfer"].len(),
             1
         );
+    }
+
+    /// #2704: a second dataset sealing the same bytes has no catalogue entry to restore from, so it
+    /// published beside the rotted shared file, catalogued it and let its caller prune hot.
+    #[test]
+    fn a_second_dataset_replaces_a_corrupt_shared_segment_it_seals_again() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (a, b) = (data.join("nid0"), data.join("nid1"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).unwrap();
+            test_set_table_floor(dir, 0);
+        }
+        seal_range(&a, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let seg = only(&load_manifest(&a).unwrap(), "usdc__transfer");
+        let shared = root
+            .path()
+            .join(SEGMENTS_DIR)
+            .join(format!("{}.parquet", seg.hash));
+        std::fs::write(&shared, b"rotted in place").unwrap();
+
+        seal_range(&b, &[transfer(10, 0, "1")], 10, 10).unwrap();
+        let theirs = only(&load_manifest(&b).unwrap(), "usdc__transfer");
+        assert_eq!(theirs.hash, seg.hash, "premise: the same content address");
+        assert!(
+            segment_intact(&b, &theirs),
+            "the second dataset catalogued the corrupt shared file"
+        );
+        assert!(segment_intact(&a, &seg), "the first dataset was not healed");
     }
 
     /// #2266: when the bad file cannot be replaced, the seal fails, so its caller keeps hot.
