@@ -1453,6 +1453,66 @@ mod tests {
         );
     }
 
+    /// A relay that answers slowly does not hold the cursor: a request queued while the MEV pass
+    /// waits on it is served in the meantime, not after its deadline (#2732).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_relay_does_not_hold_the_cursor() {
+        use crate::address_mode::{Discovery, Need, Request};
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let g = h.generation().unwrap();
+        for action in [
+            Action::TokenTx,
+            Action::TokenNftTx,
+            Action::Token1155Tx,
+            Action::BeaconWithdrawals,
+        ] {
+            h.record(action, A, &[], (100, 199), g).unwrap();
+        }
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let slow: Relays = {
+            let asked = asked.clone();
+            Arc::new(move |_, _| {
+                asked.notify_one();
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    Ok(vec![])
+                })
+            })
+        };
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(100, Some(199), 0)
+        .with_relays(slow);
+        let request = async {
+            asked.notified().await;
+            let sent = tokio::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let answer = state
+                .ask(deadline, |deadline, reply| Request::Cover {
+                    address: "0x00000000000000000000000000000000000000cc".into(),
+                    need: Need::Discovered,
+                    from: 100,
+                    to: 101,
+                    deadline,
+                    reply,
+                })
+                .await;
+            (sent.elapsed(), answer)
+        };
+        let d = evidence_rpc();
+        let (_, (waited, answer)) = tokio::join!(d.catch_up(&state, 1_000), request);
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{waited:?}: {answer:?}"
+        );
+    }
+
     fn frame(
         pos: u64,
         tx: &str,
