@@ -1678,6 +1678,9 @@ fn attempt(
             false,
         )?;
         let degraded_tables = defined.degraded.clone();
+        // Factory children views before the authored ones. A view in `views/*.sql` may read
+        // `{template}__children`, and that relation has to exist when the authored view is planned (#2723).
+        define_children_views(session, dir);
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
         // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
         // this - they only touch the raw per-event tables.
@@ -1697,10 +1700,6 @@ fn attempt(
         if as_of.is_none() {
             define_labels_view(session, dir);
         }
-        // Factory nests (RFC-0009): a `{template}__children` view over the sealed factory events, so
-        // "which pools, discovered when, by which parent" is one query. Best-effort - no factories, no-op.
-        define_children_views(session, dir);
-
         // Every view this query could be reading now exists, so the names it used can be widened to the
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
         // happen here rather than beside the security walk: at that point the catalogue was empty.
@@ -2370,9 +2369,9 @@ pub(crate) fn view_name(create_view_sql: &str) -> Option<String> {
 /// definitions. The files are the authored truth; the catalogue is a cache of it.
 ///
 /// `None` means "could not work it out", and every caller must then define everything. Returned for
-/// a view body that will not parse, and for any `…__children` name: those views are built by
-/// `define_children_views` after this point, out of factory tables enumerated from the config, and
-/// working out which ones here would be a second copy of that logic to keep in step.
+/// a view body that will not parse, and when the closure names any `…__children` view: those are
+/// built by `define_children_views` out of factory tables enumerated from the config, and working
+/// out which ones here would be a second copy of that logic to keep in step.
 fn reachable_tables(
     session: &dyn Session,
     dir: &Path,
@@ -2388,9 +2387,6 @@ fn reachable_tables_stopping(
     referenced: &std::collections::BTreeSet<String>,
     leaves: &std::collections::BTreeSet<String>,
 ) -> Option<std::collections::BTreeSet<String>> {
-    if referenced.iter().any(|n| n.ends_with("__children")) {
-        return None;
-    }
     let bodies = nest_view_bodies(dir);
 
     let mut out = referenced.clone();
@@ -2416,6 +2412,10 @@ fn reachable_tables_stopping(
             break;
         }
         frontier = next;
+    }
+    // An authored view over `{template}__children` reaches it only after the bodies expand (#2723).
+    if out.iter().any(|n| n.ends_with("__children")) {
+        return None;
     }
     Some(out)
 }
@@ -5063,6 +5063,101 @@ template="pool"
             a[0]["parent_address"],
             Value::from("0x1f98431c8ad98523631ae4a59f267346ea31f984")
         );
+    }
+
+    /// #2723: an authored view over `{template}__children` answers on a fresh session, and a later
+    /// query on the same session sees the hot rows of this request.
+    #[test]
+    fn an_authored_view_over_children_sees_this_requests_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            r#"
+[nest]
+name="univ3"
+chain="mainnet"
+chain_id=1
+rpc_urls=["https://rpc"]
+[[contracts]]
+alias="factory"
+address="0x1f98431c8ad98523631ae4a59f267346ea31f984"
+abi="abis/factory.json"
+[[templates]]
+name="pool"
+abi="abis/pool.json"
+[[factories]]
+watch="factory"
+event="PoolCreated"
+child_param="pool"
+template="pool"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join("abis/factory.json"),
+            r#"[{"type":"event","name":"PoolCreated","anonymous":false,"inputs":[
+                {"name":"pool","type":"address","indexed":false}]}]"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/pool.json"), "[]").unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("views/10-kids.sql"),
+            "CREATE VIEW kids AS SELECT * FROM pool__children\n",
+        )
+        .unwrap();
+        let sealed = r#"{"table":"factory__pool_created","pool":"0xAAAA000000000000000000000000000000000001","block_number":10,"log_index":0,"block_timestamp":1700000010,"tx_hash":"0xt","address":"0x1f98431c8ad98523631ae4a59f267346ea31f984"}"#;
+        crate::seal::seal_range(dir.path(), &[sealed.to_string()], 10, 20).unwrap();
+
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 100,
+            ..Default::default()
+        };
+        let hot_row = |pool: &str, block: u64| {
+            serde_json::json!({
+                "pool": pool,
+                "block_number": block,
+                "log_index": 0,
+                "block_timestamp": 1700000000u64 + block,
+                "tx_hash": "0xt",
+                "address": "0x1f98431c8ad98523631ae4a59f267346ea31f984",
+            })
+        };
+        let mut hot = HotRows::new();
+        hot.insert(
+            "factory__pool_created".into(),
+            vec![hot_row("0xBBBB000000000000000000000000000000000002", 21)],
+        );
+        let count = |hot: &HotRows| {
+            query_hot_cold(
+                dir.path(),
+                r#"SELECT count(*) AS n FROM kids"#,
+                guard,
+                hot,
+                20,
+                &[],
+            )
+            .unwrap()
+        };
+        let first = count(&hot);
+        assert_eq!(first.rows[0]["n"], serde_json::json!(2));
+        assert_eq!(session_opens_for(dir.path()), 1);
+        hot.insert(
+            "factory__pool_created".into(),
+            vec![
+                hot_row("0xBBBB000000000000000000000000000000000002", 21),
+                hot_row("0xCCCC000000000000000000000000000000000003", 22),
+            ],
+        );
+        let second = count(&hot);
+        assert_eq!(
+            second.rows[0]["n"],
+            serde_json::json!(3),
+            "the pooled session must read this request's hot rows"
+        );
+        assert_eq!(session_opens_for(dir.path()), 1);
     }
 
     /// A unit still asking for DuckDB is told, not served by something else.
