@@ -62,7 +62,9 @@ pub fn uncached<R>(f: impl FnOnce() -> R) -> R {
 /// Whether a session over `dir` for the shared tenant is in the cache now, for tests.
 #[cfg(all(test, feature = "sync-server"))]
 pub(crate) fn session_cached(dir: &Path) -> bool {
-    session_cache_lock().contains_key(&(dir.to_path_buf(), None))
+    session_cache_lock()
+        .keys()
+        .any(|(d, t, _)| d == dir && t.is_none())
 }
 
 /// Run `f` with the queries it makes on this thread isolated to `tenant` (RFC-0073 FR8): their own
@@ -151,12 +153,17 @@ fn content_stamp(path: &Path) -> Option<InputStamp> {
     Some(hex::encode(Sha256::digest(&bytes)))
 }
 
-/// A dataset, and the tenant its session is isolated to under strict isolation.
-type SessionKey = (PathBuf, Option<Arc<str>>);
+/// A dataset, the tenant its session is isolated to, and the watermark the views were built at.
+/// A cold reader (`u64::MAX`) and `/sql` (the nest's own watermark) each keep a slot (#2727).
+type SessionKey = (PathBuf, Option<Arc<str>>, u64);
+
+/// Opens are counted per dataset and tenant, across every watermark.
+type SessionOpensKey = (PathBuf, Option<Arc<str>>);
 
 static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<SessionKey, SessionCache>>> =
     OnceLock::new();
-static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionKey, u64>>> = OnceLock::new();
+static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionOpensKey, u64>>> =
+    OnceLock::new();
 static SESSION_USE: AtomicU64 = AtomicU64::new(0);
 /// Sessions the cache keeps where the split leaves nothing over, as at the 2 GiB default.
 pub const SESSION_CACHE_FLOOR: usize = 16;
@@ -209,7 +216,7 @@ fn note_session_open(dir: &Path, tenant: Option<&Arc<str>>) {
 
 /// Drop a nest's analytical connections when its runtime ownership ends (#824), every tenant's.
 pub fn invalidate_session_cache(dir: &Path) {
-    session_cache_lock().retain(|(d, _), _| d != dir);
+    session_cache_lock().retain(|(d, _, _), _| d != dir);
 }
 
 pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, InputStamp> {
@@ -244,7 +251,10 @@ fn retain_session_cache(
     mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>>,
     slot: SessionCache,
 ) {
-    cache.insert((slot.dir.clone(), slot.tenant.clone()), slot);
+    cache.insert(
+        (slot.dir.clone(), slot.tenant.clone(), slot.sealed_through),
+        slot,
+    );
     while cache.len() > session_cache_capacity() {
         let Some(victim) = cache
             .iter()
@@ -1566,7 +1576,7 @@ fn attempt(
     let inputs = cache_inputs(dir);
     let cached = !UNCACHED.with(std::cell::Cell::get);
     let mut slot = cached
-        .then(|| session_cache_lock().remove(&(dir.to_path_buf(), tenant.clone())))
+        .then(|| session_cache_lock().remove(&(dir.to_path_buf(), tenant.clone(), sealed_through)))
         .flatten();
     let reusable = slot.as_ref().is_some_and(|c| {
         c.sealed_through == sealed_through
@@ -6480,6 +6490,31 @@ template="pool"
             session_opens_for(dir.path()),
             2,
             "a new sealed_through must not reuse the stale connection"
+        );
+    }
+
+    /// #2727: a cold reader and a reader at the nest's watermark keep their own sessions.
+    /// One slot for the directory made each switch open a new one.
+    #[test]
+    fn a_cold_reader_keeps_its_session_beside_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+            ..Default::default()
+        };
+        let hot = HotRows::new();
+        query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+        query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, 20, &[]).unwrap();
+        assert_eq!(session_opens_for(dir.path()), 2);
+        for _ in 0..3 {
+            query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+            query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, 20, &[]).unwrap();
+        }
+        assert_eq!(
+            session_opens_for(dir.path()),
+            2,
+            "alternating the two watermarks must reuse both sessions"
         );
     }
 
