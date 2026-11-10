@@ -2146,13 +2146,13 @@ impl AddressHistory {
         Ok(())
     }
 
-    /// A re-ask's outcome, in one transaction: the relays' answer cached (the block is finalized),
+    /// A re-ask's outcome, in one transaction: the relays' answer cached, if every relay gave one,
     /// each address's changed rows at the block replaced, and the block kept on the schedule or taken
     /// off it. Refused if the generation moved since the re-ask began.
     pub fn apply_reask(
         &self,
         block: u64,
-        record: &Map<String, Value>,
+        record: Option<&Map<String, Value>>,
         changes: &[(String, Vec<Row>)],
         keep_asking: bool,
         now: u64,
@@ -2167,9 +2167,11 @@ impl AddressHistory {
             if current != generation {
                 bail!("address history changed during the re-ask (generation {generation} -> {current}); ask again");
             }
-            let mut buf = Vec::new();
-            encode_record(record, &mut buf)?;
-            wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            if let Some(record) = record {
+                let mut buf = Vec::new();
+                encode_record(record, &mut buf)?;
+                wtx.open_table(RELAY_CACHE)?.insert(block, buf.as_slice())?;
+            }
             let mut wrote = false;
             for (address, rows) in changes {
                 let a = parse_address(address)?;
@@ -4645,7 +4647,7 @@ mod tests {
         let changes = vec![(ALICE.to_string(), vec![row])];
         let stale = h.generation().unwrap() + 1;
         assert!(h
-            .apply_reask(150, &record, &changes, false, 9, stale)
+            .apply_reask(150, Some(&record), &changes, false, 9, stale)
             .is_err());
         assert!(h.relay_record(150).unwrap().is_none());
         assert!(h
@@ -4654,7 +4656,8 @@ mod tests {
             .is_empty());
         assert_eq!(h.mev_pending().unwrap().len(), 1);
         let g = h.generation().unwrap();
-        h.apply_reask(150, &record, &changes, false, 9, g).unwrap();
+        h.apply_reask(150, Some(&record), &changes, false, 9, g)
+            .unwrap();
         assert!(h.relay_record(150).unwrap().is_some());
         assert_eq!(
             h.rows_in(Action::ProducedBlocks, ALICE, (150, 150))
@@ -4676,7 +4679,7 @@ mod tests {
         let g = h.generation().unwrap();
         h.unwatch(ALICE).unwrap();
         let changes = vec![(ALICE.to_string(), vec![tx(100, 1)])];
-        h.apply_reask(100, &Map::new(), &changes, false, 2, g)
+        h.apply_reask(100, Some(&Map::new()), &changes, false, 2, g)
             .unwrap();
         assert!(h
             .rows_in(Action::ProducedBlocks, ALICE, (0, 1_000))

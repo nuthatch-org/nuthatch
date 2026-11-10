@@ -6650,8 +6650,15 @@ mod tests {
                         record: row,
                     }];
                     let g = h.generation().unwrap();
-                    h.apply_reask(150, &record, &[(ALICE.to_lowercase(), rows)], false, 1, g)
-                        .unwrap();
+                    h.apply_reask(
+                        150,
+                        Some(&record),
+                        &[(ALICE.to_lowercase(), rows)],
+                        false,
+                        1,
+                        g,
+                    )
+                    .unwrap();
                 }
                 Box::pin(async move { Ok([7; 32]) })
             })
@@ -10286,7 +10293,7 @@ mod tests {
         s.history
             .apply_reask(
                 150,
-                &record,
+                Some(&record),
                 &[(ALICE.to_lowercase(), rows)],
                 false,
                 unix_now(),
