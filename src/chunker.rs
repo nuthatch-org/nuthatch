@@ -58,6 +58,8 @@ pub struct AdaptiveWindow {
     streak_needed: u32,
     /// The ceiling was last moved by a doubling that has not yet held for a streak of its own.
     probing: bool,
+    /// [`too_large`](Self::too_large) halved since the last window a tip loop was served (#2700).
+    halved: bool,
 }
 
 /// How many consecutive windows must be served whole at a lowered ceiling before it doubles (#1170).
@@ -88,6 +90,7 @@ impl AdaptiveWindow {
             whole_streak: 0,
             streak_needed: RECOVERY_STREAK,
             probing: false,
+            halved: false,
         }
     }
 
@@ -232,6 +235,18 @@ impl AdaptiveWindow {
     pub fn too_large(&mut self) {
         self.window = (self.window / 2).max(self.min);
         self.whole_streak = 0;
+        self.halved = true;
+    }
+
+    /// A tip loop's window of `width` came back (#2700). Its halving is [`too_large`](Self::too_large),
+    /// not a splitter, so a window served after one is a split's evidence. A window the tip cut short
+    /// says nothing about the cap.
+    pub fn served(&mut self, width: u64) {
+        if !std::mem::take(&mut self.halved) {
+            self.served_whole(width);
+        } else if width == self.window {
+            self.served_by_splitting(width);
+        }
     }
 
     /// Re-bound the ceiling for one iteration (RFC-0036, #458). A caller whose ceiling changes
