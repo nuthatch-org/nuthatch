@@ -197,8 +197,8 @@ pub trait BundleStore: Send + Sync {
     /// Remove a blob; an absent one is not an error.
     async fn delete_blob(&self, hash: &str) -> Result<()>;
     /// Remove a `name@version` ref only while it still names `hash`. False when it did not, or was
-    /// already gone. The filesystem registry compares under its ref lock; an object store, which has
-    /// no conditional delete, reads then deletes, so a re-point between the two is still lost there.
+    /// already gone. The filesystem registry compares under its ref lock; an object store overwrites
+    /// the ref with a tombstone by a put conditional on the version it read (#2712).
     async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool>;
     /// Remove a NID entry only while it still names `hash`, as [`BundleStore::delete_ref_if`].
     async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool>;
@@ -900,6 +900,14 @@ mod object_store_impl {
             })
         }
 
+        #[cfg(test)]
+        pub(crate) fn over(inner: Arc<dyn object_store::ObjectStore>, prefix: &str) -> ObjStore {
+            ObjStore {
+                inner,
+                prefix: ObjPath::from(prefix),
+            }
+        }
+
         fn blob_key(&self, hash: &str) -> ObjPath {
             self.prefix.child("blobs").child(format!("{hash}.bundle"))
         }
@@ -936,7 +944,70 @@ mod object_store_impl {
                 Err(e) => Err(map_obj_err(e, subject)),
             }
         }
+
+        /// A ref's hash and the version of the object it was read from; `None` when the key is
+        /// absent or holds [`TOMBSTONE`].
+        async fn read_ref(
+            &self,
+            key: &ObjPath,
+            subject: &str,
+        ) -> Result<Option<(String, object_store::UpdateVersion)>> {
+            let got = match self.inner.get(key).await {
+                Ok(got) => got,
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) => return Err(map_obj_err(e, subject)),
+            };
+            let version = object_store::UpdateVersion {
+                e_tag: got.meta.e_tag.clone(),
+                version: got.meta.version.clone(),
+            };
+            let raw = got.bytes().await.context("reading ref")?;
+            let hash = String::from_utf8(raw.to_vec())
+                .context("ref is not valid utf-8")?
+                .trim()
+                .to_string();
+            Ok((!hash.is_empty()).then_some((hash, version)))
+        }
+
+        async fn get_ref_at(&self, key: &ObjPath, subject: &str) -> Result<String> {
+            match self.read_ref(key, subject).await? {
+                Some((hash, _)) => Ok(hash),
+                None => Err(not_found_err(subject)),
+            }
+        }
+
+        /// Overwrite a ref with [`TOMBSTONE`] only while it is the object read naming `hash`, so a
+        /// publish that re-points it in between wins.
+        async fn remove_if_naming(&self, key: &ObjPath, hash: &str, subject: &str) -> Result<bool> {
+            let Some((now, version)) = self.read_ref(key, subject).await? else {
+                return Ok(false);
+            };
+            if now != hash {
+                return Ok(false);
+            }
+            let put = self
+                .inner
+                .put_opts(
+                    key,
+                    object_store::PutPayload::from_static(TOMBSTONE),
+                    object_store::PutMode::Update(version).into(),
+                )
+                .await;
+            match put {
+                Ok(_) => Ok(true),
+                Err(object_store::Error::Precondition { .. }) => Ok(false),
+                Err(object_store::Error::NotImplemented) => bail!(
+                    "{subject} cannot be removed: this object store does not support conditional \
+                     writes, and an unconditional delete could remove a ref a publish just wrote"
+                ),
+                Err(e) => Err(map_obj_err(e, subject)),
+            }
+        }
     }
+
+    /// What a removed ref is overwritten with, since `object_store` has a conditional put but no
+    /// conditional delete. No hash is empty. It stays until a publish writes that ref again.
+    const TOMBSTONE: &[u8] = b"";
 
     /// Map an object-store error into a legible registry error: `NotFound` → "not found",
     /// `PermissionDenied`/`Unauthenticated` (a private bucket, missing/rejected creds) → the shared
@@ -1024,33 +1095,18 @@ mod object_store_impl {
                 .await
         }
 
-        // object_store has no conditional delete, so another writer can still re-point the ref
-        // between this read and the delete. A filesystem registry closes that window with a lock.
         async fn delete_ref_if(&self, name: &str, version: &str, hash: &str) -> Result<bool> {
-            match self.get_ref(name, version).await {
-                Ok(now) if now == hash => {}
-                Ok(_) => return Ok(false),
-                Err(e) if is_not_found(&e) => return Ok(false),
-                Err(e) => return Err(e),
-            }
-            self.delete_key(
+            self.remove_if_naming(
                 &self.ref_key(name, version),
+                hash,
                 &format!("nest '{name}@{version}'"),
             )
-            .await?;
-            Ok(true)
+            .await
         }
 
         async fn delete_nid_ref_if(&self, nid: &str, hash: &str) -> Result<bool> {
-            match self.get_nid_ref(nid).await {
-                Ok(now) if now == hash => {}
-                Ok(_) => return Ok(false),
-                Err(e) if is_not_found(&e) => return Ok(false),
-                Err(e) => return Err(e),
-            }
-            self.delete_key(&self.nid_key(nid), &format!("nid {nid}"))
-                .await?;
-            Ok(true)
+            self.remove_if_naming(&self.nid_key(nid), hash, &format!("nid {nid}"))
+                .await
         }
 
         async fn get_blob(&self, hash: &str) -> Result<Vec<u8>> {
@@ -1076,17 +1132,11 @@ mod object_store_impl {
         }
 
         async fn get_ref(&self, name: &str, version: &str) -> Result<String> {
-            let key = self.ref_key(name, version);
-            let got = self
-                .inner
-                .get(&key)
-                .await
-                .map_err(|e| map_obj_err(e, &format!("nest '{name}@{version}'")))?;
-            let raw = got.bytes().await.context("reading ref")?;
-            Ok(String::from_utf8(raw.to_vec())
-                .context("ref is not valid utf-8")?
-                .trim()
-                .to_string())
+            self.get_ref_at(
+                &self.ref_key(name, version),
+                &format!("nest '{name}@{version}'"),
+            )
+            .await
         }
 
         async fn set_nid_ref(&self, nid: &str, hash: &str) -> Result<()> {
@@ -1101,16 +1151,8 @@ mod object_store_impl {
         }
 
         async fn get_nid_ref(&self, nid: &str) -> Result<String> {
-            let got = self
-                .inner
-                .get(&self.nid_key(nid))
+            self.get_ref_at(&self.nid_key(nid), &format!("nid {nid}"))
                 .await
-                .map_err(|e| map_obj_err(e, &format!("nid {nid}")))?;
-            let raw = got.bytes().await.context("reading ref")?;
-            Ok(String::from_utf8(raw.to_vec())
-                .context("ref is not valid utf-8")?
-                .trim()
-                .to_string())
         }
     }
 
@@ -1800,6 +1842,162 @@ abi = "abis/c.json"
     async fn object_store_prune_keeps_what_is_reachable_and_nothing_else() {
         let store = open("memory://reg").unwrap();
         prune_keeps_what_is_reachable_and_nothing_else(store.as_ref()).await;
+    }
+
+    /// An in-memory object store whose first delete or conditional put of `key` is preceded by
+    /// another writer re-pointing it at `hash`: the window between a prune's read and its removal.
+    #[cfg(feature = "object-store")]
+    #[derive(Debug)]
+    struct RepointFirst {
+        inner: object_store::memory::InMemory,
+        key: object_store::path::Path,
+        hash: String,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "object-store")]
+    impl RepointFirst {
+        async fn maybe_fire(&self, location: &object_store::path::Path) {
+            use object_store::ObjectStore as _;
+            if *location == self.key && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let body = self.hash.as_bytes().to_vec();
+                self.inner.put(location, body.into()).await.unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "object-store")]
+    impl std::fmt::Display for RepointFirst {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RepointFirst({})", self.inner)
+        }
+    }
+
+    #[cfg(feature = "object-store")]
+    #[async_trait]
+    impl object_store::ObjectStore for RepointFirst {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if !matches!(opts.mode, object_store::PutMode::Overwrite) {
+                self.maybe_fire(location).await;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.maybe_fire(location).await;
+            self.inner.delete(location).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// #2712: an object-store ref re-pointed at a kept blob between a prune's read of it and its
+    /// removal survives, and the prune does not report it deleted.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn an_object_store_ref_repointed_as_a_prune_removes_it_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fa, fb) = (dir.path().join("a.bundle"), dir.path().join("b.bundle"));
+        let (ha, na) = write_bundle_fixture_with_nid(&fa, "a");
+        write_bundle_fixture_with_nid(&fb, "b");
+        let inner = std::sync::Arc::new(RepointFirst {
+            inner: object_store::memory::InMemory::new(),
+            key: object_store::path::Path::from("reg/index/b/1"),
+            hash: ha.clone(),
+            fired: Default::default(),
+        });
+        let store = ObjStore::over(inner.clone(), "reg");
+        publish(&store, &fa, Some("a"), Some("1")).await.unwrap();
+        publish(&store, &fb, Some("b"), Some("1")).await.unwrap();
+
+        let keep = std::collections::BTreeSet::from([na]);
+        let report = prune(&store, &keep, std::time::Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert!(inner.fired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.get_ref("b", "1").await.unwrap(), ha);
+        assert!(
+            !report.deleted_refs.contains(&"b@1".to_string()),
+            "{report:?}"
+        );
+        assert!(store.get_ref("b", "latest").await.is_err(), "{report:?}");
+        no_ref_dangles(&store).await;
+    }
+
+    /// A pruned object-store ref reads as absent everywhere, and a publish brings it back.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn a_removed_object_store_ref_is_absent_until_republished() {
+        let store = open("memory://reg").unwrap();
+        store.set_ref("n", "1", "h1").await.unwrap();
+        store.set_nid_ref("nid", "h1").await.unwrap();
+        assert!(!store.delete_ref_if("n", "1", "h2").await.unwrap());
+        assert!(store.delete_ref_if("n", "1", "h1").await.unwrap());
+        assert!(store.delete_nid_ref_if("nid", "h1").await.unwrap());
+        assert!(!store.delete_ref_if("n", "1", "h1").await.unwrap());
+        assert!(is_not_found(&store.get_ref("n", "1").await.unwrap_err()));
+        assert!(is_not_found(&store.get_nid_ref("nid").await.unwrap_err()));
+        assert!(store.list_refs().await.unwrap().is_empty());
+        assert!(store.list_nid_refs().await.unwrap().is_empty());
+        store.set_ref("n", "1", "h3").await.unwrap();
+        assert_eq!(store.get_ref("n", "1").await.unwrap(), "h3");
+    }
+
+    /// A store that cannot write conditionally refuses the removal rather than racing a publish.
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn an_object_store_without_conditional_writes_refuses_to_remove_a_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let store = ObjStore::over(std::sync::Arc::new(local), "reg");
+        store.set_ref("n", "1", "h1").await.unwrap();
+        let err = store.delete_ref_if("n", "1", "h1").await.unwrap_err();
+        assert!(format!("{err:#}").contains("conditional"), "{err:#}");
+        assert_eq!(store.get_ref("n", "1").await.unwrap(), "h1");
     }
 
     /// A blob whose NID entry was re-pointed at another bundle of the same NID is still that NID's,
