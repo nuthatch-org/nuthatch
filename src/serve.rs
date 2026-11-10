@@ -1673,7 +1673,11 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     }
     // A strict mount answers its own tenant, so it carries only the samples labelled with itself
     // (#2714). The root `/metrics` keeps the whole runtime for the operator.
-    if let (Some(_), Some((own, _))) = (&s.isolation, &s.runtime_health) {
+    if s.isolation.is_some() {
+        let own = match &s.runtime_health {
+            Some((name, _)) => name.as_str(),
+            None => s.nest_info["name"].as_str().unwrap_or_default(),
+        };
         body = own_series(&body, own);
     }
     body.push_str(&entity_metrics(&s));
@@ -1693,19 +1697,18 @@ fn own_series(exposition: &str, nest: &str) -> String {
     let label = format!("nest=\"{nest}\"");
     let (opened, joined) = (format!("{{{label}"), format!(",{label}"));
     let mut out = String::new();
-    let mut header = String::new();
-    let mut in_samples = false;
+    let (mut header, mut family) = (String::new(), "");
     for line in exposition.lines() {
-        if line.starts_with('#') {
-            if in_samples {
+        if let Some(meta) = line.strip_prefix('#') {
+            let name = meta.split_whitespace().nth(1).unwrap_or_default();
+            if name != family {
                 header.clear();
-                in_samples = false;
+                family = name;
             }
             header.push_str(line);
             header.push('\n');
             continue;
         }
-        in_samples = true;
         let labels = line.rsplit_once(' ').map_or(line, |(series, _)| series);
         if labels.contains(&opened) || labels.contains(&joined) {
             out.push_str(&header);
@@ -9125,6 +9128,32 @@ mod tests {
             "{strict}"
         );
         assert!(strict.contains("# TYPE nuthatch_nest_health"), "{strict}");
+    }
+
+    /// A kept sample carries its own family's header and no other's, and a name that only shares
+    /// a prefix is not this mount.
+    #[test]
+    fn own_series_keeps_its_family_headers_and_nothing_else() {
+        let exposition = "# HELP a A.\n# TYPE a gauge\na{nest=\"other\"} 1\n\
+                          # HELP b B.\n# TYPE b gauge\nb 2\n\
+                          # HELP c C.\n# TYPE c gauge\nc{nest=\"me\"} 3\nc{nest=\"me2\"} 4\n";
+        assert_eq!(
+            own_series(exposition, "me"),
+            "# HELP c C.\n# TYPE c gauge\nc{nest=\"me\"} 3\n"
+        );
+    }
+
+    /// #2714: a strict state with no runtime health is filtered on its nest name, not served whole.
+    #[tokio::test]
+    async fn a_strict_mount_without_runtime_health_is_still_filtered() {
+        crate::metrics::METRICS
+            .nest("globex/fail-closed-2714")
+            .set_tip(1);
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        st.isolation = Some(Arc::from("acme"));
+        let (_, body) = get(router(SharedNest::new(st)), "/metrics").await;
+        assert!(!String::from_utf8(body.to_vec()).unwrap().contains("globex"));
     }
 
     #[tokio::test]
