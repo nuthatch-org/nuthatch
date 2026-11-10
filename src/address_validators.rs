@@ -353,7 +353,7 @@ pub fn respond(
             return Ok(incomplete(&format!("validator {validator} is not watched")));
         }
         if let Some(u) = until.filter(|u| start > *u) {
-            return Ok(incomplete(&format!("history ends at block {u}")));
+            return Ok(unsupported(&format!("history ends at block {u}")));
         }
         let through = validators
             .coverage(validator)?
@@ -372,7 +372,7 @@ pub fn respond(
             return Ok(json!({"status": "0", "message": "No transactions found", "result": []}));
         }
         if until.is_some_and(|u| end > u) {
-            return Ok(incomplete(&format!(
+            return Ok(unsupported(&format!(
                 "history ends at block {}",
                 until.unwrap_or(0)
             )));
@@ -664,7 +664,7 @@ mod tests {
             a["result"]
                 .as_str()
                 .unwrap()
-                .contains("history ends at block 199"),
+                .starts_with("NUTHATCH_UNSUPPORTED: history ends at block 199"),
             "{a}"
         );
         let mut above = q.clone();
@@ -674,7 +674,7 @@ mod tests {
             a["result"]
                 .as_str()
                 .unwrap()
-                .contains("history ends at block 199"),
+                .starts_with("NUTHATCH_UNSUPPORTED: history ends at block 199"),
             "{a}"
         );
     }
