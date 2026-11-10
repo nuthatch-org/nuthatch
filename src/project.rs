@@ -365,7 +365,13 @@ pub fn rename_alias(dir: &Path, old: &str, new: &str) -> Result<()> {
     config.contracts[idx].abi = new_rel;
     if let Err(e) = config.save(dir) {
         if moved {
-            let _ = std::fs::rename(&new_abi, &old_abi);
+            if let Err(back) = std::fs::rename(&new_abi, &old_abi) {
+                return Err(e.context(format!(
+                    "and moving the ABI back failed ({back}): it is at {}, the config still names {}",
+                    new_abi.display(),
+                    old_abi.display()
+                )));
+            }
         }
         return Err(e);
     }

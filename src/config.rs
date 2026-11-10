@@ -511,11 +511,24 @@ impl Config {
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(CONFIG_FILE);
         let raw = toml::to_string_pretty(self).context("failed to serialise config")?;
+        // Replace what a link points at, not the link, and keep the mode: the file holds RPC URLs.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, raw).with_context(|| format!("failed to write {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("failed to replace {}", path.display()))?;
-        Ok(())
+        let written = std::fs::write(&tmp, raw)
+            .with_context(|| format!("failed to write {}", tmp.display()))
+            .and_then(|()| match std::fs::metadata(&path) {
+                Ok(m) => std::fs::set_permissions(&tmp, m.permissions())
+                    .with_context(|| format!("failed to set the mode of {}", tmp.display())),
+                Err(_) => Ok(()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&tmp, &path)
+                    .with_context(|| format!("failed to replace {}", path.display()))
+            });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// The first contract - the indexer's single-contract path uses this until step 3 generalises
@@ -686,6 +699,28 @@ mod tests {
         );
         assert_eq!(Config::load(dir.path()).unwrap().nest.name, "renamed");
         assert!(!dir.path().join(format!("{CONFIG_FILE}.tmp")).exists());
+    }
+
+    /// #2688: the replacement keeps what writing in place kept, the file's mode and a link to it.
+    #[test]
+    fn save_keeps_the_mode_and_writes_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let raw = "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n";
+        std::fs::write(&real, raw).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(CONFIG_FILE)).unwrap();
+        let mut cfg = Config::load(dir.path()).unwrap();
+
+        cfg.nest.name = "renamed".into();
+        cfg.save(dir.path()).unwrap();
+
+        let link = std::fs::symlink_metadata(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(link.file_type().is_symlink(), "save replaced the link");
+        assert!(std::fs::read_to_string(&real).unwrap().contains("renamed"));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     /// #1582: a misspelt key is reported, and nothing a real config says, or a parsed one writes
