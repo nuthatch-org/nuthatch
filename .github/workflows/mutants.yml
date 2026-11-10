@@ -64,17 +64,26 @@ jobs:
           #
           # Sharded since #1715. seal.rs went from about 10 mutants to 185 and chunker.rs from 26 to
           # 43, at seven to nine minutes a mutant, and a job cannot run past 360 minutes. A shard is
-          # sized to about 25 mutants.
+          # sized to about 25 mutants. seal.rs went to sixteen shards for #2758: at about 270 mutants
+          # and 12 to 19 minutes each, two of eight shards were cancelled at 330 minutes.
           - { file: src/chunker.rs, shard: 0/2, timeout: 330 }
           - { file: src/chunker.rs, shard: 1/2, timeout: 330 }
-          - { file: src/seal.rs, shard: 0/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 1/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 2/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 3/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 4/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 5/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 6/8, timeout: 330 }
-          - { file: src/seal.rs, shard: 7/8, timeout: 330 }
+          - { file: src/seal.rs, shard: 0/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 1/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 2/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 3/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 4/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 5/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 6/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 7/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 8/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 9/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 10/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 11/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 12/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 13/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 14/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 15/16, timeout: 330 }
           # Only 3 mutants because #581 moved decode into its own crate, so the decode path is
           # covered by the `decode` entry rather than by the file it used to live in.
           - { file: src/registry.rs, shard: 0/1, timeout: 120 }
