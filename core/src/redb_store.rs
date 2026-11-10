@@ -711,10 +711,16 @@ impl<F: Feed> Store<F> {
 
     /// The oldest `limit` pending deliveries, as `(seq, payload)`, in enqueue order.
     pub fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+        self.outbox_pending_from(0, limit)
+    }
+
+    /// [`Self::outbox_pending`], starting at `seq`.
+    pub fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
         let rtx = self.db.begin_read()?;
         let t = rtx.open_table(OUTBOX)?;
         let mut out = Vec::with_capacity(limit.min(1024));
-        for row in t.iter()? {
+        let from = Self::outbox_key(seq);
+        for row in t.range(from.as_str()..)? {
             let (k, v) = row?;
             let seq: u64 = k.value().parse().context("corrupt outbox key")?;
             out.push((seq, v.value().to_string()));
@@ -2076,6 +2082,9 @@ impl<F: Feed> HotStore for Store<F> {
     }
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
         Store::outbox_pending(self, limit)
+    }
+    fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
+        Store::outbox_pending_from(self, seq, limit)
     }
     fn outbox_remove(&self, seq: u64) -> Result<()> {
         Store::outbox_remove(self, seq)

@@ -1197,13 +1197,18 @@ impl nuthatch_core::store::HotStore for PgStore {
     }
 
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
+        self.outbox_pending_from(0, limit)
+    }
+
+    fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
         let sql = format!(
-            "SELECT key, value FROM \"{}\".outbox ORDER BY key LIMIT $1",
+            "SELECT key, value FROM \"{}\".outbox WHERE key >= $1 ORDER BY key LIMIT $2",
             self.schema
         );
-        let limit = limit as i64;
+        let from = format!("{seq:020}");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.conn.with(move |c| {
-            c.query(&sql, &[&limit])?
+            c.query(&sql, &[&from, &limit])?
                 .into_iter()
                 .map(|r| {
                     let k: String = r.get(0);
