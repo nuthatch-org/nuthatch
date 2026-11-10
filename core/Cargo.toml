@@ -22,6 +22,9 @@ anyhow = "1"
 # The IPC slice sizing both `collect_ipc`s share (#2599); already in the graph through nuthatch-seal.
 arrow-array = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
+# #2811: `ipc_check` reads a stream's flatbuffers and buffer layouts before the reader does.
+arrow-data = { version = "59", default-features = false }
+arrow-ipc = { version = "59", default-features = false }
 alloy-primitives = "1.6"
 arc-swap = "1"
 bytes = "1"
@@ -80,6 +83,7 @@ web-sys = { version = "0.3", optional = true, features = [
 
 [dev-dependencies]
 alloy-json-abi = "1.6"
+flatbuffers = "25"
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

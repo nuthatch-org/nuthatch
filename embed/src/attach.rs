@@ -138,6 +138,8 @@ pub fn supplied(
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(g.arrow.as_bytes())
                 .map_err(|e| format!("`{qualified}`'s arrow is not base64: {e}"))?;
+            nuthatch_core::ipc_check::check(&bytes)
+                .map_err(|e| format!("`{qualified}` is not an Arrow IPC stream: {e}"))?;
             let reader =
                 arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
                     .map_err(|e| format!("`{qualified}` is not an Arrow IPC stream: {e}"))?;
@@ -346,6 +348,26 @@ mod tests {
             refused.contains("`pools.indexers`") && refused.contains("as of block 99"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn a_stream_arrow_ipc_would_panic_on_is_refused() {
+        // attach_ipc's first crash (#2811): one overwritten byte makes a field's type NONE.
+        let stream = hex::decode(
+            "fffffffff80000001000000000000a000c000a00090004000a00000010000000000104000800080000\
+             000400080000000400000003000000780000003c0000001400000010001400100000000f00040000000800\
+             10000000140000000c000000000000040c00000000000000dcffffff0100000062000000d8ffffff180000\
+             000c000000000001051000000000000000040004000400000001000000730000000000140010000e000f00\
+             040000000800100000001800000020000000000001021c00000008000c0004000b00080000004000000000\
+             00000100000000010000006900000000000000000000000000000000000000000000000000000000000000\
+             ffffffff00000000",
+        )
+        .unwrap();
+        let given = json!({"pools": {"indexers": {
+            "arrow": base64::engine::general_purpose::STANDARD.encode(stream),
+            "answer": {"provenance": {"as_of": 100}}}}});
+        let refused = supplied(&pools(), &given, Some(100)).err().unwrap();
+        assert!(refused.contains("type NONE"), "{refused}");
     }
 
     #[test]

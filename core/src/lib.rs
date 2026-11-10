@@ -29,6 +29,7 @@ pub mod feed;
 pub mod fetch;
 pub mod flags;
 pub mod hooks;
+pub mod ipc_check;
 pub mod labels;
 pub mod metrics;
 pub mod mirror;
