@@ -47,6 +47,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # #2741: a tag runs the workflow file of the commit it names, so a tag on an unmerged commit skips
+      # main's required checks. A release is cut on main or its release branch (docs/releases/README.md).
+      - name: refuse a tag off main and its release branch
+        run: |
+          set -euo pipefail
+          line=$(echo "$GITHUB_REF_NAME" | sed -nE 's/^v([0-9]+\.[0-9]+)\..*/\1/p')
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on main"
+          elif [ -n "$line" ] && git rev-parse -q --verify "origin/release/$line" >/dev/null \
+            && git merge-base --is-ancestor "$GITHUB_SHA" "origin/release/$line"; then
+            echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on release/$line"
+          else
+            echo "::error::$GITHUB_REF_NAME names $GITHUB_SHA, which is on neither main nor release/$line"
+            exit 1
+          fi
       - name: resolve release notes
         id: notes
         run: |
@@ -450,8 +467,8 @@ jobs:
       # own assets and verifies each against the transparency log - the same command a user runs, run
       # once by us first - so a release whose provenance does not verify never becomes public.
       #
-      # `--repo` is what binds it. Without that flag `gh attestation verify` will accept an
-      # attestation from *any* repository, which is most of the property we are trying to establish.
+      # `--repo` alone accepts an attestation from any workflow on any ref of the repository (#2741), so
+      # the signer is pinned to this workflow and the source to this tag.
       - name: verify provenance before publishing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -477,7 +494,7 @@ jobs:
           files+=(nuthatch-events.wasm nuthatch-engine.js)
           for f in "${files[@]}"; do
             echo "--- $f ---"
-            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-ref "$GITHUB_REF"
           done
           echo "provenance verified for ${#files[@]} artifact(s)"
 
@@ -542,7 +559,7 @@ jobs:
         run: |
           set -euo pipefail
           for d in $DIGESTS; do
-            gh attestation verify "oci://ghcr.io/$GITHUB_REPOSITORY@$d" --repo "$GITHUB_REPOSITORY"
+            gh attestation verify "oci://ghcr.io/$GITHUB_REPOSITORY@$d" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-ref "$GITHUB_REF"
           done
 
       # #2736: `:latest` moves only once that attestation has verified, and only when this tag is the
