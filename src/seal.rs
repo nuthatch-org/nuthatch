@@ -4720,6 +4720,23 @@ mod tests {
         assert!(parent_at < manifest_at, "trace: {trace:?}");
     }
 
+    /// The walk stops at the first directory that exists: only the parents of what was created are
+    /// synced, not every ancestor up to the root.
+    #[test]
+    fn creating_a_directory_syncs_only_the_parents_of_what_it_created() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a").join("b");
+        let trace = capture_durable(|| create_dir_durable(&dir).unwrap());
+        assert_eq!(
+            trace,
+            [
+                Durable::ParentDir(root.path().to_path_buf()),
+                Durable::ParentDir(root.path().join("a")),
+            ]
+        );
+        assert!(capture_durable(|| create_dir_durable(&dir).unwrap()).is_empty());
+    }
+
     /// RFC-0065 S2: the segment bytes sealing writes, pinned. Moving the writer into `nuthatch-seal`
     /// must leave every hash here unchanged; a parquet or arrow bump that moves them is a re-seal.
     #[test]
