@@ -21,7 +21,7 @@ from deployment: `nuthatch dev --backfill 100000` (last 100k blocks). Point at y
 
 ## Index several contracts together
 
-Pass multiple addresses to `init`, or grow an existing nest with `add` (no re-init):
+Pass multiple addresses to `init`, or grow a nest that has not indexed yet with `add`:
 
 ```sh
 nuthatch init 0xUSDC 0xWETH --alias usdc,weth

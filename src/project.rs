@@ -207,7 +207,6 @@ pub async fn add(args: AddArgs) -> Result<()> {
             dir.display()
         )
     })?;
-    refuse_an_indexed_nest(&dir, &config, &args.addresses)?;
     // The chain is the nest's, already chosen at init - never re-detected. Adding a contract that
     // lives on a different chain is a different nest (one cursor, one chain - non-negotiable).
     let chain = chains::from_config(&config.nest.chain, config.nest.chain_id);
@@ -235,6 +234,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
             new_addresses.len()
         );
     }
+    refuse_an_indexed_nest(&dir, &config, &args.addresses)?;
 
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.iter().cloned());
     let rpc = RpcClient::new(rpc_urls)?;
@@ -379,13 +379,25 @@ pub fn rename_alias(dir: &Path, old: &str, new: &str) -> Result<()> {
     let old_abi = dir.join(&config.contracts[idx].abi);
     let new_rel = format!("abis/{new}.json");
     let new_abi = dir.join(&new_rel);
-    if old_abi.exists() && old_abi != new_abi {
+    let moved = old_abi.exists() && old_abi != new_abi;
+    if moved {
         std::fs::rename(&old_abi, &new_abi)
             .with_context(|| format!("moving {} → {}", old_abi.display(), new_abi.display()))?;
     }
     config.contracts[idx].alias = new.to_string();
     config.contracts[idx].abi = new_rel;
-    config.save(dir)?;
+    if let Err(e) = config.save(dir) {
+        if moved {
+            if let Err(back) = std::fs::rename(&new_abi, &old_abi) {
+                return Err(e.context(format!(
+                    "and moving the ABI back failed ({back}): it is at {}, the config still names {}",
+                    new_abi.display(),
+                    old_abi.display()
+                )));
+            }
+        }
+        return Err(e);
+    }
     if let Some(mut sem) = crate::semantic::load(dir)? {
         crate::semantic::rekey_alias(&mut sem, old, new);
         crate::semantic::save(dir, &sem)?;
@@ -2231,6 +2243,44 @@ mod tests {
             !after.tables.contains_key("c0__transfer"),
             "the old key must be gone"
         );
+    }
+
+    /// #2688: the ABI was moved before the config was saved, so a failed save left the old config
+    /// naming an ABI that was gone.
+    #[test]
+    fn a_failed_rename_alias_leaves_the_abi_where_the_config_says() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let abis = dir.path().join("abis");
+        std::fs::create_dir_all(&abis).unwrap();
+        std::fs::write(abis.join("c0.json"), "[]").unwrap();
+        let config = dir.path().join("nuthatch.toml");
+        std::fs::write(
+            &config,
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\
+             [[contracts]]\nalias = \"c0\"\n\
+             address = \"0x0000000000000000000000000000000000000001\"\nabi = \"abis/c0.json\"\n",
+        )
+        .unwrap();
+        // The nest directory and its config refuse writes; `abis/` does not.
+        let mode =
+            |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        mode(&config, 0o444).unwrap();
+        mode(dir.path(), 0o555).unwrap();
+        let result = rename_alias(dir.path(), "c0", "gns");
+        mode(dir.path(), 0o755).unwrap();
+        mode(&config, 0o644).unwrap();
+
+        assert!(result.is_err(), "premise: the save must fail");
+        assert_eq!(
+            Config::load(dir.path()).unwrap().contracts[0].abi,
+            "abis/c0.json"
+        );
+        assert!(
+            abis.join("c0.json").exists(),
+            "the ABI the config names is gone"
+        );
+        assert!(!abis.join("gns.json").exists());
     }
 
     /// #2685: `add` grew an indexed nest and promised a backfill, and `dev` then refused the store.
