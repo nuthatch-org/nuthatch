@@ -7,20 +7,6 @@
 # Removing an entry is the good direction and needs no ceremony. Adding one needs a reason a reader
 # can disagree with.
 
-[[survivor]]
-file = "src/chunker.rs"
-mutation = "replace < with <= in AdaptiveWindow::served_by_splitting"
-reason = """
-`if w < self.max` vs `if w <= self.max`. The two differ only when `narrowest_served == self.max`
-exactly: the original leaves `self.window` untouched, the mutant also clamps it to `self.max`, which
-matters only if `window > max` - reachable after `set_max` lowers the ceiling under a wider window.
-
-A real gap and a narrow one. Recorded rather than fixed on the day the gate landed, because a gate
-whose first act is to demand unrelated work is a gate people learn to route around. Worth a test:
-this is the window controller #672 took five attempts to get right, and its boundary conditions are
-exactly where that went wrong.
-"""
-
 # --- Log-only (#1757). ---------------------------------------------------------------------------
 #
 # Each of these changes whether a log line is written and nothing else: no return value, file or

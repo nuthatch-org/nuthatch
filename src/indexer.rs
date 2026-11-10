@@ -20655,8 +20655,9 @@ template = "pool"
     }
 
     /// Serves any one block and refuses any wider range as over the cap, as a busy topic0 against a
-    /// 10,000-result cap does (#2679).
-    struct OneBlockAtATime(MockSource);
+    /// 10,000-result cap does (#2679). It panics on a range refused 100 times running: a controller
+    /// that stopped narrowing would otherwise spin forever against a source that never yields.
+    struct OneBlockAtATime(MockSource, std::sync::Mutex<(u64, u64, usize)>);
 
     #[async_trait::async_trait]
     impl Source for OneBlockAtATime {
@@ -20673,6 +20674,16 @@ template = "pool"
             to: u64,
         ) -> Result<Vec<crate::rpc::Log>> {
             if to > from {
+                let mut last = self.1.lock().unwrap();
+                *last = match *last {
+                    (f, t, n) if (f, t) == (from, to) => (f, t, n + 1),
+                    _ => (from, to, 1),
+                };
+                assert!(
+                    last.2 < 100,
+                    "{from}..={to} was refused {} times running",
+                    last.2
+                );
                 anyhow::bail!("query returned more than 10000 results");
             }
             self.0.logs(filter, from, to).await
@@ -20686,11 +20697,14 @@ template = "pool"
     }
 
     fn one_block_at_a_time(blocks: std::ops::RangeInclusive<u64>) -> OneBlockAtATime {
-        OneBlockAtATime(MockSource {
-            logs: blocks
-                .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
-                .collect(),
-        })
+        OneBlockAtATime(
+            MockSource {
+                logs: blocks
+                    .flat_map(|b| [transfer_log(b, 0), transfer_log(b, 1)])
+                    .collect(),
+            },
+            std::sync::Mutex::default(),
+        )
     }
 
     /// #2679: a one-block window still asks for its overlap tail, so a provider refusing that
