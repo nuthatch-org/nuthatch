@@ -3,7 +3,9 @@
 //!
 //! The schema is checked as a flatbuffer, because converting it is where most of the panics are
 //! (`convert::get_data_type`), then each batch's nodes and buffers are walked in the order the
-//! reader takes them. Whatever the reader refuses with an error is left to it.
+//! reader takes them. Whatever the reader refuses with an error is left to it, with one exception: a
+//! compressed batch is refused outright, since its decompressed size is an unchecked allocation
+//! where lz4 or zstd is compiled in, and nothing here writes one.
 
 use std::collections::VecDeque;
 
@@ -296,7 +298,7 @@ fn walk<'a>(
     version: MetadataVersion,
 ) -> Result<bool, String> {
     if batch.compression().is_some() {
-        return Err("a compressed batch, which nothing here writes".into());
+        return Err("a compressed batch, which is refused unread".into());
     }
     let (Some(nodes), Some(buffers)) = (batch.nodes(), batch.buffers()) else {
         return Ok(false);
@@ -1155,6 +1157,31 @@ mod tests {
             stream.extend([0; 8]);
             assert!(check(&stream).unwrap_err().contains("body of"));
         }
+    }
+
+    #[test]
+    fn a_negative_fixed_size_list_is_left_to_the_reader() {
+        let mut stream = one(|fbb| {
+            let t = fb::FixedSizeList::create(fbb, &fb::FixedSizeListArgs { listSize: -1 });
+            let c = int_field(fbb);
+            field(
+                fbb,
+                fb::Type::FixedSizeList,
+                Some(t.as_union_value()),
+                Some(&[c]),
+            )
+        });
+        stream.extend(batch(Batch {
+            len: 1,
+            nodes: &[(1, 0), (0, 0)],
+            buffers: &[(0, 0), (0, 0), (0, 0)],
+            ..Default::default()
+        }));
+        check(&stream).unwrap();
+        let read = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(&stream), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>();
+        assert!(read.unwrap_err().to_string().contains("negative"));
     }
 
     #[test]
