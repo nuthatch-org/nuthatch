@@ -1258,7 +1258,10 @@ pub fn adoptable(
         match crate::store::recorded_registry_hash(&db) {
             Ok(Some(recorded)) => match crate::store::recorded_identity_formula(&db) {
                 Ok(None) => recorded == want.registry_hash,
-                Ok(Some(_)) => decode_identity_of(dir).is_some_and(|id| recorded == id),
+                Ok(Some(f)) => {
+                    decode_identity_of(dir).is_some_and(|id| recorded == id)
+                        || (f == "2" && formula_2_identity_of(dir).is_some_and(|id| recorded == id))
+                }
                 Err(_) => false,
             },
             Ok(None) => {
@@ -1283,11 +1286,21 @@ pub fn adoptable(
 /// The full decode identity the running binary computes for a dataset's inputs, as
 /// `guard_registry_identity` records it. `None` when the inputs cannot be read, which disqualifies.
 fn decode_identity_of(dir: &Path) -> Option<String> {
+    identity_of(dir, crate::project::decode_identity)
+}
+
+/// [`decode_identity_of`] under identity formula 2, which `guard_registry_identity` adopts once (#2697).
+fn formula_2_identity_of(dir: &Path) -> Option<String> {
+    identity_of(dir, crate::project::decode_identity_formula_2)
+}
+
+fn identity_of(
+    dir: &Path,
+    identity: fn(&Path, &Config, &crate::registry::DecodeRegistry) -> Result<[u8; 32]>,
+) -> Option<String> {
     let config = Config::load(dir).ok()?;
     let registry = crate::registry::from_nest(dir, &config).ok()?;
-    crate::project::decode_identity(dir, &config, &registry)
-        .ok()
-        .map(hex::encode)
+    identity(dir, &config, &registry).ok().map(hex::encode)
 }
 
 /// Which side of an adoption is asking [`holds_data`].

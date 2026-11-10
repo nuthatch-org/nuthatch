@@ -617,6 +617,16 @@ fn column_ref(s: &str) -> Option<&str> {
 /// differ only in what they extract are (RFC-0014). Without this they would share a decode hash, and
 /// segment reuse would happily serve one nest's rows to the other.
 pub fn decl_hash(decls: &[CallDecl]) -> [u8; 32] {
+    hash_decls(decls, true)
+}
+
+/// [`decl_hash`] as identity formula 2 computed it, blind to what a row-driven call reads, so a store
+/// recorded under it can be adopted once (#2697).
+pub fn decl_hash_formula_2(decls: &[CallDecl]) -> [u8; 32] {
+    hash_decls(decls, false)
+}
+
+fn hash_decls(decls: &[CallDecl], reads: bool) -> [u8; 32] {
     let mut h = Sha256::new();
     for d in decls {
         // Field-separated for the same reason `CallKey::address` separates: concatenating raw would
@@ -630,6 +640,28 @@ pub fn decl_hash(decls: &[CallDecl]) -> [u8; 32] {
         h.update(d.every.to_be_bytes());
         h.update(b"\x1f");
         h.update(d.start.unwrap_or(0).to_be_bytes());
+        if reads {
+            // Only when set, so a declaration naming none of these keeps its identity. Length
+            // prefixed because an argument is arbitrary text and may contain any separator.
+            let canonical = d.canonical.then(|| "1".to_string());
+            let fields: [(&str, &[String]); 6] = [
+                ("on", d.on.as_slice()),
+                ("on_any", &d.on_any),
+                ("signature", d.signature.as_slice()),
+                ("args", &d.args),
+                ("contract_column", d.contract_column.as_slice()),
+                ("canonical", canonical.as_slice()),
+            ];
+            for (tag, values) in fields.iter().filter(|(_, v)| !v.is_empty()) {
+                h.update(b"\x1d");
+                h.update(tag.as_bytes());
+                for v in values.iter() {
+                    h.update(b"\x1f");
+                    h.update((v.len() as u64).to_be_bytes());
+                    h.update(v.as_bytes());
+                }
+            }
+        }
         h.update(b"\x1e");
     }
     h.finalize().into()
@@ -972,6 +1004,52 @@ mod tests {
         multi.on = None;
         multi.on_any.push("service__closed".into());
         assert!(multi.validate().is_err());
+    }
+
+    /// #2697: every field that changes what a call reads moves the identity. A sampled declaration
+    /// keeps the hash it had before, written against that layout so an unconditional append fails.
+    #[test]
+    fn what_a_row_driven_call_reads_moves_its_identity() {
+        let sampled = decl("supply", 100);
+        let mut h = Sha256::new();
+        h.update(b"supply\x1f0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\x1f0x18160ddd\x1f");
+        h.update(100u64.to_be_bytes());
+        h.update(b"\x1f");
+        h.update(0u64.to_be_bytes());
+        h.update(b"\x1e");
+        let before: [u8; 32] = h.finalize().into();
+        assert_eq!(decl_hash(std::slice::from_ref(&sampled)), before);
+        assert_eq!(decl_hash_formula_2(std::slice::from_ref(&sampled)), before);
+
+        let from = row_driven("bal", "balanceOf(address)", &["{from}"]);
+        let edits: [fn(&mut CallDecl); 7] = [
+            |d| d.args = vec!["{to}".into()],
+            |d| d.signature = Some("balanceOf(address,uint256)".into()),
+            |d| d.on = Some("tok__approval".into()),
+            |d| {
+                d.on = None;
+                d.on_any = vec!["tok__transfer".into()];
+            },
+            |d| d.contract_column = Some("token".into()),
+            |d| d.canonical = true,
+            |d| d.args = vec!["{fr".into(), "om}".into()],
+        ];
+        let mut ids = vec![decl_hash(std::slice::from_ref(&from))];
+        for edit in edits {
+            let mut d = from.clone();
+            edit(&mut d);
+            assert_eq!(
+                decl_hash_formula_2(std::slice::from_ref(&d)),
+                decl_hash_formula_2(std::slice::from_ref(&from)),
+                "premise: formula 2 could not see {d:?}"
+            );
+            ids.push(decl_hash(&[d]));
+        }
+        for i in 0..ids.len() {
+            for j in i + 1..ids.len() {
+                assert_ne!(ids[i], ids[j], "edits {i} and {j} must be different nests");
+            }
+        }
     }
 
     /// The claim RFC-0038 exists for: a declaration can name an event's parameters, which is what a

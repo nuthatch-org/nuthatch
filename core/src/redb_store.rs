@@ -407,9 +407,10 @@ pub type OutboxHolds = std::collections::HashMap<
 /// spellings of one key is exactly the drift that [`recorded_registry_hash`] exists to close.
 pub const REGISTRY_KEY: &str = "registry_hash";
 /// Which formula [`REGISTRY_KEY`] was recorded under. Absent means the event registry alone; present
-/// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations.
+/// means the full decode identity, which also covers call, `[[ipfs]]` and `[[calls]]` declarations;
+/// "3" is that identity once `[[calls]]` covers what a row-driven call reads (#2697).
 pub const IDENTITY_FORMULA_KEY: &str = "identity_formula";
-pub const IDENTITY_FORMULA: &str = "2";
+pub const IDENTITY_FORMULA: &str = "3";
 /// What the store's data covers beyond its decode, as JSON: chain, contracts and their start blocks,
 /// factories, extraction (#1420).
 pub const COVERAGE_KEY: &str = "indexed_coverage";
