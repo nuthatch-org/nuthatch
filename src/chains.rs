@@ -95,6 +95,17 @@ pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<Resolved
         .chain_id()
         .await
         .with_context(|| format!("could not read the chain id for '{name}' from --rpc"))?;
+    // A provider's own name for a registered chain keeps the registry's policy, on the caller's RPC (#2686).
+    if let Some(c) = lookup_by_id(chain_id) {
+        println!(
+            "chain_id {chain_id} is '{}' in the built-in registry; using that name",
+            c.name
+        );
+        return Ok(ResolvedChain {
+            rpc_urls: rpc_urls.to_vec(),
+            ..c.into()
+        });
+    }
     Ok(ResolvedChain {
         name: name.to_string(),
         chain_id,
@@ -520,6 +531,22 @@ mod tests {
         // laxer or stricter default than the runtime it will actually run under.
         assert_eq!(resolved.finality, UNREGISTERED_FINALITY);
         assert_eq!(resolved.log_window, UNREGISTERED_WINDOW);
+    }
+
+    /// #2686: a provider's name for a registered chain took the unregistered policy, a 20-block
+    /// window and depth-64 finality on Arbitrum. The registry entry is adopted; the caller's RPC stays.
+    #[tokio::test]
+    async fn resolve_of_another_name_for_a_registered_id_adopts_the_registry_entry() {
+        let (url, _rpc) = fake_chain_id_rpc(42161).await;
+        let resolved = resolve("arbitrum-mainnet", std::slice::from_ref(&url))
+            .await
+            .unwrap();
+        let arb = lookup("arbitrum-one").unwrap();
+        assert_eq!(resolved.name, "arbitrum-one");
+        assert_eq!(resolved.chain_id, 42161);
+        assert_eq!(resolved.finality, arb.finality);
+        assert_eq!(resolved.log_window, arb.log_window);
+        assert_eq!(resolved.rpc_urls, vec![url]);
     }
 
     #[test]

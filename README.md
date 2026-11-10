@@ -126,7 +126,8 @@ under load is unmeasured).
 checksum cannot give you:
 
 ```sh
-gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch \
+  --signer-workflow nuthatch-org/nuthatch/.github/workflows/release.yml --source-ref refs/tags/v<version>
 ```
 
 **From source**, which is the only route on a platform we do not publish a binary for:

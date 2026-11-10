@@ -389,7 +389,7 @@ impl ModeState {
     /// Hand `make(deadline, reply)` to the cursor and wait for it, no later than `deadline`: the
     /// request's own, set when it arrived, so queue time counts against it. `Err` says why it was not
     /// done; nothing is partly answered.
-    async fn ask(
+    pub(crate) async fn ask(
         &self,
         deadline: Instant,
         make: impl FnOnce(Instant, Reply) -> Request,
@@ -1924,14 +1924,18 @@ async fn mev_passes<M: Rpc, T: Rpc>(
                         .map(|c| c.iter().map(|(f, t)| t - f + 1).sum::<u64>())
                 };
                 let (before, started) = (through(&state.history), Instant::now());
-                let more = crate::address_mev::mev_step(
-                    d,
-                    relays,
-                    &state.history,
-                    a,
-                    state.start_block,
-                    to,
-                    now,
+                // A relay may be slow and still answer: requests and polls are served meanwhile.
+                let more = while_serving(
+                    crate::address_mev::mev_step(
+                        d,
+                        relays,
+                        &state.history,
+                        a,
+                        state.start_block,
+                        to,
+                        now,
+                    ),
+                    &|| Box::pin(yield_cursor(state, d)),
                 )
                 .await?;
                 if !more {
@@ -1968,8 +1972,11 @@ async fn mev_passes<M: Rpc, T: Rpc>(
             let produced = state
                 .history
                 .accounts_with(&[Action::ProducedBlocks], false)?;
-            let more =
-                crate::address_mev::reask_pass(d, relays, &state.history, &produced, now).await?;
+            let more = while_serving(
+                crate::address_mev::reask_pass(d, relays, &state.history, &produced, now),
+                &|| Box::pin(yield_cursor(state, d)),
+            )
+            .await?;
             if !more {
                 break;
             }
@@ -3794,8 +3801,8 @@ fn sweep_refusal(
     })
 }
 
-/// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
-/// on the nest's own RPC, exact or refused.
+/// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else, on a
+/// loopback bind, searched on the nest's own RPC, exact or refused.
 async fn block_by_time(
     s: &Arc<ModeState>,
     q: &HashMap<String, String>,
@@ -3812,6 +3819,11 @@ async fn block_by_time(
         .get("timestamp")
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
+    if !s.loopback {
+        return crate::address_history::unsupported(&format!(
+            "no verified headers bracket timestamp {t}, and off a loopback bind the RPC is not searched"
+        ));
+    }
     let after = q.get("closest").map(String::as_str) == Some("after");
     // A search gets half the deadline; when the last one needed more, the RPC is too busy to finish
     // this one in time either, and it is refused at once rather than held.
@@ -6650,8 +6662,15 @@ mod tests {
                         record: row,
                     }];
                     let g = h.generation().unwrap();
-                    h.apply_reask(150, &record, &[(ALICE.to_lowercase(), rows)], false, 1, g)
-                        .unwrap();
+                    h.apply_reask(
+                        150,
+                        Some(&record),
+                        &[(ALICE.to_lowercase(), rows)],
+                        false,
+                        1,
+                        g,
+                    )
+                    .unwrap();
                 }
                 Box::pin(async move { Ok([7; 32]) })
             })
@@ -7420,6 +7439,32 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was asked");
+    }
+
+    /// Off a loopback bind a timestamp is answered from verified headers only; the RPC is not
+    /// searched for an anonymous caller (#2733).
+    #[tokio::test]
+    async fn off_loopback_a_timestamp_is_not_searched_on_the_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), false).with_forward(forward),
+        );
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before",
+            None,
+        )
+        .await;
+        let why = v["result"].as_str().unwrap();
+        assert!(
+            why.starts_with("NUTHATCH_UNSUPPORTED:") && why.contains("loopback"),
+            "{v}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
     }
 
     #[tokio::test]
@@ -10286,7 +10331,7 @@ mod tests {
         s.history
             .apply_reask(
                 150,
-                &record,
+                Some(&record),
                 &[(ALICE.to_lowercase(), rows)],
                 false,
                 unix_now(),

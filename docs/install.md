@@ -70,14 +70,16 @@ binary therefore carries a **build provenance attestation**, signed by GitHub's 
 workflow run that produced it and recorded in a public transparency log. It needs no key from us:
 
 ```sh
-gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.tar.gz --repo nuthatch-org/nuthatch \
+  --signer-workflow nuthatch-org/nuthatch/.github/workflows/release.yml --source-ref refs/tags/v<version>
 ```
 
-That answers what a checksum cannot: which repository, which commit and which workflow built the file.
-`--repo` is the load-bearing part - without it, an attestation from *any* repository is accepted,
-which is most of the property you are checking for. The release workflow runs the same verification
+That answers what a checksum cannot: which repository, which workflow and which tag built the file.
+All three flags bind it. `--repo` alone accepts an attestation from any workflow on any branch of the
+repository, and without `--repo` one from any repository at all. `--source-ref` names the tag of the
+release you downloaded: `refs/tags/v5.17.2` for 5.17.2. The release workflow runs the same verification
 against its own assets before it publishes, so a release whose provenance does not verify never
-becomes public.
+becomes public, and it refuses a tag whose commit is on neither `main` nor its release branch.
 
 ## Building from source
 
@@ -110,5 +112,6 @@ The images are pushed only once the release has passed every gate the binaries p
 digest carries a build provenance attestation:
 
 ```sh
-gh attestation verify oci://ghcr.io/nuthatch-org/nuthatch:<version> --repo nuthatch-org/nuthatch
+gh attestation verify oci://ghcr.io/nuthatch-org/nuthatch:<version> --repo nuthatch-org/nuthatch \
+  --signer-workflow nuthatch-org/nuthatch/.github/workflows/release.yml --source-ref refs/tags/v<version>
 ```

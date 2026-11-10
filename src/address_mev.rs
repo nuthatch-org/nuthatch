@@ -81,37 +81,47 @@ pub fn relays_over_http() -> Result<Relays> {
     }))
 }
 
-/// Every relay's deliveries for `block`, from the cache or asked now. A relay that cannot be asked
-/// fails the lookup: a missing answer is not an absent delivery. Only a finalized block's answer is
-/// cached.
+/// Every relay's deliveries for `block`, from the cache or asked now. `None` when a relay could not
+/// be asked: a missing answer is not an absent delivery, so nothing is cached and the block is
+/// unrecorded. Only a finalized block's answer is cached.
 async fn relay_record(
     history: &AddressHistory,
     relays: &Relays,
     block: u64,
     deadline: Option<std::time::Instant>,
-) -> Result<Map<String, Value>> {
+) -> Result<Option<Map<String, Value>>> {
     if let Some(r) = history.relay_record(block)? {
-        return Ok(r);
+        return Ok(Some(r));
     }
     let record = ask_relays(relays, block, deadline).await?;
-    history.cache_relay_record(block, &record)?;
+    if let Some(r) = &record {
+        history.cache_relay_record(block, r)?;
+    }
     Ok(record)
 }
 
 /// Every relay's deliveries for `block`, asked now and kept nowhere, each ask within `deadline`.
+/// `None` when a relay could not be asked; a deadline passed is an error.
 async fn ask_relays(
     relays: &Relays,
     block: u64,
     deadline: Option<std::time::Instant>,
-) -> Result<Map<String, Value>> {
+) -> Result<Option<Map<String, Value>>> {
     let mut delivered = Vec::new();
     for (name, _) in RELAYS {
         let ask = relays(name, block);
         let traces = match deadline {
-            None => ask.await?,
+            None => ask.await,
             Some(d) => tokio::time::timeout_at(d.into(), ask)
                 .await
-                .map_err(|_| anyhow!("not covered within the deadline; try again shortly"))??,
+                .map_err(|_| anyhow!("not covered within the deadline; try again shortly"))?,
+        };
+        let traces = match traces {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("address history: MEV relay {name} could not be asked: {e:#}");
+                return Ok(None);
+            }
         };
         for trace in traces {
             if trace.get("block_number").and_then(Value::as_str) != Some(block.to_string().as_str())
@@ -137,7 +147,7 @@ async fn ask_relays(
     }
     let mut record = Map::new();
     record.insert("delivered".into(), Value::Array(delivered));
-    Ok(record)
+    Ok(Some(record))
 }
 
 /// What the relays say they delivered in one block, if any did, and whether they disagree.
@@ -193,10 +203,11 @@ pub async fn block_mev(
 ) -> Map<String, Value> {
     let record = if fresh {
         match ask_relays(relays, block, deadline).await {
-            Ok(r) => {
+            Ok(Some(r)) => {
                 let _ = history.cache_relay_record(block, &r);
-                Ok(r)
+                Ok(Some(r))
             }
+            Ok(None) => Ok(None),
             Err(e) => Err(e),
         }
     } else {
@@ -208,6 +219,7 @@ pub async fn block_mev(
     };
     match record
         .ok()
+        .flatten()
         .and_then(|rec| delivery(&rec, &hash.to_ascii_lowercase(), ""))
     {
         Some(dl) => {
@@ -363,7 +375,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
     history: &AddressHistory,
     address: &str,
     (from, to): (u64, u64),
-    asked: Option<&BTreeMap<u64, Map<String, Value>>>,
+    asked: Option<&BTreeMap<u64, Option<Map<String, Value>>>>,
     deadline: Option<std::time::Instant>,
 ) -> Result<Produced> {
     let a = address.to_ascii_lowercase();
@@ -445,7 +457,7 @@ pub async fn produced_blocks<M: Rpc, T: Rpc>(
             Some(r) => r.clone(),
             None => relay_record(history, relays, b, deadline).await?,
         };
-        let found = delivery(&record, &hash, &a);
+        let found = record.as_ref().and_then(|r| delivery(r, &hash, &a));
         if found.is_none() {
             out.unrecorded.push(b);
         }
@@ -716,7 +728,14 @@ async fn reask_block<M: Rpc, T: Rpc>(
     .await?;
     // Past thirty days a block leaves the schedule whatever the relays said.
     let keep_asking = unrecorded && now.saturating_sub(first) < REASK_FOR_SECS;
-    history.apply_reask(block, &record, &changes, keep_asking, now, generation)
+    history.apply_reask(
+        block,
+        record.as_ref(),
+        &changes,
+        keep_asking,
+        now,
+        generation,
+    )
 }
 
 #[cfg(test)]
@@ -901,7 +920,7 @@ mod tests {
         assert_eq!(*asked.lock().unwrap(), first);
     }
 
-    /// A relay that cannot be asked fails the lookup; nothing is cached as absent.
+    /// A relay that cannot be asked leaves the block without a record; nothing is cached as absent.
     #[tokio::test]
     async fn an_unreachable_relay_is_not_an_absent_delivery() {
         let dir = tempfile::tempdir().unwrap();
@@ -916,7 +935,7 @@ mod tests {
                 Ok(vec![])
             })
         });
-        assert!(relay_record(&h, &down, 100, None).await.is_err());
+        assert!(relay_record(&h, &down, 100, None).await.unwrap().is_none());
         assert!(h.relay_record(100).unwrap().is_none());
 
         // A block past what the nest serves is asked about but not kept: a relay may yet learn
@@ -1029,6 +1048,60 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// One relay that cannot be asked leaves each block it was asked about unrecorded and on the
+    /// re-ask schedule, with nothing cached as its answer, rather than failing every address's
+    /// window (#2731). When it answers again, the re-ask settles the rows.
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_asked_leaves_blocks_unrecorded_not_the_window_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let late = late_relays(on);
+        let flaky: Relays = {
+            let up = up.clone();
+            Arc::new(move |name, block| {
+                if name == "titan" && !up.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Box::pin(async { anyhow::bail!("relay titan answered 404") });
+                }
+                late(name, block)
+            })
+        };
+        let d = evidence_rpc();
+        let t0 = 1_800_000_000;
+        assert!(mev_step(&d, &flaky, &h, A, 100, 1_000, t0).await.unwrap());
+        assert_eq!(h.coverage(Action::ProducedBlocks, A).unwrap(), [(100, 199)]);
+        assert_eq!(view(&h), ["100 unrecorded "]);
+        let pending: Vec<u64> = h.mev_pending().unwrap().iter().map(|p| p.0).collect();
+        assert_eq!(pending, [100, 101, 102]);
+        for b in [100, 101, 102] {
+            assert!(h.relay_record(b).unwrap().is_none(), "block {b}");
+        }
+
+        let watched = [A.to_string()];
+        reask_pass(&d, &flaky, &h, &watched, t0 + REASK_EVERY_SECS)
+            .await
+            .unwrap();
+        assert_eq!(
+            view(&h),
+            ["100 unrecorded "],
+            "still unasked, still unrecorded"
+        );
+        assert_eq!(h.mev_pending().unwrap().len(), 3);
+        assert!(h.relay_record(100).unwrap().is_none());
+
+        up.store(true, std::sync::atomic::Ordering::Relaxed);
+        reask_pass(&d, &flaky, &h, &watched, t0 + 2 * REASK_EVERY_SECS)
+            .await
+            .unwrap();
+        assert_eq!(
+            view(&h),
+            ["100 relay ", "101 relay 0xp101", "102 relay 0xp102"]
+        );
+        assert!(h.mev_pending().unwrap().is_empty());
     }
 
     /// A relay that saved its record late is asked again on the schedule, across a restart: the
@@ -1377,6 +1450,66 @@ mod tests {
         assert_eq!(
             h.coverage(Action::ProducedBlocks, A).unwrap(),
             vec![(100, 199)]
+        );
+    }
+
+    /// A relay that answers slowly does not hold the cursor: a request queued while the MEV pass
+    /// waits on it is served in the meantime, not after its deadline (#2732).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_relay_does_not_hold_the_cursor() {
+        use crate::address_mode::{Discovery, Need, Request};
+        let dir = tempfile::tempdir().unwrap();
+        let h = evidence_chain(dir.path());
+        evidence_rows(&h);
+        let g = h.generation().unwrap();
+        for action in [
+            Action::TokenTx,
+            Action::TokenNftTx,
+            Action::Token1155Tx,
+            Action::BeaconWithdrawals,
+        ] {
+            h.record(action, A, &[], (100, 199), g).unwrap();
+        }
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let slow: Relays = {
+            let asked = asked.clone();
+            Arc::new(move |_, _| {
+                asked.notify_one();
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    Ok(vec![])
+                })
+            })
+        };
+        let state = crate::address_mode::ModeState::new(
+            h.clone(),
+            1,
+            std::time::Duration::from_secs(300),
+            true,
+        )
+        .with_range(100, Some(199), 0)
+        .with_relays(slow);
+        let request = async {
+            asked.notified().await;
+            let sent = tokio::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let answer = state
+                .ask(deadline, |deadline, reply| Request::Cover {
+                    address: "0x00000000000000000000000000000000000000cc".into(),
+                    need: Need::Discovered,
+                    from: 100,
+                    to: 101,
+                    deadline,
+                    reply,
+                })
+                .await;
+            (sent.elapsed(), answer)
+        };
+        let d = evidence_rpc();
+        let (_, (waited, answer)) = tokio::join!(d.catch_up(&state, 1_000), request);
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{waited:?}: {answer:?}"
         );
     }
 

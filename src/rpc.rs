@@ -1938,6 +1938,32 @@ mod tests {
         );
     }
 
+    /// #2695: a log outside `[fromBlock, toBlock]`, or one the filter does not match, is not
+    /// returned; the next window would otherwise store and fold it a second time.
+    #[tokio::test]
+    async fn a_log_outside_the_request_is_not_returned() {
+        let log = |block: u64, li: u64, address: &str, topic0: &str| {
+            serde_json::json!({"address":address,"topics":[topic0],"data":"0x",
+                "blockNumber":format!("0x{block:x}"),"blockHash":"0xbh","transactionHash":"0xtx",
+                "logIndex":format!("0x{li:x}")})
+        };
+        let (url, h) = canned_rpc(serde_json::json!({"jsonrpc":"2.0","id":1, "result":[
+            log(9, 0, "0xaa", "0x01"),
+            log(10, 1, "0xAA", "0x01"),
+            log(10, 2, "0xbb", "0x01"),
+            log(10, 3, "0xaa", "0x02"),
+            log(11, 4, "0xaa", "0x01"),
+        ]}))
+        .await;
+        let c = RpcClient::new(vec![url]).unwrap();
+        let got = c
+            .get_logs(&["0xaa".into()], &["0x01".into()], 10, 10)
+            .await
+            .unwrap();
+        h.abort();
+        assert_eq!(got.iter().map(|l| l.log_index).collect::<Vec<_>>(), vec![1]);
+    }
+
     /// #2155: one endpoint refusing our key is not the pool refusing it. The verdict of a call that
     /// another endpoint failed for a passing reason must not read as terminal, or a retry site that
     /// stops on terminal gives up on a pool that will recover (#538).
@@ -2150,6 +2176,23 @@ mod tests {
              failure RFC-0028 was avoiding: {err:#}"
         );
         assert!(!crate::chunker::is_result_too_large(&err));
+    }
+
+    /// #2702: a header batch answering one id twice is refused, not settled by whichever came last.
+    #[tokio::test]
+    async fn a_header_batch_with_a_duplicate_id_is_refused() {
+        let header =
+            |ts: u64| serde_json::json!({"number": "0x64", "timestamp": format!("0x{ts:x}")});
+        let (url, server) = canned_rpc(serde_json::json!([
+            {"jsonrpc": "2.0", "id": 0, "result": header(100)},
+            {"jsonrpc": "2.0", "id": 0, "result": header(200)},
+        ]))
+        .await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let got = c.block_timestamps(&[100]).await;
+        server.abort();
+        let err = got.expect_err("two answers for one block");
+        assert!(format!("{err:#}").contains("duplicate id"), "{err:#}");
     }
 
     /// **RFC-0029 §6h.** A timestamp batch too large to read must be *halved*, not reissued at the

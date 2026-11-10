@@ -164,9 +164,7 @@ struct FsSink<'a> {
 
 impl SegmentSink for FsSink<'_> {
     fn manifest(&mut self) -> Result<Manifest> {
-        let seg_dir = self.dir.join(SEGMENTS_DIR);
-        std::fs::create_dir_all(&seg_dir)
-            .with_context(|| format!("cannot create {}", seg_dir.display()))?;
+        prepare_segment_dir(&self.dir.join(SEGMENTS_DIR))?;
         load_manifest(self.dir)
     }
 
@@ -1831,6 +1829,7 @@ pub(crate) enum Durable {
     ParentDir(PathBuf),
     SegmentDir(PathBuf),
     ManifestDir(PathBuf),
+    EntryDir(PathBuf),
 }
 
 /// A temp name no other write in this process holds: two nests in one runtime can publish the same
@@ -1963,16 +1962,46 @@ fn stage_durable(
 }
 
 fn prepare_segment_dir(dir: &Path) -> Result<()> {
-    let created = !dir.exists();
-    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    if created {
-        if let Some(parent) = dir.parent() {
-            #[cfg(test)]
-            note_durable(Durable::ParentDir(parent.to_path_buf()));
-            sync_dir(parent)?;
-        }
+    create_dir_durable(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
+/// Create `dir` and any missing ancestors, fsyncing the parent of each one created: a new entry is
+/// only as durable as the directory that holds it (#2709).
+pub(crate) fn create_dir_durable(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = Some(dir);
+    while let Some(d) = at.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+        missing.push(d);
+        at = d.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    for created in missing.into_iter().rev() {
+        let parent = parent_dir(created);
+        #[cfg(test)]
+        note_durable(Durable::ParentDir(parent.to_path_buf()));
+        fsync_dir(parent)?;
     }
     Ok(())
+}
+
+/// Install the written file `tmp` as `path`. Its bytes are fsynced before the name exists and the
+/// name after, so power loss leaves the old file or the whole new one (#1632).
+pub(crate) fn install_durable(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(tmp)?.sync_all()?;
+    #[cfg(test)]
+    note_durable(Durable::FileSync(tmp.to_path_buf()));
+    std::fs::rename(tmp, path)?;
+    let dir = parent_dir(path);
+    #[cfg(test)]
+    note_durable(Durable::EntryDir(dir.to_path_buf()));
+    fsync_dir(dir)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
 }
 
 fn install_staged(tmp: &Path, final_path: &Path, dir: &Path) -> Result<()> {
@@ -2018,15 +2047,18 @@ fn sync_manifest_dir(dir: &Path) -> Result<()> {
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
+    fsync_dir(dir).with_context(|| format!("fsyncing {}", dir.display()))
+}
+
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if FAIL_DIR_SYNC.with(|fail| fail.get()) {
-        anyhow::bail!("fsyncing {} failed", dir.display());
+        return Err(std::io::Error::other(format!(
+            "fsyncing {} failed",
+            dir.display()
+        )));
     }
-    let directory = std::fs::File::open(dir)
-        .with_context(|| format!("opening {} to fsync it", dir.display()))?;
-    directory
-        .sync_all()
-        .with_context(|| format!("fsyncing {}", dir.display()))
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -2111,7 +2143,7 @@ fn before_install() {
 
 /// Install a whole catalogue into a nest that has none of its own yet (`nuthatch seed`).
 pub(crate) fn install_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
-    std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).context("creating the segments directory")?;
+    prepare_segment_dir(&dir.join(SEGMENTS_DIR))?;
     save_manifest(dir, manifest)
 }
 
@@ -3364,6 +3396,10 @@ mod tests {
         let trace = capture_durable(|| {
             seal_range(solo.path(), &[transfer(10, 0, "1")], 10, 10).unwrap();
         });
+        assert!(
+            trace.contains(&Durable::ParentDir(solo.path().to_path_buf())),
+            "the new segments/ entry in the nest must be durable before hot is pruned. trace: {trace:?}"
+        );
         assert_seal_durable(solo.path(), &trace, solo.path().join(SEGMENTS_DIR));
 
         let root = tempfile::tempdir().unwrap();

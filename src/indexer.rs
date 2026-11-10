@@ -2323,13 +2323,14 @@ fn drain_lifecycle(
                 }
             }
             CursorCommand::Rename { from, to, ack } => {
+                // The runtime gave up waiting and kept its records on `from` (#2716).
+                if ack.as_ref().is_some_and(|a| a.is_closed()) {
+                    tracing::warn!("rename of '{from}' to '{to}' was abandoned; keeping '{from}'");
+                    continue;
+                }
                 let applied = match (sup.index_of(&from), sup.index_of(&to)) {
                     (Some(i), None) => {
-                        sup.names[i] = to.clone();
-                        if let Some(n) = nests[i].as_mut() {
-                            n.name = to.clone();
-                        }
-                        crate::metrics::METRICS.rename_nest(&from, &to);
+                        rename_at(sup, nests, i, &from, &to);
                         tracing::info!("nest '{from}' is now '{to}' on this cursor");
                         true
                     }
@@ -2342,11 +2343,29 @@ fn drain_lifecycle(
                     (None, _) => false,
                 };
                 if let Some(ack) = ack {
-                    let _ = ack.send(applied);
+                    if ack.send(applied).is_err() && applied {
+                        // The receiver went away between the check and the rename.
+                        let i = sup.index_of(&to).expect("just renamed");
+                        rename_at(sup, nests, i, &to, &from);
+                    }
                 }
             }
         }
     }
+}
+
+fn rename_at(
+    sup: &mut Supervisor,
+    nests: &mut [Option<NestIngest>],
+    i: usize,
+    from: &str,
+    to: &str,
+) {
+    sup.names[i] = to.to_string();
+    if let Some(n) = nests[i].as_mut() {
+        n.name = to.to_string();
+    }
+    crate::metrics::METRICS.rename_nest(from, to);
 }
 
 /// A lifecycle command for a *running* cursor (RFC-0027 §2).
@@ -13142,6 +13161,30 @@ template = "pool"
         assert!(nests[0].is_none(), "the slot was empty and stays empty");
     }
 
+    /// #2716: the runtime timed out on a rename and kept its records on the old name, so the
+    /// cursor must too.
+    #[test]
+    fn an_abandoned_rename_keeps_the_old_name() {
+        let mut sup = test_supervisor(1);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle = Some(rx);
+        let mut nests: Vec<Option<NestIngest>> = vec![None];
+        let mut nexts = vec![10u64];
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        drop(ack_rx);
+        tx.send(CursorCommand::Rename {
+            from: "nest0".into(),
+            to: "heir".into(),
+            ack: Some(ack_tx),
+        })
+        .unwrap();
+        drain_lifecycle(&mut lifecycle, &mut sup, &mut nests, &mut nexts);
+
+        assert_eq!(sup.index_of("nest0"), Some(0));
+        assert_eq!(sup.index_of("heir"), None);
+    }
+
     /// #1535: a mount whose caller has gone is not admitted, and the store it was holding can be
     /// opened again. Admitting it would leave the file locked with no routes.
     #[tokio::test]
@@ -16020,6 +16063,11 @@ template = "pool"
         };
         assert!(rename("c", "c2").await.unwrap(), "a free name is taken");
         assert!(!rename("a", "b").await.unwrap(), "a name in use is refused");
+        drop(rename("c2", "c3"));
+        assert!(
+            rename("c2", "c4").await.unwrap(),
+            "an abandoned rename is not applied (#2716)"
+        );
 
         let (ack, acked) = tokio::sync::oneshot::channel();
         tx.send(CursorCommand::Unmount {
@@ -16032,7 +16080,7 @@ template = "pool"
             b_store.upgrade().is_none(),
             "the unmount was acknowledged while something still held b's store"
         );
-        for name in ["a", "c2"] {
+        for name in ["a", "c4"] {
             tx.send(CursorCommand::unmount(name)).unwrap();
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;

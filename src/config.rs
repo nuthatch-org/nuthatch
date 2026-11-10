@@ -311,6 +311,7 @@ impl Config {
         }
         cfg.refuse_tip_finality_webhooks()?;
         cfg.refuse_unknown_since()?;
+        cfg.refuse_another_name_for_a_registered_chain()?;
         refuse_feature_only_files(dir)?;
         refuse_removed_screening(&raw)?;
         Ok(cfg)
@@ -437,6 +438,24 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse a chain name the registry does not know over a chain id it does (#2686): it ran on the
+    /// unregistered policy, as a runtime declaration of the same pair is refused for.
+    fn refuse_another_name_for_a_registered_chain(&self) -> Result<()> {
+        let (name, id) = (&self.nest.chain, self.nest.chain_id);
+        if crate::chains::lookup(name).is_some() {
+            return Ok(());
+        }
+        if let Some(known) = crate::chains::lookup_by_id(id) {
+            bail!(
+                "chain_id {id} is '{}' in the built-in registry, not '{name}': set `chain = \"{}\"` \
+                 so the nest keeps the registry's finality and log window (this changes its NID)",
+                known.name,
+                known.name
+            );
+        }
+        Ok(())
+    }
+
     /// Reader and feature gates shared by normal and diagnostic loading.
     fn check_schema_version(&self) -> Result<()> {
         nuthatch_core::nest_config::check_schema_version(&self.nest, READABLE_SCHEMA_VERSION)?;
@@ -511,9 +530,24 @@ impl Config {
     pub fn save(&self, dir: &Path) -> Result<()> {
         let path = dir.join(CONFIG_FILE);
         let raw = toml::to_string_pretty(self).context("failed to serialise config")?;
-        std::fs::write(&path, raw)
-            .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        // Replace what a link points at, not the link, and keep the mode: the file holds RPC URLs.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let tmp = path.with_extension("toml.tmp");
+        let written = std::fs::write(&tmp, raw)
+            .with_context(|| format!("failed to write {}", tmp.display()))
+            .and_then(|()| match std::fs::metadata(&path) {
+                Ok(m) => std::fs::set_permissions(&tmp, m.permissions())
+                    .with_context(|| format!("failed to set the mode of {}", tmp.display())),
+                Err(_) => Ok(()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&tmp, &path)
+                    .with_context(|| format!("failed to replace {}", path.display()))
+            });
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// The first contract - the indexer's single-contract path uses this until step 3 generalises
@@ -663,6 +697,50 @@ fn one_edit_away(word: &str) -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2688: `save` truncated the live file, so a full disk or a kill mid-write left it empty. A
+    /// replaced file leaves the old bytes whole under any other link to them.
+    #[test]
+    fn save_replaces_the_file_rather_than_rewriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n";
+        std::fs::write(dir.path().join(CONFIG_FILE), raw).unwrap();
+        let mut cfg = Config::load(dir.path()).unwrap();
+        std::fs::hard_link(dir.path().join(CONFIG_FILE), dir.path().join("held.toml")).unwrap();
+
+        cfg.nest.name = "renamed".into();
+        cfg.save(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("held.toml")).unwrap(),
+            raw,
+            "save wrote into the live file"
+        );
+        assert_eq!(Config::load(dir.path()).unwrap().nest.name, "renamed");
+        assert!(!dir.path().join(format!("{CONFIG_FILE}.tmp")).exists());
+    }
+
+    /// #2688: the replacement keeps what writing in place kept, the file's mode and a link to it.
+    #[test]
+    fn save_keeps_the_mode_and_writes_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let raw = "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n";
+        std::fs::write(&real, raw).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join(CONFIG_FILE)).unwrap();
+        let mut cfg = Config::load(dir.path()).unwrap();
+
+        cfg.nest.name = "renamed".into();
+        cfg.save(dir.path()).unwrap();
+
+        let link = std::fs::symlink_metadata(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(link.file_type().is_symlink(), "save replaced the link");
+        assert!(std::fs::read_to_string(&real).unwrap().contains("renamed"));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 
     /// #1582: a misspelt key is reported, and nothing a real config says, or a parsed one writes
     /// back, is. A false positive would make every nest warn and `check` fail.
@@ -1034,6 +1112,30 @@ abi = "abis/t.json"
             let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
             assert!(err.contains("is invalid"), "{alias} {template}: {err}");
         }
+    }
+
+    /// #2686: a name the registry does not know, over a chain id it does, ran on the unregistered
+    /// policy. A runtime refuses that chain declaration; a nest's config is refused the same way.
+    #[test]
+    fn another_name_for_a_registered_chain_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |chain: &str, chain_id: u64| {
+            std::fs::write(
+                dir.path().join(CONFIG_FILE),
+                format!(
+                    "[nest]\nname = \"n\"\nchain = \"{chain}\"\nchain_id = {chain_id}\nrpc_urls = []\n"
+                ),
+            )
+            .unwrap();
+            Config::load(dir.path())
+        };
+        let err = format!("{:#}", load("arbitrum-mainnet", 42161).unwrap_err());
+        assert!(
+            err.contains("'arbitrum-one'"),
+            "name the registry's chain: {err}"
+        );
+        load("arbitrum", 42161).expect("a registry alias");
+        load("avalanche", 43114).expect("an unregistered chain");
     }
 
     /// A webhook declaring `finality = "tip"` is refused rather than accepted and silently never
