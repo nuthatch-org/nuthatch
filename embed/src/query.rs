@@ -429,8 +429,9 @@ impl TabQuery {
     }
 }
 
-/// The base tables `sql` reads, lowercased, followed through the authored views, as the node's
-/// `reject_unknown_table_refs` and `expand_through_views` find them. `None` where it does not parse.
+/// The base tables `sql` reads, lowercased, followed through the authored views and entities, as the
+/// node's `reject_unknown_table_refs` and `expand_through_views` find them. A qualified name counts
+/// as its table. `None` where it does not parse.
 pub fn referenced_tables(
     sql: &str,
     files: &NestFiles,
@@ -440,10 +441,33 @@ pub fn referenced_tables(
         Err(burrmill::BurrmillError::Parse(_)) => return None,
         Err(e) => return Some(Err(e)),
     };
-    let bodies = view_bodies(files).unwrap_or_default();
+    let bodies = relation_bodies(files);
     Some(Ok(nuthatch_core::bind::through_views(&named, |name| {
         burrmill::inspect::base_tables(bodies.get(name)?)
     })))
+}
+
+/// Authored views and entities, by lowercased name, so a statement that names one is read as the
+/// tables behind it (#2737).
+fn relation_bodies(files: &NestFiles) -> std::collections::BTreeMap<String, String> {
+    let mut out = view_bodies(files).unwrap_or_default();
+    let Some(raw) = files.get("entities.toml") else {
+        return out;
+    };
+    let Ok(decls) = crate::entity_decl::parse(raw) else {
+        return out;
+    };
+    for d in decls {
+        let Ok(path) = d.sql_path() else {
+            continue;
+        };
+        let key = path.to_string_lossy().replace('\\', "/");
+        if let Some(sql) = files.get(&key) {
+            out.entry(d.name.to_ascii_lowercase())
+                .or_insert_with(|| sql.clone());
+        }
+    }
+    out
 }
 
 /// Each authored view's lowercased name and the query it registers.
@@ -524,4 +548,51 @@ fn define_views(engine: &mut burrmill::Engine, text: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn files(pairs: &[(&str, &str)]) -> NestFiles {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_view_over_an_entity_names_the_table_under_it() {
+        let files = files(&[
+            (
+                "views/approvals.sql",
+                "CREATE VIEW all_approvals AS SELECT * FROM received",
+            ),
+            (
+                "entities.toml",
+                "[[entities]]\nname = \"received\"\nsql = \"entities/received.sql\"\nkey = [\"to\"]\nmax_rows = 10\n",
+            ),
+            (
+                "entities/received.sql",
+                "SELECT \"to\" FROM tab__transfer",
+            ),
+        ]);
+        let got = referenced_tables("SELECT count(*) AS n FROM all_approvals", &files)
+            .unwrap()
+            .unwrap();
+        assert!(got.contains("tab__transfer"), "{got:?}");
+    }
+
+    #[test]
+    fn a_qualified_name_names_its_table() {
+        let got = referenced_tables("SELECT * FROM public.approval", &NestFiles::new())
+            .unwrap()
+            .unwrap();
+        assert!(got.contains("approval"), "{got:?}");
+    }
+
+    #[test]
+    fn an_unparseable_statement_names_nothing() {
+        assert!(referenced_tables("SELECT FROM", &NestFiles::new()).is_none());
+    }
 }

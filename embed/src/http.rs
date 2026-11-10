@@ -429,9 +429,10 @@ async fn route_sql(
     })
 }
 
-/// RFC-0081 S3: what a narrowed nest's answer read. `read` is the nest's tables the statement names
-/// (null where it does not parse here), and `unfiltered` those of them no filter covers, which the
-/// nest holds none of.
+/// RFC-0081 S3: what a narrowed nest's answer read. `read` is the nest's tables the statement
+/// reaches, views and entities followed through to those tables and a qualified name counted as its
+/// table (null where it does not parse here). `unfiltered` is those of them no filter covers, which
+/// the nest holds none of (#2737).
 fn narrowed(sql: &str, n: &Nest, filtered: &BTreeSet<String>, whole: bool) -> Value {
     let own: BTreeSet<String> = n
         .nest
@@ -440,7 +441,10 @@ fn narrowed(sql: &str, n: &Nest, filtered: &BTreeSet<String>, whole: bool) -> Va
         .into_iter()
         .map(|t| t.table.to_ascii_lowercase())
         .collect();
-    let read = crate::attach::bare_tables(sql).map(|t| own.intersection(&t).cloned().collect());
+    let read = match referenced_tables(sql, n.files) {
+        Some(Ok(t)) => Some(own.intersection(&t).cloned().collect()),
+        _ => None,
+    };
     let unfiltered = read
         .as_ref()
         .map(|r: &BTreeSet<String>| r.difference(filtered).cloned().collect::<Vec<_>>());
