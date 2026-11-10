@@ -1391,7 +1391,10 @@ impl<T: Transport> RpcClient<T> {
                 let detail = format!("transport error: timed out: {}", e.error);
                 return anyhow::Error::new(NoAnswerInTime(detail));
             }
-            classified(FailureClass::Transient, format!("transport error: {}", e.error))
+            classified(
+                FailureClass::Transient,
+                format!("transport error: {}", e.error),
+            )
         })?;
         let status = resp.status();
         let status_line = resp.status_line();
