@@ -76,7 +76,7 @@ pub fn check(args: CheckArgs) -> Result<()> {
     // anything (#539): a nest with views and no `checks/*.sql` yet is a normal intermediate state,
     // and it's exactly when an author most wants this validator. The old order bailed on the empty
     // `checks/` dir first, which made view drift invisible until a check happened to exist.
-    let views_validated = nest_schema(&dir).map(|schema| {
+    let views_validated = nest_schema(&dir)?.map(|schema| {
         let issues = analytics::validate_nest_views(&dir, &schema);
         let n = issues.len();
         for issue in issues {
@@ -179,7 +179,7 @@ pub fn check(args: CheckArgs) -> Result<()> {
 /// that do not are named.
 #[cfg(feature = "folds")]
 fn check_folds(dir: &Path, from_genesis: bool) -> Result<()> {
-    let schema = nest_schema(dir).unwrap_or_default();
+    let schema = nest_schema(dir)?.unwrap_or_default();
     let set = crate::folds::FoldSet::load(dir, &schema)?;
     if set.folds.is_empty() {
         bail!("{} has no folds/", dir.display());
@@ -204,11 +204,15 @@ fn check_folds(dir: &Path, from_genesis: bool) -> Result<()> {
 }
 
 /// The nest's decode-registry table schemas, for view drift-validation. `None` if the dir isn't a
-/// nest (no config) - view validation is then skipped, not fatal.
-fn nest_schema(dir: &Path) -> Option<Vec<crate::registry::TableSchema>> {
-    let cfg = crate::config::Config::load(dir).ok()?;
-    let reg = crate::registry::from_nest(dir, &cfg).ok()?;
-    Some(reg.schema())
+/// nest (no config), and view validation is then skipped. A config `dev` would refuse is an error
+/// (#2687): skipping on it let `check` pass a nest that does not start.
+fn nest_schema(dir: &Path) -> Result<Option<Vec<crate::registry::TableSchema>>> {
+    if !dir.join(crate::config::CONFIG_FILE).exists() {
+        return Ok(None);
+    }
+    let cfg = crate::config::Config::load(dir)?;
+    let reg = crate::registry::from_nest(dir, &cfg).context("building the decode registry")?;
+    Ok(Some(reg.schema()))
 }
 
 /// Every `checks/<name>.sql` (sorted), optionally filtered to names containing `filter`.
@@ -335,6 +339,43 @@ mod tests {
             "must not be the generic empty-checks bail: {err}"
         );
         assert!(err.contains("authored-definition issue"), "{err}");
+    }
+
+    /// #2687: a `nuthatch.toml` that `dev` refuses at load made every bind check skip, so `check`
+    /// passed a nest with a refused webhook and an entity over a table that does not exist.
+    #[test]
+    fn a_config_dev_refuses_fails_check_with_the_load_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\
+             [[webhooks]]\nname = \"fast\"\ntable = \"t\"\nurl = \"http://127.0.0.1:8099/\"\n\
+             finality = \"tip\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT owner, count(*) AS n FROM missing GROUP BY owner",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['owner']\nmax_rows=10\n",
+        )
+        .unwrap();
+
+        let err = check(CheckArgs {
+            name: None,
+            dir: dir.path().display().to_string(),
+            update: false,
+            #[cfg(feature = "folds")]
+            folds: false,
+            #[cfg(feature = "folds")]
+            from_genesis: false,
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("#577"), "{err:#}");
     }
 
     /// Unchanged: a nest with neither `checks/*.sql` nor any views has truly nothing to check.
