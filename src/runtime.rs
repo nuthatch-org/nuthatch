@@ -7685,8 +7685,13 @@ impl RuntimeHandles {
             // An alias has serving series under its own name and no ingest series to keep.
             crate::metrics::METRICS.remove_nest(name);
             self.health.unregister(name);
+            let own = self.surface_record(name).and_then(|r| r.publish);
+            let mirrored = self.publishers.iter().any(|(n, _)| n == name);
             self.publishers.retain(|(n, _)| n != name);
-            self.states.remove(idx);
+            let (_, gone) = self.states.remove(idx);
+            if mirrored && own.is_none() {
+                self.hand_default_mirror(&gone.store);
+            }
             return self.recompose_after_unmount(name);
         }
 
@@ -7715,6 +7720,45 @@ impl RuntimeHandles {
             .filter(|(n, s)| n != name && Arc::ptr_eq(&s.store, store))
             .map(|(n, _)| n.clone())
             .collect()
+    }
+
+    /// Start the runtime's default mirror of the dataset behind `store` for the mount that now holds
+    /// its cursor key, once the mount that published it has gone (#2715).
+    fn hand_default_mirror(&mut self, store: &Arc<dyn crate::store::HotStore>) {
+        let Some(default) = self.mount_ctx.publish.clone() else {
+            return;
+        };
+        let Some((heir, cursor_key, fence)) = self
+            .states
+            .iter()
+            .filter(|(_, s)| Arc::ptr_eq(&s.store, store))
+            .find_map(|(n, s)| {
+                let key = s.runtime_health.as_ref().map_or(n, |(k, _)| k);
+                (key == n).then(|| {
+                    let fence = crate::feed_http::writer_fence(s.store.as_ref());
+                    (n.clone(), key.clone(), fence)
+                })
+            })
+        else {
+            return;
+        };
+        if self.publishers.iter().any(|(n, _)| *n == heir) {
+            return;
+        }
+        let Some(record) = self.surface_record(&heir).filter(|r| r.publish.is_none()) else {
+            return;
+        };
+        match spawn_publisher(
+            &self.mount_ctx.dir,
+            &record,
+            &default,
+            &self.default_tenant,
+            &cursor_key,
+            fence,
+        ) {
+            Ok((_, publisher)) => self.publishers.push((heir, publisher)),
+            Err(e) => tracing::error!("'{heir}' could not take over its dataset's mirror: {e:#}"),
+        }
     }
 
     /// Record that a shared dataset's cursor key has passed from `name`, moving off it, to `holder`.
