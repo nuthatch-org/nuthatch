@@ -247,6 +247,23 @@ pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, In
         .collect()
 }
 
+/// Puts a taken session back when it drops, so a refusal that returns before the statement runs
+/// leaves the warm one in the cache (#2726). An interrupt clears `restore` and the session goes.
+struct RestoreSlot {
+    slot: Option<SessionCache>,
+    restore: bool,
+}
+
+impl Drop for RestoreSlot {
+    fn drop(&mut self) {
+        if self.restore {
+            if let Some(slot) = self.slot.take() {
+                retain_session_cache(session_cache_lock(), slot);
+            }
+        }
+    }
+}
+
 fn retain_session_cache(
     mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>>,
     slot: SessionCache,
@@ -1600,7 +1617,12 @@ fn attempt(
     }
     let mut slot = slot.expect("just inserted");
     slot.last_used = SESSION_USE.fetch_add(1, Ordering::Relaxed);
+    let mut warm = RestoreSlot {
+        slot: Some(slot),
+        restore: cached,
+    };
     let (referenced, offchain, degraded_tables, interrupted, (spilled, held), outcome, cap, scan) = {
+        let slot = warm.slot.as_mut().expect("session");
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
         // The token outlives the previous statement. Clear it before the watchdog or the shutdown
@@ -1824,11 +1846,10 @@ fn attempt(
         )
     };
     let (referenced, copies) = referenced;
-    if interrupted.load(Ordering::SeqCst) || !cached {
-        drop(slot);
-    } else {
-        retain_session_cache(session_cache_lock(), slot);
+    if interrupted.load(Ordering::SeqCst) {
+        warm.restore = false;
     }
+    drop(warm);
 
     let scan = match scan {
         Some(Err(_)) if interrupted.load(Ordering::SeqCst) => {
@@ -6490,6 +6511,26 @@ template="pool"
             session_opens_for(dir.path()),
             2,
             "a new sealed_through must not reuse the stale connection"
+        );
+    }
+
+    /// #2726: a statement refused before it runs puts the warm session back.
+    #[test]
+    fn a_refused_statement_puts_the_session_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+            ..Default::default()
+        };
+        query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+        assert_eq!(session_opens_for(dir.path()), 1);
+        assert!(query_guarded(dir.path(), "SELECT * FROM foo(1)", guard).is_err());
+        query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+        assert_eq!(
+            session_opens_for(dir.path()),
+            1,
+            "a refusal must leave the warm session in the cache"
         );
     }
 
