@@ -290,6 +290,19 @@ pub fn body_capped(err: &anyhow::Error) -> bool {
     err.chain().any(|e| e.is::<BodyCapped>())
 }
 
+/// A request that timed out before its status line. Transient to every caller but a getLogs range,
+/// which narrows it as a body-read timeout narrows (#2671).
+#[derive(Debug)]
+struct NoAnswerInTime(String);
+
+impl std::fmt::Display for NoAnswerInTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoAnswerInTime {}
+
 /// Appends `chunk` unless it would take `body` past `cap`, growing it by doubling no further than
 /// the cap, so neither the bytes nor the allocation ever exceed it.
 pub fn append_capped(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), BodyCapped> {
@@ -430,6 +443,9 @@ pub fn class_of(err: &anyhow::Error) -> Option<FailureClass> {
                 suggested: None,
                 escalated_from_rate_limit: false,
             });
+        }
+        if e.is::<NoAnswerInTime>() {
+            return Some(FailureClass::Transient);
         }
         e.downcast_ref::<ClassifiedError>().map(|c| c.class.clone())
     })
@@ -1371,11 +1387,11 @@ impl<T: Transport> RpcClient<T> {
         let resp = self.http.post(url, body).await.map_err(|e| {
             // reqwest's own text for a timeout is "error sending request", which a caller narrowing
             // its range on a timeout cannot tell from a refused connection.
-            let timed_out = if e.timed_out { "timed out: " } else { "" };
-            classified(
-                FailureClass::Transient,
-                format!("transport error: {timed_out}{}", e.error),
-            )
+            if e.timed_out {
+                let detail = format!("transport error: timed out: {}", e.error);
+                return anyhow::Error::new(NoAnswerInTime(detail));
+            }
+            classified(FailureClass::Transient, format!("transport error: {}", e.error))
         })?;
         let status = resp.status();
         let status_line = resp.status_line();
@@ -1440,7 +1456,10 @@ impl<T: Transport> RpcClient<T> {
             //
             // A *syntax* error stays transient: garbage from a load balancer is no smaller in halves,
             // and calling it narrowable would split a dead endpoint down to single blocks.
-            let class = if e.timed_out {
+            //
+            // A caller that can still narrow passes a cap. Without one there is nothing to halve, so a
+            // stall is only slow, and calling it narrowable made one slow block "over the cap" (#2693).
+            let class = if e.timed_out && body_cap.is_some() {
                 FailureClass::Narrowable {
                     suggested: None,
                     escalated_from_rate_limit: false,
@@ -2471,7 +2490,21 @@ impl<T: Transport> RpcClient<T> {
                 // One block cannot be narrowed; refusing it would only make its answer an error.
                 (from < to).then_some(self.logs_body_cap),
             )
-            .await?;
+            .await
+            .map_err(|e| {
+                // A range too dense to answer in time sends no status line at all (GraphOps,
+                // #2671): the same size signal as a body-read timeout, so it narrows the same way.
+                if from < to && e.chain().any(|c| c.is::<NoAnswerInTime>()) {
+                    return anyhow::Error::new(ClassifiedError {
+                        class: FailureClass::Narrowable {
+                            suggested: None,
+                            escalated_from_rate_limit: false,
+                        },
+                        detail: format!("{e:#}"),
+                    });
+                }
+                e
+            })?;
         let arr = result
             .as_array()
             .ok_or_else(|| anyhow!("eth_getLogs did not return an array"))?;
