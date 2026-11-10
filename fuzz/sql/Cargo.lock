@@ -1563,7 +1563,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=ea8cf40c74b4e9da61983c4658d50d2d18217b7f#ea8cf40c74b4e9da61983c4658d50d2d18217b7f"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=10c73d4b4027f4feb7970b7a0d5c74b8f8b248ad#10c73d4b4027f4feb7970b7a0d5c74b8f8b248ad"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -4627,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "5.12.0"
+version = "5.17.0"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -4654,8 +4654,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "lz4_flex",
  "md-5",
  "num-bigint 0.4.8",
+ "nuthatch-core",
  "nuthatch-decode",
  "nuthatch-identity",
  "nuthatch-scaffold",
@@ -4684,6 +4686,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "nuthatch-core"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "arc-swap",
+ "arrow-array",
+ "arrow-schema 59.3.0",
+ "async-trait",
+ "bytes",
+ "dbsp",
+ "feldera-size-of",
+ "futures",
+ "hex",
+ "js-sys",
+ "nuthatch-decode",
+ "nuthatch-scaffold",
+ "nuthatch-seal",
+ "redb",
+ "rkyv",
+ "send_wrapper",
+ "serde",
+ "serde_ignored",
+ "serde_json",
+ "sha2",
+ "sqlparser",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
+]
+
+[[package]]
 name = "nuthatch-decode"
 version = "3.0.0-alpha.1"
 dependencies = [
@@ -4705,6 +4744,7 @@ dependencies = [
  "libfuzzer-sys",
  "nuthatch",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 
@@ -6109,6 +6149,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "send_wrapper"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "seq-macro"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6915,6 +6964,7 @@ dependencies = [
  "http 1.4.2",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

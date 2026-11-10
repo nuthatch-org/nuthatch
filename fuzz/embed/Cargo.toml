@@ -1,0 +1,53 @@
+[package]
+name = "nuthatch-fuzz-embed"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: the engine crate builds on patched dbsp, and a patch applies only from the root
+# manifest, so this copies `embed/`'s.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+arrow-array = { version = "=59.3.0", default-features = false }
+arrow-ipc = { version = "=59.3.0", default-features = false }
+arrow-schema = { version = "=59.3.0", default-features = false }
+
+[dependencies.nuthatch-embed]
+path = "../../embed"
+default-features = false
+
+[patch.crates-io]
+dbsp = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-types = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-storage = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-buffer-cache = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-samply = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-ir = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-macros = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
+feldera-size-of = { git = "https://github.com/nuthatch-org/size-of", rev = "1181ec2f62317a85f8a4d57abb4c2170adf9d771" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "header_chain"
+path = "fuzz_targets/header_chain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attach_ipc"
+path = "fuzz_targets/attach_ipc.rs"
+test = false
+doc = false
+bench = false
