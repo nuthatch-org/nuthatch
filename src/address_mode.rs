@@ -3471,8 +3471,8 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
     }
 }
 
-/// Why an account request starts before the configured history, if it does: `startblock`, or 0
-/// when absent, under `start_block`.
+/// Why an account request lies outside the configured history, if it does: `startblock`, or 0 when
+/// absent, under `start_block`, or either bound above `end_block`.
 fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> {
     use crate::address_history::Action;
     if q.get("module").map(String::as_str) != Some("account") || q.contains_key("txhash") {
@@ -3485,8 +3485,12 @@ fn before_history(s: &ModeState, q: &HashMap<String, String>) -> Option<String> 
         None => 0,
         Some(v) => v.parse::<u64>().ok()?,
     };
-    if let Some(end) = s.end_block.filter(|e| start > *e) {
-        return Some(format!("history ends at block {end}"));
+    let end = q.get("endblock").and_then(|v| v.parse::<u64>().ok());
+    if let Some(e) = s
+        .end_block
+        .filter(|e| start > *e || end.is_some_and(|x| x > *e))
+    {
+        return Some(format!("history ends at block {e}"));
     }
     (start < s.start_block).then(|| {
         format!(
@@ -6474,20 +6478,26 @@ mod tests {
             ),
         );
         for action in actions {
-            let (_, v) = call(
-                router(ended.clone()),
-                "GET",
-                &format!("/api?module=account&action={action}&address={ALICE}&startblock=25800001"),
-                None,
-            )
-            .await;
-            assert!(
-                v["result"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains("history ends at block 25800000"),
-                "{action}: {v}"
-            );
+            // An end above it can never be covered either, so it is not "being backfilled" (#2734).
+            for range in [
+                "startblock=25800001",
+                "startblock=25700000&endblock=99999999",
+            ] {
+                let (_, v) = call(
+                    router(ended.clone()),
+                    "GET",
+                    &format!("/api?module=account&action={action}&address={ALICE}&{range}"),
+                    None,
+                )
+                .await;
+                assert!(
+                    v["result"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("history ends at block 25800000"),
+                    "{action} {range}: {v}"
+                );
+            }
         }
         for action in actions {
             for start in ["", "&startblock=0", "&startblock=25699999"] {
