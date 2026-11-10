@@ -479,6 +479,7 @@ fn rows_of(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>>
 fn batch_rows(bytes: &[u8], allow: &mut Allowance) -> Result<Vec<(String, String)>> {
     let ipc = lz4_flex::block::decompress_size_prepended(bytes)
         .map_err(|e| anyhow::anyhow!("a delta batch that does not decompress: {e}"))?;
+    nuthatch_core::ipc_check::check(&ipc).map_err(|e| anyhow::anyhow!("a delta batch: {e}"))?;
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)?;
     let mut out = Vec::new();
     for batch in reader {
@@ -1010,6 +1011,29 @@ mod tests {
             .expect("refused as too large");
         assert!(too.needed > 1 << 20, "{too:?}");
         assert_eq!(decode_delta(&body, Some(8 << 20)).unwrap().ops, d.ops);
+    }
+
+    #[test]
+    fn a_batch_arrow_ipc_would_panic_on_is_refused() {
+        // #2811: a stream whose one field's type byte was overwritten to NONE.
+        let stream = hex::decode(
+            "fffffffff80000001000000000000a000c000a00090004000a00000010000000000104000800080000\
+             000400080000000400000003000000780000003c0000001400000010001400100000000f00040000000800\
+             10000000140000000c000000000000040c00000000000000dcffffff0100000062000000d8ffffff180000\
+             000c000000000001051000000000000000040004000400000001000000730000000000140010000e000f00\
+             040000000800100000001800000020000000000001021c00000008000c0004000b00080000004000000000\
+             00000100000000010000006900000000000000000000000000000000000000000000000000000000000000\
+             ffffffff00000000",
+        )
+        .unwrap();
+        let mut allow = Allowance {
+            left: None,
+            limit: 0,
+            used: 0,
+        };
+        let bytes = lz4_flex::block::compress_prepend_size(&stream);
+        let err = batch_rows(&bytes, &mut allow).unwrap_err().to_string();
+        assert!(err.contains("type NONE"), "{err}");
     }
 
     #[test]
