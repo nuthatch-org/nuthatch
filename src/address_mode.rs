@@ -3351,10 +3351,10 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
         return Json(block_by_time(&s, &q, deadline).await);
     }
-    // A range from before the configured history is refused in the one wording a client reads to ask
-    // again from the start, whatever the action and whether or not it named a start.
+    // A range outside the configured history is never covered here, so it is unsupported, in the one
+    // wording a client reads to ask again from the start, whether or not it named a start.
     if let Some(why) = before_history(&s, &q) {
-        return Json(crate::address_history::incomplete(&why));
+        return Json(crate::address_history::unsupported(&why));
     }
     // A txhash lookup needs no coverage: a transaction the store has not traced is traced now, by
     // the cursor, once the request is one `respond` would answer.
@@ -6460,8 +6460,8 @@ mod tests {
         );
     }
 
-    /// rotki asks from block 0, or names no start: every account action must answer in the wording
-    /// rotki reads to ask again from the configured start.
+    /// rotki asks from block 0, or names no start: every account action must answer unsupported, in
+    /// the wording rotki reads to ask again from the configured start.
     #[tokio::test]
     async fn a_range_before_the_configured_history_names_where_it_starts() {
         let dir = tempfile::tempdir().unwrap();
@@ -6502,11 +6502,10 @@ mod tests {
                     None,
                 )
                 .await;
+                let result = v["result"].as_str().unwrap_or_default();
                 assert!(
-                    v["result"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("history ends at block 25800000"),
+                    result.starts_with("NUTHATCH_UNSUPPORTED:")
+                        && result.contains("history ends at block 25800000"),
                     "{action} {range}: {v}"
                 );
             }
@@ -6521,6 +6520,11 @@ mod tests {
                 )
                 .await;
                 let result = v["result"].as_str().unwrap_or_default().to_string();
+                // Never coverable here, so not to be asked again (#2823).
+                assert!(
+                    result.starts_with("NUTHATCH_UNSUPPORTED:"),
+                    "{action}{start}: {v}"
+                );
                 // rotki's pattern: `history starts at block (\d+)`.
                 let n = result.split("history starts at block ").nth(1).map(|r| {
                     r.chars()
