@@ -3794,8 +3794,8 @@ fn sweep_refusal(
     })
 }
 
-/// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else searched
-/// on the nest's own RPC, exact or refused.
+/// `block/getblocknobytime`: from verified headers where they bracket the timestamp, else, on a
+/// loopback bind, searched on the nest's own RPC, exact or refused.
 async fn block_by_time(
     s: &Arc<ModeState>,
     q: &HashMap<String, String>,
@@ -3812,6 +3812,11 @@ async fn block_by_time(
         .get("timestamp")
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
+    if !s.loopback {
+        return crate::address_history::unsupported(&format!(
+            "no verified headers bracket timestamp {t}, and off a loopback bind the RPC is not searched"
+        ));
+    }
     let after = q.get("closest").map(String::as_str) == Some("after");
     // A search gets half the deadline; when the last one needed more, the RPC is too busy to finish
     // this one in time either, and it is refused at once rather than held.
@@ -7427,6 +7432,32 @@ mod tests {
             );
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was asked");
+    }
+
+    /// Off a loopback bind a timestamp is answered from verified headers only; the RPC is not
+    /// searched for an anonymous caller (#2733).
+    #[tokio::test]
+    async fn off_loopback_a_timestamp_is_not_searched_on_the_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), false).with_forward(forward),
+        );
+        let (_, v) = call(
+            router(s),
+            "GET",
+            "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before",
+            None,
+        )
+        .await;
+        let why = v["result"].as_str().unwrap();
+        assert!(
+            why.starts_with("NUTHATCH_UNSUPPORTED:") && why.contains("loopback"),
+            "{v}"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
     }
 
     #[tokio::test]
