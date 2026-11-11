@@ -5058,6 +5058,17 @@ pub async fn start_nest(
     };
     let mut discoverer = Discoverer::new(Counted::new(main), Counted::new(trace));
     discoverer.residual = crate::address_residual::residual_chain(chain_id);
+    if discoverer.residual && crate::address_residual::traces_code(chain_id) {
+        discoverer.trace_code = true;
+        // Alchemy's stated limit is a lie past ~15 s (see `Window`), so start below that.
+        discoverer.trace_window = crate::address_discovery::Window::new(10_000);
+        let cleared = history.clear_unprovable()?;
+        if cleared > 0 {
+            tracing::info!(
+                "address history: {cleared} accounts with code are traced now, no longer refused"
+            );
+        }
+    }
     discoverer.mint_logs = crate::address_residual::mint_logs(chain_id);
     let discovery = Arc::new(discoverer);
     // Forwarded calls wait on the same chain check the cursor does.

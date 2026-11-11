@@ -205,6 +205,9 @@ pub struct Window {
     /// The largest limit the provider has stated. Alchemy states 5,000 and then, for a while, 100
     /// on Optimism, so the ceiling is the largest stated, not the latest.
     stated: AtomicU64,
+    /// The widest span answered. A limit stated below it is contradicted: Alchemy's Gnosis traces
+    /// say "limited to 100 blocks" when a span runs past about 15 s, having served 20,000.
+    served: AtomicU64,
     start: u64,
     streak: AtomicU64,
     /// Whether the current size has been served once. Spans go out concurrently only then, so an
@@ -232,6 +235,7 @@ impl Window {
             size: AtomicU64::new(start.max(1)),
             ceiling: AtomicU64::new(start.max(1)),
             stated: AtomicU64::new(0),
+            served: AtomicU64::new(0),
             start: start.max(1),
             streak: AtomicU64::new(0),
             proven: AtomicBool::new(false),
@@ -251,7 +255,8 @@ impl Window {
     /// on the window have grown it to meanwhile.
     fn refused(&self, refused: u64, error: &str) -> u64 {
         self.streak.store(0, Ordering::Relaxed);
-        let next = match stated_limit(error).filter(|n| *n >= 1) {
+        let served = self.served.load(Ordering::Relaxed);
+        let next = match stated_limit(error).filter(|n| *n >= 1 && *n >= served) {
             Some(n) => {
                 let most = self.stated.fetch_max(n, Ordering::Relaxed).max(n);
                 self.ceiling.store(most.min(self.start), Ordering::Relaxed);
@@ -274,6 +279,7 @@ impl Window {
     /// it or counts towards growing it: a smaller one still in flight from before a regrowth says
     /// nothing about the new size.
     fn succeeded(&self, served: u64) {
+        self.served.fetch_max(served, Ordering::Relaxed);
         if served < self.get() {
             return;
         }
@@ -364,6 +370,14 @@ pub(crate) fn range_shaped(error: &str) -> bool {
 
 /// The block-span limit an error message states, in the forms providers use:
 /// `limited to 100 blocks`, `"maxAllowedRange":16384`, `max range of 2000`.
+/// Whether an endpoint answered that it has no such method, as opposed to failing a call of it.
+fn method_not_served(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    s.contains("-32601")
+        || s.contains("method not found")
+        || (s.contains("method") && (s.contains("does not exist") || s.contains("not supported")))
+}
+
 pub(crate) fn stated_limit(error: &str) -> Option<u64> {
     let lower = error.to_ascii_lowercase();
     for marker in [
@@ -882,6 +896,8 @@ pub struct Discoverer<M, T> {
     pub log_window: Window,
     /// Find normal transactions by the balance residual instead of `trace_filter`.
     pub residual: bool,
+    /// Where the residual cannot prove an account with code, find its transactions by `trace_filter`.
+    pub trace_code: bool,
     /// Logs that mint native value outside any call frame, read as credits by the residual.
     pub mint_logs: &'static [crate::address_residual::MintLog],
     /// Transfer logs naming an address that filed no row: not the standard event, or undecodable data.
@@ -896,6 +912,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             trace_window: Window::new(100_000),
             log_window: Window::new(100_000),
             residual: false,
+            trace_code: false,
             mint_logs: &[],
             skipped_logs: Arc::default(),
         }
@@ -919,7 +936,18 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 if !actions.contains(&Action::TxList) {
                     Ok((Vec::new(), Vec::new()))
                 } else if self.residual {
-                    self.residual_transactions(&a, from, to).await
+                    match self.residual_transactions(&a, from, to).await {
+                        Err(e)
+                            if self.trace_code && e.is::<crate::address_residual::Unprovable>() =>
+                        {
+                            match self.normal_transactions(&a, from, to).await {
+                                // A trace endpoint without the method leaves the account as before.
+                                Err(t) if method_not_served(&t) => Err(e),
+                                traced => traced,
+                            }
+                        }
+                        proved => proved,
+                    }
                 } else {
                     self.normal_transactions(&a, from, to).await
                 }
@@ -2895,6 +2923,15 @@ mod tests {
             w.succeeded(w.get());
         }
         assert_eq!(w.get(), 100, "capped at the stated limit");
+
+        // A limit stated below a span already served is not believed.
+        let w = Window::new(100_000);
+        w.succeeded(20_000);
+        assert_eq!(w.refused(50_000, "currently limited to 100 blocks"), 25_000);
+        for _ in 0..8 * REGROW_AFTER {
+            w.succeeded(w.get());
+        }
+        assert_eq!(w.get(), 100_000, "the contradicted limit caps nothing");
     }
 
     /// A span that timed out is asked again in halves, though the client classifies the timeout as
@@ -4115,6 +4152,58 @@ mod tests {
         let d = Discoverer::new(main, blind);
         let err = d.discover_now(&h, A, 100, 199).await.unwrap_err();
         assert!(format!("{err:#}").contains("by its nonce"), "{err:#}");
+    }
+
+    /// On a residual chain that traces code, a contract's transactions come from `trace_filter`
+    /// instead of being refused; without it, or from a trace endpoint that lacks the method, they
+    /// are refused as before.
+    #[tokio::test]
+    async fn a_contract_on_a_residual_chain_is_traced() {
+        use crate::address_residual::Unprovable;
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let residual = |trace: Script, trace_code: bool| {
+            let (main, _) = chain(false);
+            let coded = script(move |m, p| match m {
+                "eth_getCode" => Ok(json!("0x6080")),
+                "eth_getBalance" => Ok(json!("0x0")),
+                _ => (main.answer)(m, p),
+            });
+            let mut d = Discoverer::new(coded, trace);
+            d.residual = true;
+            d.trace_code = trace_code;
+            d
+        };
+        let found = residual(chain(false).1, true)
+            .discover_now(&h, A, 100, 199)
+            .await
+            .unwrap();
+        assert_eq!(found.txlist.len(), 1);
+        assert_eq!(found.txlist[0].record["hash"], "0xaa");
+
+        let err = residual(chain(false).1, false)
+            .discover_now(&h, A, 100, 199)
+            .await
+            .unwrap_err();
+        assert!(err.is::<Unprovable>(), "{err:#}");
+
+        let unserved =
+            script(|_, _| bail!("-32601: the method trace_filter does not exist/is not available"));
+        let err = residual(unserved, true)
+            .discover_now(&h, A, 100, 199)
+            .await
+            .unwrap_err();
+        assert!(err.is::<Unprovable>(), "{err:#}");
+
+        let failing = script(|_, _| bail!("transport error: timed out"));
+        let err = residual(failing, true)
+            .discover_now(&h, A, 100, 199)
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is::<Unprovable>(),
+            "a failed trace is retried, not refused: {err:#}"
+        );
     }
 
     /// Code at the window's end means a contract or a delegated account, whose nonce does not count

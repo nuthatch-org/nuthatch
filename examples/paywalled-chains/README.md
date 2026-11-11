@@ -88,6 +88,8 @@ The full directory, with the two variables pointed at keyless endpoints, started
 
 - An account with contract code, or EIP-7702 delegated code, gets `NUTHATCH_UNSUPPORTED` for
   `txlist` and `txlistinternal` from the block it had code; its token transfers are still served.
+  On Gnosis it is traced with `trace_filter` instead when the trace endpoint serves it: Alchemy read
+  20,000 blocks a call, the keyless endpoints 100, at 2 to 4 s each.
 - An incoming transaction that moves no value is not listed, though Etherscan lists it.
 - `getblocknobytime` is refused on BNB Chain, whose blocks can share a second.
 - Your RPC provider sees which addresses you watch. The history itself stays on your machine.

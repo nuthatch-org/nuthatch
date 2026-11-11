@@ -229,7 +229,9 @@ traced, with `debug_traceBlockByNumber`, which the trace RPC must serve. Each tr
 must equal the balance's rise to the wei, or the window is not recorded. This proves the history of an
 externally owned account: for a contract, or an account with EIP-7702 delegated code, `txlist` and
 `txlistinternal` answer `NUTHATCH_UNSUPPORTED` from the first block it had code, so the caller asks
-another source; its token transfers are still served. An incoming transaction that moves no value, a
+another source; its token transfers are still served. On Gnosis such an account is found by
+`trace_filter` instead, as on Ethereum, when the trace RPC serves it, and is refused only when it does
+not. An incoming transaction that moves no value, a
 zero-value call or a failed transfer to the account, is not listed, though Etherscan lists it; token
 transfers are found from logs as everywhere.
 
