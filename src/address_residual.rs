@@ -45,6 +45,12 @@ pub fn residual_chain(chain_id: u64) -> bool {
     matches!(chain_id, 10 | 56 | 100 | 137 | 8453 | 42161)
 }
 
+/// Residual chains whose coded accounts are found by `trace_filter` instead of refused. Gnosis's
+/// providers serve it (Alchemy 20,000 blocks in 11.7 s, 2026-11-11).
+pub fn traces_code(chain_id: u64) -> bool {
+    chain_id == 100
+}
+
 /// A log that records native value minted to an account outside any call frame, so no trace shows
 /// it: `(emitter, topic0)`, with the recipient and the value as the data's first two words.
 pub type MintLog = (&'static str, &'static str);

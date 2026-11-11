@@ -1400,6 +1400,20 @@ impl AddressHistory {
         Ok(())
     }
 
+    /// Forget every unprovable marker, on a chain whose coded accounts are now traced; their history
+    /// from each marker on is owed again. Returns how many there were.
+    pub fn clear_unprovable(&self) -> Result<u64> {
+        let wtx = self.store.database().begin_write()?;
+        let cleared = {
+            let mut t = wtx.open_table(UNPROVABLE)?;
+            let n = redb::ReadableTableMetadata::len(&t)?;
+            t.retain(|_, _| false)?;
+            n
+        };
+        wtx.commit()?;
+        Ok(cleared)
+    }
+
     pub fn unprovable_from(&self, address: &str) -> Result<Option<u64>> {
         let a = parse_address(address)?;
         let rtx = self.store.database().begin_read()?;
@@ -5141,6 +5155,16 @@ mod tests {
             3,
             "txlist still lists all three"
         );
+    }
+
+    /// Cleared markers leave nothing refused, and the history from each is owed again.
+    #[test]
+    fn clearing_unprovable_markers_forgets_them_all() {
+        let (_d, h) = history();
+        h.mark_unprovable(ALICE, 80).unwrap();
+        assert_eq!(h.clear_unprovable().unwrap(), 1);
+        assert_eq!(h.unprovable_from(ALICE).unwrap(), None);
+        assert_eq!(h.clear_unprovable().unwrap(), 0);
     }
 
     /// An address marked unprovable from a block answers unsupported for any page reaching it, is
