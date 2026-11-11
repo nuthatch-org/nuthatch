@@ -231,7 +231,7 @@ externally owned account: for a contract, or an account with EIP-7702 delegated 
 `txlistinternal` answer `NUTHATCH_UNSUPPORTED` from the first block it had code, so the caller asks
 another source; its token transfers are still served. On Gnosis such an account is found by
 `trace_filter` instead, as on Ethereum, when the trace RPC serves it, and is refused only when it does
-not. An incoming transaction that moves no value, a
+not; that history rests on the trace RPC's answer, with no balance to check it against. An incoming transaction that moves no value, a
 zero-value call or a failed transfer to the account, is not listed, though Etherscan lists it; token
 transfers are found from logs as everywhere.
 

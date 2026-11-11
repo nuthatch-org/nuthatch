@@ -368,16 +368,24 @@ pub(crate) fn range_shaped(error: &str) -> bool {
     .any(|m| lower.contains(m))
 }
 
-/// The block-span limit an error message states, in the forms providers use:
-/// `limited to 100 blocks`, `"maxAllowedRange":16384`, `max range of 2000`.
 /// Whether an endpoint answered that it has no such method, as opposed to failing a call of it.
 fn method_not_served(err: &anyhow::Error) -> bool {
     let s = format!("{err:#}").to_ascii_lowercase();
     s.contains("-32601")
         || s.contains("method not found")
-        || (s.contains("method") && (s.contains("does not exist") || s.contains("not supported")))
+        || ((s.contains("method") || s.contains("trace_filter"))
+            && [
+                "does not exist",
+                "not supported",
+                "unsupported",
+                "not available",
+            ]
+            .iter()
+            .any(|m| s.contains(m)))
 }
 
+/// The block-span limit an error message states, in the forms providers use:
+/// `limited to 100 blocks`, `"maxAllowedRange":16384`, `max range of 2000`.
 pub(crate) fn stated_limit(error: &str) -> Option<u64> {
     let lower = error.to_ascii_lowercase();
     for marker in [
@@ -4187,13 +4195,18 @@ mod tests {
             .unwrap_err();
         assert!(err.is::<Unprovable>(), "{err:#}");
 
-        let unserved =
-            script(|_, _| bail!("-32601: the method trace_filter does not exist/is not available"));
-        let err = residual(unserved, true)
-            .discover_now(&h, A, 100, 199)
-            .await
-            .unwrap_err();
-        assert!(err.is::<Unprovable>(), "{err:#}");
+        for wording in [
+            "-32601: the method trace_filter does not exist/is not available",
+            "unsupported method: trace_filter",
+            "trace_filter not supported",
+        ] {
+            let unserved = script(move |_, _| bail!("{wording}"));
+            let err = residual(unserved, true)
+                .discover_now(&h, A, 100, 199)
+                .await
+                .unwrap_err();
+            assert!(err.is::<Unprovable>(), "{wording}: {err:#}");
+        }
 
         let failing = script(|_, _| bail!("transport error: timed out"));
         let err = residual(failing, true)
