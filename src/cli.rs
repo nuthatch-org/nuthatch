@@ -114,7 +114,8 @@ pub enum Command {
     /// Fetch + cache a token's immutable metadata - `decimals`/`symbol`/`name` (RFC-0023 tier 2). Called
     /// once (they never change) and remembered in `metadata.json`; the constants tier 1 can't derive.
     Metadata(MetadataArgs),
-    /// Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1).
+    /// Seal a local file, or a feed pulled once, into the explicitly non-chain offchain namespace
+    /// (RFC-0045).
     Offchain(OffchainArgs),
     /// Mirror sealed segments to an object-store prefix (RFC-0052).
     Publish(PublishArgs),
