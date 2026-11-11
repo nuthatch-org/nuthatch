@@ -4627,7 +4627,7 @@ dependencies = [
 
 [[package]]
 name = "nuthatch"
-version = "5.18.0"
+version = "5.19.0"
 dependencies = [
  "alloy-consensus",
  "alloy-dyn-abi",
@@ -4693,6 +4693,8 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow-array",
+ "arrow-data",
+ "arrow-ipc",
  "arrow-schema 59.3.0",
  "async-trait",
  "bytes",
