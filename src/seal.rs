@@ -3295,6 +3295,28 @@ mod tests {
         assert!(!r.releasable(&f));
     }
 
+    /// A follower has applied the stopping commit only on that commit's epoch: a later generation
+    /// under another writer's epoch, or an earlier one under the same epoch, still holds the file.
+    #[test]
+    fn past_its_grace_a_segment_waits_for_a_follower_on_the_same_epoch() {
+        let dataset = PathBuf::from("/nests/a");
+        let mut r = Retention::default();
+        r.windows
+            .insert(dataset.clone(), (Duration::ZERO, Duration::from_secs(3600)));
+        let f = Retained {
+            key: PathBuf::from("/segments/x.parquet"),
+            hash: "x".into(),
+            dataset: dataset.clone(),
+            at: Instant::now(),
+            stopped: Some((2, 5)),
+        };
+        for (applied, released) in [((1, 9), false), ((2, 4), false), ((2, 5), true)] {
+            r.followers
+                .insert(dataset.clone(), HashMap::from([(1, Some(applied))]));
+            assert_eq!(r.releasable(&f), released, "follower at {applied:?}");
+        }
+    }
+
     /// #2363: a quarantined segment changes what a nest holds, never what it is. Every identity is a
     /// function of `collect_files`, so the inputs it sees must be the same either side of the move.
     #[test]
