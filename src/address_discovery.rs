@@ -373,15 +373,13 @@ fn method_not_served(err: &anyhow::Error) -> bool {
     let s = format!("{err:#}").to_ascii_lowercase();
     s.contains("-32601")
         || s.contains("method not found")
-        || ((s.contains("method") || s.contains("trace_filter"))
-            && [
-                "does not exist",
-                "not supported",
-                "unsupported",
-                "not available",
-            ]
-            .iter()
-            .any(|m| s.contains(m)))
+        || s.contains("trace_filter not supported")
+        || s.contains("trace_filter is not supported")
+        // Every error here names trace_filter in its context, so the method must be the subject.
+        || (s.contains("method")
+            && ["does not exist", "not supported", "unsupported"]
+                .iter()
+                .any(|m| s.contains(m)))
 }
 
 /// The block-span limit an error message states, in the forms providers use:
@@ -4207,6 +4205,14 @@ mod tests {
                 .unwrap_err();
             assert!(err.is::<Unprovable>(), "{wording}: {err:#}");
         }
+
+        // A pruned node's answer names the method only in the call's context.
+        let pruned = script(|_, _| bail!("-32014: requested data not available"));
+        let err = residual(pruned, true)
+            .discover_now(&h, A, 100, 199)
+            .await
+            .unwrap_err();
+        assert!(!err.is::<Unprovable>(), "{err:#}");
 
         let failing = script(|_, _| bail!("transport error: timed out"));
         let err = residual(failing, true)
