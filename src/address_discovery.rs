@@ -317,6 +317,11 @@ pub(crate) fn span_answer(err: &anyhow::Error) -> SpanAnswer {
         }) => SpanAnswer::Limited(None),
         Some(FailureClass::Narrowable { .. }) => SpanAnswer::Narrow,
         Some(FailureClass::FilterRefused) => SpanAnswer::Filter,
+        // A span the provider ran out of time on was too wide, as it was read before #2730. Alchemy's
+        // Gnosis traces and GraphOps's dense log windows both end this way (2026-11-11).
+        Some(FailureClass::Transient) if format!("{err:#}").contains("timed out") => {
+            SpanAnswer::Narrow
+        }
         Some(_) => SpanAnswer::Fatal,
         None => {
             let why = format!("{err:#}");
@@ -2890,6 +2895,56 @@ mod tests {
             w.succeeded(w.get());
         }
         assert_eq!(w.get(), 100, "capped at the stated limit");
+    }
+
+    /// A span that timed out is asked again in halves, though the client classifies the timeout as
+    /// transient; one block that times out fails, and so does a transient failure of another kind.
+    #[tokio::test]
+    async fn a_span_that_times_out_is_narrowed() {
+        let slow = |most: u64| {
+            script(move |_, p| {
+                let s = hex_u64(&p[0]["fromBlock"])?;
+                let e = hex_u64(&p[0]["toBlock"])?;
+                if e - s + 1 > most {
+                    return Err(nuthatch_core::rpc::ClassifiedError {
+                        class: nuthatch_core::rpc::FailureClass::Transient,
+                        detail: "transport error: timed out".into(),
+                    }
+                    .into());
+                }
+                Ok(json!([{ "b": s }]))
+            })
+        };
+        let blocks = |s: u64, e: u64| json!([{ "fromBlock": format!("0x{s:x}"), "toBlock": format!("0x{e:x}") }]);
+        let w = Window::new(8);
+        let got = ranged(&slow(2), &w, 0, 7, "trace_filter", blocks)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(w.get(), 2);
+        let got = ranged(&slow(2), &Window::new(8), 0, 7, "eth_getLogs", blocks)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 4);
+        let down = script(|_, _| {
+            Err(nuthatch_core::rpc::ClassifiedError {
+                class: nuthatch_core::rpc::FailureClass::Transient,
+                detail: "transport error: connection refused".into(),
+            }
+            .into())
+        });
+        ranged(&down, &Window::new(8), 0, 7, "eth_getLogs", blocks)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            down.asked.lock().unwrap().len(),
+            1,
+            "a dead endpoint is not halved towards"
+        );
+        let err = ranged(&slow(0), &Window::new(8), 0, 7, "trace_filter", blocks)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("at block 0"), "{err:#}");
     }
 
     /// A provider that silently truncates at 10,000 results: a span answering that many is split
