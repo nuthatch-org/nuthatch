@@ -340,7 +340,7 @@ fn died(e: burrmill::BurrmillError) -> Died {
         NotAllowed(_) | Parse(_) | Plan(_) | NoSegments(_) => Died::Binding(engine_err(e)),
         // DataFusion's disk manager stops the statement itself, well inside the watchdog's poll,
         // and names a setting of its own. `/sql` answers this as it does the watchdog's stop.
-        Substrate(m) if m.contains("disk space during the spilling process has exceeded") => {
+        LimitExceeded(m) if m.contains("disk space during the spilling process has exceeded") => {
             Died::Executing(
                 crate::analytics::QuerySpillExceeded {
                     cap_bytes: crate::analytics_budget::spill_cap_bytes(
@@ -1077,7 +1077,7 @@ mod tests {
     fn a_running_statement_shows_in_its_pool_and_its_peak_outlives_the_session() {
         use crate::engine::Session;
         let dir = tempfile::tempdir().unwrap();
-        let s = sorting_session(dir.path(), &[("small", 2_000), ("large", 40_000)]);
+        let s = sorting_session(dir.path(), &[("small", 10_000), ("large", 40_000)]);
 
         let mut during = None;
         s.for_each_row("SELECT n, block_number FROM small ORDER BY n", &mut |_| {
