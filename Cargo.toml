@@ -142,7 +142,7 @@ bytes = "1"
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 # The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
-burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "78ee4aeffcd91a96a9d4c36b066bf414256325f9", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "15d299613c98d6469285cd25fbdf6c80fb1d7823", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via

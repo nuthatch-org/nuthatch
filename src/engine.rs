@@ -151,11 +151,10 @@ pub(crate) trait Session: Send {
     /// Every scalar, aggregate and window function a statement can call (RFC-0073 FR8).
     fn function_names(&self) -> Vec<String>;
 
-    /// The security walk: what the statement reaches, from the engine's own parse. `None` when the
-    /// parser could not say (it fails open; the denylist is still in front), `Some(Err)` when the
-    /// statement is refused with the reason, `Some(Ok((tables, surveys)))` with the base tables and
-    /// CTE names lowercased and whether it asks about the catalogue.
-    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>>;
+    /// The security walk: what the statement reaches, from the engine's own parse. `Err` when the
+    /// statement is refused or will not parse, with the reason; otherwise the base tables and CTE
+    /// names lowercased and whether it asks about the catalogue.
+    fn reach(&self, sql: &str) -> Result<(BTreeSet<String>, bool)>;
 
     /// `SELECT * FROM table ORDER BY ALL` written to `path` as one Parquet file (a fold checkpoint).
     fn write_parquet(&self, table: &str, path: &Path) -> Result<()>;
