@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
                     ("--trace-rpc", !args.trace_rpc.is_empty()),
                     ("--public-host", !args.public_host.is_empty()),
                     ("--local-host", !args.local_host.is_empty()),
+                    ("--write-token-env", args.write_token_env.is_some()),
                 ] {
                     if set {
                         anyhow::bail!("{flag} serves an address-history nest, which runs alone, not in a runtime");
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
-                indexer::dev(args).await
+                indexer::dev(*args).await
             }
         }
         cli::Command::Serve(args) if args.runtime.is_some() || args.follow.is_some() => {
