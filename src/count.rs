@@ -362,6 +362,13 @@ fn typed_ahead<T>(_: &T) -> bool {
     false
 }
 
+/// The `/sql` queries this process has accepted, kept here so deleting this file deletes it.
+static QUERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn query() {
+    QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Starts the weekly `alive` for a command that serves a nest, and does nothing for any other.
 pub fn alive(command: &crate::cli::Command) {
     use crate::cli::Command;
@@ -374,7 +381,7 @@ pub fn alive(command: &crate::cli::Command) {
         loop {
             tokio::time::sleep(ALIVE_CHECK).await;
             let (ci, opted_out) = silenced();
-            let queries = crate::metrics::METRICS.sql_queries();
+            let queries = QUERIES.load(std::sync::atomic::Ordering::Relaxed);
             if beat(ENDPOINT, &path, queries - sent, ci, opted_out, today_days()).await {
                 sent = queries;
             }

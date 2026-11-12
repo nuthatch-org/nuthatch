@@ -1131,10 +1131,8 @@ impl Metrics {
             s.nest.http_requests.fetch_add(1, Relaxed);
         });
     }
-    pub fn sql_queries(&self) -> u64 {
-        self.sql_queries.load(Relaxed)
-    }
     pub fn inc_sql(&self) {
+        crate::count::query(); // RFC-0054 hook
         self.sql_queries.fetch_add(1, Relaxed);
         in_serving_scope(|s| {
             s.nest.sql_queries.fetch_add(1, Relaxed);
