@@ -148,7 +148,7 @@ pub struct Key([u8; 32]);
 /// Returned as a digest: an entry kept the list itself, a path per segment, which on a nest of
 /// thousands of segments outweighed the rows it was remembering (#2072).
 pub fn segment_stamps(dir: &Path, tables: Option<&std::collections::BTreeSet<String>>) -> [u8; 32] {
-    let Ok(manifest) = crate::seal::load_manifest(dir) else {
+    let Ok(manifest) = crate::seal::shared_manifest(dir) else {
         return Sha256::digest([]).into();
     };
     let mut out = Vec::new();
@@ -195,7 +195,7 @@ pub fn segment_stamps(dir: &Path, tables: Option<&std::collections::BTreeSet<Str
 /// straight to segments with nothing hot (`--seal-direct`), the watermark admitting a written segment
 /// is exactly a change to this set.
 pub fn sealed_segments(dir: &Path, sealed_through: u64) -> Option<String> {
-    let manifest = crate::seal::load_manifest(dir).ok()?;
+    let manifest = crate::seal::shared_manifest(dir).ok()?;
     let mut h = Sha256::new();
     for (table, segs) in &manifest.tables {
         for seg in segs.iter().filter(|s| s.to_block <= sealed_through) {
@@ -511,6 +511,22 @@ mod tests {
         let before = at(20);
         write(json!([seg("a", 1, 10), seg("c", 11, 20)]));
         assert_ne!(before, at(20), "a segment replaced over the same range");
+    }
+
+    /// A memo hit reads the catalogue three times and a miss four; one parse serves them all.
+    #[test]
+    fn one_catalogue_is_parsed_once_across_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = r#"{"table":"usdc__transfer","value":"5","block_number":1,"tx_hash":"0xcc","log_index":0}"#;
+        crate::seal::seal_range(tmp.path(), &[row.to_string()], 1, 1).unwrap();
+        for _ in 0..3 {
+            sealed_segments(tmp.path(), 1).unwrap();
+            sealed_segments(tmp.path(), 1).unwrap();
+            segment_stamps(tmp.path(), None);
+            crate::analytics::query(tmp.path(), "SELECT count(*) AS n FROM usdc__transfer")
+                .unwrap();
+        }
+        assert_eq!(crate::seal::catalogue_parses_of(tmp.path()), 1);
     }
 
     fn inputs<'a>(

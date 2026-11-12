@@ -1077,17 +1077,17 @@ pub fn unfollow(dir: &Path) {
 
 /// The catalogue's bytes: the serving copy's where it carries one, else the file, which is never
 /// read for a directory a follower holds.
-fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
+fn read_catalogue(dir: &Path) -> std::io::Result<Arc<[u8]>> {
     if let Some(s) = current_serving().filter(|s| s.dir == dir) {
         return match (s.store.served_catalogue(), &s.catalogue) {
-            (Some(Some(raw)), _) => Ok(raw.as_bytes().to_vec()),
+            (Some(Some(raw)), _) => Ok(Arc::from(raw)),
             (Some(None), _) => Err(std::io::ErrorKind::NotFound.into()),
             (None, Some(pinned)) => match &pinned.raw {
-                Some(raw) => Ok(raw.to_vec()),
+                Some(raw) => Ok(raw.clone()),
                 None => Err(std::io::ErrorKind::NotFound.into()),
             },
             // The writer's own store outside a snapshot: its catalogue is the file.
-            (None, None) => std::fs::read(manifest_path(dir)),
+            (None, None) => std::fs::read(manifest_path(dir)).map(Arc::from),
         };
     }
     let held = followed()
@@ -1100,7 +1100,114 @@ fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
             dir.display()
         )));
     }
-    std::fs::read(manifest_path(dir))
+    std::fs::read(manifest_path(dir)).map(Arc::from)
+}
+
+/// The catalogue last parsed for one dataset, and the exact bytes it was parsed from.
+struct Parsed {
+    raw: Arc<[u8]>,
+    manifest: Arc<Manifest>,
+    hash: OnceLock<String>,
+}
+
+/// Datasets whose last parsed catalogue is kept. Each entry holds its catalogue twice, as bytes and
+/// parsed, so this bounds the memory to that many catalogues' worth.
+const PARSED_CATALOGUES: usize = 16;
+
+/// Each with the tick it was last used at.
+type ParsedCatalogues = Mutex<HashMap<PathBuf, (Arc<Parsed>, u64)>>;
+
+fn parsed_catalogues() -> &'static ParsedCatalogues {
+    static PARSED: OnceLock<ParsedCatalogues> = OnceLock::new();
+    PARSED.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn catalogue_parses() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    PARSES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn catalogue_parses_of(dir: &Path) -> usize {
+    catalogue_parses()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The catalogue as [`read_catalogue`] sees it, parsed once per distinct content: reading it is
+/// still needed to know it is unchanged, but a catalogue of tens of thousands of segments costs
+/// several times more to parse than to read and compare. `None` when nothing has sealed.
+fn parsed_catalogue(dir: &Path) -> Result<Option<Arc<Parsed>>> {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let raw = match read_catalogue(dir) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("failed to read manifest"),
+    };
+    let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut cache = parsed_catalogues()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((hit, used)) = cache.get_mut(dir) {
+            if hit.raw == raw {
+                *used = tick;
+                return Ok(Some(hit.clone()));
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        *catalogue_parses()
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_default() += 1;
+    }
+    let manifest = checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?)?;
+    let parsed = Arc::new(Parsed {
+        raw,
+        manifest: Arc::new(manifest),
+        hash: OnceLock::new(),
+    });
+    let mut cache = parsed_catalogues()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.insert(dir.to_path_buf(), (parsed.clone(), tick));
+    while cache.len() > PARSED_CATALOGUES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(d, _)| d.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    Ok(Some(parsed))
+}
+
+/// [`load_manifest`], shared rather than owned, and parsed only when its bytes have changed.
+pub fn shared_manifest(dir: &Path) -> Result<Arc<Manifest>> {
+    Ok(parsed_catalogue(dir)?.map_or_else(Default::default, |p| p.manifest.clone()))
+}
+
+/// [`load_manifest_with_hash`], as [`shared_manifest`].
+pub fn shared_manifest_with_hash(dir: &Path) -> Result<(Arc<Manifest>, Option<String>)> {
+    Ok(match parsed_catalogue(dir)? {
+        Some(p) => {
+            let hash = p
+                .hash
+                .get_or_init(|| hex::encode(Sha256::digest(&p.raw)))
+                .clone();
+            (p.manifest.clone(), Some(hash))
+        }
+        None => (Default::default(), None),
+    })
 }
 
 /// Load the segment catalogue (empty if none yet).
@@ -3216,6 +3323,50 @@ mod tests {
             "the deadline must land before the corrupt (last) segment is ever read, or this proves \
              nothing about stopping early"
         );
+    }
+
+    #[test]
+    fn a_catalogue_is_parsed_once_until_its_bytes_change() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        for _ in 0..3 {
+            assert_eq!(shared_manifest(dir.path()).unwrap().tables.len(), 1);
+            shared_manifest_with_hash(dir.path()).unwrap();
+        }
+        assert_eq!(catalogue_parses_of(dir.path()), 1);
+
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = |dir: &Path| shared_manifest(dir).unwrap().tables["usdc__transfer"].len();
+        assert_eq!(
+            segs(dir.path()),
+            2,
+            "a new seal was served from the old parse"
+        );
+        assert_eq!(catalogue_parses_of(dir.path()), 2);
+
+        // The same length and modification time, different bytes: only the content can tell.
+        let path = manifest_path(dir.path());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut m = load_manifest(dir.path()).unwrap();
+        m.tables.get_mut("usdc__transfer").unwrap()[1].to_block = 102;
+        let before = std::fs::metadata(&path).unwrap().len();
+        save_manifest(dir.path(), &m).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        let (shared, hash) = shared_manifest_with_hash(dir.path()).unwrap();
+        let (fresh, fresh_hash) = load_manifest_with_hash(dir.path()).unwrap();
+        assert_eq!(shared.tables["usdc__transfer"][1].to_block, 102);
+        assert_eq!(
+            serde_json::to_value(&*shared).unwrap(),
+            serde_json::to_value(&fresh).unwrap()
+        );
+        assert_eq!(hash, fresh_hash);
     }
 
     #[test]

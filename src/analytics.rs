@@ -2857,7 +2857,7 @@ fn define_views_bound(
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
-    let (manifest, catalogue_hash) = crate::seal::load_manifest_with_hash(dir)?;
+    let (manifest, catalogue_hash) = crate::seal::shared_manifest_with_hash(dir)?;
     let mut overtaken = false;
     let mut gone_on_follower: Option<PathBuf> = None;
     #[cfg(test)]
