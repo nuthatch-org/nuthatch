@@ -910,6 +910,7 @@ async fn put_follower_files(
                 // Folded after the catalogue was read; the seal wakes the next pass.
                 continue;
             }
+            refuse_unless_intact(dir, "provisional", s).await?;
             mirror.put_file(&key, &src).await?;
             put.push(provisional_key(&s.hash));
         }
@@ -957,9 +958,11 @@ async fn put_follower_files(
         }
         let key = prefix(&offchain_key(&s.file));
         if mirror.head(&key).await?.is_none() {
-            mirror
-                .put_file(&key, &crate::offchain::segment_path(dir, s))
-                .await?;
+            let (path, hash) = (crate::offchain::segment_path(dir, s), s.hash.clone());
+            let checked = path.clone();
+            tokio::task::spawn_blocking(move || seal::check_segment_bytes(&checked, &hash))
+                .await??;
+            mirror.put_file(&key, &path).await?;
             put.push(offchain_key(&s.file));
         }
         present.held.insert(id);
@@ -1067,6 +1070,13 @@ fn stopped_publisher(dir: &Path) -> (Option<u64>, u64) {
 }
 
 /// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
+/// Hash a segment before it leaves for the mirror, refusing (and quarantining) bytes that are not
+/// the address they would be stored under.
+async fn refuse_unless_intact(dir: &Path, table: &str, seg: &seal::Segment) -> Result<()> {
+    let (dir, table, seg) = (dir.to_path_buf(), table.to_string(), seg.clone());
+    tokio::task::spawn_blocking(move || seal::check_or_quarantine(&dir, &table, &seg)).await?
+}
+
 async fn put_seed(mirror: &dyn Mirror, dir: &Path, seed: &SeedEnvelope) -> Result<Vec<String>> {
     let prefix = |k: &str| format!("{}/{k}", seed.data_identity);
     let remote_bytes = mirror.get(&prefix(SEED_FILE)).await?;
@@ -1086,6 +1096,7 @@ async fn put_seed(mirror: &dyn Mirror, dir: &Path, seed: &SeedEnvelope) -> Resul
             return Ok(put);
         }
         let key = seed_tail_key(table);
+        refuse_unless_intact(dir, table, seg).await?;
         mirror.put_file(&prefix(&key), &src).await?;
         put.push(key);
     }
@@ -1239,6 +1250,7 @@ async fn sync_pass(
                             src.display()
                         ),
                     };
+                    refuse_unless_intact(dir, table, seg).await?;
                     mirror_ref.put_file(&key, &src).await?;
                     if let Some(m) = metrics {
                         m.publish_uploaded(len);
@@ -2528,6 +2540,45 @@ abi = "abis/usdc.json"
             parquet_rows(&nest.path().join(seal::SEGMENTS_DIR)),
             parquet_rows(&mirror.path().join(&report.dataset)),
             "mirrored parquet must carry the same rows as the sealed directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_that_rotted_before_its_first_publish_is_refused_not_mirrored() {
+        let nest = sealed_nest();
+        let manifest = seal::load_manifest(nest.path()).unwrap();
+        let (table, seg) = manifest
+            .tables
+            .iter()
+            .flat_map(|(t, s)| s.iter().map(move |s| (t, s)))
+            .find(|(_, s)| !s.provisional)
+            .expect("a final segment");
+        let path = seal::segment_path(nest.path(), &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mirror = tempfile::tempdir().unwrap();
+        let synced = sync(nest.path(), mirror.path().to_str().unwrap(), false).await;
+        assert!(synced.is_err(), "a corrupt segment was published");
+        fn held(dir: &Path, hash: &str) -> bool {
+            std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(hash) || held(&e.path(), hash))
+        }
+        assert!(
+            !held(mirror.path(), &seg.hash),
+            "the mirror holds the corrupt bytes"
+        );
+        assert!(
+            nest.path()
+                .join(seal::QUARANTINE_DIR)
+                .join(&seg.file)
+                .exists(),
+            "{table}'s corrupt segment was not quarantined"
         );
     }
 

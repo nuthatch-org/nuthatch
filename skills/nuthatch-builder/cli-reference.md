@@ -181,7 +181,7 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--dir <DIR>` - Nest directory to read `rpc_urls` from when no `--rpc` is given
 - `--address <ADDRESS>` - Probe `eth_getLogs` width filtered to this address, rather than unfiltered. Closer to what a real nest asks for, and some endpoints cap an unfiltered query harder than a filtered one
 - `--json` - Print one JSON object per endpoint on stdout (no prose). The live-endpoints gate keys on these fields, not on the wording of the human report (#716)
-- `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
+- `--catalogue` - Check the segment catalogue in `--dir`: every entry's file exists and hashes. It only reports and moves nothing; a running nest quarantines what its own integrity passes find. Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check only, so the live-endpoints gate is unchanged
 - `--publish <PUBLISH>` - Check the mirror of the nest in `--dir` at this target, as `publish verify` does without `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked
 - `--publish-etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise
 
