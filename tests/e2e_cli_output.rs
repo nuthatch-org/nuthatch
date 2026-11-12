@@ -61,3 +61,76 @@ fn watch_says_nothing_answered_and_fails_when_the_url_is_dead() {
     assert!(err.contains("cannot reach"), "{err}");
     assert!(err.contains("nuthatch dev"), "{err}");
 }
+
+/// A command that logs before it fails, with stdout piped, leaves no colour codes in the log. The
+/// helper's unit test cannot see whether the subscriber is wired to it.
+#[cfg(feature = "watch")]
+#[test]
+fn piped_text_logs_carry_no_ansi_escapes() {
+    let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["watch", "--url", "http://127.0.0.1:1", "--exit-after", "1"])
+        .env("RUST_LOG", "debug")
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run nuthatch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("DEBUG"),
+        "the run must have logged, or this proves nothing:\n{stdout}"
+    );
+    assert!(!stdout.contains('\u{1b}'), "colour codes in:\n{stdout:?}");
+}
+
+/// A failed `nuthatch sql` leads with its hint, in both backends. The unit tests cover the
+/// formatting; this covers that each call site uses it.
+#[test]
+fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
+    let nest = tempfile::tempdir().unwrap();
+    drop(nuthatch::store::Store::open(&nest.path().join("nuthatch.redb")).unwrap());
+    let (code, _, err) = run(&[
+        "sql",
+        "SELECT * FROM transfer",
+        "--dir",
+        nest.path().to_str().unwrap(),
+    ]);
+    assert_ne!(code, 0, "{err}");
+    let body = err.trim_start_matches("Error: ");
+    assert!(body.starts_with("no table `transfer`"), "{err}");
+    assert!(!err.contains("`schema` tool"), "{err}");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let reply = serde_json::json!({
+        "error": "no segments: Catalog Error: Table with name transfer does not exist!\n\nhint: no table `transfer`. Call the `schema` tool for the list of tables."
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        while let Ok((mut s, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = write!(
+                s,
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    let empty = tempfile::tempdir().unwrap();
+    let (code, _, err) = run(&[
+        "sql",
+        "SELECT * FROM transfer",
+        "--dir",
+        empty.path().to_str().unwrap(),
+        "--url",
+        &url,
+    ]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.trim_start_matches("Error: ")
+            .starts_with("no table `transfer`"),
+        "{err}"
+    );
+    assert!(!err.contains("`schema` tool"), "{err}");
+}
