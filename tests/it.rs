@@ -21,6 +21,8 @@ mod bind_drops_slow_headers;
 mod check_production_nid_script;
 #[path = "compact_rows_prototype.rs"]
 mod compact_rows_prototype;
+#[path = "compose_image_is_current.rs"]
+mod compose_image_is_current;
 #[path = "concurrent_sql_does_not_corrupt.rs"]
 mod concurrent_sql_does_not_corrupt;
 #[path = "control_api.rs"]
