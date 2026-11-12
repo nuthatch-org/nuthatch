@@ -247,7 +247,7 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         .collect();
     let (balance_routes, balance_tools) = if has_transfers(schema) {
         (
-            "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true`\n\
+            "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true` (false or null means net flow)\n\
              - `GET /balance/{address}`   one address's derived balance, on the same condition. That flag means indexed from the configured `start_block` with no `--backfill`: the deployment only if `start_block` is the deployment block, which `init` sets\n",
             ", balance, top_balances",
         )

@@ -213,6 +213,7 @@ fn a_message_that_is_not_a_request_gets_invalid_request_and_stdio_recovers() {
         "[]",
         r#"[{"jsonrpc":"2.0","id":9,"method":"ping"}]"#,
         r#"{"jsonrpc":"2.0","id":6}"#,
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
         r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
         r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
     ] {
@@ -227,13 +228,13 @@ fn a_message_that_is_not_a_request_gets_invalid_request_and_stdio_recovers() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(responses.len(), 6, "{stdout}");
-    for invalid in &responses[..5] {
+    assert_eq!(responses.len(), 7, "{stdout}");
+    for invalid in &responses[..6] {
         assert_eq!(invalid["id"], serde_json::Value::Null, "{stdout}");
         assert_eq!(invalid["error"]["code"], -32600, "{stdout}");
         assert_eq!(invalid["error"]["message"], "Invalid Request", "{stdout}");
     }
-    assert_eq!(responses[5]["id"], 3, "the loop carries on: {stdout}");
+    assert_eq!(responses[6]["id"], 3, "the loop carries on: {stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("nuthatch mcp: invalid JSON-RPC request"),

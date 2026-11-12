@@ -241,6 +241,11 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
         eprintln!("nuthatch mcp: invalid JSON-RPC request: no method");
         return Some(err(Value::Null, -32600, "Invalid Request"));
     }
+    // MCP: a request's id must not be null.
+    if obj.get("id").is_some_and(Value::is_null) {
+        eprintln!("nuthatch mcp: invalid JSON-RPC request: null id");
+        return Some(err(Value::Null, -32600, "Invalid Request"));
+    }
     let id = req.get("id").cloned();
     match req.get("method").and_then(Value::as_str).unwrap_or("") {
         "initialize" => Some(ok(id?, initialize_result())),

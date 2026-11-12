@@ -7297,7 +7297,7 @@ impl NestIngest {
                     self.store.set_meta(START_BLOCK_KEY, &origin.to_string())?;
                     self.store.set_meta(
                         HISTORY_FROM_DEPLOYMENT_KEY,
-                        history_flag(backfill.is_none() && self.start_block.is_some()),
+                        history_flag(history_from_deployment(self.start_block, backfill)),
                     )?;
                 }
                 if resume_from > origin {
@@ -7481,7 +7481,7 @@ impl NestIngest {
                     )))
                 })?;
                 let start = cold_start_block(self.start_block, backfill, tip);
-                let from_deployment = backfill.is_none() && self.start_block.is_some();
+                let from_deployment = history_from_deployment(self.start_block, backfill);
                 self.store.set_meta(START_BLOCK_KEY, &start.to_string())?;
                 self.store
                     .set_meta(HISTORY_FROM_DEPLOYMENT_KEY, history_flag(from_deployment))?;
@@ -7498,11 +7498,30 @@ impl NestIngest {
                 start
             }
         };
-        if let Some(from) = self
+        let started = self
             .store
             .get_meta(START_BLOCK_KEY)?
-            .and_then(|v| v.parse::<u64>().ok())
-        {
+            .and_then(|v| v.parse::<u64>().ok());
+        // A store written before the flag existed: work it out once, by the cold start's own rule.
+        if self.store.get_meta(HISTORY_FROM_DEPLOYMENT_KEY)?.is_none() {
+            match derive_history_flag(self.start_block, started) {
+                Some(flag) => {
+                    self.store
+                        .set_meta(HISTORY_FROM_DEPLOYMENT_KEY, history_flag(flag))?;
+                    tracing::info!(
+                        "recorded history_from_deployment = {flag} for a store that predates it: it \
+                         began at block {} and the configured start_block is {:?}",
+                        started.unwrap_or_default(),
+                        self.start_block
+                    );
+                }
+                None => tracing::info!(
+                    "this store records no start block, so whether its history begins at the \
+                     configured start_block stays unknown; balances will read as net flows"
+                ),
+            }
+        }
+        if let Some(from) = started {
             self.metrics.set_indexed_from(from);
         }
         self.start_ipfs_resolver();
@@ -8634,6 +8653,22 @@ fn start_over(dir: &Path) -> StartOver {
     } else {
         StartOver::Shared(segments)
     }
+}
+
+/// Whether a cold start's history begins at the contracts' configured `start_block`: it does unless
+/// `--backfill` cut it short or there is none. The one definition both a fresh start and a derived
+/// flag use.
+fn history_from_deployment(start_block: Option<u64>, backfill: Option<u64>) -> bool {
+    backfill.is_none() && start_block.is_some()
+}
+
+/// The flag for a store that never recorded one, from the block it began at: true when that is the
+/// configured `start_block` a cold start without `--backfill` uses, false when it began anywhere else
+/// (a `--backfill` start is the tip less N), unknown when the store records no start. A configured
+/// start past the tip at the time would also read false; that is not a real deployment.
+fn derive_history_flag(start_block: Option<u64>, stored: Option<u64>) -> Option<bool> {
+    let stored = stored?;
+    Some(history_from_deployment(start_block, None) && start_block == Some(stored))
 }
 
 fn history_flag(from_deployment: bool) -> &'static str {
@@ -12926,6 +12961,80 @@ template = "pool"
                 "start {start:?}, backfill {backfill:?}"
             );
         }
+    }
+
+    /// A store written before the flag existed has blocks and a start block but no flag. It is worked
+    /// out once, by the cold start's own rule, so an upgrade does not turn every complete nest's
+    /// `balance` into a net flow.
+    #[tokio::test]
+    async fn a_store_that_predates_the_history_flag_gets_it_derived() {
+        use crate::rpc::Log;
+
+        struct Tip;
+        #[async_trait::async_trait]
+        impl Source for Tip {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<Log>> {
+                Ok(Vec::new())
+            }
+        }
+
+        // (configured start_block, the start block the 5.20 store recorded, the flag it derives)
+        for (configured, stored, want) in [
+            (Some(10), Some("10"), Some("true")),
+            (Some(10), Some("800"), Some("false")),
+            (None, Some("995"), Some("false")),
+            (Some(10), None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut nest = build_contract_free_test_nest(dir.path()).await;
+            nest.start_block = configured;
+            nest.store.set_meta(LAST_BLOCK_KEY, "900").unwrap();
+            if let Some(s) = stored {
+                nest.store.set_meta(START_BLOCK_KEY, s).unwrap();
+            }
+            prepare_retrying(&mut nest, &Tip, None, false, 1, 5)
+                .await
+                .unwrap();
+            assert_eq!(
+                nest.store
+                    .get_meta(HISTORY_FROM_DEPLOYMENT_KEY)
+                    .unwrap()
+                    .as_deref(),
+                want,
+                "start_block {configured:?}, stored {stored:?}"
+            );
+        }
+
+        // A flag already recorded is never overwritten by a guess.
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest = build_contract_free_test_nest(dir.path()).await;
+        nest.start_block = Some(10);
+        nest.store.set_meta(LAST_BLOCK_KEY, "900").unwrap();
+        nest.store.set_meta(START_BLOCK_KEY, "10").unwrap();
+        nest.store
+            .set_meta(HISTORY_FROM_DEPLOYMENT_KEY, "false")
+            .unwrap();
+        prepare_retrying(&mut nest, &Tip, None, false, 1, 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            nest.store
+                .get_meta(HISTORY_FROM_DEPLOYMENT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
     }
 
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {
