@@ -1838,9 +1838,9 @@ error.
 **What the integrity passes took is on `/ready`.** Once this process has quarantined a segment the
 nest names, `integrity` is `{"quarantined_segments", "reduced_tables", "seals_stopped",
 "seals_stopped_tables", "derived_state_stale"}`; it is absent until then, and holds until restart. A
-quarantined provisional tail stops every later seal, so `seals_stopped` turns true and the nest
-answers `503` at once, without waiting for `tip_seal_stalled`; the next start records the tail as lost
-and sealing resumes. `derived_state_stale` means the start rebuilt balances, exposure, velocity and
+quarantined provisional tail stops every later seal, so `seals_stopped` turns true, and once the cursor
+holds a block past the sealed watermark the nest answers `503`, without waiting for
+`tip_seal_stalled`; the next start records the tail as lost and sealing resumes. `derived_state_stale` means the start rebuilt balances, exposure, velocity and
 entities from a segment since quarantined: they stay as built, the nest stays ready, and until a
 restart rebuilds them from what remains, `/balances`, `/balance`, `/exposure`, `/flags` and
 `/derived` answers carry `"derived_state_stale": true`, and a `/sql` answer naming an entity lists it
@@ -2005,9 +2005,10 @@ tail found corrupt in the background stops later seals until the next start reco
 `/ready` answers `503` with `integrity.seals_stopped` from that moment. Where the quarantine cannot be renamed
 into place, as across filesystems when `segments/` is a link onto another disk, the segment is copied
 there and removed; where it cannot be moved at all, it stays on disk refused, so no read uses it,
-until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it reads it for upload, once, and refuses
-(and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
---catalogue` checks the same thing and only reports.
+until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it
+reads it for upload, once, and refuses one that does not match, quarantining it unless it is a
+provisional tail, so a corrupted segment is never mirrored. `nuthatch doctor --catalogue` checks the
+same thing and only reports.
 
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or

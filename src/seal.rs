@@ -2000,9 +2000,13 @@ fn move_by_copy(from: &Path, dest: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("copy refused by a test"));
     }
     let partial = dest.with_extension("parquet.partial");
-    std::fs::copy(from, &partial)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, dest)?;
+    let copied = std::fs::copy(from, &partial)
+        .and_then(|_| std::fs::File::open(&partial)?.sync_all())
+        .and_then(|()| std::fs::rename(&partial, dest));
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    copied?;
     std::fs::remove_file(from)
 }
 
@@ -2347,9 +2351,16 @@ fn hash_throttled(
 /// Quarantine a catalogued segment a caller read whole, to hand on, and found not to hash to its
 /// address. A provisional tail is left for the next start to record as lost.
 pub fn quarantine_mismatched(dir: &Path, table: &str, s: &Segment) {
-    if !s.provisional {
-        let path = segment_path(dir, &s.file, &s.hash);
-        quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+    if s.provisional {
+        return;
+    }
+    let path = segment_path(dir, &s.file, &s.hash);
+    // Read again: a seal may have restored the right bytes since the caller's read.
+    let mut throttle = Throttle::new(u64::MAX);
+    if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, &|| true) {
+        if got != s.hash {
+            quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+        }
     }
 }
 
