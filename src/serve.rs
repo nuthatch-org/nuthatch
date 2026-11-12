@@ -1529,13 +1529,24 @@ async fn etherscan_api(
 /// "the index is empty". Derived from what the nest *has* - a transfer-shaped decoder (the same gate
 /// the balance view uses) and whether RFC-0008 compliance is configured - so the surface stays honest
 /// by construction, with no operator knob.
+fn nest_gates(s: &AppState) -> crate::semantic::Gates {
+    crate::semantic::Gates {
+        transfers: s.tables.iter().any(|t| t.is_transfer_shaped()),
+        compliance: s.threshold.is_some()
+            || s.velocity_threshold.is_some()
+            || s.dir.join(crate::labels::LABELS_DIR).is_dir()
+            || s.dir.join(crate::lists::LISTS_DIR).is_dir(),
+    }
+}
+
 async fn shape(State(s): State<AppState>) -> Json<Value> {
-    let transfers = s.tables.iter().any(|t| t.is_transfer_shaped());
-    let compliance = s.threshold.is_some()
-        || s.velocity_threshold.is_some()
-        || s.dir.join(crate::labels::LABELS_DIR).is_dir()
-        || s.dir.join(crate::lists::LISTS_DIR).is_dir();
-    Json(json!({ "transfers": transfers, "compliance": compliance }))
+    let gates = nest_gates(&s);
+    Json(json!({
+        "transfers": gates.transfers,
+        "compliance": gates.compliance,
+        "free_form": s.surface.free_form_allowed(),
+        "queries": s.surface.queries.len(),
+    }))
 }
 
 /// Whether `listen` binds only the loopback interface.
@@ -3857,7 +3868,13 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
             }
         })
         .collect();
-    let doc = crate::semantic::compose(&s.tables, sem.as_ref(), Some(&coverage), &maintained);
+    let doc = crate::semantic::compose(
+        &s.tables,
+        sem.as_ref(),
+        Some(&coverage),
+        &maintained,
+        nest_gates(&s),
+    );
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -9778,6 +9795,34 @@ mod tests {
         );
         assert_eq!(ask(shared.clone()).await, 5, "the new generation");
         drop(old);
+    }
+
+    /// The bridge hides `sql` and offers the declared queries off this, so `/shape` states the mount's
+    /// SQL mode and how many queries it declares.
+    #[tokio::test]
+    async fn shape_reports_the_sql_mode_and_the_declared_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        let (_, body) = get_json(state.clone(), "/shape").await;
+        assert_eq!(
+            (&body["free_form"], &body["queries"]),
+            (&json!(true), &json!(0)),
+            "{body}"
+        );
+        state.surface = Arc::new(crate::allowlist::Surface {
+            access: crate::allowlist::SqlAccess::Allowlist,
+            queries: vec![crate::allowlist::NamedQuery {
+                name: "one".into(),
+                sql: "SELECT 1 AS one".into(),
+                params: Default::default(),
+            }],
+        });
+        let (_, body) = get_json(state, "/shape").await;
+        assert_eq!(
+            (&body["free_form"], &body["queries"]),
+            (&json!(false), &json!(1)),
+            "{body}"
+        );
     }
 
     /// A nest started past its contract's deployment holds net flows, so `/schema` says where its
