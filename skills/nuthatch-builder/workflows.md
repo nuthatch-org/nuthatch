@@ -182,6 +182,8 @@ claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-env NEST_TOKEN
 ```
 
+A runtime hosting several nests serves nothing at its root: point `--url` at one mount, `http://127.0.0.1:8288/<alias>` (or `/<tenant>/<alias>`). `GET /nests` lists them.
+
 The agent then calls the `schema` tool (per-nest, with footguns + coverage), writes SQL, and gets
 compact results with a provenance stamp. Fully offline; nothing phones home.
 

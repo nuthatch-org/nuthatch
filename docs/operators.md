@@ -2236,6 +2236,8 @@ nuthatch mcp --print-config          # copy-paste config for Claude Code / any M
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 
+A runtime hosting several nests serves nothing at its root: point `--url` at one mount, `http://127.0.0.1:8288/<alias>` (or `/<tenant>/<alias>`). `GET /nests` lists them.
+
 `nuthatch mcp` is a thin, fully-offline stdio bridge to the local `dev` HTTP API - it never contends
 with the single writer and nothing phones home. The client launches it; you ask for your contract's
 data in plain English and it writes the SQL. Tool advertisement is adaptive (RFC-0025): a nest only
