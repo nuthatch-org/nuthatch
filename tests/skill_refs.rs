@@ -101,6 +101,10 @@ fn unreal_flags(
     let mut out = Vec::new();
     for line in text.lines() {
         for flag in flags_in(line) {
+            // A cargo flag in a build instruction (`--features flight`), not one of nuthatch's.
+            if flag == "--features" {
+                continue;
+            }
             if real.contains(&flag) {
                 continue;
             }

@@ -291,9 +291,9 @@ mod tests {
         let mut tunnel = open(&ssh, "http://10.0.0.5:8288").unwrap();
         let base = tunnel.local_url.clone();
 
-        crate::watch::run_lines(&base, Some(1), None, Some(&mut tunnel), Some(4))
-            .await
-            .unwrap();
+        // The stand-in never speaks HTTP, so the run itself ends "nothing answered".
+        let ran = crate::watch::run_lines(&base, Some(1), None, Some(&mut tunnel), Some(4)).await;
+        assert!(ran.is_err_and(|e| e.to_string().contains("nothing answered")));
 
         let opened = std::fs::read_to_string(&spawns).unwrap().lines().count();
         assert!(opened >= 2, "the forward was opened {opened} time(s)");
