@@ -80,19 +80,29 @@ fn client_config_json(exe: &str, base: &str, token_env: Option<&str>) -> Value {
 /// is larger, and an unbounded line is an unbounded allocation (#1661).
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// The next newline-delimited message, or `None` at end of input. A line longer than `max` is read
-/// through to its newline and dropped rather than held.
+#[derive(Debug, PartialEq, Eq)]
+enum IncomingMessage {
+    Line(String),
+    Oversized,
+}
+
+/// The next newline-delimited message, or `None` at end of input. Oversized lines are drained
+/// through their newline without being held, then reported to the caller.
 async fn next_message<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     max: usize,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Option<IncomingMessage>> {
     let mut line = Vec::new();
     let mut oversized = false;
     loop {
         let buf = r.fill_buf().await?;
         if buf.is_empty() {
-            return Ok((!line.is_empty() && !oversized)
-                .then(|| String::from_utf8_lossy(&line).into_owned()));
+            if oversized {
+                eprintln!("nuthatch mcp: message over {max} bytes");
+                return Ok(Some(IncomingMessage::Oversized));
+            }
+            return Ok((!line.is_empty())
+                .then(|| IncomingMessage::Line(String::from_utf8_lossy(&line).into_owned())));
         }
         let (take, done) = match buf.iter().position(|&b| b == b'\n') {
             Some(i) => (i + 1, true),
@@ -109,11 +119,12 @@ async fn next_message<R: tokio::io::AsyncBufRead + Unpin>(
         r.consume(take);
         if done {
             if oversized {
-                eprintln!("nuthatch mcp: dropped a message over {max} bytes");
-                oversized = false;
-                continue;
+                eprintln!("nuthatch mcp: message over {max} bytes");
+                return Ok(Some(IncomingMessage::Oversized));
             }
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            return Ok(Some(IncomingMessage::Line(
+                String::from_utf8_lossy(&line).into_owned(),
+            )));
         }
     }
 }
@@ -127,15 +138,24 @@ pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
     let client = http_client(token.as_deref())?;
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    while let Some(line) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(req) = serde_json::from_str::<Value>(line) else {
-            continue;
+    while let Some(message) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
+        let resp = match message {
+            IncomingMessage::Oversized => Some(err(Value::Null, -32700, "Parse error")),
+            IncomingMessage::Line(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(line) {
+                    Ok(req) => respond(&req, &client, &base, token.as_deref()).await,
+                    Err(parse_error) => {
+                        eprintln!("nuthatch mcp: malformed JSON-RPC message: {parse_error}");
+                        Some(err(Value::Null, -32700, "Parse error"))
+                    }
+                }
+            }
         };
-        if let Some(resp) = respond(&req, &client, &base, token.as_deref()).await {
+        if let Some(resp) = resp {
             stdout
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
@@ -193,7 +213,7 @@ fn redact_token(v: &mut Value, token: &str) {
 async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Value> {
     let id = req.get("id").cloned();
     match req.get("method").and_then(Value::as_str).unwrap_or("") {
-        "initialize" => Some(ok(id?, initialize_result(req))),
+        "initialize" => Some(ok(id?, initialize_result())),
         "notifications/initialized" => None,
         "ping" => Some(ok(id?, json!({}))),
         "tools/list" => Some(ok(
@@ -249,14 +269,10 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
     }
 }
 
-fn initialize_result(req: &Value) -> Value {
-    // Echo the client's requested protocol version when present.
-    let pv = req
-        .pointer("/params/protocolVersion")
-        .and_then(Value::as_str)
-        .unwrap_or(PROTOCOL_VERSION);
+fn initialize_result() -> Value {
     json!({
-        "protocolVersion": pv,
+        // This server implements one protocol version, so unsupported requests fall back to it.
+        "protocolVersion": PROTOCOL_VERSION,
         // Advertise exactly what we implement - tools, resources, prompts; nothing else. When a future
         // standing-queries RFC lands, `notifications` slots in here without breaking a client (§6).
         "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
@@ -816,18 +832,41 @@ fn content(text: &str, is_error: bool) -> Value {
 mod tests {
     use super::*;
 
-    /// #1661: a line over the cap is read through and dropped, and the next message still arrives.
+    /// #1661: an oversized line is reported without retaining it, and the next message arrives.
     #[tokio::test]
-    async fn an_oversized_message_is_dropped_and_the_next_one_read() {
-        let input = format!("{}\n{{\"id\":1}}\n{{\"id\":2}}", "x".repeat(100));
+    async fn an_oversized_message_is_reported_and_the_next_one_is_read() {
+        let input = format!(
+            "{}\n{}\n{{\"id\":1}}\n{{\"id\":2}}",
+            "x".repeat(15),
+            "x".repeat(17)
+        );
         let mut r = tokio::io::BufReader::with_capacity(8, input.as_bytes());
         assert_eq!(
-            super::next_message(&mut r, 16).await.unwrap().as_deref(),
-            Some("{\"id\":1}\n")
+            super::next_message(&mut r, 16).await.unwrap(),
+            Some(IncomingMessage::Line(format!("{}\n", "x".repeat(15))))
         );
         assert_eq!(
-            super::next_message(&mut r, 16).await.unwrap().as_deref(),
-            Some("{\"id\":2}")
+            super::next_message(&mut r, 16).await.unwrap(),
+            Some(IncomingMessage::Oversized)
+        );
+        assert_eq!(
+            super::next_message(&mut r, 16).await.unwrap(),
+            Some(IncomingMessage::Line("{\"id\":1}\n".to_string()))
+        );
+        assert_eq!(
+            super::next_message(&mut r, 16).await.unwrap(),
+            Some(IncomingMessage::Line("{\"id\":2}".to_string()))
+        );
+        assert_eq!(super::next_message(&mut r, 16).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_without_a_newline_is_reported_at_eof() {
+        let input = "x".repeat(17);
+        let mut r = tokio::io::BufReader::with_capacity(8, input.as_bytes());
+        assert_eq!(
+            super::next_message(&mut r, 16).await.unwrap(),
+            Some(IncomingMessage::Oversized)
         );
         assert_eq!(super::next_message(&mut r, 16).await.unwrap(), None);
     }
@@ -1100,11 +1139,18 @@ mod tests {
         let resp = handle(&init, &client, "http://127.0.0.1:1").await.unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "nuthatch");
         assert_eq!(
-            resp["result"]["protocolVersion"], "2025-03-26",
-            "echoes client version"
+            resp["result"]["protocolVersion"], PROTOCOL_VERSION,
+            "unsupported client versions fall back to the version implemented by this server"
         );
 
-        let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+        let supported_init = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": { "protocolVersion": PROTOCOL_VERSION } });
+        let supported = handle(&supported_init, &client, "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        assert_eq!(supported["result"]["protocolVersion"], PROTOCOL_VERSION);
+
+        let list = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
         let resp = handle(&list, &client, "http://127.0.0.1:1").await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
