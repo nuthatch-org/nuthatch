@@ -1498,6 +1498,17 @@ jobs:
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
           bash .github/workflows/footprint.sh
+      - name: measure peak RSS, a 16-way seal-direct backfill on one endpoint
+        # A seal-direct backfill holds every window it has in flight, and `--concurrency` once
+        # multiplied that: 16-way over one endpoint peaked at 1,026 MB against 244 MB sequential in a
+        # debug build. `SEAL_DIRECT_IN_FLIGHT_LOGS` bounds it whatever the concurrency; this fails if
+        # that bound stops holding, at a ceiling well under the 2 GB per-cursor budget.
+        env:
+          BIN: bin/nuthatch
+          FIXTURE_RPC: bin/fixture-rpc
+          SEAL_DIRECT: "16"
+          MAX_RSS_MB: "512"
+        run: bash .github/workflows/footprint.sh
 
   rolling-upgrade:
     name: rolling upgrade (followers answer throughout)

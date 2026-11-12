@@ -12,9 +12,6 @@ Symptom → what to look at (`/metrics`, Prometheus) → remedy. All `/metrics` 
 - **Is it actually slow, or just quiet?** At tip the default poll interval is five minutes, so
   `seconds_since_poll` up to `poll_interval_secs` is normal. During backfill, watch
   `nuthatch_rows_decoded_total` / `nuthatch_last_block` climb; on a TTY `dev` shows events/sec and ETA.
-- **`--seal-direct` on one endpoint runs one window at a time** whatever `--concurrency` says:
-  `seal_direct_concurrency.capped_by` reads `single_rpc_endpoint`. Add `rpc_urls` to get the
-  concurrency you asked for.
 - A *sparse* contract over millions of blocks looks slow because each window is near-empty - widen it:
   `--window 50000`. That is also the widest range it will ask for, so keep it within the provider's
   `getLogs` range cap.

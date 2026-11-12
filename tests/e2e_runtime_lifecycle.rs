@@ -124,7 +124,6 @@ async fn two_nest_roost(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -638,23 +637,14 @@ async fn a_mount_is_refused_for_a_taken_name_an_undeclared_chain_or_a_breached_b
     assert_eq!(handles.states.len(), 2, "no partial mount was left behind");
 }
 
-/// A nest mounted into a running runtime fetches through its chain's shared source, so the
-/// single-endpoint concurrency cap applies to its seal-direct pass as it does at boot, and `/ready` says
-/// so. The mount used the runtime's uncapped `--concurrency` before this.
+/// A nest mounted into a running runtime runs its seal-direct pass at the runtime's `--concurrency`,
+/// one endpoint behind its chain's source or several, and `/ready` says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hot_mount_is_held_to_the_single_endpoint_concurrency_cap() {
-    for (name, endpoints, want) in [
-        (
-            "solohost",
-            1,
-            serde_json::json!({"requested": 8, "effective": 1, "capped_by": "single_rpc_endpoint"}),
-        ),
-        (
-            "twohosts",
-            2,
-            serde_json::json!({"requested": 8, "effective": 8, "capped_by": null}),
-        ),
-    ] {
+async fn a_hot_mount_reports_the_seal_direct_concurrency_it_runs_at() {
+    for (name, want) in [(
+        "solohost",
+        serde_json::json!({"requested": 8, "effective": 8, "capped_by": null}),
+    )] {
         let roost_dir = tempfile::tempdir().unwrap();
         let usdc_dir = roost_dir.path().join("nests/usdc");
         let arb_dir = roost_dir.path().join("nests/arb");
@@ -668,10 +658,6 @@ async fn a_hot_mount_is_held_to_the_single_endpoint_concurrency_cap() {
 
         handles.mount_ctx.seal_direct = true;
         handles.mount_ctx.concurrency = 8;
-        handles
-            .mount_ctx
-            .endpoint_counts
-            .insert("arbitrum-one".to_string(), endpoints);
         handles.mount(name, None).await.expect("mount");
 
         let ready = body_json(&handles.live, &format!("/{name}/ready")).await;
@@ -730,7 +716,7 @@ async fn route_named_runtime(
     let health = Arc::new(RuntimeHealth::new());
     health.register(route, "arbitrum-one");
     // `runtime::dev` records the concurrency before it spawns the cursor; this harness spawns directly.
-    indexer::backfill_concurrency_for(1, 1, true, &[route]);
+    indexer::backfill_concurrency_for(1, true, &[route]);
     let cursor = indexer::spawn_runtime(
         tape.clone(),
         vec![(route.to_string(), nest_dir.to_path_buf(), cfg)],
@@ -793,7 +779,6 @@ async fn route_named_runtime(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: true,
             concurrency: 1,
@@ -1025,7 +1010,6 @@ async fn mounting_an_unrecorded_nest_resolves_by_nid_and_persists_its_record() {
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -1213,7 +1197,6 @@ async fn a_malformed_nid_is_rejected_before_the_runtime_stops_loading() {
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -1605,7 +1588,6 @@ async fn a_second_live_mount_of_one_dataset_shares_it_and_survives_the_first_unm
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -1762,7 +1744,6 @@ pub(crate) async fn empty_runtime(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
@@ -3044,7 +3025,6 @@ async fn reclaim_over_the_admin_api_frees_a_dataset_only_once_nothing_mounts_it(
                 "arbitrum-one".to_string(),
                 tape.clone() as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
