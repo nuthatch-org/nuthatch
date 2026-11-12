@@ -21,6 +21,8 @@ not to infer work that remains.
 - [The accepted query dialect](graph-query-dialect-accepted.md) - every shape that compiles, every
   refusal and its reason.
 - [Schema generation rules](graph-schema-generation-rules.md) - how the Graph-shaped schema is derived.
+- [Check a subgraph locally before publishing](check-a-subgraph-locally.md) - what a nest verifies about
+  a subgraph that has not been deployed, and what it cannot: the mappings never run.
 
 ## Operating and verifying nuthatch
 
