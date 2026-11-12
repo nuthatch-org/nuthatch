@@ -74,14 +74,14 @@ fn answer(req: &Value) -> Value {
     json!({"jsonrpc": "2.0", "id": req["id"].clone(), "result": result})
 }
 
-/// One JSON-RPC host over HTTP/1, on its own thread and runtime so the client's cannot stall it.
-fn serve(get_logs: Arc<AtomicU64>) -> String {
+/// One JSON-RPC host over HTTP/1, on its own thread and runtime so the client's cannot stall it. The
+/// first `slow` `eth_getLogs` answers arrive after [`TIMEOUT`] three times over.
+fn serve(get_logs: Arc<AtomicU64>, slow: u64) -> String {
     async fn handler(
-        axum::extract::State(get_logs): axum::extract::State<Arc<AtomicU64>>,
+        axum::extract::State((get_logs, slow)): axum::extract::State<(Arc<AtomicU64>, u64)>,
         axum::Json(req): axum::Json<Value>,
     ) -> axum::Json<Value> {
-        if req["method"] == "eth_getLogs" && get_logs.fetch_add(1, Ordering::SeqCst) < SLOW_GETLOGS
-        {
+        if req["method"] == "eth_getLogs" && get_logs.fetch_add(1, Ordering::SeqCst) < slow {
             tokio::time::sleep(TIMEOUT * 3).await;
         }
         axum::Json(match req.as_array() {
@@ -100,17 +100,41 @@ fn serve(get_logs: Arc<AtomicU64>) -> String {
             .unwrap()
             .block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let app = axum::Router::new().fallback(handler).with_state(get_logs);
+                let app = axum::Router::new()
+                    .fallback(handler)
+                    .with_state((get_logs, slow));
                 axum::serve(listener, app).await.unwrap();
             })
     });
     url
 }
 
+/// Every block from the backfill's origin through the finalized one, each with all its logs.
+fn assert_sealed_whole(dir: &std::path::Path) {
+    let rows = nuthatch::analytics::query(
+        dir,
+        "SELECT min(block_number) AS lo, max(block_number) AS hi, count(*) AS n FROM usdc__transfer",
+    )
+    .unwrap();
+    // `--backfill TIP` starts the backfill at block 0.
+    assert_eq!(
+        rows[0]["lo"],
+        json!(0),
+        "a leading window was lost: {rows:?}"
+    );
+    assert_eq!(rows[0]["hi"], json!(FINALIZED), "{rows:?}");
+    assert_eq!(
+        rows[0]["n"],
+        json!((FINALIZED + 1) * LOGS_PER_BLOCK),
+        "a window was lost: {rows:?}"
+    );
+}
+
+/// The retry under a single host's late answers, below the CLI so the client's timeout can be short.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sixteen_way_backfill_to_one_host_survives_answers_that_time_out() {
     let get_logs = Arc::new(AtomicU64::new(0));
-    let url = serve(get_logs.clone());
+    let url = serve(get_logs.clone(), SLOW_GETLOGS);
     let dir = tempfile::tempdir().unwrap();
     let cfg = scaffold_nest(dir.path(), "usdc", USDC);
     let source: Arc<dyn Source> = Arc::new(RpcClient::with_timeout(vec![url], TIMEOUT).unwrap());
@@ -144,19 +168,64 @@ async fn a_sixteen_way_backfill_to_one_host_survives_answers_that_time_out() {
         get_logs.load(Ordering::SeqCst) > SLOW_GETLOGS,
         "no window was ever answered too late, so this proves nothing"
     );
-    let rows = nuthatch::analytics::query(
-        dir.path(),
-        "SELECT min(block_number) AS lo, max(block_number) AS hi, count(*) AS n FROM usdc__transfer",
-    )
-    .unwrap();
-    let (lo, hi) = (
-        rows[0]["lo"].as_u64().unwrap(),
-        rows[0]["hi"].as_u64().unwrap(),
-    );
-    assert_eq!(hi, store.sealed_through(), "{rows:?}");
+    assert_sealed_whole(dir.path());
+}
+
+/// `nuthatch dev` with one `--rpc` runs the concurrency asked for, and says so on `/ready`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dev_runs_a_sixteen_way_seal_direct_backfill_on_one_endpoint() {
+    let get_logs = Arc::new(AtomicU64::new(0));
+    let url = serve(get_logs, 0);
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_nest(dir.path(), "usdc", USDC);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut dev = std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+        .args(["dev", "--dir"])
+        .arg(dir.path())
+        .args(["--seal-direct", "--concurrency", &CONCURRENCY.to_string()])
+        .args(["--backfill", &TIP.to_string(), "--rpc", &url])
+        .args(["--listen", &format!("127.0.0.1:{port}"), "--no-admin"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let http = reqwest::Client::new();
+    let get = |path: &'static str| {
+        let http = http.clone();
+        async move {
+            let r = http
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .await
+                .ok()?;
+            r.json::<Value>().await.ok()
+        }
+    };
+    let start = std::time::Instant::now();
+    let mut sealed = 0;
+    while sealed < FINALIZED && start.elapsed() < Duration::from_secs(300) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Some(v) = get("/").await {
+            sealed = v["sealed_through"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+        }
+    }
+    let ready = get("/ready").await;
+    let _ = dev.kill();
+    let _ = dev.wait();
+    assert_eq!(sealed, FINALIZED, "the backfill did not finish");
+    let ready = ready.expect("/ready answered");
     assert_eq!(
-        rows[0]["n"],
-        json!((hi - lo + 1) * LOGS_PER_BLOCK),
-        "a window was lost"
+        ready["seal_direct_concurrency"],
+        json!({"requested": CONCURRENCY, "effective": CONCURRENCY, "capped_by": null}),
+        "{ready}"
     );
+    assert_sealed_whole(dir.path());
 }

@@ -4133,6 +4133,34 @@ fn seal_rows(rows: &[crate::registry::DecodedRow], threshold: Option<i128>) -> V
 /// controller's target, so only a window that overshot reaches it.
 const SEAL_DIRECT_WINDOW_LOGS: usize = 20_000;
 
+/// Logs the windows of one pipelined seal-direct backfill may be expected to hold at once, fetched or
+/// being fetched and not yet merged, whatever its `--concurrency`. A window is weighed before it is
+/// asked for at twice what the densest range seen so far puts in it; until one has been seen it weighs
+/// all of this. Measured on `fixture-rpc footprint`, a 16-way and a 64-way backfill peak no higher than
+/// a 4-way one (docs/benchmarks.md), and CI fails a 16-way one over 512 MB.
+pub const SEAL_DIRECT_IN_FLIGHT_LOGS: u32 = 32_000;
+
+/// `width`, narrowed so that at the densest range seen so far in logs per 1,024 blocks it expects no
+/// more than [`SEAL_DIRECT_WINDOW_LOGS`].
+fn within_window_logs(width: u64, densest: u64) -> u64 {
+    if densest == u64::MAX || densest == 0 {
+        return width;
+    }
+    width.min((SEAL_DIRECT_WINDOW_LOGS as u64 * 1024 / densest).max(1))
+}
+
+/// [`SEAL_DIRECT_IN_FLIGHT_LOGS`] a window of `width` blocks is weighed at, against the densest
+/// range seen so far in logs per 1,024 blocks, `u64::MAX` before any.
+fn window_weight(width: u64, densest: u64) -> u32 {
+    if densest == u64::MAX {
+        return SEAL_DIRECT_IN_FLIGHT_LOGS;
+    }
+    let logs = width.saturating_mul(densest).saturating_mul(2) / 1024;
+    u32::try_from(logs)
+        .unwrap_or(u32::MAX)
+        .clamp(1, SEAL_DIRECT_IN_FLIGHT_LOGS)
+}
+
 /// One pipelined seal-direct window, decoded. `w_to` falls short of `asked_to` when the window
 /// reached [`SEAL_DIRECT_WINDOW_LOGS`].
 struct FetchedWindow {
@@ -4146,6 +4174,8 @@ struct FetchedWindow {
     served_width: u64,
     whole_width: u64,
     json: Vec<SealRow>,
+    /// Its share of [`SEAL_DIRECT_IN_FLIGHT_LOGS`], released once its rows are merged.
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Merge one fetched window into the seal buffer (#1144).
@@ -6147,30 +6177,50 @@ pub async fn backfill_direct_pipelined_with(
         std::sync::atomic::AtomicBool::new(false),
         tokio::sync::Notify::new(),
     ));
+    // A window holds its weight from before it is asked for until its rows are merged, so concurrency
+    // hides latency without multiplying what is held. Taken here, in window order: a later window
+    // holding the weight the head waits for would never be consumed.
+    let in_flight = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        SEAL_DIRECT_IN_FLIGHT_LOGS as usize,
+    ));
+    let densest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let weighed = densest.clone();
     let windows = futures::stream::unfold(
         (from, chunker.clone(), gate.clone(), false),
-        move |(next, ch, gate, final_done)| async move {
-            while gate.0.load(std::sync::atomic::Ordering::SeqCst) {
-                gate.1.notified().await;
-            }
-            if next > to {
-                if final_done {
-                    return None;
+        move |(next, ch, gate, final_done)| {
+            let (in_flight, densest) = (in_flight.clone(), weighed.clone());
+            async move {
+                while gate.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    gate.1.notified().await;
                 }
-                // The last window has no window after it to refetch its tail (#1144): one more
-                // window over the range's last `FETCH_TAIL_OVERLAP` blocks, flagged so it is not
-                // widened again.
-                return Some((
-                    (overlap_from(to + 1, from), to, true),
-                    (to + 1, ch, gate, true),
-                ));
+                let weigh = |width: u64| {
+                    let held = in_flight.clone();
+                    let want =
+                        window_weight(width, densest.load(std::sync::atomic::Ordering::Relaxed));
+                    async move { held.acquire_many_owned(want).await.ok() }
+                };
+                if next > to {
+                    if final_done {
+                        return None;
+                    }
+                    // The last window has no window after it to refetch its tail (#1144): one more
+                    // window over the range's last `FETCH_TAIL_OVERLAP` blocks, flagged so it is not
+                    // widened again.
+                    let tail = overlap_from(to + 1, from);
+                    let held = weigh(to - tail + 1).await;
+                    return Some(((tail, to, true, held), (to + 1, ch, gate, true)));
+                }
+                let w = ch.lock().expect("window controller").window();
+                // The controller learns a window late by as many as are in flight, so on a dense range it
+                // can ask for many times what one response should hold; none is asked to expect more.
+                let w = within_window_logs(w, densest.load(std::sync::atomic::Ordering::Relaxed));
+                let chunk_to = (next.saturating_add(w - 1)).min(to);
+                let held = weigh(chunk_to - next + 1).await;
+                Some((
+                    (next, chunk_to, false, held),
+                    (chunk_to + 1, ch, gate, final_done),
+                ))
             }
-            let w = ch.lock().expect("window controller").window();
-            let chunk_to = (next.saturating_add(w - 1)).min(to);
-            Some((
-                (next, chunk_to, false),
-                (chunk_to + 1, ch, gate, final_done),
-            ))
         },
     );
 
@@ -6357,10 +6407,15 @@ pub async fn backfill_direct_pipelined_with(
             served_width,
             whole_width,
             json,
+            held: None,
         })
     };
     let stream = windows
-        .map(move |(w_from, w_to, final_pass)| run_window(w_from, w_to, final_pass, None))
+        .map(move |(w_from, w_to, final_pass, held)| async move {
+            let mut w = run_window(w_from, w_to, final_pass, None).await?;
+            w.held = held;
+            Ok(w)
+        })
         .buffered(concurrency.max(1));
     // `unfold`'s generator future is not `Unpin` (it borrows `chunker` across an await), so the stream
     // has to be pinned before it can be polled in a loop.
@@ -6393,7 +6448,14 @@ pub async fn backfill_direct_pipelined_with(
             served_width,
             whole_width,
             json,
+            held,
         } = res?;
+        let seen = fetched.saturating_mul(1024) / (w_to - fetch_from + 1).max(1);
+        let _ = densest.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |d| Some(if d == u64::MAX { seen } else { d.max(seen) }),
+        );
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
         // step anyway, so a lag of a few windows costs a few steps of convergence, and the alternative
@@ -6417,6 +6479,8 @@ pub async fn backfill_direct_pipelined_with(
         let n = merge_window_rows_seeing(&mut buf, fetch_from, json, |r| {
             documents += u64::from(crate::ipfs_resolve::is_document_row(r.1))
         })?;
+        // Before the next window is awaited, which may be waiting for this weight.
+        drop(held);
         if let (Some(metrics), true) = (extras.metrics, documents > 0) {
             metrics.add_ipfs_resolved(documents);
         }
@@ -8391,6 +8455,12 @@ async fn detect_reorg(
 /// nothing awaited, and a timed-out window is now retried and a dead task surfaces.
 pub fn backfill_concurrency_for(requested: usize, seal_direct: bool, nests: &[&str]) -> usize {
     if seal_direct {
+        if requested > 1 {
+            tracing::info!(
+                "seal-direct backfill runs {requested}-way, on one RPC endpoint as on several: a single \
+                 endpoint is no longer capped to one window at a time"
+            );
+        }
         for nest in nests {
             METRICS
                 .nest(nest)
@@ -12320,6 +12390,22 @@ template = "pool"
         assert_eq!(resume_from_watermark(Some(40), 100), 41);
         // No overflow at the ceiling.
         assert_eq!(resume_from_watermark(Some(u64::MAX), 100), u64::MAX);
+    }
+
+    #[test]
+    fn a_window_is_weighed_and_narrowed_by_the_densest_range_seen() {
+        // Nothing seen yet: the first window weighs the whole bound and goes alone.
+        assert_eq!(window_weight(100, u64::MAX), SEAL_DIRECT_IN_FLIGHT_LOGS);
+        assert_eq!(within_window_logs(100_000, u64::MAX), 100_000);
+        // Four logs a block: 2,000 blocks expect 8,000 logs and weigh twice that.
+        let four = 4 * 1024;
+        assert_eq!(window_weight(2_000, four), 16_000);
+        assert_eq!(window_weight(100_000, four), SEAL_DIRECT_IN_FLIGHT_LOGS);
+        assert_eq!(
+            within_window_logs(100_000, four),
+            SEAL_DIRECT_WINDOW_LOGS as u64 / 4
+        );
+        assert_eq!(window_weight(1, 1), 1);
     }
 
     /// One endpoint runs the concurrency asked for. Recorded for `/ready` only for a nest running a
