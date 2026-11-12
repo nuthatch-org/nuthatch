@@ -872,7 +872,7 @@ struct EndpointStats {
 }
 
 impl Metrics {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             tip_height: AtomicU64::new(0),
             ceiling: AtomicU64::new(0),
@@ -973,7 +973,19 @@ impl Metrics {
     /// Remove a departed nest's series and its storage paths. Its handle may live briefly in an
     /// in-flight request, but it is no longer reachable from `/metrics` (#827).
     pub fn remove_nest(&self, name: &str) {
-        self.per_nest.lock().unwrap().remove(name);
+        {
+            let mut per = self.per_nest.lock().unwrap();
+            if let Some(gone) = per.remove(name) {
+                // A dataset another nest still indexes keeps its webhooks' standing.
+                let dir = gone.dataset.lock().unwrap().clone();
+                if let Some(dir) = dir.filter(|d| {
+                    !per.values()
+                        .any(|m| m.dataset.lock().unwrap().as_ref() == Some(d))
+                }) {
+                    crate::webhooks::forget(&dir);
+                }
+            }
+        }
         self.serving.lock().unwrap().remove(name);
     }
 
@@ -2142,7 +2154,11 @@ impl Metrics {
         self.render_serving(&mut s);
         self.render_cursors(&mut s);
         crate::feed_metrics::metrics().render(&mut s);
-        s.push_str(&crate::webhooks::render_metrics());
+        let datasets: Vec<(String, PathBuf)> = per
+            .iter()
+            .filter_map(|(nest, m)| Some((nest.clone(), m.dataset.lock().unwrap().clone()?)))
+            .collect();
+        s.push_str(&crate::webhooks::render_metrics(&datasets));
         s
     }
 
