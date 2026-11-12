@@ -2506,6 +2506,7 @@ async fn runtime_index_loop(
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
     let mut reorg_gate = ReorgGate::default();
+    let mut announced = false;
     let mut topic0_refused = false;
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
@@ -2649,6 +2650,7 @@ async fn runtime_index_loop(
 
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
+            announce_caught_up(&mut announced, ceiling);
             check_live_health(&nests, &mut sup, &live)?;
             republish_idle(&mut nests, &mut sup, &live).await?;
             sleep_for(freshness.poll_interval).await;
@@ -2787,9 +2789,12 @@ async fn runtime_index_loop(
                 // Caught up as of this iteration's tip: wait the interval here as well as at the
                 // top, for the reason the solo loop gives (#1190).
                 if to == ceiling {
+                    announce_caught_up(&mut announced, to);
                     let live = sup.live();
                     check_live_health(&nests, &mut sup, &live)?;
                     sleep_for(freshness.poll_interval).await;
+                } else {
+                    announced = false;
                 }
             }
             Err(e) if narrowing_can_help(&e, global_next, to) => {
@@ -3262,9 +3267,9 @@ pub fn refuse_duplicate_tables(tables: &[crate::registry::TableSchema]) -> Resul
 /// this once per nest.
 #[allow(clippy::too_many_arguments)]
 async fn build_nest(
-    // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
-    // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
-    _source: &Arc<dyn Source>,
+    // The single-nest build leaves spawning the tip loop to the caller; it reads the tip once, for the
+    // empty-table notice, so a runtime driver can still `build_nest` then `index_loop(source, …)`.
+    source: &Arc<dyn Source>,
     dir: PathBuf,
     config: &Config,
     window_override: Option<u64>,
@@ -3583,16 +3588,20 @@ async fn build_nest(
     // this line simply stops naming that table, which is as much of an answer as the day it started.
     let never_fired = crate::analytics::declared_but_never_sealed(&dir, &served);
     if !never_fired.is_empty() {
-        let indexed = store
-            .get_meta(LAST_BLOCK_KEY)?
-            .and_then(|v| v.parse::<u64>().ok())
-            .zip(
-                store
-                    .get_meta(START_BLOCK_KEY)?
-                    .and_then(|v| v.parse::<u64>().ok()),
-            )
-            .map(|(last, from)| (from, last));
-        tracing::info!("{}", no_data_notice(&never_fired, indexed));
+        let meta = |key: &str| -> Result<Option<u64>> {
+            Ok(store.get_meta(key)?.and_then(|v| v.parse::<u64>().ok()))
+        };
+        // The manifest only speaks for what has sealed, so the range ends there, not at LAST_BLOCK.
+        let sealed = store.sealed_through();
+        let indexed = meta(START_BLOCK_KEY)?.map(|from| (from, sealed));
+        let last = meta(LAST_BLOCK_KEY)?;
+        let tip = tokio::time::timeout(std::time::Duration::from_secs(2), source.tip())
+            .await
+            .ok()
+            .and_then(|r| r.ok());
+        let at_tip =
+            matches!((last, tip), (Some(l), Some(t)) if l.saturating_add(AT_TIP_WITHIN) >= t);
+        tracing::info!("{}", no_data_notice(&never_fired, indexed, at_tip));
     }
 
     // Grafting (RFC-0033): tell the author up front what will and will not be reusable, rather than
@@ -8465,15 +8474,32 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     }
 }
 
-/// A restart partway through a backfill has not reached later events yet, so with an indexed range on
-/// record the notice names that range instead of claiming the event never fired.
-fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>) -> String {
+/// One "caught up" line per catch-up for a runtime cursor, which has no progress reporter: the latch
+/// is cleared by the next window that falls short of the ceiling.
+fn announce_caught_up(announced: &mut bool, block: u64) {
+    if !std::mem::replace(announced, true) {
+        tracing::info!("✓ caught up to tip at block {block}; now following");
+    }
+}
+
+/// Blocks behind the tip within which a nest counts as caught up for the empty-table notice.
+const AT_TIP_WITHIN: u64 = 1_000;
+
+/// With an indexed range on record the notice names it. A nest still short of the tip has not reached
+/// later events yet; one at the tip has covered the whole range, so the event may never have fired.
+fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>, at_tip: bool) -> String {
     let n = tables.len();
     let names = tables.join(", ");
     match indexed {
-        Some((from, last)) => format!(
-            "{n} declared table(s) have no data in blocks {from} to {last}, the range indexed so far: \
-             {names}. Each reads as an empty table, not an error, and fills as the nest reaches events."
+        Some((from, to)) if at_tip => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to}, the whole sealed range; the \
+             event may never have fired on this chain: {names}. Each reads as an empty table, not an \
+             error, and starts populating the day it does."
+        ),
+        Some((from, to)) => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to} so far, and the nest has not \
+             reached the tip: {names}. Each reads as an empty table, not an error, and fills as the \
+             nest reaches events."
         ),
         None => format!(
             "{n} declared table(s) have no data yet - the event has likely never fired on this chain: \
@@ -12334,11 +12360,14 @@ template = "pool"
     #[test]
     fn a_partial_backfill_does_not_claim_an_event_never_fired() {
         let tables = vec!["usdc__pause".to_string()];
-        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)));
+        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)), false);
         assert!(!partial.contains("never fired"), "{partial}");
         assert!(partial.contains("blocks 6082465 to 6783217"), "{partial}");
         assert!(partial.contains("usdc__pause"), "{partial}");
-        assert!(no_data_notice(&tables, None).contains("likely never fired"));
+        let complete = no_data_notice(&tables, Some((6_082_465, 26_000_000)), true);
+        assert!(complete.contains("may never have fired"), "{complete}");
+        assert!(!complete.contains("so far"), "{complete}");
+        assert!(no_data_notice(&tables, None, false).contains("likely never fired"));
     }
 
     #[test]
@@ -14487,52 +14516,56 @@ template = "pool"
         }
     }
 
-    /// The first catch-up announces itself when its window reaches the ceiling, not after the poll
-    /// interval: on a live chain the tip has always moved by then, so the top-of-loop check never ran.
-    #[tokio::test]
-    async fn the_first_catch_up_is_announced_before_the_poll_interval_sleep() {
-        use tracing_subscriber::layer::SubscriberExt as _;
+    /// Captures INFO-and-above messages for as long as the returned guard lives (single-threaded
+    /// tokio tests only: the subscriber is thread-local).
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
 
-        #[derive(Clone, Default)]
-        struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Msg<'a>(&'a mut String);
-                impl tracing::field::Visit for Msg<'_> {
-                    fn record_debug(
-                        &mut self,
-                        f: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        use std::fmt::Write as _;
-                        if f.name() == "message" {
-                            let _ = write!(self.0, "{value:?}");
-                        }
-                    }
-                }
-                let mut line = String::new();
-                event.record(&mut Msg(&mut line));
-                self.0.lock().unwrap().push(line);
-            }
+    impl Lines {
+        fn capture() -> (Self, tracing::dispatcher::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let lines = Lines::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::filter::LevelFilter::INFO)
+                    .with(lines.clone()),
+            );
+            (lines, tracing::dispatcher::set_default(&dispatch))
         }
 
-        let lines = Lines::default();
-        let dispatch = tracing::Dispatch::new(
-            tracing_subscriber::registry()
-                .with(tracing_subscriber::filter::LevelFilter::INFO)
-                .with(lines.clone()),
-        );
-        let _guard = tracing::dispatcher::set_default(&dispatch);
+        fn count(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        let mut nest =
-            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
-        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
-        let source = Arc::new(MovingTip(
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    use std::fmt::Write as _;
+                    if f.name() == "message" {
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Msg(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    fn moving_tip_source() -> Arc<MovingTip> {
+        Arc::new(MovingTip(
             OpenSource {
                 logs: vec![crate::rpc::Log {
                     block_hash: format!("0x{:064x}", 7),
@@ -14541,21 +14574,53 @@ template = "pool"
                 calls: std::sync::Mutex::new(Vec::new()),
             },
             std::sync::atomic::AtomicU64::new(0),
-        ));
-        let task = tokio::spawn(index_loop(source, nest, Some(5), false, 1, 50));
+        ))
+    }
+
+    /// The first catch-up announces itself when its window reaches the ceiling, not after the poll
+    /// interval: on a live chain the tip has always moved by then, so the top-of-loop check never ran.
+    #[tokio::test]
+    async fn the_first_catch_up_is_announced_before_the_poll_interval_sleep() {
+        let (lines, _guard) = Lines::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+        let task = tokio::spawn(index_loop(moving_tip_source(), nest, Some(5), false, 1, 50));
         wait_for(
             "the catch-up announcement",
             std::time::Duration::from_secs(20),
-            || {
-                lines
-                    .0
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|l| l.contains("caught up to tip"))
-            },
+            || lines.count("caught up to tip") > 0,
         )
         .await;
+        task.abort();
+    }
+
+    /// A mounts runtime has no progress reporter, so its cursor says "caught up" itself, once.
+    #[tokio::test]
+    async fn a_runtime_cursor_announces_its_catch_up_before_the_poll_interval_sleep() {
+        let (lines, _guard) = Lines::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+        let task = spawn_test_cursor(
+            CursorKind::Shared,
+            moving_tip_source() as Arc<dyn Source>,
+            vec![nest],
+            Some(5),
+            50,
+            Arc::new(crate::health::RuntimeHealth::new()),
+            false,
+            None,
+        );
+        wait_for(
+            "the catch-up announcement",
+            std::time::Duration::from_secs(20),
+            || lines.count("caught up to tip") > 0,
+        )
+        .await;
+        assert_eq!(lines.count("caught up to tip"), 1);
         task.abort();
     }
 
