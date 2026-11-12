@@ -431,20 +431,17 @@ impl TabQuery {
 
 /// The base tables `sql` reads, lowercased, followed through the authored views and entities, as the
 /// node's `reject_unknown_table_refs` and `expand_through_views` find them. A qualified name counts
-/// as its table. `None` where it does not parse.
+/// as its table. A statement it cannot parse is refused with the parser's message: the walk parses
+/// with the engine's dialect, so the engine could not run it either.
 pub fn referenced_tables(
     sql: &str,
     files: &NestFiles,
-) -> Option<Result<BTreeSet<String>, burrmill::BurrmillError>> {
-    let named = match burrmill::inspect::reach(sql) {
-        Ok(r) => r.tables,
-        Err(burrmill::BurrmillError::Parse(_)) => return None,
-        Err(e) => return Some(Err(e)),
-    };
+) -> Result<BTreeSet<String>, burrmill::BurrmillError> {
+    let named = burrmill::inspect::reach(sql)?.tables;
     let bodies = relation_bodies(files);
-    Some(Ok(nuthatch_core::bind::through_views(&named, |name| {
+    Ok(nuthatch_core::bind::through_views(&named, |name| {
         burrmill::inspect::base_tables(bodies.get(name)?)
-    })))
+    }))
 }
 
 /// Authored views and entities, by lowercased name, so a statement that names one is read as the
@@ -577,22 +574,20 @@ mod tests {
                 "SELECT \"to\" FROM tab__transfer",
             ),
         ]);
-        let got = referenced_tables("SELECT count(*) AS n FROM all_approvals", &files)
-            .unwrap()
-            .unwrap();
+        let got = referenced_tables("SELECT count(*) AS n FROM all_approvals", &files).unwrap();
         assert!(got.contains("tab__transfer"), "{got:?}");
     }
 
     #[test]
     fn a_qualified_name_names_its_table() {
-        let got = referenced_tables("SELECT * FROM public.approval", &NestFiles::new())
-            .unwrap()
-            .unwrap();
+        let got = referenced_tables("SELECT * FROM public.approval", &NestFiles::new()).unwrap();
         assert!(got.contains("approval"), "{got:?}");
     }
 
     #[test]
-    fn an_unparseable_statement_names_nothing() {
-        assert!(referenced_tables("SELECT FROM", &NestFiles::new()).is_none());
+    fn an_unparseable_statement_is_refused_with_the_parsers_message() {
+        let e = referenced_tables("SELECT (1 FROM t", &NestFiles::new()).unwrap_err();
+        assert!(matches!(e, burrmill::BurrmillError::Parse(_)), "{e:?}");
+        assert!(e.to_string().contains("Parser Error"), "{e}");
     }
 }
