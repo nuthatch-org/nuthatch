@@ -46,7 +46,7 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /entity/{id}`         one row by id (`{block:012}-{logindex:06}`)
 - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
                              authored view (`views/*.sql`) answers by its own name
-- `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)
+- `GET /balances?limit=N`    top holder balances
 - `GET /balance/{address}`   one address's derived balance. Net flow since `start_block` (see `GET /`), a balance only if that is the contract's deployment block (not so after `--backfill` or a later `start_block`)
 - `GET /queries`             the mount's SQL mode and the queries its operator declared in
                              `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
@@ -54,5 +54,5 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`
 
 ## MCP (for coding agents)
-Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity, diff,
-balance, top_balances. Fully offline against the local instance; nothing phones home.
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, explain, entity, diff, balance, top_balances.
+Fully offline against the local instance; nothing phones home.
