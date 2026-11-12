@@ -121,7 +121,7 @@ const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The task that owns `dir`'s webhook outbox and cursors once the nest is running, so a seal only
-/// records how far it got ([`sealed`]) and the writer never waits on a delivery query. It is the
+/// wakes it ([`sealed`]) and the writer never waits on a delivery query. It is the
 /// only writer of those keys after startup (`init_cursors` runs before the first seal), and a
 /// cursor still moves only after its rows are queued, so delivery stays in order and exactly once
 /// across slices and restarts.
@@ -157,20 +157,15 @@ impl Drop for Collector {
     }
 }
 
-/// Record that `dir` has sealed through `sealed_to`. Returns whether a collector took it; a caller
-/// with none delivers inline.
-pub fn sealed(dir: &std::path::Path, sealed_to: u64) -> bool {
+/// Wake `dir`'s collector: something sealed, or its cursors were just registered. Returns whether a
+/// collector took it; a caller with none delivers inline. The collector reads how far the nest has
+/// sealed from the store, so a seal never hands it a number to take on trust.
+pub fn sealed(dir: &std::path::Path) -> bool {
     let all = collectors().lock().unwrap_or_else(|p| p.into_inner());
     let Some((_, tx)) = all.get(dir) else {
         return false;
     };
-    tx.send_if_modified(|through| {
-        let moved = sealed_to > *through;
-        if moved {
-            *through = sealed_to;
-        }
-        moved
-    });
+    tx.send_modify(|wakes| *wakes = wakes.wrapping_add(1));
     true
 }
 
@@ -184,7 +179,8 @@ impl Collector {
         store: std::sync::Arc<dyn HotStore>,
         webhooks: std::sync::Arc<Vec<Webhook>>,
     ) {
-        let mut pause = None;
+        // One pass at once: a backlog held when the process stopped has no seal coming to wake it.
+        let mut pause = Some(std::time::Duration::ZERO);
         let mut backoff = RETRY;
         let mut was_failing = false;
         loop {
@@ -205,7 +201,10 @@ impl Collector {
                     }
                 }
             }
-            let sealed_to = *self.rx.borrow_and_update();
+            self.rx.borrow_and_update();
+            // What the nest has sealed, not what the chain has finalized: a cursor must never pass
+            // blocks whose segments do not exist yet.
+            let sealed_to = store.sealed_through();
             let pass = {
                 let (store, dir, webhooks) = (store.clone(), self.dir.clone(), webhooks.clone());
                 tokio::task::spawn_blocking(move || {
@@ -265,6 +264,17 @@ fn deliver_sealed_within(
     sealed_to: u64,
     outbox_max: u64,
 ) -> Result<usize> {
+    deliver_sealed_bounded(store, dir, webhooks, sealed_to, outbox_max, SEAL_BUDGET)
+}
+
+fn deliver_sealed_bounded(
+    store: &dyn HotStore,
+    dir: &std::path::Path,
+    webhooks: &[Webhook],
+    sealed_to: u64,
+    outbox_max: u64,
+    budget: std::time::Duration,
+) -> Result<usize> {
     let started = std::time::Instant::now();
     let mut enqueued = 0usize;
     // `table` and `where` come from the bundle, which a tenant writes: they run as a request from a
@@ -274,6 +284,10 @@ fn deliver_sealed_within(
     // Each run starts one webhook further on, so one that spends the whole budget cannot starve the rest.
     let first = next_turn(dir, sealed.len());
     for w in sealed[first..].iter().chain(&sealed[..first]).copied() {
+        // Not registered yet: `init_cursors` runs once the tip is known and wakes the collector.
+        if store.get_meta(&cursor_key(&w.name))?.is_none() {
+            continue;
+        }
         let cursor = |store: &dyn HotStore| -> Result<u64> {
             Ok(store
                 .get_meta(&cursor_key(&w.name))?
@@ -291,12 +305,16 @@ fn deliver_sealed_within(
             );
             continue;
         };
+        let own_timeout = seat
+            .as_ref()
+            .map_or_else(crate::analytics::QueryGuard::default, |s| s.guard)
+            .timeout;
         let mut span = SLICE_BLOCKS;
         let mut error = None;
         let mut waiting = false;
         loop {
             let from = cursor(store)?;
-            let left = SEAL_BUDGET.saturating_sub(started.elapsed());
+            let left = budget.saturating_sub(started.elapsed());
             if from >= sealed_to {
                 break;
             }
@@ -329,6 +347,16 @@ fn deliver_sealed_within(
                 Ok(r) => {
                     error = None;
                     r
+                }
+                // The pass's budget ran out mid-query, not the mount's own deadline: the webhook is
+                // not failing, it waits for its next pass.
+                Err(e)
+                    if e.downcast_ref::<crate::analytics::QueryBudgetExceeded>()
+                        .is_some()
+                        && left < own_timeout =>
+                {
+                    waiting = true;
+                    break;
                 }
                 Err(e) if partial.is_none() && span > 1 => {
                     span /= 2;
@@ -382,11 +410,18 @@ fn deliver_sealed_within(
                 }
             }
             if !rows.is_empty() {
-                tracing::info!(
-                    "webhook '{}': {} row(s) sealed in ({from}, {through}] → queued",
-                    w.name,
-                    rows.len()
-                );
+                match next_partial {
+                    Some((b, pos)) => tracing::info!(
+                        "webhook '{}': {} row(s) queued, {pos} of block {b} so far",
+                        w.name,
+                        rows.len()
+                    ),
+                    None => tracing::info!(
+                        "webhook '{}': {} row(s) sealed in ({from}, {through}] → queued",
+                        w.name,
+                        rows.len()
+                    ),
+                }
             }
         }
         if let Some(e) = &error {
@@ -1202,11 +1237,17 @@ mod tests {
     /// of the store as an unmount does.
     async fn collect(dir: &std::path::Path, webhooks: &[Webhook], through: u64) -> Vec<(u64, u64)> {
         let store = std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap());
+        store
+            .set_meta(
+                nuthatch_core::store::SEALED_THROUGH_KEY,
+                &through.to_string(),
+            )
+            .unwrap();
         let task = tokio::spawn(collector(dir).run(
             store.clone() as std::sync::Arc<dyn HotStore>,
             std::sync::Arc::new(webhooks.to_vec()),
         ));
-        assert!(sealed(dir, through), "a collector is registered");
+        assert!(sealed(dir), "a collector is registered");
         let mut got = vec![];
         let started = std::time::Instant::now();
         while store
@@ -1266,14 +1307,11 @@ mod tests {
     #[test]
     fn a_seal_with_no_collector_is_left_to_the_caller() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!sealed(dir.path(), 10));
+        assert!(!sealed(dir.path()));
         let c = collector(dir.path());
-        assert!(sealed(dir.path(), 10));
+        assert!(sealed(dir.path()));
         drop(c);
-        assert!(
-            !sealed(dir.path(), 11),
-            "a dropped collector is deregistered"
-        );
+        assert!(!sealed(dir.path()), "a dropped collector is deregistered");
     }
 
     /// A webhook held by a failing query is retried after 5 s, 10 s, 20 s and so on up to 5 minutes,
@@ -1285,13 +1323,16 @@ mod tests {
         let webhooks = vec![wh("w", "t__transfer", "genesis")];
         init_cursors(store.as_ref(), &webhooks, 1000).unwrap();
         crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        store
+            .set_meta(nuthatch_core::store::SEALED_THROUGH_KEY, "5")
+            .unwrap();
         // Unseated under strict isolation, so every pass fails until a mount seats it.
         strict_nest(dir.path());
         let task = tokio::spawn(collector(dir.path()).run(
             store.clone() as std::sync::Arc<dyn HotStore>,
             std::sync::Arc::new(webhooks.clone()),
         ));
-        assert!(sealed(dir.path(), 5));
+        assert!(sealed(dir.path()));
         let failures = || standing(dir.path()).first().map_or(0, |(_, s)| s.failures);
         let started = tokio::time::Instant::now();
         while failures() < 8 {
@@ -1321,6 +1362,54 @@ mod tests {
             assert!(started.elapsed() < std::time::Duration::from_secs(7200));
         }
         assert_eq!(standing(dir.path())[0].1.last_error, None);
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A pass that runs out of its own budget is a webhook waiting for its next pass, not a failure:
+    /// nothing is counted or recorded against it.
+    #[test]
+    fn a_pass_that_runs_out_of_budget_is_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let rows: Vec<String> = (1..=500).map(|b| transfer(b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 500).unwrap();
+        let tiny = std::time::Duration::from_millis(2);
+        deliver_sealed_bounded(&store, dir.path(), &webhooks, 500, WEBHOOK_OUTBOX_MAX, tiny)
+            .unwrap();
+        let (_, s) = standing(dir.path()).pop().unwrap();
+        assert_eq!((s.failures, s.last_error.as_deref()), (0, None), "{s:?}");
+        assert!(s.waiting_for_turn && s.backlog_blocks > 0, "{s:?}");
+    }
+
+    /// A backlog held when the process stopped is delivered by a collector that has seen no seal since
+    /// it started, and the webhook has its standing from the first pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_backlog_is_delivered_after_a_restart_without_a_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(&dir.path().join("t.redb")).unwrap());
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(store.as_ref(), &webhooks, 0).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 1, 9).unwrap();
+        store
+            .set_meta(nuthatch_core::store::SEALED_THROUGH_KEY, "9")
+            .unwrap();
+        let task = tokio::spawn(collector(dir.path()).run(
+            store.clone() as std::sync::Arc<dyn HotStore>,
+            std::sync::Arc::new(webhooks.clone()),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while store.outbox_len() == 0 || standing(dir.path()).is_empty() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "nothing delivered with no seal to wake the collector"
+        );
         task.abort();
         let _ = task.await;
     }

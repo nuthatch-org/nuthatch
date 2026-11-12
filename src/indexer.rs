@@ -7264,6 +7264,8 @@ impl NestIngest {
             if let Ok(tip) = source.tip().await {
                 if let Err(e) = crate::webhooks::init_cursors(&self.store, &self.webhooks, tip) {
                     tracing::warn!("webhook cursor init failed: {e:#}");
+                } else {
+                    crate::webhooks::sealed(&self.dir);
                 }
             }
         }
@@ -7464,7 +7466,7 @@ impl NestIngest {
                 }
                 // Fire webhooks for the freshly-sealed history (a `since = "genesis"`/block webhook wants
                 // it; a `since = "registration"` one is cursored past it, so this is a no-op there).
-                if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir, sealed_to) {
+                if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir) {
                     if let Err(e) = crate::webhooks::deliver_sealed(
                         &self.store,
                         &self.dir,
@@ -8115,19 +8117,19 @@ impl nuthatch_core::hooks::WindowHooks for NodeHooks {
     }
 
     #[cfg_attr(not(feature = "folds"), allow(unused_variables))]
-    fn sealed(&self, finalized_through: u64, sealed_through: u64, at_tip: bool) {
+    fn sealed(&self, _finalized_through: u64, sealed_through: u64, at_tip: bool) {
         if at_tip {
             crate::maintained::changed(&self.dir);
         }
         // Deliver user webhooks for whatever just sealed (RFC-0010 Part B). The collector task
         // queries and enqueues, the delivery worker POSTs; neither holds this loop. With no collector
         // (a node built without one) the rows are queued here instead.
-        if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir, finalized_through) {
+        if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir) {
             if let Err(e) = crate::webhooks::deliver_sealed(
                 &self.store,
                 &self.dir,
                 &self.webhooks,
-                finalized_through,
+                sealed_through,
             ) {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
