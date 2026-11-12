@@ -40,7 +40,7 @@ pub enum Command {
     /// Add another contract to a nest that has not indexed yet - resolve its ABI and grow the config.
     Add(AddArgs),
     /// Run the indexer: poll logs, store entities, and serve the API.
-    Dev(DevArgs),
+    Dev(Box<DevArgs>),
     /// Query a nest's data with SQL - the live tip and sealed history, one surface. Prints a table.
     Sql(SqlArgs),
     /// Serve the Model Context Protocol over stdio (bridges to a running `nuthatch dev`).

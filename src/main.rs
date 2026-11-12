@@ -183,7 +183,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
-                indexer::dev(args).await
+                indexer::dev(*args).await
             }
         }
         cli::Command::Serve(args) if args.runtime.is_some() || args.follow.is_some() => {
