@@ -333,6 +333,33 @@ seal-direct path hardcoding an empty calls slice regardless of what the nest dec
 on the hot arm too, so the "vs hot store" column is a comparison between two arms doing the same
 tier-3 work rather than one doing it and one skipping it.
 
+### What the pipeline holds in flight (#2880)
+
+A window holds its response, the parse of it and its decoded rows until the consumer merges it, and
+the window controller learns of a window as late as there are windows in flight, so on a dense range
+it asked for many times what one response should hold. `--concurrency` multiplied both. Two bounds
+now hold it: no window is asked to expect more than `SEAL_DIRECT_WINDOW_LOGS` at the density of the
+last window merged, and the windows in flight may expect at most `SEAL_DIRECT_IN_FLIGHT_LOGS` (32,000) between
+them, each weighed at twice its expected logs before it is asked for.
+
+Peak RSS of a debug `nuthatch dev --seal-direct --concurrency K` against `fixture-rpc footprint` on
+one endpoint, the machine shared and loaded, so a run varies by tens of MB. "Before" is the cap lifted
+with neither bound; the 64-way and 40-logs figures there are the review's, on the same commands:
+
+| fixture | K | before | after |
+|---|---|---|---|
+| 300,000 blocks, 4 logs a block | 1 | 244 MB | 251 MB |
+| | 4 | | 409 MB |
+| | 16 | 1,026 MB | 410 MB |
+| | 64 | 939 MB | 410 MB |
+| 50,000 blocks, 40 logs a block | 1 | 295 MB | 282 MB |
+| | 4 | | 399 MB |
+| | 16 | 1,141 MB | 396 MB |
+
+The `footprint (RAM budget)` job runs the 16-way case over a 100,000-block chain and fails it over
+512 MB (`SEAL_DIRECT=16 bash .github/workflows/footprint.sh`). Without the bounds it measured 722 MB
+here, and 410 MB with them.
+
 ## Baseline matrix (pre-optimization)
 
 _Pending - the full W1-W3 × T1-T3 matrix is populated from archive-node runs (needed for the
