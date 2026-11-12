@@ -1969,9 +1969,13 @@ fn move_by_copy(from: &Path, dest: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::other("copy refused by a test"));
     }
     let partial = dest.with_extension("parquet.partial");
-    std::fs::copy(from, &partial)?;
-    std::fs::File::open(&partial)?.sync_all()?;
-    std::fs::rename(&partial, dest)?;
+    let copied = std::fs::copy(from, &partial)
+        .and_then(|_| std::fs::File::open(&partial)?.sync_all())
+        .and_then(|()| std::fs::rename(&partial, dest));
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    copied?;
     std::fs::remove_file(from)
 }
 
