@@ -744,13 +744,12 @@ impl Session for BurrmillSession {
     }
 
     /// Burrmill's own walk, `inspect::reach`: sqlparser's AST under nuthatch's allowlist and
-    /// reachability rules, failing closed. A parse it cannot make is `None`.
-    fn reach(&self, sql: &str) -> Option<Result<(BTreeSet<String>, bool)>> {
-        match burrmill::inspect::reach(sql) {
-            Ok(r) => Some(Ok((r.tables, r.surveys))),
-            Err(burrmill::BurrmillError::Parse(_)) => None,
-            Err(e) => Some(Err(engine_err(e))),
-        }
+    /// reachability rules, failing closed. It parses with the engine's own dialect, so a statement
+    /// it cannot parse is one the engine cannot run either.
+    fn reach(&self, sql: &str) -> Result<(BTreeSet<String>, bool)> {
+        burrmill::inspect::reach(sql)
+            .map(|r| (r.tables, r.surveys))
+            .map_err(engine_err)
     }
 
     fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
@@ -1346,7 +1345,6 @@ mod tests {
         let s = super::BurrmillSession::new(None).unwrap();
         let err = s
             .reach("SELECT max(block_number) FROM t__union")
-            .unwrap()
             .unwrap_err();
         assert!(err.to_string().contains("t__union"), "{err}");
     }

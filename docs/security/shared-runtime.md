@@ -63,7 +63,7 @@ service.
 | A stacked or non-query statement: `;` then `COPY … TO`, `ATTACH`, `WITH … COPY`, `CREATE EXTERNAL TABLE`, `INSERT`, `SET`, `SHOW`, `EXPLAIN` | Leading-keyword gate, `WITH`-prefixed DML refusal, stacking refusal, Burrmill's single-query parse | same |
 | Another dataset's tables, by qualifier: `bbbb.t__e`, `"/…/data/bbbb".t__e`, `datafusion.public.t__e` | A session is opened per dataset and starts empty; a qualifier resolves inside it, so each of these reads A's own `t__e` | same |
 | The catalogue: `information_schema`, view text, B's view names | Burrmill builds `information_schema.tables` and `.columns` from the session alone; `views`, `df_settings`, `schemata`, `pg_catalog` do not exist; view text is not exposed | same |
-| The parts a registration is built from: `t__e__raw`, `__hot`, `__union` | Refused by name in Burrmill's walk | same |
+| The parts a registration is built from: `t__e__raw`, `__hot`, `__union` | Refused by name in Burrmill's walk, which parses with the engine's dialect and refuses a statement it cannot parse | same, `confinement::engine_only_syntax_is_walked_like_any_other_statement` |
 | A scalar function that reaches outside the query | `input_file_name` and `file_row_index` are not registered; under `strict`, the allow-list | `isolation::tests::*`, `confinement::strict_refuses_off_list_functions_in_statements_and_the_views_they_reach` |
 | B's hot rows through a reused session | Sessions are cached per dataset, and per tenant under `strict` | `confinement::a_mount_cannot_reach…` (B's session holds B's hot rows first) |
 | An authored path that leaves the nest: `offchain/manifest.json` naming `/…` or `../…` | Fixed in 5.12.1, see below | `confinement::an_offchain_catalogue_cannot_name_a_file_outside_its_nest` |
