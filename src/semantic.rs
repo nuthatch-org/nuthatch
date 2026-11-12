@@ -118,6 +118,10 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
 pub struct Coverage {
     pub sealed_through: u64,
     pub tip: u64,
+    /// The first block indexed. Balances count from here, not from the contract's deployment.
+    pub first_indexed: Option<u64>,
+    /// Whether that is the contracts' deployment; `None` when the store does not say.
+    pub history_from_deployment: Option<bool>,
 }
 
 /// Compose the enriched schema document from the four layers the RFC names: **structure** (registry),
@@ -162,9 +166,20 @@ pub fn compose(
     if let Some(c) = coverage {
         out.push_str(&format!(
             "COVERAGE\n  sealed_through = {} (rows at or below this block are sealed Parquet);\n  \
-             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n\n",
+             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n",
             c.sealed_through, c.tip
         ));
+        if let Some(from) = c.first_indexed {
+            let meaning = match c.history_from_deployment {
+                Some(true) => "history starts at the contracts' deployment, so the `balances` view is complete",
+                Some(false) => "history was cut short, so the `balances` view is the net flow since then, not a balance",
+                None => "this nest does not record whether that is the deployment, so read the `balances` view as a net flow since then, not a balance",
+            };
+            out.push_str(&format!(
+                "  first_indexed = {from} - no block before it is in this nest; {meaning}.\n"
+            ));
+        }
+        out.push('\n');
     }
 
     out.push_str("TABLES (one per contract event; query via the `sql` tool)\n");
@@ -761,6 +776,34 @@ mod tests {
             .unwrap_or_else(|| panic!("no snapshot label in:\n{doc}"));
         assert!(line.contains("offchain__prices"), "{line}");
         assert_eq!(doc.matches("reproducible by snapshot").count(), 1, "{doc}");
+    }
+
+    #[test]
+    fn coverage_names_the_first_indexed_block() {
+        let cov = |first_indexed, history_from_deployment| Coverage {
+            sealed_through: 90,
+            tip: 100,
+            first_indexed,
+            history_from_deployment,
+        };
+        let say = |c| compose(&[transfer_table()], None, Some(&c), &[]);
+        let doc = say(cov(Some(26_397_446), Some(false)));
+        assert!(doc.contains("first_indexed = 26397446"), "{doc}");
+        assert!(
+            doc.contains("net flow") && doc.contains("cut short"),
+            "{doc}"
+        );
+        let doc = say(cov(Some(26_397_446), None));
+        assert!(
+            doc.contains("does not record") && doc.contains("net flow"),
+            "{doc}"
+        );
+        let doc = say(cov(Some(9_000), Some(true)));
+        assert!(
+            doc.contains("complete") && !doc.contains("net flow"),
+            "{doc}"
+        );
+        assert!(!say(cov(None, None)).contains("first_indexed"));
     }
 
     #[test]

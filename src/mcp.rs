@@ -347,7 +347,9 @@ fn render_prompt(name: &str, args: &Value) -> Option<Value> {
         "investigate-address" => {
             let a = args.get("address").and_then(Value::as_str).unwrap_or("<address>");
             format!(
-                "Investigate the address {a}. Use `balance` for its token balance, `exposure` for its \
+                "Investigate the address {a}. Use `balance` for its token balance (read \
+                 `complete_history` in its answer: when false or null the figure is a net flow since \
+                 `indexed_from`, not a balance), `exposure` for its \
                  exposure to labeled addresses, and `flags` for threshold/velocity flags. Then \
                  summarise the risk picture, citing blocks."
             )
@@ -404,9 +406,9 @@ fn tool_specs(shape: &Shape) -> Value {
     // gate the balance view uses - so they never return an empty `{"count":0}` that an agent misreads
     // as "the index is empty".
     if shape.transfers {
-        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string).",
+        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string). The result carries `complete_history`. When true the nest indexed from the contract's deployment and the figure is under `balance`. When false or null it is only the net of transfers since `indexed_from` and is returned as `net_flow_since_indexed_from` with a note: a negative figure is then not an error, and it must not be reported as a balance.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
-        tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings).",
+        tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings). The result carries `complete_history`. When true these are holders (`holders`, `balance`). When false or null they are only net flows since `indexed_from` (`net_receivers`, `net_flow_since_indexed_from`, with a note) and must not be reported as holders or balances.",
           "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "default": 20 } } } }));
     }
     // Compliance tools (RFC-0008): advertised only where compliance is configured (RFC-0025).
@@ -496,11 +498,13 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let a = args["address"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`address` is required"))?;
-            get(client, &format!("{base}/balance/{}", segment(a)?)).await
+            let body = get(client, &format!("{base}/balance/{}", segment(a)?)).await?;
+            Ok(balance_result(&body, &history(client, base).await))
         }
         "top_balances" => {
             let n = args["limit"].as_u64().unwrap_or(20);
-            get(client, &format!("{base}/balances?limit={n}")).await
+            let body = get(client, &format!("{base}/balances?limit={n}")).await?;
+            Ok(balance_result(&body, &history(client, base).await))
         }
         "flags" => {
             let kind = args["kind"].as_str().unwrap_or("threshold");
@@ -517,6 +521,79 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             get(client, &format!("{base}/exposure/{}", segment(a)?)).await
         }
         other => bail!("unknown tool `{other}`"),
+    }
+}
+
+/// Where a nest's balance view starts counting, from `GET /`.
+struct History {
+    /// The first block indexed.
+    from: Option<u64>,
+    /// Whether that is the contracts' deployment; `None` when the nest does not say.
+    complete: Option<bool>,
+    /// The status answered; false when it could not be read at all.
+    status_read: bool,
+}
+
+async fn history(client: &reqwest::Client, base: &str) -> History {
+    let status = get(client, &format!("{base}/"))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let status_read = status.is_some();
+    let status = status.unwrap_or(Value::Null);
+    History {
+        status_read,
+        from: match &status["start_block"] {
+            Value::String(b) => b.parse().ok(),
+            other => other.as_u64(),
+        },
+        complete: status["history_from_deployment"].as_bool(),
+    }
+}
+
+/// A balance answer as the model should read it. The view counts from the first indexed block, so
+/// unless that is the contracts' deployment its figures are net flows, and the keys say so: `balance`
+/// and `holders` appear only when `complete_history` is true. A nest that does not say gets the
+/// cautious names. The HTTP routes are not touched (the wasm host answers them byte for byte).
+fn balance_result(body: &str, h: &History) -> String {
+    let Ok(Value::Object(mut answer)) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    answer.insert("complete_history".into(), json!(h.complete));
+    if let Some(from) = h.from {
+        answer.insert("indexed_from".into(), json!(from));
+    }
+    if h.complete != Some(true) {
+        let since = h.from.map_or("its first indexed block".to_string(), |b| {
+            format!("block {b}")
+        });
+        let why = if h.complete == Some(false) {
+            "this nest did not index from the contract's deployment"
+        } else if h.status_read {
+            "this nest does not record whether it indexed from the contract's deployment"
+        } else {
+            "the nest's status could not be read to tell whether it indexed from the contract's deployment"
+        };
+        answer.insert(
+            "note".into(),
+            json!(format!(
+                "Not balances: {why}, so each figure is only the net of transfers since {since}."
+            )),
+        );
+        rename(&mut answer, "balance", "net_flow_since_indexed_from");
+        rename(&mut answer, "holders", "net_receivers");
+        if let Some(Value::Array(items)) = answer.get_mut("items") {
+            for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                rename(item, "balance", "net_flow_since_indexed_from");
+            }
+        }
+    }
+    Value::Object(answer).to_string()
+}
+
+fn rename(o: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+    if let Some(v) = o.remove(from) {
+        o.insert(to.into(), v);
     }
 }
 
@@ -1088,6 +1165,28 @@ mod tests {
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
     }
 
+    #[test]
+    fn balance_tools_name_complete_history() {
+        let token = Shape {
+            transfers: true,
+            compliance: false,
+        };
+        let specs = tool_specs(&token);
+        for name in ["balance", "top_balances"] {
+            let d = specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str())
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(
+                d.contains("complete_history") && d.contains("indexed_from"),
+                "{d}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn advertises_resources_and_prompts_and_lists_them() {
         let client = reqwest::Client::new();
@@ -1469,5 +1568,123 @@ mod tests {
             text.contains("cannot reach nuthatch") && text.contains("nuthatch dev"),
             "tell the caller to start the local instance: {text}"
         );
+    }
+
+    /// The tool result is what the model reads, so it must say what the figure is: on a nest whose
+    /// history does not begin at deployment there is no `balance` key anywhere in it.
+    #[tokio::test]
+    async fn balance_results_say_what_the_figure_is() {
+        use axum::{routing::get, Router};
+        async fn serve(status: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+            let app = Router::new()
+                .route("/", get(move || async move { status }))
+                .route(
+                    "/balance/{address}",
+                    get(|| async {
+                        r#"{"address":"0x1111","balance":"-4100","dropped_over_i128":0}"#
+                    }),
+                )
+                .route(
+                    "/balances",
+                    get(|| async {
+                        r#"{"holders":2,"count":1,"items":[{"address":"0x1111","balance":"-4100"}],"dropped_over_i128":0}"#
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            (
+                base,
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            )
+        }
+        fn keys(v: &Value, out: &mut Vec<String>) {
+            match v {
+                Value::Object(o) => o.iter().for_each(|(k, v)| {
+                    out.push(k.clone());
+                    keys(v, out);
+                }),
+                Value::Array(a) => a.iter().for_each(|v| keys(v, out)),
+                _ => {}
+            }
+        }
+        let client = reqwest::Client::new();
+        let ask = |base: String, name: &'static str, args: Value| {
+            let client = client.clone();
+            async move {
+                let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": name, "arguments": args } });
+                let resp = handle(&req, &client, &base).await.unwrap();
+                serde_json::from_str::<Value>(tool_text(&resp)).unwrap()
+            }
+        };
+
+        // A `--backfill` nest.
+        let (base, server) =
+            serve(r#"{"start_block":"9800","history_from_deployment":false}"#).await;
+        let one = ask(base.clone(), "balance", json!({ "address": "0x1111" })).await;
+        assert_eq!(
+            one,
+            json!({
+                "address": "0x1111", "net_flow_since_indexed_from": "-4100",
+                "dropped_over_i128": 0, "complete_history": false, "indexed_from": 9800,
+                "note": "Not balances: this nest did not index from the contract's deployment, so each figure is only the net of transfers since block 9800."
+            })
+        );
+        let top = ask(base, "top_balances", json!({})).await;
+        assert_eq!(
+            top,
+            json!({
+                "net_receivers": 2, "count": 1, "dropped_over_i128": 0,
+                "items": [{ "address": "0x1111", "net_flow_since_indexed_from": "-4100" }],
+                "complete_history": false, "indexed_from": 9800,
+                "note": "Not balances: this nest did not index from the contract's deployment, so each figure is only the net of transfers since block 9800."
+            })
+        );
+        for v in [&one, &top] {
+            let mut k = Vec::new();
+            keys(v, &mut k);
+            assert!(!k.iter().any(|k| k == "balance" || k == "holders"), "{v}");
+        }
+        server.abort();
+
+        // A full-history nest keeps the names it always had.
+        let (base, server) =
+            serve(r#"{"start_block":"9000","history_from_deployment":true}"#).await;
+        let one = ask(base.clone(), "balance", json!({ "address": "0x1111" })).await;
+        assert_eq!(
+            one,
+            json!({
+                "address": "0x1111", "balance": "-4100", "dropped_over_i128": 0,
+                "complete_history": true, "indexed_from": 9000
+            })
+        );
+        let top = ask(base, "top_balances", json!({})).await;
+        assert_eq!(top["holders"], 2, "{top}");
+        assert_eq!(top["items"][0]["balance"], "-4100", "{top}");
+        assert_eq!(top["complete_history"], true, "{top}");
+        server.abort();
+
+        // A status that cannot be read is said to be unreadable, not unrecorded.
+        let (base, server) = serve("not json").await;
+        let one = ask(base, "balance", json!({ "address": "0x1111" })).await;
+        assert_eq!(one["complete_history"], Value::Null, "{one}");
+        assert!(
+            one["note"].as_str().unwrap().contains("could not be read"),
+            "{one}"
+        );
+        assert!(one.get("balance").is_none(), "{one}");
+        server.abort();
+
+        // A store written before the record existed: never claimed as a balance.
+        let (base, server) = serve(r#"{"start_block":"9000"}"#).await;
+        let one = ask(base, "balance", json!({ "address": "0x1111" })).await;
+        assert_eq!(one["complete_history"], Value::Null, "{one}");
+        assert!(one.get("balance").is_none(), "{one}");
+        assert_eq!(one["net_flow_since_indexed_from"], "-4100", "{one}");
+        assert!(
+            one["note"].as_str().unwrap().contains("does not record"),
+            "{one}"
+        );
+        server.abort();
     }
 }

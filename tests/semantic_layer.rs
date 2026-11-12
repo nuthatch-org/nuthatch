@@ -52,6 +52,8 @@ fn composed_schema_teaches_footguns_and_the_coverage_seam() {
     let coverage = nuthatch::semantic::Coverage {
         sealed_through: 7,
         tip: 10,
+        first_indexed: None,
+        history_from_deployment: None,
     };
     let doc = nuthatch::semantic::compose(&schema, Some(&sem), Some(&coverage), &[]);
 
