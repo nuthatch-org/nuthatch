@@ -44,8 +44,8 @@ overlap RPC latency:
 nuthatch dev --seal-direct --concurrency 8
 ```
 
-Keep `--concurrency` at 1 against a single public endpoint (high concurrency to one host can stall the
-runtime); use 8-16 only when you have multiple `rpc_urls` or your own node. For a *sparse* contract over
+`--concurrency` takes effect only with two or more `rpc_urls`: with one endpoint, your own node
+included, the backfill runs sequentially and logs that it capped the value. For a *sparse* contract over
 a long range, widen the getLogs window: `--window 50000`. `--window N` is where the adaptive window
 starts and the widest range it will ever ask for; it still shrinks when a provider refuses a range.
 Without it the window starts at the chain default and grows over empty ranges.
