@@ -17,6 +17,19 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+#[cfg(not(feature = "postgres-store"))]
+#[test]
+fn worker_and_control_name_the_scaled_build_without_asking_for_their_flags() {
+    for sub in ["worker", "control"] {
+        let (code, _, err) = run(&[sub]);
+        assert_ne!(code, 0, "{sub}");
+        assert!(err.contains("nuthatch-scaled-"), "{sub}: {err}");
+        assert!(err.contains("-scaled"), "{sub}: {err}");
+        assert!(!err.contains("CLAUDE.md"), "{sub}: {err}");
+        assert!(!err.contains("required arguments"), "{sub}: {err}");
+    }
+}
+
 #[cfg(feature = "watch")]
 #[test]
 fn watch_says_nothing_answered_and_fails_when_the_url_is_dead() {

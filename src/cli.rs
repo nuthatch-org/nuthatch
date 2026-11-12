@@ -84,13 +84,14 @@ pub enum Command {
     Settle(SettleArgs),
 
     // --- SCALED: the docker-compose writer-pool / control-plane topology (RFC-0022). ---
-    /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
-    /// take cursor leases, index what this worker is assigned.
+    /// Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): reconcile against the
+    /// control plane, take cursor leases, index what this worker is assigned.
     ///
     /// This is the scaled-mode counterpart of `dev`. `dev` indexes a nest directory it owns outright;
     /// a worker is told what to run and holds a lease proving it may.
     Worker(WorkerArgs),
-    /// Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run.
+    /// Run the control-plane API for scaled mode (RFC-0022 §3; scaled build only): declare what the
+    /// fleet should run.
     ///
     /// Writes *desired state* only. Workers reconcile against it on their own tick - nothing here
     /// commands a worker or waits for one.
@@ -1366,17 +1367,20 @@ pub struct AddArgs {
 #[derive(Args)]
 pub struct WorkerArgs {
     /// The control-plane Postgres URL - desired state and the worker registry.
+    // The default build refuses the subcommand by name in `main`; clap must not ask for flags first.
+    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
     #[arg(long)]
     pub control_db: String,
 
     /// The hot-store Postgres URL - where indexed state lives. Usually the same server as the control
     /// plane, but a distinct database: one holds *what should run*, the other holds *indexed data*.
+    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
     #[arg(long)]
     pub hot_store: String,
 
     /// Chains this worker can host. The scheduler decides which it *should* run and the lease decides
     /// which it *does*; this is only what the machine is capable of.
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',', required = cfg!(feature = "postgres-store"))]
     pub chains: Vec<String>,
 
     /// This worker's identity in the fleet. Defaults to the hostname, which is unique per container
@@ -1433,6 +1437,7 @@ pub struct ControlArgs {
     /// The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state,
     /// **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's
     /// outage are different events.
+    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
     #[arg(long)]
     pub db: String,
 }

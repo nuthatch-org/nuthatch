@@ -207,15 +207,17 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Worker(_) => anyhow::bail!(
-            "the writer-worker role needs a build with `--features postgres-store`. The default \
-             binary is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+            "`nuthatch worker` is part of the scaled build, which this embedded binary is not. Use \
+             the `nuthatch-scaled-<target>.tar.gz` attached to the release, or the \
+             `ghcr.io/nuthatch-org/nuthatch:<version>-scaled` image."
         ),
         #[cfg(feature = "postgres-store")]
         cli::Command::Control(args) => nuthatch::control_api::run(&args.listen, &args.db).await,
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Control(_) => anyhow::bail!(
-            "the control plane needs a build with `--features postgres-store`. The default binary \
-             is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+            "`nuthatch control` is part of the scaled build, which this embedded binary is not. Use \
+             the `nuthatch-scaled-<target>.tar.gz` attached to the release, or the \
+             `ghcr.io/nuthatch-org/nuthatch:<version>-scaled` image."
         ),
         cli::Command::Sql(args) => run_sql(args).await,
         #[cfg(feature = "watch")]
