@@ -211,6 +211,7 @@ impl SegmentSink for FsSink<'_> {
         };
         replace_durable(&target, bytes)?;
         unrefuse(&target);
+        record_restored(&s.hash);
         Ok(())
     }
 
@@ -1895,6 +1896,10 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                         s.provisional = false;
                         lost_tails += 1;
                     }
+                    // A quarantine before this start is still a reduction, and `/ready` keeps saying so.
+                    if let Some(store) = quarantined_copy(dir, s) {
+                        record_quarantine(dir, store.as_deref(), table, s);
+                    }
                     continue;
                 }
                 Err(_) => "unreadable",
@@ -2011,12 +2016,21 @@ fn move_by_copy(from: &Path, dest: &Path) -> std::io::Result<()> {
     let partial = dest.with_extension("parquet.partial");
     let copied = std::fs::copy(from, &partial)
         .and_then(|_| std::fs::File::open(&partial)?.sync_all())
-        .and_then(|()| std::fs::rename(&partial, dest));
+        .and_then(|()| std::fs::rename(&partial, dest))
+        .and_then(|()| fsync_dir(dest.parent().unwrap_or(Path::new("."))));
     if copied.is_err() {
+        // `dest` is a fresh name, so whatever is there is this attempt's.
         let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(dest);
     }
     copied?;
-    std::fs::remove_file(from)
+    std::fs::remove_file(from)?;
+    // Gone from where it is read either way; a crash before this sync can only bring it back,
+    // for the next pass to quarantine again.
+    if let Err(e) = fsync_dir(from.parent().unwrap_or(Path::new("."))) {
+        tracing::warn!("{}: the removal is not yet durable: {e}", from.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2068,6 +2082,8 @@ struct Quarantined {
     provisional: bool,
     from_block: u64,
     at: Instant,
+    /// A seal has since written the bytes its address names.
+    restored: bool,
 }
 
 /// What the start rebuilt derived state from: when, and through the last block each table then had
@@ -2102,7 +2118,26 @@ fn record_quarantine(dir: &Path, store: Option<&Path>, table: &str, s: &Segment)
             provisional: s.provisional,
             from_block: s.from_block,
             at: Instant::now(),
+            restored: false,
         });
+}
+
+/// What a new process knows of `dir`: nothing but what is on disk.
+#[cfg(test)]
+pub(crate) fn forget_findings(dir: &Path) {
+    let key = lease_key(dir);
+    let mut f = findings().lock().unwrap();
+    f.quarantined.retain(|q| q.dataset != key);
+    f.rebuilt.remove(&key);
+}
+
+/// A seal wrote `hash`'s own bytes back: it no longer reduces anything, though state derived from the
+/// bad copy stays stale.
+fn record_restored(hash: &str) {
+    let mut f = findings().lock().unwrap_or_else(|e| e.into_inner());
+    for q in f.quarantined.iter_mut().filter(|q| q.hash == hash) {
+        q.restored = true;
+    }
 }
 
 /// The start is about to rebuild `dir`'s derived state (balances, exposure, velocity, entities) from
@@ -2129,8 +2164,9 @@ pub fn record_rebuild(dir: &Path) {
         );
 }
 
-/// What this process's integrity passes took from a dataset, for `/ready` and the answers derived
-/// from it. Holds until restart, which re-records a lost tail and rebuilds from what remains.
+/// What the integrity passes took from a dataset, for `/ready`, `/metrics` and the answers derived
+/// from it. A start derives it again from what `quarantine/` holds; a seal that restores a segment
+/// clears that segment, and only a restart clears stale derived state.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Integrity {
     /// Tables whose cold data is reduced by a segment quarantined and not since restored.
@@ -2188,7 +2224,7 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
             (None, false) => continue,
         };
         out.derived_stale |= stale(q.at, &table, from_block);
-        if !counted.insert(q.hash.as_str()) {
+        if q.restored || !counted.insert(q.hash.as_str()) {
             continue;
         }
         out.quarantined_segments += 1;
@@ -2198,6 +2234,35 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
         out.reduced_tables.insert(table);
     }
     (out != Integrity::default()).then_some(out)
+}
+
+/// Where an earlier pass quarantined `s`: `Some(None)` in this dataset's own `quarantine/`,
+/// `Some(Some(store))` beside the store outside it, `None` when there is no copy.
+fn quarantined_copy(dir: &Path, s: &Segment) -> Option<Option<PathBuf>> {
+    let held = |in_dir: &Path, name: &str| {
+        let stem = name.strip_suffix(".parquet").unwrap_or(name);
+        std::fs::read_dir(in_dir).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n == name || (n.starts_with(&format!("{stem}.")) && n.ends_with(".parquet"))
+            })
+        })
+    };
+    if held(&dir.join(QUARANTINE_DIR), &s.file) {
+        return Some(None);
+    }
+    let store = outer_store(dir)?;
+    held(
+        &store.with_file_name(QUARANTINE_DIR),
+        &format!("{}.parquet", s.hash),
+    )
+    .then_some(Some(store))
+}
+
+/// Whether `s` is gone from where it is read because an integrity pass took it aside.
+pub fn is_quarantined(dir: &Path, s: &Segment) -> bool {
+    !segment_path(dir, &s.file, &s.hash).exists() && quarantined_copy(dir, s).is_some()
 }
 
 /// `dest`, or where it already holds an earlier quarantined copy, the same name stamped with now.
@@ -2243,9 +2308,10 @@ pub fn verify_in_background(
     std::thread::Builder::new()
         .name("segment-verify".into())
         .spawn(move || {
+            let _verifying = Verifying::register(&dir);
             let mut wait = delay;
             loop {
-                if !sleep_while(wait, &alive) {
+                if !sleep_serving(wait, &alive, &dir) {
                     return;
                 }
                 let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -2268,15 +2334,76 @@ pub fn verify_in_background(
         .expect("spawning the segment verifier")
 }
 
-/// Sleep `d` in short steps, false as soon as `alive` stops holding.
-fn sleep_while(d: Duration, alive: &impl Fn() -> bool) -> bool {
+/// Segments a publisher in this process found wrong, waiting for the dataset's own verifier.
+type Requests = Mutex<HashMap<PathBuf, Vec<(String, Segment)>>>;
+
+fn requests() -> &'static Requests {
+    static R: OnceLock<Requests> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// A verifier running for a dataset, for as long as it is held.
+struct Verifying(PathBuf);
+
+impl Verifying {
+    fn register(dir: &Path) -> Verifying {
+        let key = lease_key(dir);
+        requests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), Vec::new());
+        Verifying(key)
+    }
+}
+
+impl Drop for Verifying {
+    fn drop(&mut self) {
+        requests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Ask the writer in this process that verifies `dir` to hash `s` now and quarantine it if it does
+/// not match, rather than at its next full pass. False when no verifier for `dir` runs here.
+pub fn request_verify(dir: &Path, table: &str, s: &Segment) -> bool {
+    let mut r = requests().lock().unwrap_or_else(|e| e.into_inner());
+    match r.get_mut(&lease_key(dir)) {
+        Some(pending) => {
+            pending.push((table.to_string(), s.clone()));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Sleep `d` in short steps, answering [`request_verify`] for `dir` between them; false as soon as
+/// `alive` stops holding.
+fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
     let until = Instant::now() + d;
+    let key = lease_key(dir);
     while alive() {
+        let asked = requests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&key)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for (table, s) in asked {
+            let path = segment_path(dir, &s.file, &s.hash);
+            let mut throttle = Throttle::new(u64::MAX);
+            if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
+                if got != s.hash {
+                    quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
+                }
+            }
+        }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
         }
-        std::thread::sleep(left.min(Duration::from_secs(1)));
+        std::thread::sleep(left.min(Duration::from_millis(200)));
     }
     false
 }
@@ -4547,6 +4674,34 @@ mod tests {
         let (rows, degraded) = values_and_degraded(dir.path());
         assert!(rows.is_empty(), "{rows:?}");
         assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+    }
+
+    /// The copy aside is durable before the original goes: a quarantine directory that will not
+    /// sync keeps the original, refused, and leaves no copy that might not survive a crash.
+    #[test]
+    fn a_cross_device_quarantine_syncs_the_quarantine_directory_before_removing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seg, path) = decodable_rot(dir.path());
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                FAIL_DIR_SYNC.with(|fail| fail.set(false));
+            }
+        }
+        let _clear = Clear;
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        assert!(!quarantine_segment(
+            dir.path(),
+            "usdc__transfer",
+            &seg,
+            &path,
+            HASH_MISMATCH
+        ));
+        FAIL_DIR_SYNC.with(|fail| fail.set(false));
+        assert!(path.exists(), "removed before its copy was durable");
+        assert!(refused(&path));
+        assert!(!dir.path().join(QUARANTINE_DIR).join(&seg.file).exists());
     }
 
     #[test]

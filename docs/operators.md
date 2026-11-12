@@ -1735,6 +1735,7 @@ not reach the mirror; a rising count is a writer about to fence itself off).
 | **Queries out of memory** | `increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0` | a query did not fit the engine's memory budget; a release that regressed memory shows here first, as 4.1.1 would have |
 | **Logs not decoding** | `increase(nuthatch_nest_logs_undecoded_total[1h]) > 0` | a contract's ABI no longer fits what it emits, usually a proxy upgrade; the nest indexes less and stays ready. `/ready`'s `undecoded` names the pair, the warn line the error |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
+| **Sealed data quarantined** | `nuthatch_quarantined_segments > 0` or `nuthatch_derived_state_stale == 1` | a segment failed its hash and the nest answers reduced; restore it, re-index, or restart to rebuild derived state |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 | **Sealed history disagrees** | `increase(nuthatch_audit_mismatches_total[1d]) > 0` | a second endpoint served different logs for a sealed range; one of the two providers is wrong (below) |
 | **Audit not running** | `increase(nuthatch_audit_ranges_total[6h]) == 0` for 2h (the series exists only where `--audit-rpc` is set; six hours assumes the default 24 samples a day) | the audit endpoint is unreachable or on the wrong chain; `nuthatch_audit_errors_total` and the log say which |
@@ -1837,7 +1838,10 @@ error.
 
 **What the integrity passes took is on `/ready`.** Once this process has quarantined a segment the
 nest names, `integrity` is `{"quarantined_segments", "reduced_tables", "seals_stopped",
-"seals_stopped_tables", "derived_state_stale"}`; it is absent until then, and holds until restart. A
+"seals_stopped_tables", "derived_state_stale"}`; it is absent until then. A start derives it again
+from what `quarantine/` holds, so a reduction stays reported across restarts until a seal writes the
+segment's bytes back, which clears it at once; `/metrics` carries the same as
+`nuthatch_quarantined_segments` and `nuthatch_derived_state_stale`. A
 quarantined provisional tail stops every later seal, so `seals_stopped` turns true, and once the cursor
 holds a block past the sealed watermark the nest answers `503`, without waiting for
 `tip_seal_stalled`; the next start records the tail as lost and sealing resumes. `derived_state_stale` means the start rebuilt balances, exposure, velocity and
@@ -2007,8 +2011,11 @@ until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes ev
 reads it for upload, once, and refuses one that does not match by name, exiting non-zero, so a
 corrupted segment is never mirrored. It quarantines the file itself only for a solo nest no running
 `dev` holds, and never a provisional tail; a shared segment, or one a running writer holds, is left
-for that writer's own pass. `nuthatch doctor --catalogue` checks the
-same thing and only reports.
+for that writer's own pass. A publisher inside the writer's own process (`dev --publish-target`,
+or a runtime's `[mounts.publish]`) asks that writer to verify the segment at once. Once a segment
+the mirror never held is quarantined, the next publish leaves it out of the catalogue and logs that
+it did: the mirror is published reduced, as the nest itself now answers.
+`nuthatch doctor --catalogue` checks the same thing and only reports.
 
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
