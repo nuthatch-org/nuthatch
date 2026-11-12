@@ -521,7 +521,7 @@ script is never asked, and a yes says nothing about whether the nest lived or wa
 - **Payload v2.** `v` is 2 on every event. One new event, `alive`, with one new field:
 
   ```json
-  {"v":2,"event":"alive","version":"5.20.0","os":"linux","arch":"x86_64","queries":"100+"}
+  {"v":2,"event":"alive","version":"5.21.0","os":"linux","arch":"x86_64","queries":"100+"}
   ```
 
   `queries` is the `/sql` queries the process accepted since it last sent one, as one of `0`, `1+`,
