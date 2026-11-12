@@ -2745,8 +2745,6 @@ pub async fn dev(
         std::collections::HashMap::new();
     let mut pools: std::collections::HashMap<String, Arc<crate::source::LivePool>> =
         std::collections::HashMap::new();
-    let mut endpoint_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
     let mut chain_freshness: std::collections::HashMap<String, crate::freshness::Freshness> =
         std::collections::HashMap::new();
     let mut runtime_total_mb = RUNTIME_BASE_RSS_MB;
@@ -2807,9 +2805,7 @@ pub async fn dev(
             .iter()
             .map(|(name, _, _)| name.as_str())
             .collect();
-        let concurrency =
-            indexer::backfill_concurrency_for(rpc_urls.len(), concurrency, seal_direct, &names);
-        endpoint_counts.insert(group.endpoint.chain.clone(), rpc_urls.len());
+        let concurrency = indexer::backfill_concurrency_for(concurrency, seal_direct, &names);
 
         // Per-cursor footprint budget (RFC-0021), held per mount as a live mount is (RFC-0073 FR5).
         // Every nest is registered to this chain's cursor, so a cursor fault marks all of them.
@@ -3024,7 +3020,6 @@ pub async fn dev(
             dir: dir.clone(),
             mounts: all_mounts.mounts.clone(),
             sources,
-            endpoint_counts,
             backfill,
             seal_direct,
             concurrency,
@@ -4845,9 +4840,6 @@ pub async fn replace_rpc(
     persist_chain(&h.mount_ctx.dir, &endpoint)?;
     if let Some(pool) = h.mount_ctx.chains.pools.get(chain) {
         pool.replace(rpc);
-        h.mount_ctx
-            .endpoint_counts
-            .insert(chain.to_string(), rpc_urls.len());
     } else if let Some(d) = h.mount_ctx.dormant.get_mut(chain) {
         d.endpoint.rpc_urls = rpc_urls;
     }
@@ -5159,9 +5151,6 @@ pub struct MountContext {
     pub mounts: Vec<Mount>,
     /// Chain -> the source driving that chain's cursor. A nest whose chain is absent cannot be mounted.
     pub sources: std::collections::HashMap<String, Arc<dyn Source>>,
-    /// Chain -> the endpoints that source spreads over. A mounted nest fetches through it, so this is
-    /// what `safe_backfill_concurrency` guards, not the nest's own `rpc_urls`.
-    pub endpoint_counts: std::collections::HashMap<String, usize>,
     pub backfill: Option<u64>,
     pub seal_direct: bool,
     pub concurrency: usize,
@@ -7190,9 +7179,6 @@ impl RuntimeHandles {
                         .pools
                         .insert(chain.clone(), pool.clone());
                     self.mount_ctx.sources.insert(chain.clone(), pool);
-                    self.mount_ctx
-                        .endpoint_counts
-                        .insert(chain.clone(), d.endpoint.rpc_urls.len());
                     self.mount_ctx.chain_freshness.insert(chain.clone(), dial);
                     self.mount_ctx.dormant.remove(&chain);
                     stamp_operator_settings(
@@ -7222,13 +7208,7 @@ impl RuntimeHandles {
                 let dataset_dir = dir.clone();
                 let prepared = prepare_dataset(&self.mount_ctx.dir, dir, nid.as_deref(), name);
 
-                // Guarded by the chain's endpoints, as at boot. A chain missing from the count is capped to one.
                 let concurrency = indexer::backfill_concurrency_for(
-                    self.mount_ctx
-                        .endpoint_counts
-                        .get(&chain)
-                        .copied()
-                        .unwrap_or(1),
                     self.mount_ctx.concurrency,
                     self.mount_ctx.seal_direct,
                     &[name],
@@ -9778,7 +9758,6 @@ mod tests {
                 dir: root.path().to_path_buf(),
                 mounts: Vec::new(),
                 sources: std::collections::HashMap::new(),
-                endpoint_counts: std::collections::HashMap::new(),
                 backfill: None,
                 seal_direct: false,
                 concurrency: 1,
@@ -10649,7 +10628,6 @@ mod tests {
                 dir: root.path().to_path_buf(),
                 mounts: Vec::new(),
                 sources,
-                endpoint_counts: std::collections::HashMap::new(),
                 backfill: None,
                 seal_direct: false,
                 concurrency: 1,
@@ -11471,7 +11449,6 @@ mod tests {
                 dir: dir.to_path_buf(),
                 mounts: Vec::new(),
                 sources: std::collections::HashMap::new(),
-                endpoint_counts: std::collections::HashMap::new(),
                 backfill: None,
                 seal_direct: false,
                 concurrency: 1,
@@ -13012,7 +12989,6 @@ mod fr5_tests {
                 dir: root.to_path_buf(),
                 mounts: Vec::new(),
                 sources: std::collections::HashMap::new(),
-                endpoint_counts: std::collections::HashMap::new(),
                 backfill: None,
                 seal_direct: false,
                 concurrency: 1,
