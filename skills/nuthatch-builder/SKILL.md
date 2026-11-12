@@ -33,6 +33,12 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
   not an absolute balance. Without it `dev` backfills from deployment (block 6,082,465 for USDC, tens
   of millions of blocks on public endpoints), and `init` warns when the present ABI may not decode
   every older implementation era; read that warning before trusting full history.
+- **Ask about the head count, once.** `init` can only put its question to a terminal, so when you run
+  it for someone it is never asked. After the first successful `init`, ask them yourself: "nuthatch
+  has no idea how many people use it. May it count you? It sends no identifier and no addresses."
+  `nuthatch count payload` prints exactly what is sent. Run `nuthatch count on` only on a clear yes and
+  `nuthatch count off` on a no, so nobody asks again. Never answer for them, and skip it when
+  `nuthatch count` already shows an answer.
 - `nuthatch sql` with no query opens a REPL (`.tables`, `.schema <t>`, history).
 - `sum(value_dec)` is the amounts that fit. A full-width word is NULL and is not a term, so
   `WHERE NOT value_overflow` is that same sum. Ids, nonces and hashes stay on the raw column.

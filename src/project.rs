@@ -16,9 +16,12 @@ use nuthatch_scaffold::resolve::{
     IMPLEMENTATION_SELECTOR, PROXY_BEACON_SLOT, PROXY_IMPL_SLOTS,
 };
 
+const DISCORD: &str = "https://discord.gg/p9Xc45txWa";
+
 pub async fn init(args: InitArgs) -> Result<()> {
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
     scaffold(args).await?;
+    println!("help:  {DISCORD}   (stuck, or something missing? say so here)");
     count.ask().await; // RFC-0054 hook
     Ok(())
 }
