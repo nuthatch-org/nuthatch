@@ -3281,6 +3281,11 @@ const PROXY_HEADERS: &[&str] = &[
     "true-client-ip",
     "x-client-ip",
     "fly-client-ip",
+    "client-ip",
+    "x-cluster-client-ip",
+    "x-forwarded-prefix",
+    "x-envoy-external-address",
+    "x-azure-clientip",
 ];
 
 /// The host of an authority that is `host[:digits]` and nothing else, lowercased.
@@ -8255,6 +8260,49 @@ mod tests {
             lent_to,
             "the RPC lent beyond local callers"
         );
+    }
+
+    /// A caller that is not this machine, through a declared public host or a proxy that rewrites
+    /// `Host`, gets no trace of an unwatched hash and no timestamp search on the RPC.
+    #[tokio::test]
+    async fn a_remote_caller_on_a_loopback_bind_is_neither_traced_for_nor_searched_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_forward(forward)
+                .with_deadline(Duration::from_millis(200)),
+        );
+        let hosts = Hosts {
+            public: vec!["wallet.example.com".into()],
+            ..Default::default()
+        };
+        let addr = listen(router_for(s, hosts)).await;
+        let trace = format!(
+            "/api?module=account&action=txlistinternal&txhash=0x{}",
+            "cd".repeat(32)
+        );
+        let time = "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before";
+        for headers in [
+            vec!["Host: wallet.example.com".to_string()],
+            vec![
+                format!("Host: 127.0.0.1:{}", addr.port()),
+                "Via: 1.1 proxy".into(),
+            ],
+        ] {
+            for path in [trace.as_str(), time] {
+                let (code, body) = raw(addr, "GET", path, &headers, None).await;
+                assert_eq!(code, 200, "{headers:?}");
+                assert!(
+                    body.contains("NUTHATCH_UNSUPPORTED")
+                        && body.contains("this request is not one"),
+                    "{headers:?} {path}: {body}"
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
     }
 
     /// A refusal says what it saw and what to do about it.
