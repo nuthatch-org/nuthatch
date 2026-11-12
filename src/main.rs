@@ -32,7 +32,7 @@ use nuthatch::{
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -99,6 +99,14 @@ async fn main() -> Result<()> {
             .with_env_filter(filter())
             .with_writer(writer())
             .with_target(false)
+            .with_ansi(log_ansi(
+                if data_on_stdout {
+                    std::io::stderr().is_terminal()
+                } else {
+                    std::io::stdout().is_terminal()
+                },
+                std::env::var_os("NO_COLOR").as_deref(),
+            ))
             .init(),
         // One JSON object per line for a log aggregator. Every `tracing::info!(block = .., tip = ..,
         // "…")` field (the at-tip heartbeat, RFC #302) lands as its own JSON key instead of being
@@ -856,6 +864,12 @@ fn caveats(out: &analytics::QueryOutput) -> Vec<String> {
     lines
 }
 
+/// Whether text logs may carry colour codes: only to a terminal, and never when `NO_COLOR` is set
+/// to anything non-empty (no-color.org). A redirected log with escapes in it defeats `grep`.
+fn log_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
 /// Where `nuthatch sql` queries run: the local store (when `dev` is stopped) or the running instance's
 /// HTTP API (when `dev` holds the single-writer redb). Opened once, so a REPL reuses one connection.
 enum SqlBackend {
@@ -1353,6 +1367,15 @@ mod tests {
         assert!(tikv_jemalloc_ctl::opt::background_thread::read().unwrap());
         let dirty = unsafe { tikv_jemalloc_ctl::raw::read::<isize>(b"opt.dirty_decay_ms\0") };
         assert_eq!(dirty.unwrap(), 1000);
+    }
+
+    #[test]
+    fn text_logs_are_coloured_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(log_ansi(true, None));
+        assert!(log_ansi(true, Some(OsStr::new(""))));
+        assert!(!log_ansi(false, None));
+        assert!(!log_ansi(true, Some(OsStr::new("1"))));
     }
 
     #[test]
