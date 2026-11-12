@@ -1776,9 +1776,10 @@ pub struct DoctorArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Check the segment catalogue in `--dir`: every entry's file exists and hashes. Does not
-    /// quarantine (that is startup). Exit 1 if anything disagrees. With `--json` and no `--rpc`,
-    /// stdout is the catalogue check only, so the live-endpoints gate is unchanged.
+    /// Check the segment catalogue in `--dir`: every entry's file exists and hashes. It only
+    /// reports and moves nothing; a running nest quarantines what its own integrity passes find.
+    /// Exit 1 if anything disagrees. With `--json` and no `--rpc`, stdout is the catalogue check
+    /// only, so the live-endpoints gate is unchanged.
     #[arg(long)]
     pub catalogue: bool,
 

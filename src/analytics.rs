@@ -130,6 +130,8 @@ struct SessionCache {
     inputs: std::collections::BTreeMap<PathBuf, InputStamp>,
     last_used: u64,
     session: Box<dyn Session>,
+    /// `labels` is registered on `session`, from the snapshots `inputs` names.
+    labels_bound: bool,
 }
 
 /// A content hash of one cache input, hex sha256 (#840).
@@ -231,21 +233,48 @@ pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, In
                 .filter(|p| p.extension().is_some_and(|x| x == "sql")),
         );
     }
+    let mut addressed = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir.join(crate::labels::LABELS_DIR)) {
-        paths.extend(
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "json")),
-        );
+        for p in entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        {
+            if content_addressed(&p) {
+                addressed.push(p);
+            } else {
+                paths.push(p);
+            }
+        }
     }
-    paths
+    let mut stamps: std::collections::BTreeMap<PathBuf, InputStamp> = paths
         .into_iter()
         .filter_map(|path| {
             let stamp = content_stamp(&path)?;
             Some((path, stamp))
         })
-        .collect()
+        .collect();
+    // An imported snapshot is named by its own hash, which a reread could only confirm.
+    stamps.extend(addressed.into_iter().filter_map(|path| {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&path).ok()?;
+        let stamp = format!(
+            "addressed:{}:{}.{}:{}",
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ino()
+        );
+        Some((path, stamp))
+    }));
+    stamps
+}
+
+/// `labels/<sha256>.json`, as `labels import` writes it.
+fn content_addressed(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Puts a taken session back when it drops, so a refusal that returns before the statement runs
@@ -269,6 +298,14 @@ fn retain_session_cache(
     mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>>,
     slot: SessionCache,
 ) {
+    // The watermark only moves forward, so a session at any other, a cold reader's aside, is dead.
+    let cold = slot.sealed_through == u64::MAX;
+    cache.retain(|(dir, tenant, at), _| {
+        cold || *at == u64::MAX
+            || *at == slot.sealed_through
+            || dir != &slot.dir
+            || tenant != &slot.tenant
+    });
     cache.insert(
         (slot.dir.clone(), slot.tenant.clone(), slot.sealed_through),
         slot,
@@ -1614,6 +1651,7 @@ fn attempt(
             inputs,
             last_used: SESSION_USE.fetch_add(1, Ordering::Relaxed),
             session,
+            labels_bound: false,
         });
     }
     let mut slot = slot.expect("just inserted");
@@ -1692,8 +1730,11 @@ fn attempt(
         };
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
         // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
-        if as_of.is_none() {
-            define_labels_view(session, dir);
+        if as_of.is_none()
+            && !slot.labels_bound
+            && wanted.as_ref().is_none_or(|w| w.contains("labels"))
+        {
+            slot.labels_bound = define_labels_view(session, dir);
         }
         // Every view this query could be reading now exists, so the names it used can be widened to the
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
@@ -2552,7 +2593,7 @@ pub fn cold_velocity(
 /// Define a read-only `labels` view over the content-addressed snapshots in `dir/labels/*.json`
 /// (each a flat JSON array of `{address, label}`). No snapshots → no view, so joins against it are
 /// only attempted when labels exist. Addresses are lower-cased for a clean join with decoded hex.
-fn define_labels_view(session: &dyn Session, dir: &Path) {
+fn define_labels_view(session: &dyn Session, dir: &Path) -> bool {
     let labels_dir = dir.join(crate::labels::LABELS_DIR);
     let has_snapshot = std::fs::read_dir(&labels_dir)
         .map(|rd| {
@@ -2561,11 +2602,29 @@ fn define_labels_view(session: &dyn Session, dir: &Path) {
         })
         .unwrap_or(false);
     if !has_snapshot {
-        return;
+        return false;
     }
-    if let Err(e) = session.bind_labels(&labels_dir) {
-        tracing::debug!("labels view skipped: {e}");
+    #[cfg(test)]
+    {
+        *label_binds()
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_default() += 1;
     }
+    match session.bind_labels(&labels_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("labels view skipped: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn label_binds() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static BINDS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    BINDS.get_or_init(Default::default)
 }
 
 /// Define a `{template}__children` view per template for a factory nest (RFC-0009 §Serving): the set
@@ -2792,7 +2851,7 @@ fn define_views_bound(
 ) -> Result<DefinedViews> {
     let mut degraded: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut bound: std::collections::BTreeMap<String, TableScan> = Default::default();
-    let (manifest, catalogue_hash) = crate::seal::load_manifest_with_hash(dir)?;
+    let (manifest, catalogue_hash) = crate::seal::shared_manifest_with_hash(dir)?;
     let mut overtaken = false;
     let mut gone_on_follower: Option<PathBuf> = None;
     #[cfg(test)]
@@ -6662,6 +6721,30 @@ template="pool"
         );
     }
 
+    /// A session at a watermark the nest has moved past is never asked for again, and kept, it
+    /// evicts a co-tenant's warm one.
+    #[test]
+    fn a_moved_watermark_drops_the_session_it_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+            ..Default::default()
+        };
+        let hot = HotRows::new();
+        query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+        for watermark in 10..22 {
+            query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, watermark, &[]).unwrap();
+        }
+        // Other tests share the cache and may evict a survivor, so only the dead ones are asserted.
+        let dead: Vec<u64> = session_cache_lock()
+            .keys()
+            .filter(|(d, _, w)| d == dir.path() && *w != 21 && *w != u64::MAX)
+            .map(|(_, _, w)| *w)
+            .collect();
+        assert_eq!(dead, Vec::<u64>::new());
+    }
+
     /// #825: a cached connection is valid only for the authored inputs it was built from. Both an
     /// added view and its deletion must force a fresh catalogue; otherwise the old view stays
     /// queryable until process restart.
@@ -6764,6 +6847,28 @@ template="pool"
             session_opens_for(dir.path()),
             3,
             "removing a view must not leave the old catalogue cached"
+        );
+    }
+
+    #[test]
+    fn labels_are_bound_once_per_session_and_only_for_a_statement_that_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("labels.csv");
+        std::fs::write(&input, "0x1111111111111111111111111111111111111111,mixer\n").unwrap();
+        crate::labels::import(dir.path(), &input).unwrap();
+        let binds = || label_binds().lock().unwrap().get(dir.path()).copied();
+        query(dir.path(), "SELECT 1 AS n").unwrap();
+        query(dir.path(), "SELECT 1 AS n").unwrap();
+        assert_eq!(binds(), None, "a statement that reads no labels bound them");
+        for _ in 0..3 {
+            let rows = query(dir.path(), "SELECT count(*) AS n FROM labels").unwrap();
+            assert_eq!(rows[0]["n"], serde_json::json!(1));
+        }
+        assert_eq!(session_opens_for(dir.path()), 1);
+        assert_eq!(
+            binds(),
+            Some(1),
+            "a warm session bound the same labels again"
         );
     }
 

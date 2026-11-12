@@ -3423,11 +3423,18 @@ async fn build_nest(
     // Startup integrity pass (0.5.x hardening): quarantine any sealed segment whose bytes no longer
     // hash to their content address (disk corruption / tampering) before the view rebuild below scans
     // them. A corrupt segment reduces a table's cold data, loudly - it never crash-loops the node.
-    // The owner's alone: both rewrite the catalogue a sealing writer owns.
+    // It rereads only files that changed since a pass last hashed them; every segment is hashed
+    // again in the background once serving. The owner's alone: both touch what a sealing writer owns.
     if owner {
         if let Err(e) = seal::verify_and_quarantine(&dir) {
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
+        let alive = Arc::downgrade(&store);
+        seal::verify_in_background(
+            dir.clone(),
+            move || alive.strong_count() > 0,
+            seal::BACKGROUND_VERIFY_DELAY,
+        );
         // Before the view rebuild below reads cold under the watermark (#2169).
         nuthatch_core::seal::finish_unpruned_fold(&seal::FsSinks(&dir), store.as_ref())?;
     }
