@@ -12,8 +12,7 @@ Data is local - never call an external API for it.
 
 ## Preferred: MCP
 If a `nuthatch` MCP server is configured, use its tools. Call `schema` first to learn the
-data model, then `sql` / `entity` / `balance` / `top_balances`. The balance tools report net flow since
-`indexed_from`, a balance only if that is the contract's deployment block.
+data model, then `sql` / `entity` / `balance` / `top_balances`.
 
 ## Fallback: HTTP (a `nuthatch dev` must be running)
 - Recent rows:  `curl localhost:8288/entities?limit=20`

@@ -2549,6 +2549,7 @@ fn summary_value(s: &AppState) -> Value {
         "address": s.address,
         "entities": count,
         "start_block": s.store.get_meta("start_block").ok().flatten(),
+        "history_from_deployment": history_from_deployment(s),
         "last_block": last_block,
         "sealed_through": s.store.get_meta("sealed_through").ok().flatten(),
         "holders": s.balances.holders(),
@@ -3830,6 +3831,7 @@ async fn schema_doc(State(s): State<AppState>) -> impl IntoResponse {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
         first_indexed: first_indexed(&s),
+        history_from_deployment: history_from_deployment(&s),
     };
     // #822's surface bullet: `/schema` (which the MCP `schema` tool relays verbatim) must say that
     // a relation is incremental and name its applied-through block.
@@ -6304,6 +6306,22 @@ async fn derived_all(
         &first,
         derived_provenance(&s, entity, head, &applied),
     ))
+}
+
+/// Whether this nest's history begins at the contracts' deployment; null for a store that predates
+/// the record, which a reader must not take for either answer.
+fn history_from_deployment(s: &AppState) -> Option<bool> {
+    match s
+        .store
+        .get_meta(crate::indexer::HISTORY_FROM_DEPLOYMENT_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+    {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
 }
 
 /// The first block this nest indexed.
@@ -9778,6 +9796,24 @@ mod tests {
         );
         assert_eq!(ask(shared.clone()).await, 5, "the new generation");
         drop(old);
+    }
+
+    /// `GET /` says whether the history begins at deployment, and null where the store never recorded
+    /// it, so the bridge never claims a balance it cannot vouch for.
+    #[tokio::test]
+    async fn status_says_whether_history_begins_at_deployment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), 1);
+        let (_, body) = get_json(state.clone(), "/").await;
+        assert_eq!(body["history_from_deployment"], Value::Null, "{body}");
+        for (stored, want) in [("true", json!(true)), ("false", json!(false))] {
+            state
+                .store
+                .set_meta(crate::indexer::HISTORY_FROM_DEPLOYMENT_KEY, stored)
+                .unwrap();
+            let (_, body) = get_json(state.clone(), "/").await;
+            assert_eq!(body["history_from_deployment"], want, "{body}");
+        }
     }
 
     /// A nest started past its contract's deployment holds net flows, so `/schema` says where its

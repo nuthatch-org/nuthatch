@@ -29,7 +29,7 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
                              authored view (`views/*.sql`) answers by its own name
 - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)
-- `GET /balance/{address}`   one address's derived balance. Net flow since `start_block` (see `GET /`), a balance only if that is the contract's deployment block (not so after `--backfill` or a later `start_block`)
+- `GET /balance/{address}`   one address's derived balance
 - `GET /queries`             the mount's SQL mode and the queries its operator declared in
                              `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
 - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one

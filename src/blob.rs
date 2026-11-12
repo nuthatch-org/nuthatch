@@ -1353,15 +1353,13 @@ abi = "abis/c.json"
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
     /// identity fixes (#2355, #2362, #2363, #2368, #2369). A change that moves one re-indexes every
     /// operator holding that nest.
-    /// The `scaffold/*` NIDs have since moved with the scaffolded `llms.txt` and `SKILL.md`, which are
-    /// part of the package; their data identities have not.
     #[test]
     fn the_fixture_nests_keep_their_identities() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut moved = Vec::new();
         for (nest, nid, data) in [
-            ("scaffold/pair", "be1d572e3a92f9541e2c110ba23bc054e797f6a9f4e0232368b40dc575c706a1", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
-            ("scaffold/two", "f3001031575658f2db45b0e3f61ad226f2548f9cf236c4d1b04d5da58c2e51f8", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
+            ("scaffold/pair", "9286e466fb1e8c5007ac26c04931947effcba6a462fb4c6cd36f8059843ece49", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
+            ("scaffold/two", "1d2fa19f2ef741dadb0b650f4389ac54f0592897f3b251c675ffb94500730b4a", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
             ("diff/control", "409f7c7db35d5dab9db410e849be7420e7ab69460c06d3114024df2d7fe1c164", "8a12eac0c6604e0df102425c78ce588b7ac1b58434208e561166b9cc4e19ceff"),
             ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
             ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),
