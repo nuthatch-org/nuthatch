@@ -115,8 +115,10 @@ fn collectors() -> &'static Collectors {
 }
 
 /// How long a collector waits to retry a webhook that is held (an outbox with no room, a failed
-/// query), when no seal comes sooner.
+/// query), when no seal comes sooner. A failing query doubles it up to [`RETRY_MAX`]; a success
+/// resets it.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The task that owns `dir`'s webhook outbox and cursors once the nest is running, so a seal only
 /// records how far it got ([`sealed`]) and the writer never waits on a delivery query. It is the
@@ -183,6 +185,8 @@ impl Collector {
         webhooks: std::sync::Arc<Vec<Webhook>>,
     ) {
         let mut pause = None;
+        let mut backoff = RETRY;
+        let mut was_failing = false;
         loop {
             match pause {
                 None => {
@@ -211,22 +215,34 @@ impl Collector {
             let failed = match pass.await {
                 Ok(Ok(_)) => false,
                 Ok(Err(e)) => {
-                    tracing::warn!("webhook delivery failed: {e:#}");
+                    if !was_failing {
+                        tracing::warn!("webhook delivery failed: {e:#}");
+                    }
                     true
                 }
                 Err(e) => {
-                    tracing::warn!("webhook delivery task failed: {e}");
+                    if !was_failing {
+                        tracing::warn!("webhook delivery task failed: {e}");
+                    }
                     true
                 }
             };
             let standing = standing(&self.dir);
+            let failing = failed || standing.iter().any(|(_, s)| s.last_error.is_some());
             pause = if standing.iter().any(|(_, s)| s.waiting_for_turn) {
                 Some(std::time::Duration::ZERO)
-            } else if failed || standing.iter().any(|(_, s)| s.backlog_blocks > 0) {
-                Some(RETRY)
+            } else if failing {
+                let wait = backoff;
+                backoff = (backoff * 2).min(RETRY_MAX);
+                Some(wait)
             } else {
-                None
+                backoff = RETRY;
+                standing
+                    .iter()
+                    .any(|(_, s)| s.backlog_blocks > 0)
+                    .then_some(RETRY)
             };
+            was_failing = failing;
         }
     }
 }
@@ -452,6 +468,12 @@ fn note(
             "webhook '{}' is held at block {through}: {}",
             w.name,
             error.unwrap_or_default()
+        );
+    }
+    if error.is_none() && s.last_error.is_some() {
+        tracing::info!(
+            "webhook '{}' is delivering again from block {through}",
+            w.name
         );
     }
     if error.is_some() {
@@ -1252,6 +1274,55 @@ mod tests {
             !sealed(dir.path(), 11),
             "a dropped collector is deregistered"
         );
+    }
+
+    /// A webhook held by a failing query is retried after 5 s, 10 s, 20 s and so on up to 5 minutes,
+    /// not every 5 s, and delivers again once it can.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_webhook_backs_off_and_then_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(&dir.path().join("t.redb")).unwrap());
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(store.as_ref(), &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        // Unseated under strict isolation, so every pass fails until a mount seats it.
+        strict_nest(dir.path());
+        let task = tokio::spawn(collector(dir.path()).run(
+            store.clone() as std::sync::Arc<dyn HotStore>,
+            std::sync::Arc::new(webhooks.clone()),
+        ));
+        assert!(sealed(dir.path(), 5));
+        let failures = || standing(dir.path()).first().map_or(0, |(_, s)| s.failures);
+        let started = tokio::time::Instant::now();
+        while failures() < 8 {
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            })
+            .await
+            .unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(3600));
+        }
+        // Eight failures are seven waits: 5, 10, 20, 40, 80, 160, then the 300 s cap.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_secs(615),
+            "eight failures in {:?}",
+            started.elapsed()
+        );
+
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        while store.outbox_len() == 0 {
+            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            })
+            .await
+            .unwrap();
+            assert!(started.elapsed() < std::time::Duration::from_secs(7200));
+        }
+        assert_eq!(standing(dir.path())[0].1.last_error, None);
+        task.abort();
+        let _ = task.await;
     }
 
     /// Two nests may name a webhook alike: each keeps its own series under its mount, and an unmounted
