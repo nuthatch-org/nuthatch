@@ -1441,14 +1441,14 @@ mod tests {
 
     #[test]
     fn a_sql_failure_leads_with_its_hint_and_points_at_the_repl() {
-        let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. `GET /schema` lists the tables.";
+        let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. `SELECT table_name FROM information_schema.tables` lists the tables.";
         let out = sql_failure_message(raw);
         assert!(
             out.starts_with("no table `transfer`; the closest is `weth__transfer`."),
             "{out}"
         );
         assert!(
-            out.contains("`.tables`") && !out.contains("/schema"),
+            out.contains("`.tables`") && !out.contains("information_schema"),
             "{out}"
         );
         assert_eq!(out.lines().count(), 3, "{out}");

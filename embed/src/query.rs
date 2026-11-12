@@ -664,6 +664,28 @@ mod tests {
         assert_eq!(rows, vec![serde_json::json!({"n": 0})]);
     }
 
+    /// A hint's pointer is the node's bytes, so it has to be something the tab answers too.
+    #[test]
+    fn a_hints_pointer_answers_in_the_tab() {
+        let registry = crate::tab::erc20("0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a").unwrap();
+        let schema = registry.schema();
+        let q = bound(&NestFiles::new(), &[], &schema);
+        for raw in [
+            "Table with name nope does not exist!",
+            "Referenced column \"nope\" not found in FROM clause!",
+        ] {
+            let hint = nuthatch_core::sql_errors::enrich(raw, "", &schema).unwrap();
+            let sql = hint
+                .split('`')
+                .find(|s| s.starts_with("SELECT"))
+                .expect(&hint);
+            let sql = sql.replace("<table>", "tab__transfer");
+            referenced_tables(&sql, &NestFiles::new()).unwrap();
+            let rows = crate::window::block_on(q.rows(&sql)).unwrap();
+            assert!(!rows.is_empty(), "{sql}");
+        }
+    }
+
     #[test]
     fn a_qualified_name_names_its_table() {
         let got = referenced_tables("SELECT * FROM public.approval", &NestFiles::new()).unwrap();

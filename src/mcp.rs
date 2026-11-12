@@ -676,7 +676,9 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let q = args["query"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`query` is required"))?;
-            get_query(client, &format!("{base}/explain"), &[("q", q)]).await
+            get_query(client, &format!("{base}/explain"), &[("q", q)])
+                .await
+                .map(|body| sql_errors::for_surface(&body, sql_errors::Surface::Mcp))
         }
         // The route's JSON document, returned as it was sent: the same bytes `nuthatch diff
         // --format json` prints for the same request.
@@ -1775,10 +1777,34 @@ mod tests {
                 .unwrap()
                 .to_string();
             assert!(
-                out.contains(said) && !out.contains("/schema"),
+                out.contains(said) && !out.contains("information_schema"),
                 "{tool}: {out}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_query_that_binds_is_sent_to_the_sql_tool() {
+        use axum::{response::IntoResponse, routing::get, Router};
+        let valid = nuthatch_core::answer::explain_valid(false);
+        assert!(!String::from_utf8_lossy(&valid.body).contains("sql tool"));
+        let app = Router::new().route(
+            "/explain",
+            get(move || async move {
+                ([("content-type", "application/json")], valid.body).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "explain", "arguments": { "query": "SELECT 1" } } });
+        let out = handle(&req, &Session::new(&client, &base))
+            .await
+            .unwrap()
+            .to_string();
+        assert!(out.contains("run it with the sql tool"), "{out}");
     }
 
     #[tokio::test]

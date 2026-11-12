@@ -19,8 +19,10 @@ pub fn is_out_of_memory(raw: &str) -> bool {
         && !raw.contains("Catalog Error")
 }
 
-/// Where a hint's reader is, and so what lists the tables and columns for them. `enrich` writes
-/// `Http`'s pointers; `for_surface` turns them into another surface's.
+/// Where a hint's reader is, and so what lists the tables and columns for them and where a query
+/// that binds is run. `enrich` and `/explain` write `Http`'s pointers; `for_surface` turns them into
+/// another surface's. `Http`'s are SQL `/sql` answers, so a tab, which has no `/schema`, says the
+/// same bytes as a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Http,
@@ -33,7 +35,7 @@ impl Surface {
 
     fn tables(self) -> &'static str {
         match self {
-            Surface::Http => "`GET /schema` lists the tables.",
+            Surface::Http => "`SELECT table_name FROM information_schema.tables` lists the tables.",
             Surface::Mcp => "Call the `schema` tool for the list of tables.",
             Surface::Repl => "`.tables` in the `nuthatch sql` REPL lists them.",
         }
@@ -41,9 +43,20 @@ impl Surface {
 
     fn columns(self) -> &'static str {
         match self {
-            Surface::Http => "`GET /schema` lists each table's columns.",
+            Surface::Http => {
+                "`SELECT column_name FROM information_schema.columns WHERE table_name = '<table>'` \
+                 lists a table's columns."
+            }
             Surface::Mcp => "Call the `schema` tool for each table's columns.",
             Surface::Repl => "`.schema <table>` in the REPL lists its columns.",
+        }
+    }
+
+    pub(crate) fn explain_note(self) -> &'static str {
+        match self {
+            Surface::Http => "query binds; run it at `/sql`",
+            Surface::Mcp => "query binds; run it with the sql tool",
+            Surface::Repl => "query binds; run it in `nuthatch sql`",
         }
     }
 }
@@ -55,7 +68,8 @@ pub fn for_surface(text: &str, surface: Surface) -> String {
     for from in Surface::ALL.into_iter().filter(|s| *s != surface) {
         out = out
             .replace(from.tables(), surface.tables())
-            .replace(from.columns(), surface.columns());
+            .replace(from.columns(), surface.columns())
+            .replace(from.explain_note(), surface.explain_note());
     }
     out
 }
@@ -488,10 +502,10 @@ mod tests {
         let table = enrich("Table with name nope does not exist!", "", &schema()).unwrap();
         let column = enrich("Referenced column \"nope\" not found", "", &schema()).unwrap();
         for hint in [&table, &column] {
-            assert!(hint.contains("`GET /schema` lists"), "{hint}");
+            assert!(hint.contains("FROM information_schema."), "{hint}");
             let mcp = for_surface(hint, Surface::Mcp);
             assert!(
-                mcp.contains("Call the `schema` tool") && !mcp.contains("/schema"),
+                mcp.contains("Call the `schema` tool") && !mcp.contains("information_schema"),
                 "{mcp}"
             );
             let repl = for_surface(&mcp, Surface::Repl);
@@ -503,6 +517,15 @@ mod tests {
         }
         assert!(for_surface(&table, Surface::Repl).contains("`.tables`"));
         assert!(for_surface(&column, Surface::Repl).contains("`.schema <table>`"));
+        let note = Surface::Http.explain_note();
+        assert_eq!(
+            for_surface(note, Surface::Mcp),
+            "query binds; run it with the sql tool"
+        );
+        assert_eq!(
+            for_surface(&for_surface(note, Surface::Mcp), Surface::Http),
+            note
+        );
     }
 
     /// Burrmill's message for a segment whose pages were overwritten and footer left intact

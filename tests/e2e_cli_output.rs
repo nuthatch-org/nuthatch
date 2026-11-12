@@ -98,14 +98,16 @@ fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
     let body = err.trim_start_matches("Error: ");
     assert!(body.starts_with("no table `transfer`"), "{err}");
     assert!(
-        err.contains("`.tables`") && !err.contains("`schema` tool") && !err.contains("/schema"),
+        err.contains("`.tables`")
+            && !err.contains("`schema` tool")
+            && !err.contains("information_schema"),
         "{err}"
     );
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let reply = serde_json::json!({
-        "error": "no segments: Catalog Error: Table with name transfer does not exist!\n\nhint: no table `transfer`. `GET /schema` lists the tables."
+        "error": "no segments: Catalog Error: Table with name transfer does not exist!\n\nhint: no table `transfer`. `SELECT table_name FROM information_schema.tables` lists the tables."
     })
     .to_string();
     std::thread::spawn(move || {
@@ -136,7 +138,9 @@ fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
         "{err}"
     );
     assert!(
-        err.contains("`.tables`") && !err.contains("`schema` tool") && !err.contains("/schema"),
+        err.contains("`.tables`")
+            && !err.contains("`schema` tool")
+            && !err.contains("information_schema"),
         "{err}"
     );
 }
@@ -163,7 +167,7 @@ fn check_points_a_broken_views_hint_at_the_repl() {
         "{out}"
     );
     assert!(
-        !out.contains("/schema") && !out.contains("`schema` tool"),
+        !out.contains("information_schema") && !out.contains("`schema` tool"),
         "{out}"
     );
 }

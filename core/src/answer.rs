@@ -461,7 +461,7 @@ pub fn sql_bytes(envelope: &Value, serialized: Option<&RawValue>) -> serde_json:
 pub fn explain_valid(tip_unavailable: bool) -> Answer {
     Answer::ok(&json!({
         "valid": true,
-        "note": "query binds; run it with the sql tool",
+        "note": crate::sql_errors::Surface::Http.explain_note(),
         "tip_unavailable": tip_unavailable,
     }))
 }

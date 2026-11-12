@@ -60,7 +60,7 @@
     "path": "/sql?q=SELECT%20nope%20FROM%20tab__transfer",
     "status": 400,
     "content_type": "application/json",
-    "body": "{\"error\":\"plan error: Binder Error: Referenced column \\\"nope\\\" not found in FROM clause!\\nSchema error: No field named nope.\\nValid fields are tab__transfer._seq, tab__transfer.address, tab__transfer.block_hash, tab__transfer.block_number, tab__transfer.block_timestamp, tab__transfer.from, tab__transfer.log_index, tab__transfer.table, tab__transfer.to, tab__transfer.tx_hash, tab__transfer.value, tab__transfer.value_dec, tab__transfer.value_overflow.\\n\\nhint: no column `nope`; the closest is `to`. `GET /schema` lists each table's columns.\"}"
+    "body": "{\"error\":\"plan error: Binder Error: Referenced column \\\"nope\\\" not found in FROM clause!\\nSchema error: No field named nope.\\nValid fields are tab__transfer._seq, tab__transfer.address, tab__transfer.block_hash, tab__transfer.block_number, tab__transfer.block_timestamp, tab__transfer.from, tab__transfer.log_index, tab__transfer.table, tab__transfer.to, tab__transfer.tx_hash, tab__transfer.value, tab__transfer.value_dec, tab__transfer.value_overflow.\\n\\nhint: no column `nope`; the closest is `to`. `SELECT column_name FROM information_schema.columns WHERE table_name = '<table>'` lists a table's columns.\"}"
   },
   {
     "method": "POST",
@@ -74,21 +74,21 @@
     "path": "/explain?q=SELECT%20count(*)%20FROM%20tab__transfer",
     "status": 200,
     "content_type": "application/json",
-    "body": "{\"valid\":true,\"note\":\"query binds; run it with the sql tool\",\"tip_unavailable\":false}"
+    "body": "{\"valid\":true,\"note\":\"query binds; run it at `/sql`\",\"tip_unavailable\":false}"
   },
   {
     "method": "POST",
     "path": "/explain",
     "status": 200,
     "content_type": "application/json",
-    "body": "{\"valid\":true,\"note\":\"query binds; run it with the sql tool\",\"tip_unavailable\":false}"
+    "body": "{\"valid\":true,\"note\":\"query binds; run it at `/sql`\",\"tip_unavailable\":false}"
   },
   {
     "method": "GET",
     "path": "/explain?q=SELECT%20*%20FROM%20no_such_table",
     "status": 400,
     "content_type": "application/json",
-    "body": "{\"valid\":false,\"error\":\"no segments: Catalog Error: Table with name no_such_table does not exist!\\nError during planning: no table no_such_table\\n\\nhint: no table `no_such_table`. `GET /schema` lists the tables.\"}"
+    "body": "{\"valid\":false,\"error\":\"no segments: Catalog Error: Table with name no_such_table does not exist!\\nError during planning: no table no_such_table\\n\\nhint: no table `no_such_table`. `SELECT table_name FROM information_schema.tables` lists the tables.\"}"
   },
   {
     "method": "GET",
