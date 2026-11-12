@@ -1985,8 +1985,10 @@ unchanged metadata is caught within one background pass of a start, and within 2
 pass after that. Until then a corrupted segment that still decodes can answer a query wrongly. The views
 and balances rebuilt at start read segments before that pass has verified them, where before 5.21
 rot that happened before a restart was caught before the rebuild; and nothing retracts derived state
-built from a segment that is later quarantined, so it stays wrong until the next restart. A shared segment is reported and
-left in place. A provisional tail found corrupt in the background stops later seals until the next
+built from a segment that is later quarantined, so it stays wrong until the next restart. A segment
+in a runtime's shared store (`<root>/segments/`) is moved to `<root>/quarantine/<hash>.parquet`: its
+bytes are wrong for every dataset that names that hash, so every mount of every such nest answers
+reduced from then on, and sealing the same rows again in any of them puts it back. A provisional tail found corrupt in the background stops later seals until the next
 start records it as lost. `nuthatch publish` hashes every segment before it uploads it, and refuses
 (and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
 --catalogue` checks the same thing and only reports.

@@ -1274,10 +1274,9 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// the check `verify_and_quarantine` makes at startup. Using the same one here is what stops the
 /// serving path and the startup path disagreeing about the same file, which was half of #419.
 ///
-/// **Reduce here, never quarantine.** Quarantine moves bytes, and the shared store's bytes belong to
-/// every dataset referencing them (RFC-0033 §11a). Dropping a segment from one query's view changes
-/// nothing on disk and so is safe for a shared segment, which is why this returns hashes rather than
-/// calling the startup pass.
+/// **Reduce here, never quarantine.** A query is a reader, possibly on a mount that does not own the
+/// dataset, and moving files is the integrity passes' job on the writer. Dropping a segment from one
+/// query's view changes nothing on disk, which is why this returns hashes rather than calling them.
 ///
 /// ## Cost, and the cache that is deliberately not here
 ///
@@ -1887,28 +1886,26 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
 /// Move a segment that does not hash to its address into `quarantine/`, so `define_views` skips it.
 /// True when it was moved.
 fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason: &str) -> bool {
-    // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and in the
-    // shared store those bytes belong to every dataset referencing them - one nest's integrity pass
-    // must not yank data out from under its neighbours. A corrupt shared segment is reported loudly
-    // and left in place; the operator decides, with the knowledge that more than one dataset is
-    // affected.
-    if shared_store(dir).is_some_and(|st| path.starts_with(&st)) {
-        tracing::error!(
-            "shared segment {} for table {table} is {reason} - left in place because other \
-             datasets reference it. Remove it deliberately once you know what else breaks.",
-            s.hash
-        );
-        return false;
-    }
+    // A shared file is addressed by its hash, so bytes that do not hash to it are wrong for every
+    // dataset naming it, and moving it out of the store reduces them all at once. It goes beside the
+    // store, not into this dataset, which may be unmounted while another still names the hash.
+    let shared = shared_store(dir).filter(|st| path.starts_with(st));
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
-    let quarantine = dir.join(QUARANTINE_DIR);
+    let (quarantine, dest_name, scope) = match &shared {
+        Some(store) => (
+            store.with_file_name(QUARANTINE_DIR),
+            format!("{}.parquet", s.hash),
+            "every dataset in this runtime that names it",
+        ),
+        None => (dir.join(QUARANTINE_DIR), s.file.clone(), "this table"),
+    };
     std::fs::create_dir_all(&quarantine).ok();
-    let dest = quarantine.join(&s.file);
+    let dest = quarantine.join(dest_name);
     match std::fs::rename(path, &dest) {
         Ok(()) => {
             tracing::error!(
-                "quarantined segment {} for table {table} ({reason}) → {} - cold data for this \
-                 table is reduced. Its rows left the hot store when it was sealed, so nuthatch \
+                "quarantined segment {} for table {table} ({reason}) → {} - cold data for {scope} \
+                 is reduced. Its rows left the hot store when it was sealed, so nuthatch \
                  cannot re-seal them: restore a copy hashing to {} at {}, or re-index the nest",
                 s.file,
                 dest.display(),
@@ -3979,6 +3976,74 @@ mod tests {
 
         // The reader agrees with the writer about where the bytes are.
         assert_eq!(segment_path(&dir, &seg.file, &seg.hash), shared);
+    }
+
+    /// Two datasets in one runtime name the same shared segment. Bytes that no longer hash to it are
+    /// wrong for both, so one dataset's pass takes them out of the store and the other's queries
+    /// answer reduced, never from the bad bytes.
+    #[test]
+    fn a_corrupt_shared_segment_is_quarantined_for_every_dataset_that_names_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (a, b) = (data.join("a".repeat(64)), data.join("b".repeat(64)));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("schema.json"),
+                r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+            )
+            .unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        }
+        let seg = load_manifest(&a).unwrap().tables["usdc__transfer"][0].clone();
+        assert_eq!(
+            load_manifest(&b).unwrap().tables["usdc__transfer"][0].hash,
+            seg.hash
+        );
+        let shared = segment_path(&a, &seg.file, &seg.hash);
+        assert!(shared.starts_with(root.path().join(SEGMENTS_DIR)));
+        // Rot that still decodes: another segment's valid bytes under this address.
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &shared).unwrap();
+        let values = |dir: &Path| {
+            let out = crate::analytics::query_guarded(
+                dir,
+                r#"SELECT value FROM "usdc__transfer""#,
+                Default::default(),
+            )
+            .unwrap();
+            let rows: Vec<String> = out
+                .rows
+                .iter()
+                .map(|r| r["value"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (rows, out.degraded_tables)
+        };
+        assert_eq!(
+            values(&b).0,
+            ["999"],
+            "the fixture's bad bytes do not decode"
+        );
+
+        assert_eq!(verify_and_quarantine(&a).unwrap(), 1);
+        assert!(!shared.exists(), "the bad bytes are still in the store");
+        assert!(root
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(format!("{}.parquet", seg.hash))
+            .is_file());
+        let (rows, degraded) = values(&b);
+        assert!(
+            rows.is_empty(),
+            "the other dataset still reads them: {rows:?}"
+        );
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+
+        // The right bytes sealed again put the segment back, for both.
+        seal_range(&b, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert_eq!(values(&a).0, ["5"]);
     }
 
     /// The other half of the same guard: re-sealing identical rows must not disturb the stored copy.
