@@ -78,8 +78,9 @@ pub enum Command {
     /// Drain recorded authorisations and settle them (RFC-0046 S3).
     ///
     /// The nest already served. This is the back office: it reads `authorisations.jsonl`, hands each
-    /// row to `--exec`, and records settled/failed per payer. Rebuild with `--features counter` or
-    /// the command refuses. `--dry-run` lists the queue and writes nothing.
+    /// row to `--exec`, and records settled/failed per payer. Needs a source build with the `counter`
+    /// feature (no release carries it), or the command refuses. `--dry-run` lists the queue and writes
+    /// nothing.
     Settle(SettleArgs),
 
     // --- SCALED: the docker-compose writer-pool / control-plane topology (RFC-0022). ---
@@ -974,7 +975,7 @@ pub struct QueryBenchArgs {
     pub label: Option<String>,
 
     /// Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only
-    /// reports; passed, it is a gate (CI uses it - CLAUDE.md: benchmark regressions fail the build).
+    /// reports; passed, it is a gate (CI uses it so a benchmark regression fails the build).
     #[arg(long)]
     pub max_point_read_p50_us: Option<f64>,
 
@@ -1367,13 +1368,19 @@ pub struct AddArgs {
 pub struct WorkerArgs {
     /// The control-plane Postgres URL - desired state and the worker registry.
     // The default build refuses the subcommand by name in `main`; clap must not ask for flags first.
-    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub control_db: String,
 
     /// The hot-store Postgres URL - where indexed state lives. Usually the same server as the control
     /// plane, but a distinct database: one holds *what should run*, the other holds *indexed data*.
-    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub hot_store: String,
 
@@ -1436,7 +1443,10 @@ pub struct ControlArgs {
     /// The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state,
     /// **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's
     /// outage are different events.
-    #[cfg_attr(not(feature = "postgres-store"), arg(default_value = ""))]
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub db: String,
 }
@@ -1451,8 +1461,9 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
-    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with
-    /// `--features postgres-store`. Omit to serve the nest's local redb instead - but that store
+    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires the scaled
+    /// build (the `nuthatch-scaled-<target>.tar.gz` release asset or the `:<version>-scaled` image).
+    /// Omit to serve the nest's local redb instead - but that store
     /// must already exist (`serve` never creates or writes to it), and redb's exclusive flock means
     /// exactly one process may hold it: local redb does not read-scale a box or share with `dev`,
     /// only `--hot-store` does.

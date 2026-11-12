@@ -1425,6 +1425,29 @@ mod tests {
     }
 
     #[test]
+    fn no_help_page_exposes_clap_wiring_or_an_internal_document() {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+            let help = cmd.clone().render_long_help().to_string();
+            for bad in [
+                "[default: \"\"]",
+                "global = true",
+                "CLAUDE.md",
+                "--features ",
+            ] {
+                if help.contains(bad) {
+                    out.push(format!("`{path}` help contains {bad:?}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&cli::Cli::command(), "nuthatch", &mut found);
+        assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    #[test]
     fn a_sql_failure_leads_with_its_hint_and_points_at_the_repl() {
         let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. Call the `schema` tool for the full list.";
         let out = sql_failure_message(raw);
