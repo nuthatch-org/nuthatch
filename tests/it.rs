@@ -153,6 +153,9 @@ mod gate_refresh_script;
 #[path = "graph_over_indexed_data.rs"]
 mod graph_over_indexed_data;
 #[cfg(feature = "graph")]
+#[path = "graph_scaffold_id.rs"]
+mod graph_scaffold_id;
+#[cfg(feature = "graph")]
 #[path = "graph_schema_golden.rs"]
 mod graph_schema_golden;
 #[path = "ivm_claims.rs"]
