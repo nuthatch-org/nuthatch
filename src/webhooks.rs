@@ -115,6 +115,12 @@ fn deliver_sealed_within(
     outbox_max: u64,
 ) -> Result<usize> {
     let mut enqueued = 0usize;
+    // `table` and `where` come from the bundle, which a tenant writes: they run as a request from a
+    // mount of this dataset runs, and in a strict runtime not before one has said whose they are.
+    let Some(seat) = crate::maintained::runs_as(dir) else {
+        tracing::debug!("webhooks held: no mount has seated this dataset yet");
+        return Ok(0);
+    };
     for w in webhooks.iter().filter(|w| is_sealed(w)) {
         let cursor: u64 = store
             .get_meta(&cursor_key(&w.name))?
@@ -133,7 +139,6 @@ fn deliver_sealed_within(
         }
         let batch_max = w.batch_max.unwrap_or(DEFAULT_BATCH_MAX).max(1);
         let limit = room.saturating_mul(batch_max as u64);
-        // `table`/`where` are operator-authored (trusted, like nest views); block bounds are ours.
         let predicate = w
             .where_clause
             .as_deref()
@@ -156,7 +161,27 @@ fn deliver_sealed_within(
             Some((b, pos)) => (b - 1, b, pos),
             None => (cursor, sealed_to, 0),
         };
-        let mut rows = match crate::analytics::query(dir, &select(lo, hi, offset)) {
+        let sql = select(lo, hi, offset);
+        let rows = match &seat {
+            Some(seat) => {
+                // The row and byte caps stay off: a cut answer would move the cursor past rows never
+                // queued. The statement's own LIMIT bounds it.
+                let guard = crate::analytics::QueryGuard {
+                    max_rows: usize::try_from(limit).unwrap_or(usize::MAX),
+                    max_result_bytes: usize::MAX,
+                    ..seat.guard
+                };
+                crate::analytics::isolated(Some(&seat.tenant), || {
+                    crate::analytics::query_guarded(dir, &sql, guard)
+                })
+                .and_then(|out| {
+                    anyhow::ensure!(!out.truncated, "the answer was cut short");
+                    Ok(out.rows)
+                })
+            }
+            None => crate::analytics::query(dir, &sql),
+        };
+        let mut rows = match rows {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!("webhook '{}' query skipped: {e:#}", w.name);
@@ -245,6 +270,20 @@ pub fn refuse_unbound(
         )
     };
     for w in webhooks {
+        // Spliced between quotes into every delivery query, so it must be a name and nothing more.
+        if w.table.is_empty()
+            || !w
+                .table
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            anyhow::bail!(
+                "webhook '{}': `table = \"{}\"` is not a table name; it may hold only letters, \
+                 digits and underscores",
+                w.name,
+                w.table
+            );
+        }
         let base = format!(
             "SELECT * FROM \"{}\" WHERE block_number > 0 ORDER BY block_number, log_index",
             w.table
@@ -525,5 +564,91 @@ mod tests {
             refuse_unbound(dir.path(), &declared, &[bad]).unwrap_err()
         );
         assert!(err.contains("`where = \"vlaue > 100\"`"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            refuse_unbound(
+                dir.path(),
+                &declared,
+                &[wh("w", "t__transfer\" AS a, \"t__transfer", "registration")]
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("not a table name"), "{err}");
+    }
+
+    fn strict_nest(dir: &std::path::Path) {
+        crate::maintained::attach(dir, crate::serve::SqlGate::new(2), true);
+    }
+
+    fn seat(dir: &std::path::Path, timeout: std::time::Duration) {
+        let guard = crate::analytics::QueryGuard {
+            timeout,
+            ..Default::default()
+        };
+        crate::maintained::seat(dir, "acme/w", std::sync::Arc::from("acme"), guard);
+    }
+
+    /// A strict runtime runs a tenant's delivery query as that tenant's request, so nothing runs before
+    /// a mount says whose it is, and the cursor waits for it.
+    #[test]
+    fn a_strict_delivery_waits_for_a_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 0);
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 1);
+    }
+
+    /// Under strict a `where` may call only what a tenant's `/sql` may.
+    #[test]
+    fn a_strict_delivery_refuses_a_function_off_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.where_clause = Some("version() IS NOT NULL".into());
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 0);
+        assert_eq!(store.outbox_len(), 0);
+    }
+
+    /// A delivery is held to its seat's deadline, so an expensive `where` gives the cursor back
+    /// rather than holding it until the statement ends, and the cursor stays where it was.
+    #[test]
+    fn a_delivery_is_cut_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.where_clause = Some(
+            "(SELECT sum(a.range * b.range) FROM range(1000000) a CROSS JOIN range(1000000) b) > 0"
+                .into(),
+        );
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_millis(300));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(deliver_sealed(&store, &d, &webhooks, 5).map(|n| (n, store)));
+        });
+        let (n, store) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the delivery outlived its deadline")
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            store.get_meta(&cursor_key("w")).unwrap().as_deref(),
+            Some("0")
+        );
     }
 }
