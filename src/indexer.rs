@@ -8469,8 +8469,7 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
 }
 
 /// `--backfill` only chooses where a cold start begins. Once the store holds a block it is ignored,
-/// and the operator is told so rather than left to find the full-history backfill resuming. Only a
-/// solo nest is told how to start over: a runtime dataset may be mounted by another tenant.
+/// and the operator is told so rather than left to find the full-history backfill resuming.
 fn ignored_backfill(
     backfill: Option<u64>,
     from: Option<u64>,
@@ -8482,11 +8481,15 @@ fn ignored_backfill(
         Some(from) => format!("blocks {from} to {last}"),
         None => format!("up to block {last}"),
     };
-    let tail = match solo_store_paths(dir) {
-        Some(paths) => {
+    let tail = match start_over(dir) {
+        StartOver::Remove(paths) => {
             format!(" (to start over from tip minus {n}: stop, remove {paths}, and rerun)")
         }
-        None => String::new(),
+        StartOver::Shared(shared) => format!(
+            " (its sealed segments are kept in {}, outside its directory and possibly shared, so \
+             starting over means a fresh nest directory)",
+            shared.display()
+        ),
     };
     Some(format!(
         "--backfill {n} does not apply: this dataset has already indexed {range}, so it resumes \
@@ -8496,34 +8499,42 @@ fn ignored_backfill(
 }
 
 /// Printed as a long cold-start backfill begins. It is read while the first window is already
-/// committing, so for a solo nest it says how to start over, which is what makes it true.
+/// committing, so it says how to start over, which is what makes it true.
 fn long_history_advice(span: u64, recent: u64, dir: &Path) -> String {
-    match solo_store_paths(dir) {
-        Some(paths) => format!(
+    match start_over(dir) {
+        StartOver::Remove(paths) => format!(
             "that is {span} blocks of history; to index only the last {recent} instead, stop, \
              remove {paths}, and rerun with `--backfill {recent}`"
         ),
-        None => format!(
-            "that is {span} blocks of history; a runtime started with `--backfill {recent}` \
-             indexes only the last {recent} blocks of a dataset it holds none of yet"
+        StartOver::Shared(shared) => format!(
+            "that is {span} blocks of history; `--backfill {recent}` indexes only the last \
+             {recent} blocks of a fresh dataset, and this one keeps its sealed segments in {}, \
+             outside its directory and possibly shared, so that means a fresh nest directory",
+            shared.display()
         ),
     }
 }
 
-/// The store a solo nest owns, named from the paths it really uses; `None` for a runtime dataset
-/// (`data/<nid>` or anywhere under a `mounts.toml` root), which is not the operator's to delete on
-/// one nest's say-so. A parent merely named `data` does not make a nest a runtime's.
-fn solo_store_paths(dir: &Path) -> Option<String> {
-    let runtime_root = dir.parent().and_then(Path::parent);
-    let runtime = crate::runtime::MountTable::is_identity_keyed(dir)
-        || runtime_root.is_some_and(|r| r.join(crate::runtime::MOUNTS_FILE).exists());
-    (!runtime).then(|| {
-        format!(
+enum StartOver {
+    /// The store and segment directory belong to this nest alone; removing them is a clean start.
+    Remove(String),
+    /// Sealed segments live outside the nest's directory, so nothing here is safe to delete.
+    Shared(PathBuf),
+}
+
+/// Deletion advice only where the segment files are inside the nest's own directory, asked of the
+/// same function that places them.
+fn start_over(dir: &Path) -> StartOver {
+    let segments = seal::segments_dir(dir);
+    if segments == dir.join(seal::SEGMENTS_DIR) {
+        StartOver::Remove(format!(
             "{} and {}",
             dir.join(DB_FILE).display(),
-            seal::segments_dir(dir).display()
-        )
-    })
+            segments.display()
+        ))
+    } else {
+        StartOver::Shared(segments)
+    }
 }
 
 fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -> u64 {
@@ -12408,24 +12419,21 @@ template = "pool"
         assert!(advice.contains("`--backfill 300`"), "{advice}");
         assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
 
-        // A solo nest whose parent happens to be called `data` is still a solo nest, and its
-        // remedy names where its store and segments really are.
+        // A solo nest kept under a directory named `data` has its segments outside its own
+        // directory, shared with its siblings: no deletion advice, and the shared directory is named.
         let root = tempfile::tempdir().unwrap();
         let solo_in_data = root.path().join("data").join("solo");
         std::fs::create_dir_all(&solo_in_data).unwrap();
         let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
+        assert!(!note.contains("remove"), "{note}");
         assert!(
-            note.contains(&format!(
-                "{} and {}",
-                solo_in_data.join("nuthatch.redb").display(),
-                root.path().join("segments").display()
-            )),
+            note.contains(&root.path().join("segments").display().to_string())
+                && note.contains("possibly shared"),
             "{note}"
         );
-        // A mounts.toml root makes anything under its data/ a runtime dataset.
-        std::fs::write(root.path().join("mounts.toml"), "").unwrap();
-        let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
-        assert!(!note.contains("remove"), "{note}");
+        let advice = long_history_advice(5_000_000, 300, &solo_in_data);
+        assert!(!advice.contains("remove"), "{advice}");
+        assert!(advice.contains("possibly shared"), "{advice}");
     }
 
     #[test]
