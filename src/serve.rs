@@ -2512,6 +2512,25 @@ fn ready_answer(s: &AppState) -> Answer {
         seal_fault,
         // RFC-0062: absent unless the nest declares a maintained view.
         maintained: crate::maintained::is_declared(&s.dir).then(|| maintained_status(&s.dir)),
+        webhooks: webhook_status(&s.dir),
+    })
+}
+
+/// Each webhook's delivered block, backlog in blocks and last error, once it has run.
+fn webhook_status(dir: &std::path::Path) -> Option<Value> {
+    let standing = crate::webhooks::standing(dir);
+    (!standing.is_empty()).then(|| {
+        standing
+            .into_iter()
+            .map(|(name, s)| {
+                json!({
+                    "name": name,
+                    "delivered_through": s.delivered_through,
+                    "backlog_blocks": s.backlog_blocks,
+                    "last_error": s.last_error,
+                })
+            })
+            .collect()
     })
 }
 

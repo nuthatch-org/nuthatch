@@ -3652,7 +3652,7 @@ async fn build_nest(
             tables.extend(calls.schema(&config.extract));
         }
         refuse_duplicate_tables(&tables)?;
-        crate::webhooks::refuse_unbound(&dir, &tables, &config.webhooks)?;
+        crate::webhooks::refuse_unbound(&dir, &tables, &config.webhooks, config.strict_isolation)?;
         crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
     };
 
