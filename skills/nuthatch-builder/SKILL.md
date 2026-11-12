@@ -81,5 +81,5 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
    approach is wrong - reorgs are handled by the hot store, not by rewriting Parquet.
 4. **The guards are protection, not bugs.** A 503 from `/sql` means "too many concurrent queries"; a
    timeout means "add filters or a LIMIT" - not "raise the cap."
-5. **Everything is local.** No telemetry beyond an anonymous head count (`nuthatch count off` stops it), no API token, no phone-home. AI features are BYO-key or
+5. **Everything is local.** No telemetry unless the operator opts in (`nuthatch count`), no API token, no phone-home. AI features are BYO-key or
    local Ollama, and degrade gracefully offline.

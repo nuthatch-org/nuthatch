@@ -55,7 +55,7 @@ of indexers, while a nest puts a contract's history in a database on your own ma
 **Why.** Getting at a contract's history usually means writing a subgraph or handler code, running a
 database, or renting someone else's copy. nuthatch generates the tables from the ABI, runs as one
 process with nothing else to install, and keeps the data on your machine: at most 2 GB of RAM per
-chain, no account, and no telemetry beyond an anonymous head count you can turn off. The built-in MCP server lets Claude or any MCP client query it.
+chain, no telemetry unless you opt in, no account. The built-in MCP server lets Claude or any MCP client query it.
 
 ---
 
@@ -66,10 +66,10 @@ chain, no account, and no telemetry beyond an anonymous head count you can turn 
 - **No infra.** A single Rust binary. Embedded mode needs no Postgres, no Docker, no IPFS.
 - **It's just SQL.** Your contract's events become per-event tables you query with real analytical SQL -
   the live tip *and* sealed history, one surface.
-- **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No mandatory API
-  token, ever. The one thing it sends about you is a head count: one anonymous line per `init` and one
-  a week from a running nest, said once before the first, off with `nuthatch count off`,
-  `NUTHATCH_NO_COUNT=1` or `DO_NOT_TRACK=1`. [Its totals are public](https://www.nuthatch-indexer.com/count).
+- **It's yours, and it's small.** ≤2 GB RAM for single-chain tip-following, CI-enforced. No telemetry by
+  default, no mandatory API token, ever: the one opt-in is a head count at `init` (`nuthatch count`),
+  and [its totals are public](https://www.nuthatch-indexer.com/count). Most people say no or are never asked, so
+  they are floors.
 
 ---
 
@@ -648,8 +648,8 @@ A major version is a promise about **stability**, not a claim of completeness.
   Scaled mode is built and verified across real machines, but younger: until 0.9.3 its writer pool
   did not index at all. If one process per box is enough, that is still the shape to reach for.
 
-**What is deliberately not here:** a billed or metered hosted service, a token, telemetry beyond the
-head count, or any deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
+**What is deliberately not here:** a billed or metered hosted service, a token, telemetry on by default,
+or any deployment story beyond binary + compose. Those are not backlog items; they are out of scope.
 
 ## Security
 
@@ -674,7 +674,7 @@ the findings we closed as *not ours to fix* and why, is in
   [RFC-0015](docs/rfcs/0015-the-delightful-core.md). Deferred/leftover work is in
   [`docs/backlog.md`](docs/backlog.md); what each release changed is in [`docs/releases/`](docs/releases/).
 - **Governance:** a self-funded public good, maintained by one person; everything is open source. No
-  token, no phone-home beyond the head count. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief
+  token, no phone-home. See [`GOVERNANCE.md`](GOVERNANCE.md) and the standing design brief
   [`CLAUDE.md`](CLAUDE.md).
 - **Community:** the [Nuthatch Discord](https://discord.gg/p9Xc45txWa). Ask there if you would like a
   nest run for you, on the stock binary and with no billing, or need a chain nuthatch does not support

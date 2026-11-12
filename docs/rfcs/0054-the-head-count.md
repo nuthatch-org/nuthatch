@@ -1,7 +1,7 @@
 # RFC-0054: The head count - an opt-in ping at `nuthatch init`, and the word in non-negotiable 3 it asks to change
 
-**Status:** **Accepted 2026-10-08 (Chief). Amended 2026-11-12 (Chief): on by default and said once
-instead of asked, with a weekly `alive`; §12 overrides the sections it names.** Non-negotiable 3 is amended with §1's wording in
+**Status:** **Accepted 2026-10-08 (Chief). Amended 2026-11-12 (Chief): a weekly `alive` under the
+same yes and a hint where there is no terminal, §12. Still opt-in.** Non-negotiable 3 is amended with §1's wording in
 `CLAUDE.md`, and the acceptance is recorded in its build-order block. §11 is settled with this RFC's
 leanings: (1) a single-purpose `count.toml`; (2) the receiver is the one-file binary on the Helsinki
 host, and Vercel holds nothing; (3) `chain` is sent, under the registry-only rule; (4) the number is
@@ -501,25 +501,23 @@ The RFC recommends yes with the amendment in §1, and records that a no closes i
    has enough days behind it that a single week's noise does not dominate. Publishing early and
    saying so is the house habit; the RFC follows it.
 
-## 12. Amendment, 2026-11-12: on by default, said once, and a weekly `alive`
+## 12. Amendment, 2026-11-12: a weekly `alive`, and a hint where nobody can be asked
 
-**Decided by Chief on 2026-11-12:** "dont ask, do it by default but say so." This section overrides
-§3 goal 2, §4's second non-goal, §5.1 to §5.3 where they differ, §10 B and §10 F. Everything else
-stands, the deletion test and the no-identifier rule first among them.
+**Decided by Chief on 2026-11-12.** The count stays opt-in: making it on by default with a notice
+(§10 B) was built the same day and withdrawn before it merged. This section overrides §4's second
+non-goal and §10 F, and adds to §5.2 and §5.3. Everything else stands.
 
 **Why.** From 2026-10-08 to 2026-11-12 the receiver recorded two `counted`, one of them the test
-ping, and one `init`. Over the same weeks every release's binaries were downloaded. The question was
-only ever put to a terminal, so a nest scaffolded by an agent or a script was never asked, and §8's
-second argument for a no came true: the number is too small to bound anything.
+ping, and one `init`. The question is only put to a terminal, so a nest scaffolded by an agent or a
+script is never asked, and a yes says nothing about whether the nest lived or was ever queried.
 
 **What changes.**
 
-- **No question.** With no stored answer, the first `init` prints the notice below to stderr, stores
-  `counted = true`, and sends `counted` and `init`. A terminal is not required. Nothing is said again.
-- **A no stands.** A stored `counted = false`, from any version, sends nothing and is told nothing.
-  A yes stored under v1 is told once about v2 and is not counted a second time.
-- **Three ways to stop it before the first send:** `NUTHATCH_NO_COUNT`, `DO_NOT_TRACK` set to
-  anything but empty or `0`, and `CI`. After it: `nuthatch count off`.
+- **A hint where there is no terminal.** With no stored answer and no terminal, `init` prints one
+  line to stderr and sends nothing: how to be counted (`nuthatch count on`) and how to see what is
+  sent. Silent under `CI` and the opt-outs. It stores nothing, so a later `init` at a terminal
+  still asks.
+- **`DO_NOT_TRACK`**, set to anything but empty or `0`, is honoured as `NUTHATCH_NO_COUNT` is.
 - **Payload v2.** `v` is 2 on every event. One new event, `alive`, with one new field:
 
   ```json
@@ -529,40 +527,14 @@ second argument for a no came true: the number is too small to bound anything.
   `queries` is the `/sql` queries the process accepted since it last sent one, as one of `0`, `1+`,
   `100+`, `10k+`, `1m+`. An exact figure every week would be a fingerprint; an order of magnitude is
   not. No chain, no nest count, no query text.
-- **When `alive` is sent.** `dev` and `serve` look an hour after start and hourly after that, and send
-  when the stored `alive_at` is absent or seven days old. `alive_at` is per machine, so several
-  runtimes under one user send one between them. A runtime that never ran `init` on this machine
-  says the notice in one log line at its first look and sends `counted` with it.
-- **With nowhere to store the answer, nothing is sent**, because a no could not be kept either.
+- **Who sends `alive`.** Only a machine whose stored yes was given to v2: the prompt shows both
+  objects, and `count on` is a yes to both. A yes stored under v1 keeps sending `init` and sends no
+  `alive`, per §5.2's rule that a new field is a new question. A running nest never asks.
+- **When.** `dev` and `serve` look an hour after start and hourly after that, and send when the
+  stored `alive_at` is absent or seven days old. `alive_at` is per machine, so several runtimes
+  under one user send one between them.
 
-The notice, in full:
-
-```
-nuthatch counts its users, and this is the only time it will say so.
-
-Each `init` sends this to https://count.nuthatch-indexer.com:
-
-  {"v":2,"event":"init","version":"5.20.0","os":"linux","arch":"x86_64","chain":42161,"source":"addresses"}
-
-and a running nest sends this once a week:
-
-  {"v":2,"event":"alive","version":"5.20.0","os":"linux","arch":"x86_64","queries":"0"}
-
-No identifier, no addresses, no query text. The handler stores no IP, header or
-body, and the totals are public at https://www.nuthatch-indexer.com/count.
-`nuthatch count off` stops it, as does NUTHATCH_NO_COUNT=1 or DO_NOT_TRACK=1.
-```
-
-**What this costs, recorded rather than argued away.** This is §10 B, the shape §10 rejected, and
-the first send happens on the run that prints the notice, so a person cannot decline before it
-without one of the three variables. "No telemetry unless you opt in" was a sentence in the README
-and is no longer true; the README, GOVERNANCE.md and non-negotiable 3 say what is.
-
-**Acceptance, replacing A1 and A6.**
-
-- **A1' - silence when told to be.** With `CI`, `NUTHATCH_NO_COUNT` or `DO_NOT_TRACK=1` set, or a
-  stored no, `init` and a running nest send nothing and print nothing about the count.
-- **A6' - said once.** Two consecutive `init`s on a fresh machine print one notice. `count forget`
-  then `init` prints a second.
-- **A3** gains `alive`: its key set is exactly `{v, event, version, os, arch, queries}`.
-- **A5** holds unchanged; the receiver refuses a `queries` value outside the five buckets.
+**Acceptance.** A1 holds, with the hint as the one line a no-terminal `init` may print and
+`DO_NOT_TRACK=1` added to its silent cases. A3 gains `alive`: its key set is exactly
+`{v, event, version, os, arch, queries}`. A5 holds; the receiver refuses a `queries` value outside
+the five buckets. New: a machine with no stored yes to v2 sends no `alive`, whatever runs on it.

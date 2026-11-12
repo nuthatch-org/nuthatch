@@ -19,13 +19,12 @@ non-negotiables below, stop and flag it instead of proceeding.
    Treat this as a CI-enforced budget (per cursor), not an aspiration. If a design decision
    threatens it, surface the tradeoff before implementing.
    *(Amended 2026-10-28 by Chief: the 2 GB figure is the budget nuthatch's own design must fit per cursor at the default ceiling, gated in CI. An operator may give a cursor a higher `max_rss_mb` by choice, live or in `mounts.toml`; nothing in nuthatch requires it, and the default stays 2048.)*
-3. **No phone-home beyond the head count.** The binary makes one network call about the operator:
-   the head count of RFC-0054. It is on unless a person turns it off, says what it sends once
-   before the first send, carries no identifier, and must pass RFC-0046 §1's deletion test at every
-   release: remove it from the tree and a self-hoster loses nothing. No other telemetry and none
-   required; no mandatory API tokens; no gated data services. *(Amended 2026-10-08 by Chief, from
-   "No telemetry, no mandatory API tokens, no gated data services." Amended 2026-11-12 by Chief,
-   from the opt-in wording: "dont ask, do it by default but say so.")* AI
+3. **No phone-home.** The binary makes no network call about the operator that the operator did
+   not explicitly turn on. No telemetry by default and none required; no mandatory API tokens; no
+   gated data services. The one permitted exception is the opt-in head count of RFC-0054, which is
+   off until a person answers yes, carries no identifier, and must pass RFC-0046 §1's deletion test
+   at every release: remove it from the tree and a self-hoster loses nothing. *(Amended 2026-10-08
+   by Chief, from "No telemetry, no mandatory API tokens, no gated data services.")* AI
    features use local models (Ollama) or BYO API key, and degrade gracefully offline.
 4. **Determinism in the core.** ABI decoding, reorg handling, entity derivation, and anything
    feeding stored state must be deterministic and re-executable. LLMs generate code and tests;
@@ -245,10 +244,9 @@ unconfigured.
 > tally public. §11 is settled with the RFC's own leanings: a single-purpose `count.toml`, the
 > receiver on the Helsinki host where we own the ingress log, `chain` kept under the registry-only
 > rule, and the number published early with its caveat in the same sentence.
-> **Amended 2026-11-12 by Chief** (RFC-0054 §12): five weeks of asking counted one person, so the
-> count is on by default and announced once instead of asked, and a running nest sends a weekly
-> `alive` with a bucketed query count. A stored no stands; `count off`, `NUTHATCH_NO_COUNT` and
-> `DO_NOT_TRACK` stop it.
+> **Amended 2026-11-12 by Chief** (RFC-0054 §12): still opt-in. A yes now also covers a weekly
+> `alive` from a running nest with a bucketed query count, and an `init` with no terminal prints
+> one line saying how to be counted. On-by-default was built and withdrawn the same day.
 >
 > **RFC-0063 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0063](docs/rfcs/0063-address-history.md) (address history) on 2026-10-09 for rotki, whose

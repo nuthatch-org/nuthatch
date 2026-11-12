@@ -46,8 +46,8 @@ the operator's product into the binary. Concretely (RFC-0005 §6):
 Non-negotiable regardless of who asks or pays:
 
 - **No token**, no decentralised-network features, no staking.
-- **No phone-home beyond the head count**: the one call about an operator is the head count of
-  RFC-0054, on unless turned off (`nuthatch count off`), announced before its first send and carrying no identifier. No mandatory API tokens or gated data services in the data path.
+- **No telemetry by default, no phone-home**: the one exception is the opt-in head count of
+  RFC-0054, off until a person answers yes and carrying no identifier. No mandatory API tokens or gated data services in the data path.
 - **The core stays permissively licensed** (`MIT OR Apache-2.0`) and is never relicensed to anything
   more restrictive or proprietary; **no private forks**; **no partner-only features** in core.
 - **No roadmap veto** for any funder or partner (input is welcome; veto is not).

@@ -102,22 +102,22 @@ Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet
 
 ## `nuthatch count`
 
-Turn the head count (RFC-0054) off or on. On unless you turn it off
+Opt in to, or out of, the head count (RFC-0054). Off until you say yes
 
 
 ## `nuthatch count forget`
 
-Delete the stored answer, so the count is on and the next `init` says so again
+Delete the stored answer, so the next `init` may ask again
 
 
 ## `nuthatch count off`
 
-Turn it off. Nothing is sent, ever, until you say `on`
+Say no. Nothing is sent, ever, until you say `on`
 
 
 ## `nuthatch count on`
 
-Turn it back on. Sends one `counted` event now, with no chain and no source
+Say yes. Sends one `counted` event now, with no chain and no source
 
 
 ## `nuthatch count payload`

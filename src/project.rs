@@ -19,7 +19,7 @@ use nuthatch_scaffold::resolve::{
 pub async fn init(args: InitArgs) -> Result<()> {
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
     scaffold(args).await?;
-    count.tell().await; // RFC-0054 hook
+    count.ask().await; // RFC-0054 hook
     Ok(())
 }
 
