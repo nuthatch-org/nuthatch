@@ -256,8 +256,16 @@ pub(crate) fn cache_inputs(dir: &Path) -> std::collections::BTreeMap<PathBuf, In
         .collect();
     // An imported snapshot is named by its own hash, which a reread could only confirm.
     stamps.extend(addressed.into_iter().filter_map(|path| {
-        let len = std::fs::metadata(&path).ok()?.len();
-        Some((path, format!("addressed:{len}")))
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(&path).ok()?;
+        let stamp = format!(
+            "addressed:{}:{}.{}:{}",
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ino()
+        );
+        Some((path, stamp))
     }));
     stamps
 }
