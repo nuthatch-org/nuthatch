@@ -105,6 +105,15 @@ pub fn deliver_sealed(
     deliver_sealed_within(store, dir, webhooks, sealed_to, WEBHOOK_OUTBOX_MAX)
 }
 
+/// Blocks one delivery query reads at most. A failing slice is halved, down to one block.
+const SLICE_BLOCKS: u64 = 10_000;
+/// Rows one delivery query returns at most, whatever room the outbox has.
+const SLICE_ROWS: u64 = 10_000;
+/// How long one seal's deliveries may hold the writer, across every webhook. A query is given what
+/// is left of it as its deadline, so a backlog drains a slice at a time rather than timing out whole.
+/// A cut statement takes a moment to stop, so the hook is held up to about 3 s, as measured.
+pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// [`deliver_sealed`] with the outbox room as a parameter. A full outbox is back-pressure, never a
 /// trim: the cursor stops at the last whole block enqueued and the rest is re-queried next seal.
 fn deliver_sealed_within(
@@ -114,105 +123,287 @@ fn deliver_sealed_within(
     sealed_to: u64,
     outbox_max: u64,
 ) -> Result<usize> {
+    let started = std::time::Instant::now();
     let mut enqueued = 0usize;
-    for w in webhooks.iter().filter(|w| is_sealed(w)) {
-        let cursor: u64 = store
-            .get_meta(&cursor_key(&w.name))?
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(sealed_to);
-        if cursor >= sealed_to {
-            continue;
-        }
-        let room = outbox_max.saturating_sub(store.outbox_len());
-        if room == 0 {
-            tracing::debug!(
-                "webhook '{}' held at block {cursor}: outbox full ({outbox_max})",
-                w.name
+    // `table` and `where` come from the bundle, which a tenant writes: they run as a request from a
+    // mount of this dataset runs, and in a strict runtime not before one has said whose they are.
+    let seat = crate::maintained::runs_as(dir);
+    let sealed: Vec<&Webhook> = webhooks.iter().filter(|w| is_sealed(w)).collect();
+    // Each run starts one webhook further on, so one that spends the whole budget cannot starve the rest.
+    let first = next_turn(dir, sealed.len());
+    for w in sealed[first..].iter().chain(&sealed[..first]).copied() {
+        let cursor = |store: &dyn HotStore| -> Result<u64> {
+            Ok(store
+                .get_meta(&cursor_key(&w.name))?
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(sealed_to))
+        };
+        let Some(seat) = &seat else {
+            note(
+                dir,
+                w,
+                cursor(store)?,
+                sealed_to,
+                Some("no mount has seated this dataset yet"),
+                false,
             );
             continue;
-        }
-        let batch_max = w.batch_max.unwrap_or(DEFAULT_BATCH_MAX).max(1);
-        let limit = room.saturating_mul(batch_max as u64);
-        // `table`/`where` are operator-authored (trusted, like nest views); block bounds are ours.
-        let predicate = w
-            .where_clause
-            .as_deref()
-            .map(|p| format!(" AND ({p})"))
-            .unwrap_or_default();
-        let select = |lo: u64, hi: u64, offset: u64| {
-            format!(
-                "SELECT * FROM \"{}\" WHERE block_number > {lo} AND block_number <= {hi}{predicate} \
-                 ORDER BY block_number, log_index LIMIT {limit} OFFSET {offset}",
-                w.table,
-            )
         };
-        // A block with more rows than the room is queued in pieces across passes: the cursor stays
-        // below it and this records how far into it we are, so the outbox never passes `outbox_max`.
-        let partial = store.get_meta(&partial_key(&w.name))?.and_then(|s| {
-            let (b, p) = s.split_once(':')?;
-            Some((b.parse::<u64>().ok()?, p.parse::<u64>().ok()?))
-        });
-        let (lo, hi, offset) = match partial {
-            Some((b, pos)) => (b - 1, b, pos),
-            None => (cursor, sealed_to, 0),
-        };
-        let mut rows = match crate::analytics::query(dir, &select(lo, hi, offset)) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!("webhook '{}' query skipped: {e:#}", w.name);
-                continue;
+        let mut span = SLICE_BLOCKS;
+        let mut error = None;
+        let mut waiting = false;
+        loop {
+            let from = cursor(store)?;
+            let left = SEAL_BUDGET.saturating_sub(started.elapsed());
+            if from >= sealed_to {
+                break;
             }
-        };
-        let mut through = sealed_to;
-        let mut next_partial = None;
-        if let Some((b, pos)) = partial {
-            through = b;
-            if rows.len() as u64 >= limit {
-                next_partial = Some((b, pos + rows.len() as u64));
+            if left.is_zero() {
+                waiting = true;
+                break;
             }
-        } else if rows.len() as u64 >= limit {
-            // The limit may have cut the last block short, and the cursor is per block: keep only whole
-            // blocks. If one block alone fills the room, queue what fits and come back for the rest.
-            let first = row_block(&rows[0])?;
-            let last = row_block(&rows[rows.len() - 1])?;
-            if first == last {
-                next_partial = Some((first, rows.len() as u64));
-            } else {
-                rows.retain(|r| row_block(r).is_ok_and(|b| b < last));
-                through = last - 1;
+            let room = outbox_max.saturating_sub(store.outbox_len());
+            if room == 0 {
+                tracing::debug!(
+                    "webhook '{}' held at block {from}: outbox full ({outbox_max})",
+                    w.name
+                );
+                break;
             }
-        }
-        for chunk in rows.chunks(batch_max) {
-            let payload = json!({
-                "event": "rows",
-                "webhook": w.name,
-                "url": w.url,
-                "finality": "sealed",
-                "table": w.table,
-                "count": chunk.len(),
-                "rows": chunk,
+            let batch_max = w.batch_max.unwrap_or(DEFAULT_BATCH_MAX).max(1);
+            let limit = room.saturating_mul(batch_max as u64).min(SLICE_ROWS);
+            // A block with more rows than the room is queued in pieces across passes: the cursor
+            // stays below it and this records how far into it we are.
+            let partial = store.get_meta(&partial_key(&w.name))?.and_then(|s| {
+                let (b, p) = s.split_once(':')?;
+                Some((b.parse::<u64>().ok()?, p.parse::<u64>().ok()?))
             });
-            store.outbox_push(&payload.to_string())?;
-            enqueued += 1;
-        }
-        match next_partial {
-            Some((b, pos)) => store.set_meta(&partial_key(&w.name), &format!("{b}:{pos}"))?,
-            None => {
-                store.set_meta(&cursor_key(&w.name), &through.to_string())?;
-                if partial.is_some() {
-                    store.set_meta(&partial_key(&w.name), "")?;
+            let (lo, hi, offset) = match partial {
+                Some((b, pos)) => (b - 1, b, pos),
+                None => (from, sealed_to.min(from.saturating_add(span)), 0),
+            };
+            let rows = slice(dir, w, seat.as_ref(), (lo, hi, offset), limit, left);
+            let mut rows = match rows {
+                Ok(r) => {
+                    error = None;
+                    r
+                }
+                Err(e) if partial.is_none() && span > 1 => {
+                    span /= 2;
+                    error = Some(format!("{e:#}"));
+                    continue;
+                }
+                Err(e) => {
+                    error = Some(format!("{e:#}"));
+                    break;
+                }
+            };
+            let mut through = hi;
+            let mut next_partial = None;
+            if let Some((b, pos)) = partial {
+                through = b;
+                if rows.len() as u64 >= limit {
+                    next_partial = Some((b, pos + rows.len() as u64));
+                }
+            } else if rows.len() as u64 >= limit {
+                // The limit may have cut the last block short, and the cursor is per block: keep only
+                // whole blocks. If one block alone fills the room, queue what fits and come back.
+                let first = row_block(&rows[0])?;
+                let last = row_block(&rows[rows.len() - 1])?;
+                if first == last {
+                    next_partial = Some((first, rows.len() as u64));
+                } else {
+                    rows.retain(|r| row_block(r).is_ok_and(|b| b < last));
+                    through = last - 1;
                 }
             }
+            for chunk in rows.chunks(batch_max) {
+                let payload = json!({
+                    "event": "rows",
+                    "webhook": w.name,
+                    "url": w.url,
+                    "finality": "sealed",
+                    "table": w.table,
+                    "count": chunk.len(),
+                    "rows": chunk,
+                });
+                store.outbox_push(&payload.to_string())?;
+                enqueued += 1;
+            }
+            match next_partial {
+                Some((b, pos)) => store.set_meta(&partial_key(&w.name), &format!("{b}:{pos}"))?,
+                None => {
+                    store.set_meta(&cursor_key(&w.name), &through.to_string())?;
+                    if partial.is_some() {
+                        store.set_meta(&partial_key(&w.name), "")?;
+                    }
+                }
+            }
+            if !rows.is_empty() {
+                tracing::info!(
+                    "webhook '{}': {} row(s) sealed in ({from}, {through}] → queued",
+                    w.name,
+                    rows.len()
+                );
+            }
         }
-        if !rows.is_empty() {
-            tracing::info!(
-                "webhook '{}': {} row(s) sealed in ({cursor}, {through}] → queued",
-                w.name,
-                rows.len()
-            );
+        if let Some(e) = &error {
+            tracing::debug!("webhook '{}' query failed: {e}", w.name);
         }
+        note(dir, w, cursor(store)?, sealed_to, error.as_deref(), waiting);
     }
     Ok(enqueued)
+}
+
+/// One slice's rows, `(lo, hi]` from `offset`, as a request from the seated mount, or with the
+/// default guard outside a seat, and never past `left`.
+fn slice(
+    dir: &std::path::Path,
+    w: &Webhook,
+    seat: Option<&crate::maintained::Seat>,
+    (lo, hi, offset): (u64, u64, u64),
+    limit: u64,
+    left: std::time::Duration,
+) -> Result<Vec<serde_json::Value>> {
+    let predicate = w
+        .where_clause
+        .as_deref()
+        .map(|p| format!(" AND ({p}\n)"))
+        .unwrap_or_default();
+    // The newline ends a `--` in `where` before the bounds, so a comment cannot drop them.
+    let sql = format!(
+        "SELECT * FROM {} WHERE block_number > {lo} AND block_number <= {hi}{predicate} \
+         ORDER BY block_number, log_index LIMIT {limit} OFFSET {offset}",
+        quoted(&w.table),
+    );
+    let base = seat.map_or_else(crate::analytics::QueryGuard::default, |s| s.guard);
+    // The row cap is the LIMIT, which an answer of exactly that many rows is not cut at, and the
+    // byte cap is off: a cut answer would move the cursor past rows never queued.
+    let guard = crate::analytics::QueryGuard {
+        timeout: base.timeout.min(left),
+        max_rows: usize::try_from(limit).unwrap_or(usize::MAX),
+        max_result_bytes: usize::MAX,
+        ..base
+    };
+    let out = crate::analytics::isolated(seat.map(|s| &s.tenant), || {
+        crate::analytics::query_guarded(dir, &sql, guard)
+    })?;
+    anyhow::ensure!(!out.truncated, "the answer was cut short");
+    Ok(out.rows)
+}
+
+/// Where a webhook stands, as `/ready` and `/metrics` show it.
+#[derive(Clone, Debug, Default)]
+pub struct Standing {
+    pub delivered_through: u64,
+    pub backlog_blocks: u64,
+    pub last_error: Option<String>,
+    pub failures: u64,
+    /// The seal's budget was spent before this webhook's turn finished; it goes earlier next time.
+    pub waiting_for_turn: bool,
+}
+
+fn standings(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf, String), Standing>> {
+    static S: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<(std::path::PathBuf, String), Standing>>,
+    > = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn note(
+    dir: &std::path::Path,
+    w: &Webhook,
+    through: u64,
+    sealed_to: u64,
+    error: Option<&str>,
+    waiting: bool,
+) {
+    let mut all = standings().lock().unwrap_or_else(|p| p.into_inner());
+    let s = all.entry((dir.to_path_buf(), w.name.clone())).or_default();
+    if error.is_some() && s.last_error.is_none() {
+        tracing::warn!(
+            "webhook '{}' is held at block {through}: {}",
+            w.name,
+            error.unwrap_or_default()
+        );
+    }
+    if error.is_some() {
+        s.failures += 1;
+    }
+    s.delivered_through = through;
+    s.backlog_blocks = sealed_to.saturating_sub(through);
+    s.last_error = error.map(str::to_string);
+    s.waiting_for_turn = waiting;
+}
+
+/// The index this run of `dir`'s `n` webhooks starts at, one on from the last run's.
+fn next_turn(dir: &std::path::Path, n: usize) -> usize {
+    static NEXT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    if n == 0 {
+        return 0;
+    }
+    let mut all = NEXT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let next = all.entry(dir.to_path_buf()).or_default();
+    let first = *next % n;
+    *next = first + 1;
+    first
+}
+
+/// Each webhook of `dir` by name, as its last delivery left it; empty before the first.
+pub fn standing(dir: &std::path::Path) -> Vec<(String, Standing)> {
+    standings()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|((d, _), _)| d == dir)
+        .map(|((_, name), s)| (name.clone(), s.clone()))
+        .collect()
+}
+
+/// `/metrics` lines for every webhook this process delivers, labelled by name alone.
+pub fn render_metrics() -> String {
+    let all = standings().lock().unwrap_or_else(|p| p.into_inner());
+    if all.is_empty() {
+        return String::new();
+    }
+    let mut by_name: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+    for ((_, name), s) in all.iter() {
+        let e = by_name.entry(name).or_default();
+        e.0 += s.backlog_blocks;
+        e.1 += s.failures;
+    }
+    let mut out = String::from(
+        "# HELP nuthatch_webhook_backlog_blocks Sealed blocks a webhook has yet to deliver.\n\
+         # TYPE nuthatch_webhook_backlog_blocks gauge\n",
+    );
+    for (name, (backlog, _)) in &by_name {
+        out.push_str(&format!(
+            "nuthatch_webhook_backlog_blocks{{webhook=\"{}\"}} {backlog}\n",
+            crate::metrics::label_value(name)
+        ));
+    }
+    out.push_str(
+        "# HELP nuthatch_webhook_failures_total Delivery runs that ended on a failed query.\n\
+         # TYPE nuthatch_webhook_failures_total counter\n",
+    );
+    for (name, (_, failures)) in &by_name {
+        out.push_str(&format!(
+            "nuthatch_webhook_failures_total{{webhook=\"{}\"}} {failures}\n",
+            crate::metrics::label_value(name)
+        ));
+    }
+    out
+}
+
+/// A relation name as a SQL identifier, whatever characters an alias gave it.
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn row_block(row: &serde_json::Value) -> Result<u64> {
@@ -224,10 +415,12 @@ fn row_block(row: &serde_json::Value) -> Result<u64> {
 
 /// Refuse a webhook whose `table` or `where` does not bind against the nest's declared schema (#2365).
 /// The delivery query would fail the same way on every seal, and the webhook would never fire.
+/// Under `strict`, a `where` calling a function strict isolation does not allow is refused here too.
 pub fn refuse_unbound(
     dir: &std::path::Path,
     declared: &[crate::registry::TableSchema],
     webhooks: &[Webhook],
+    strict: bool,
 ) -> Result<()> {
     let plan = |sql: &str| {
         let guard = crate::analytics::QueryGuard {
@@ -244,10 +437,27 @@ pub fn refuse_unbound(
             declared,
         )
     };
+    let relations: std::collections::BTreeSet<String> = declared
+        .iter()
+        .map(|t| t.table.clone())
+        .chain(
+            crate::analytics::nest_view_files(dir)
+                .iter()
+                .flat_map(|f| crate::analytics::split_sql_statements(&f.sql))
+                .filter_map(|s| crate::analytics::view_name(&s)),
+        )
+        .collect();
     for w in webhooks {
+        if !relations.contains(&w.table) {
+            anyhow::bail!(
+                "webhook '{}': `table = \"{}\"` is not a table or view this nest declares",
+                w.name,
+                w.table
+            );
+        }
         let base = format!(
-            "SELECT * FROM \"{}\" WHERE block_number > 0 ORDER BY block_number, log_index",
-            w.table
+            "SELECT * FROM {} WHERE block_number > 0 ORDER BY block_number, log_index",
+            quoted(&w.table)
         );
         if let Err(e) = plan(&base) {
             anyhow::bail!(
@@ -258,8 +468,8 @@ pub fn refuse_unbound(
         }
         if let Some(p) = &w.where_clause {
             let sql = format!(
-                "SELECT * FROM \"{}\" WHERE block_number > 0 AND ({p}) ORDER BY block_number, log_index",
-                w.table
+                "SELECT * FROM {} WHERE block_number > 0 AND ({p}\n) ORDER BY block_number, log_index",
+                quoted(&w.table)
             );
             if let Err(e) = plan(&sql) {
                 anyhow::bail!(
@@ -267,6 +477,11 @@ pub fn refuse_unbound(
                     w.name,
                     w.table
                 );
+            }
+            if strict {
+                if let Err(e) = crate::isolation::refuse_unlisted_functions(&sql) {
+                    anyhow::bail!("webhook '{}': `where = \"{p}\"` is refused: {e:#}", w.name);
+                }
             }
         }
     }
@@ -502,17 +717,20 @@ mod tests {
         }];
         let mut good = wh("w", "t__transfer", "registration");
         good.where_clause = Some("CAST(value AS HUGEINT) > 100".into());
-        refuse_unbound(dir.path(), &declared, &[good]).expect("a webhook that binds is accepted");
+        refuse_unbound(dir.path(), &declared, &[good], false)
+            .expect("a webhook that binds is accepted");
         let mut derived = wh("w", "t__transfer", "registration");
         derived.where_clause = Some("value_dec > 1000000".into());
-        refuse_unbound(dir.path(), &declared, &[derived]).expect("a derived `_dec` column binds");
+        refuse_unbound(dir.path(), &declared, &[derived], false)
+            .expect("a derived `_dec` column binds");
 
         let err = format!(
             "{:#}",
             refuse_unbound(
                 dir.path(),
                 &declared,
-                &[wh("w", "t__transfr", "registration")]
+                &[wh("w", "t__transfr", "registration")],
+                false
             )
             .unwrap_err()
         );
@@ -522,8 +740,267 @@ mod tests {
         bad.where_clause = Some("vlaue > 100".into());
         let err = format!(
             "{:#}",
-            refuse_unbound(dir.path(), &declared, &[bad]).unwrap_err()
+            refuse_unbound(dir.path(), &declared, &[bad], false).unwrap_err()
         );
         assert!(err.contains("`where = \"vlaue > 100\"`"), "{err}");
+
+        let err = format!(
+            "{:#}",
+            refuse_unbound(
+                dir.path(),
+                &declared,
+                &[wh("w", "t__transfer\" AS a, \"t__transfer", "registration")],
+                false
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("not a table or view this nest declares"),
+            "{err}"
+        );
+
+        let mut commented = wh("w", "t__transfer", "registration");
+        commented.where_clause = Some("1=1) --".into());
+        assert!(
+            refuse_unbound(dir.path(), &declared, &[commented], false).is_err(),
+            "a `where` that comments out the statement's bounds is refused"
+        );
+    }
+
+    fn transfer_schema(table: &str) -> Vec<crate::registry::TableSchema> {
+        let mut columns = crate::registry::implicit_columns(false);
+        columns.push(crate::registry::ColumnSchema {
+            name: "value".into(),
+            sol_type: "uint256".into(),
+            storage: "word32".into(),
+            indexed: false,
+            components: Vec::new(),
+        });
+        vec![crate::registry::TableSchema {
+            table: table.into(),
+            alias: table.split("__").next().unwrap().into(),
+            kind: crate::registry::TableKind::Event,
+            event: "Transfer".into(),
+            topic0: "0x".into(),
+            function: String::new(),
+            selector: String::new(),
+            columns,
+        }]
+    }
+
+    /// An alias is validated as one path segment, so a declared table may carry a hyphen. The declared
+    /// check admits it; what still refuses it is the SQL surface, which since 5.11 this check has
+    /// planned against and which reads a quoted name with a hyphen as a path.
+    #[test]
+    fn a_hyphenated_alias_is_declared_and_refused_only_by_the_sql_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = transfer_schema("usd-c__transfer");
+        let err = format!(
+            "{:#}",
+            refuse_unbound(
+                dir.path(),
+                &declared,
+                &[wh("w", "usd-c__transfer", "genesis")],
+                false
+            )
+            .unwrap_err()
+        );
+        assert!(!err.contains("this nest declares"), "{err}");
+        assert!(
+            err.contains("not a table this nest can deliver from"),
+            "{err}"
+        );
+    }
+
+    fn strict_nest(dir: &std::path::Path) {
+        crate::maintained::attach(dir, crate::serve::SqlGate::new(2), true);
+    }
+
+    fn seat(dir: &std::path::Path, timeout: std::time::Duration) {
+        let guard = crate::analytics::QueryGuard {
+            timeout,
+            ..Default::default()
+        };
+        crate::maintained::seat(dir, "acme/w", std::sync::Arc::from("acme"), guard);
+    }
+
+    /// A strict runtime runs a tenant's delivery query as that tenant's request, so nothing runs before
+    /// a mount says whose it is, and the cursor waits for it.
+    #[test]
+    fn a_strict_delivery_waits_for_a_seat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 0);
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 1);
+    }
+
+    /// A seated answer that fills the room exactly is whole, so the cursor moves and nothing is lost.
+    #[test]
+    fn a_seated_delivery_that_fills_the_room_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("g", "t__transfer", "genesis");
+        w.batch_max = Some(1);
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let rows: Vec<String> = (1..=7).map(|b| transfer(b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 7).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        let mut got = vec![];
+        for _ in 0..10 {
+            deliver_sealed_within(&store, dir.path(), &webhooks, 7, 3).unwrap();
+            got.extend(drain(&store));
+        }
+        assert_eq!(got, (1..=7).map(|b| (b, 0)).collect::<Vec<_>>());
+    }
+
+    /// Under strict a `where` may call only what a tenant's `/sql` may.
+    #[test]
+    fn a_strict_delivery_refuses_a_function_off_the_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.where_clause = Some("version() IS NOT NULL".into());
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 0);
+        assert_eq!(store.outbox_len(), 0);
+    }
+
+    /// A delivery is held to its seat's deadline, so an expensive `where` gives the cursor back
+    /// rather than holding it until the statement ends, and the cursor stays where it was.
+    #[test]
+    fn a_delivery_is_cut_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.where_clause = Some(
+            "(SELECT sum(a.range * b.range) FROM range(1000000) a CROSS JOIN range(1000000) b) > 0"
+                .into(),
+        );
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_millis(300));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(deliver_sealed(&store, &d, &webhooks, 5).map(|n| (n, store)));
+        });
+        let started = std::time::Instant::now();
+        let (n, store) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the delivery outlived its deadline")
+            .unwrap();
+        assert!(
+            started.elapsed() < SEAL_BUDGET + std::time::Duration::from_secs(2),
+            "the seal hook was held {:?}",
+            started.elapsed()
+        );
+        assert_eq!(n, 0);
+        assert_eq!(
+            store.get_meta(&cursor_key("w")).unwrap().as_deref(),
+            Some("0")
+        );
+        let (name, s) = standing(dir.path()).pop().expect("a standing");
+        assert_eq!(
+            (name.as_str(), s.delivered_through, s.backlog_blocks),
+            ("w", 0, 5)
+        );
+        assert!(s.last_error.is_some() && s.failures == 1, "{s:?}");
+        assert!(
+            render_metrics().contains("nuthatch_webhook_backlog_blocks{webhook=\"w\"}"),
+            "{}",
+            render_metrics()
+        );
+    }
+
+    /// Under strict a `where` that calls a function strict isolation refuses is a configuration
+    /// error, refused at load by name, not found on every seal.
+    #[test]
+    fn a_strict_where_off_the_list_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = transfer_schema("t__transfer");
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.where_clause = Some("version() IS NOT NULL".into());
+        refuse_unbound(dir.path(), &declared, std::slice::from_ref(&w), false)
+            .expect("allowed outside strict");
+        let err = format!(
+            "{:#}",
+            refuse_unbound(dir.path(), &declared, &[w], true).unwrap_err()
+        );
+        assert!(
+            err.contains("webhook 'w'") && err.contains("version"),
+            "{err}"
+        );
+    }
+
+    /// A webhook that spends the whole budget is not served first every run, so one behind it is
+    /// delivered within two runs and, while it waits, says so.
+    #[test]
+    fn a_webhook_behind_one_that_spends_the_budget_gets_its_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut slow = wh("slow", "t__transfer", "genesis");
+        slow.where_clause = Some(
+            "(SELECT sum(a.range * b.range) FROM range(1000000) a CROSS JOIN range(1000000) b) > 0"
+                .into(),
+        );
+        let webhooks = vec![slow, wh("cheap", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        let cheap = || {
+            standing(dir.path())
+                .into_iter()
+                .find(|(n, _)| n == "cheap")
+                .map(|(_, s)| s)
+        };
+        let mut delivered = 0;
+        for _ in 0..2 {
+            delivered += deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap();
+            if delivered == 0 {
+                let s = cheap().expect("a waiting webhook has a standing");
+                assert!(s.waiting_for_turn && s.backlog_blocks == 5, "{s:?}");
+            }
+        }
+        assert_eq!(delivered, 1, "the cheap webhook was starved");
+        let s = cheap().unwrap();
+        assert!(!s.waiting_for_turn && s.backlog_blocks == 0, "{s:?}");
+    }
+
+    /// A backlog wider than one slice drains in slices, each advancing the cursor, within one seal.
+    #[test]
+    fn a_wide_backlog_drains_a_slice_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let blocks = [5, SLICE_BLOCKS + 5, 2 * SLICE_BLOCKS + 5];
+        let rows: Vec<String> = blocks.iter().map(|b| transfer(*b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 5, 3 * SLICE_BLOCKS).unwrap();
+        assert_eq!(
+            deliver_sealed(&store, dir.path(), &webhooks, 3 * SLICE_BLOCKS).unwrap(),
+            3
+        );
+        assert_eq!(
+            drain(&store),
+            blocks.iter().map(|b| (*b, 0)).collect::<Vec<_>>()
+        );
+        let (_, s) = standing(dir.path()).pop().unwrap();
+        assert_eq!(
+            (s.delivered_through, s.backlog_blocks),
+            (3 * SLICE_BLOCKS, 0)
+        );
+        assert_eq!(s.last_error, None);
     }
 }
