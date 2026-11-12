@@ -13028,6 +13028,74 @@ template = "pool"
         assert!(matches!(sup.states[1], NestState::Live));
     }
 
+    /// The warning is raised by `prepare` itself, on a store that already holds blocks, and a cold
+    /// start with the same flag stays quiet.
+    #[tokio::test]
+    async fn prepare_warns_that_backfill_was_ignored_only_on_a_nest_with_blocks() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        if f.name() == "message" {
+                            let _ = write!(self.0, "{value:?}");
+                        }
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(lines.clone()),
+        );
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let ignored = || {
+            lines
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("--backfill 300 ignored"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000007").await;
+        let src = ForkSource::new(300);
+        let cold = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(cold, 0, "premise: a cold start from tip minus 300");
+        assert!(ignored().is_empty(), "a cold start honours the flag");
+
+        nest.store.set_meta(START_BLOCK_KEY, "10").unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "50").unwrap();
+        let next = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(next, 51);
+        let warned = ignored();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("blocks 10 to 50"), "{warned:?}");
+    }
+
     /// #2175: a `--seal-direct` backfill leaves a checkpoint at its watermark, so a one-block reorg
     /// of the first tip window is an ordinary rollback rather than a finality violation.
     #[tokio::test]
