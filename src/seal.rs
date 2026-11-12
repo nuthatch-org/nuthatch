@@ -1110,9 +1110,11 @@ struct Parsed {
     hash: OnceLock<String>,
 }
 
-/// Datasets whose last parsed catalogue is kept. Each entry holds its catalogue twice, as bytes and
-/// parsed, so this bounds the memory to that many catalogues' worth.
-const PARSED_CATALOGUES: usize = 16;
+/// Catalogue file bytes the cache keeps, summed over datasets, least recently used out first. An
+/// entry holds its file and the parsed form, about 2.4 times the file, so this holds under 80 MiB, a
+/// twenty-fifth of one cursor's 2 GiB, while still fitting three 38,000-segment catalogues of
+/// 10.5 MB. A catalogue larger than this is parsed per read and never kept.
+const PARSED_CATALOGUE_BYTES: usize = 32 << 20;
 
 /// Each with the tick it was last used at.
 type ParsedCatalogues = Mutex<HashMap<PathBuf, (Arc<Parsed>, u64)>>;
@@ -1177,8 +1179,12 @@ fn parsed_catalogue(dir: &Path) -> Result<Option<Arc<Parsed>>> {
     let mut cache = parsed_catalogues()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    if parsed.raw.len() > PARSED_CATALOGUE_BYTES {
+        cache.remove(dir);
+        return Ok(Some(parsed));
+    }
     cache.insert(dir.to_path_buf(), (parsed.clone(), tick));
-    while cache.len() > PARSED_CATALOGUES {
+    while cache.values().map(|(p, _)| p.raw.len()).sum::<usize>() > PARSED_CATALOGUE_BYTES {
         let Some(oldest) = cache
             .iter()
             .min_by_key(|(_, (_, used))| *used)
