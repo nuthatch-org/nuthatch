@@ -151,7 +151,7 @@ async fn scaffold(args: InitArgs) -> Result<()> {
 
     // Build the registry from the vendored ABIs to generate the schema artifact + AI surface (one
     // source of truth: schema.json, llms.txt, the skill, and `/tables` all come from here).
-    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config, AgentDocs::Rewrite)?;
     let skipped = crate::registry::from_nest(&dir, &config)
         .map(|r| r.skipped_anonymous())
         .unwrap_or(0);
@@ -307,7 +307,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
     }
 
     config.save(&dir)?;
-    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config, AgentDocs::Rewrite)?;
 
     println!(
         "✓ added {} contract(s); nest '{}' now has {} contract(s), {} table(s)",
@@ -355,7 +355,7 @@ pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     let config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
-    let n = write_nest_artifacts(&dir, &config.nest.chain, &config)?;
+    let n = write_nest_artifacts(&dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
     println!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
     Ok(())
 }
@@ -405,7 +405,7 @@ pub fn rename_alias(dir: &Path, old: &str, new: &str) -> Result<()> {
         crate::semantic::rekey_alias(&mut sem, old, new);
         crate::semantic::save(dir, &sem)?;
     }
-    write_nest_artifacts(dir, &config.nest.chain, &config)?;
+    write_nest_artifacts(dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
     println!("✓ renamed alias {old} → {new}");
     Ok(())
 }
@@ -442,10 +442,13 @@ pub fn refresh_stale_artifacts(dir: &Path, config: &Config) -> Result<Option<Str
         }
         "schema.json was older than nuthatch.toml"
     };
-    let n = write_nest_artifacts(dir, &config.nest.chain, config)?;
+    // The agent docs are part of the NID, and a timestamp must not move it: they stay as they are,
+    // and `nuthatch schema` regenerates them when someone asks.
+    let n = write_nest_artifacts(dir, &config.nest.chain, config, AgentDocs::KeepExisting)?;
     Ok(Some(format!(
-        "{why} - regenerated schema.json + AI surface ({n} table(s)). \
-         The `{{col}}_dec` companions the schema tool recommends come from this file."
+        "{why} - regenerated schema.json ({n} table(s)); llms.txt and SKILL.md are left as they \
+         are, `nuthatch schema` regenerates them. The `{{col}}_dec` companions the schema tool \
+         recommends come from schema.json."
     )))
 }
 
@@ -805,7 +808,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         address_history: None,
     };
     config.save(&dir)?;
-    let table_count = write_nest_artifacts(&dir, &chain.name, &config)?;
+    let table_count = write_nest_artifacts(&dir, &chain.name, &config, AgentDocs::Rewrite)?;
 
     // ── the honest report ────────────────────────────────────────────────
     println!(
@@ -1005,7 +1008,20 @@ pub(crate) fn write_if_changed(path: &Path, bytes: impl AsRef<[u8]>) -> std::io:
     Ok(true)
 }
 
-fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result<usize> {
+/// Whether writing a nest's artifacts may replace the agent docs it already has.
+#[derive(Clone, Copy, PartialEq)]
+enum AgentDocs {
+    Rewrite,
+    /// Write `llms.txt` and `SKILL.md` only where missing: they are hashed into the NID.
+    KeepExisting,
+}
+
+fn write_nest_artifacts(
+    dir: &Path,
+    chain_name: &str,
+    config: &Config,
+    docs: AgentDocs,
+) -> Result<usize> {
     let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
     if config.extract.decodes_calls() {
@@ -1031,7 +1047,7 @@ fn write_nest_artifacts(dir: &Path, chain_name: &str, config: &Config) -> Result
             .and_then(|f| f.set_modified(std::time::SystemTime::now()))
             .context("failed to touch schema.json")?;
     }
-    scaffold_ai_surface(dir, chain_name, &config.contracts, &schema)?;
+    scaffold_ai_surface_with(dir, chain_name, &config.contracts, &schema, docs)?;
 
     // The logic layer (RFC-0018 §1): scaffold `views/` with a commented, ready-to-uncomment starter so
     // the authored-derivations layer is *discoverable* the moment you `init` - the happy path is
@@ -1931,24 +1947,41 @@ async fn detect_chain_on_rpc(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn scaffold_ai_surface(
     dir: &Path,
     chain: &str,
     contracts: &[Contract],
     schema: &[crate::registry::TableSchema],
 ) -> Result<()> {
+    scaffold_ai_surface_with(dir, chain, contracts, schema, AgentDocs::Rewrite)
+}
+
+fn scaffold_ai_surface_with(
+    dir: &Path,
+    chain: &str,
+    contracts: &[Contract],
+    schema: &[crate::registry::TableSchema],
+    docs: AgentDocs,
+) -> Result<()> {
+    let write = |path: &Path, bytes: String| {
+        if docs == AgentDocs::KeepExisting && path.exists() {
+            return Ok(false);
+        }
+        write_if_changed(path, bytes)
+    };
     let contracts: Vec<_> = contracts
         .iter()
         .map(|c| (c.alias.as_str(), c.address.as_str()))
         .collect();
-    write_if_changed(
+    write(
         &dir.join("llms.txt"),
         nuthatch_scaffold::llms_txt(chain, &contracts, schema),
     )
     .context("failed to write llms.txt")?;
     let skill_dir = dir.join(".claude/skills/nuthatch");
     std::fs::create_dir_all(&skill_dir).context("failed to create skill dir")?;
-    write_if_changed(
+    write(
         &skill_dir.join("SKILL.md"),
         nuthatch_scaffold::skill_md(chain, &contracts, schema),
     )
@@ -2060,7 +2093,8 @@ mod tests {
                 }
             }
             let config = Config::load(dir.path()).unwrap();
-            write_nest_artifacts(dir.path(), &config.nest.chain, &config).unwrap();
+            write_nest_artifacts(dir.path(), &config.nest.chain, &config, AgentDocs::Rewrite)
+                .unwrap();
             let got = files_under(dir.path());
             assert_eq!(
                 got.keys().collect::<Vec<_>>(),

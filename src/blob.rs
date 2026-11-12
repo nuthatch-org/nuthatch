@@ -1360,8 +1360,8 @@ abi = "abis/c.json"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut moved = Vec::new();
         for (nest, nid, data) in [
-            ("scaffold/pair", "e81434d70531eb51f634040c761dd2996cf8d82adfbbf2f00efac5ec27f7cc48", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
-            ("scaffold/two", "68aed3f06e601f62a0d1637c196f5e8b2cb9b0b7024612e19ed1a2bb91c38573", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
+            ("scaffold/pair", "b16e8851af12c79705c5851d41853834a2ad04b776bcd3fb356814530bb2e38c", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
+            ("scaffold/two", "c240187c22353206b88f0a2fb196693a56abd0ed70c29f5cedf14f9ec5c0c9d7", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
             ("diff/control", "409f7c7db35d5dab9db410e849be7420e7ab69460c06d3114024df2d7fe1c164", "8a12eac0c6604e0df102425c78ce588b7ac1b58434208e561166b9cc4e19ceff"),
             ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
             ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),
@@ -2309,6 +2309,58 @@ cid_column = "cid"
         }
     }
 
+    /// `dev` regenerates a stale `schema.json` on startup, and a checkout or a `cp` is enough to make
+    /// one stale. That must not rewrite the agent docs, which are hashed into the NID: an untouched
+    /// nest directory keeps its NID across an upgrade.
+    #[test]
+    fn a_newer_nuthatch_toml_does_not_move_the_nid_through_the_startup_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/pair");
+        crate::project::copy_dir(&src, dir.path()).unwrap();
+        // The docs as an earlier release scaffolded them.
+        let llms = dir.path().join("llms.txt");
+        let skill = dir.path().join(".claude/skills/nuthatch/SKILL.md");
+        std::fs::write(
+            &llms,
+            "# nuthatch nest on mainnet\nthe text an earlier release wrote\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &skill,
+            "---\nname: nuthatch\n---\nan earlier release's skill\n",
+        )
+        .unwrap();
+        let before = build_manifest(dir.path(), None).unwrap().nid();
+
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(CONFIG_FILE))
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let said = crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+        assert!(
+            said.is_some_and(|s| s.contains("older than")),
+            "the refresh ran"
+        );
+        assert_eq!(build_manifest(dir.path(), None).unwrap().nid(), before);
+        assert!(std::fs::read_to_string(&llms)
+            .unwrap()
+            .contains("an earlier release wrote"));
+
+        // A missing doc is still written back.
+        std::fs::remove_file(&llms).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(CONFIG_FILE))
+            .unwrap()
+            .set_modified(newer + std::time::Duration::from_secs(60))
+            .unwrap();
+        crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+        assert!(llms.exists());
+    }
     /// RFC-0070: the time-lapse crate has no registry builder of the main crate's, so its NID is only
     /// the node's if it rebuilds the same event registry, whatever else the nest folds into schema.json.
     #[test]
