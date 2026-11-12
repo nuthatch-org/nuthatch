@@ -3709,6 +3709,7 @@ fn view_build_failure_at(
         schema,
         None,
     );
+    let _ = define_offchain_views(&*session, dir, None);
     define_labels_view(&*session, dir);
     define_children_views(&*session, dir);
 
@@ -3850,6 +3851,7 @@ pub fn validate_nest_views(dir: &Path, schema: &[crate::registry::TableSchema]) 
         schema,
         None,
     );
+    let _ = define_offchain_views(&*session, dir, None);
     define_labels_view(&*session, dir);
     define_children_views(&*session, dir);
 

@@ -171,3 +171,36 @@ fn check_points_a_broken_views_hint_at_the_repl() {
         "{out}"
     );
 }
+
+/// An authored view over an offchain snapshot builds wherever `/sql` reads it, so `check` passes it.
+#[test]
+fn check_passes_an_authored_view_over_an_offchain_snapshot() {
+    let nest = tempfile::tempdir().unwrap();
+    let dir = nest.path().to_str().unwrap();
+    std::fs::write(
+        nest.path().join("nuthatch.toml"),
+        "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+    )
+    .unwrap();
+    let prices = nest.path().join("prices.csv");
+    std::fs::write(&prices, "symbol,price\nGRT,2\n").unwrap();
+    let (code, out, err) = run(&[
+        "offchain",
+        "drop",
+        prices.to_str().unwrap(),
+        "--table",
+        "prices",
+        "--dir",
+        dir,
+    ]);
+    assert_eq!(code, 0, "{out}{err}");
+    std::fs::create_dir_all(nest.path().join("views")).unwrap();
+    std::fs::write(
+        nest.path().join("views/10-grt.sql"),
+        "CREATE VIEW grt AS SELECT price FROM offchain__prices WHERE symbol = 'GRT';",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["check", "--dir", dir]);
+    assert!(!out.contains("✗ view"), "{out}{err}");
+    assert_eq!(code, 0, "{out}{err}");
+}
