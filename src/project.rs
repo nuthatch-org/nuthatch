@@ -2777,8 +2777,7 @@ mod tests {
             &[url],
         )
         .await
-        .err()
-        .expect("no code, no chain");
+        .expect_err("no code, no chain");
         let msg = format!("{err:#}");
         assert!(msg.contains("mistyped"), "{msg}");
         server.abort();
