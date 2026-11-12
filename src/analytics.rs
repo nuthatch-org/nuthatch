@@ -484,8 +484,8 @@ pub struct QueryOutput {
     pub truncated: bool,
     pub degraded_tables: std::collections::BTreeSet<String>,
     pub tip_unavailable: bool,
-    /// The base tables this statement referenced, lowercased, or `None` where the parse was
-    /// unavailable and the answer is therefore not known.
+    /// The base tables this statement referenced, lowercased, or `None` on a path that does not
+    /// walk the statement.
     ///
     /// Comes from the same security walk that `reject_unknown_table_refs` already performs - one
     /// parse, one answer about what a query reaches, so the control and the provenance can never
@@ -1044,7 +1044,7 @@ fn write_copy(
 fn bind_maintained_copies(
     session: &dyn Session,
     dir: &Path,
-    referenced: Option<&std::collections::BTreeSet<String>>,
+    referenced: &std::collections::BTreeSet<String>,
     files: &std::collections::BTreeMap<PathBuf, InputStamp>,
     hot: &HotRows,
     sealed_through: u64,
@@ -1064,7 +1064,7 @@ fn bind_maintained_copies(
     if !allowed {
         return (copies, leaves);
     }
-    let Some(reach) = referenced.and_then(|r| reachable_tables(session, dir, r)) else {
+    let Some(reach) = reachable_tables(session, dir, referenced) else {
         return (copies, leaves);
     };
     for view in maintained.iter().filter(|v| reach.contains(*v)) {
@@ -1629,18 +1629,14 @@ fn attempt(
         // The token outlives the previous statement. Clear it before the watchdog or the shutdown
         // latch can arm it, or that interrupt is thrown away on the way into the statement.
         session.interrupt_handle().reset();
-        let walked = reject_unknown_table_refs(session, sql)?;
-        // No parse means no idea what the statement reaches, and the safe answer to that is "all of
-        // it" on both counts.
-        let surveys = walked.as_ref().map(|(_, sv)| *sv).unwrap_or(true);
-        let referenced = walked.map(|(r, _)| r);
+        let (referenced, surveys) = reject_unknown_table_refs(session, sql)?;
         if tenant.is_some() {
-            refuse_unlisted_in_views(session, dir, referenced.as_ref())?;
+            refuse_unlisted_in_views(session, dir, &referenced)?;
         }
         let (copies, leaves) = bind_maintained_copies(
             session,
             dir,
-            referenced.as_ref(),
+            &referenced,
             &slot.inputs,
             hot,
             sealed_through,
@@ -1652,17 +1648,15 @@ fn attempt(
                 && as_of.is_none()
                 && excluded.is_empty(),
         );
-        // Define views only for what this statement can reach (#896). `None` - an unparsed statement
-        // or a shape `reachable_tables` will not vouch for - defines everything, as before.
+        // Define views only for what this statement can reach (#896). `None` - a shape
+        // `reachable_tables` will not vouch for - defines everything, as before.
         // A statement that reaches into a catalogue schema, or calls an enumerating table function
         // such as DuckDB's `duckdb_tables()`, is asking *what tables exist* - so every view has to exist
         // for it to answer. Those keep the old whole-nest definition; everything else is narrowed.
         let wanted = if surveys {
             None
         } else {
-            referenced
-                .as_ref()
-                .and_then(|r| reachable_tables_stopping(session, dir, r, &leaves))
+            reachable_tables_stopping(session, dir, &referenced, &leaves)
         };
         let defined = define_views_bound(
             session,
@@ -1704,16 +1698,14 @@ fn attempt(
         // Every view this query could be reading now exists, so the names it used can be widened to the
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
         // happen here rather than beside the security walk: at that point the catalogue was empty.
-        let referenced = referenced.map(|names| expand_through_views(session, &names));
-        // What the answer read from offchain snapshots (#1437). Unparsed, every defined view counts:
-        // an over-reported snapshot label claims less than the answer has, never more.
-        let offchain = Some(match &referenced {
-            Some(names) => offchain
+        let referenced = expand_through_views(session, &referenced);
+        // What the answer read from offchain snapshots (#1437).
+        let offchain = Some(
+            offchain
                 .into_iter()
-                .filter(|(view, _)| names.contains(&view.to_ascii_lowercase()))
+                .filter(|(view, _)| referenced.contains(&view.to_ascii_lowercase()))
                 .collect(),
-            None => offchain,
-        });
+        );
 
         // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
         // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
@@ -1835,7 +1827,7 @@ fn attempt(
             let _ = join.join();
         }
         (
-            (referenced, copies),
+            (Some(referenced), copies),
             offchain,
             degraded_tables,
             interrupted,
@@ -2156,25 +2148,19 @@ pub(crate) const ALLOWED_TABLE_FNS: &[&str] = &["generate_series", "range", "unn
 ///   '/x.parquet'`, a DuckDB replacement scan) is a table name to a parser; requiring `[A-Za-z0-9_]`
 ///   refuses it, and no legitimate view of ours is named otherwise.
 ///
-/// Fails **open** if the statement will not parse: this is the newer of two controls, and a parse
-/// failure must not take down `/sql` while the denylist - which has guarded this surface since
-/// RFC-0008 - is still in front of it.
+/// Fails **closed** if the statement will not parse, with the parser's message. The walk parses with
+/// the engine's dialect, so a statement it cannot read is one the engine cannot run.
 ///
 /// Returns the **base tables the statement referenced**, lowercased (identifiers match
-/// case-insensitively), or `None` where the parse was unavailable and the answer is therefore not
-/// known. That set is the integrity sweep's reachability bound (see [`Attempt`]), and it comes from
-/// this walk rather than a second one so the two can never disagree about what a query reaches. CTE
-/// names parse as `BASE_TABLE` too and are included; a CTE named after a real table can only widen
-/// the set to a table that exists, which is the safe direction.
+/// case-insensitively). That set is the integrity sweep's reachability bound (see [`Attempt`]), and
+/// it comes from this walk rather than a second one so the two can never disagree about what a query
+/// reaches. CTE names parse as `BASE_TABLE` too and are included; a CTE named after a real table can
+/// only widen the set to a table that exists, which is the safe direction.
 fn reject_unknown_table_refs(
     session: &dyn Session,
     sql: &str,
-) -> Result<Option<(std::collections::BTreeSet<String>, bool)>> {
-    match session.reach(sql) {
-        None => Ok(None),
-        Some(Err(why)) => Err(why),
-        Some(Ok(found)) => Ok(Some(found)),
-    }
+) -> Result<(std::collections::BTreeSet<String>, bool)> {
+    session.reach(sql)
 }
 
 /// Widen the names a query used to the names those names *read*, following the views this connection
@@ -3213,9 +3199,9 @@ fn declared_relations(dir: &Path) -> std::collections::BTreeSet<String> {
 fn refuse_unlisted_in_views(
     session: &dyn Session,
     dir: &Path,
-    referenced: Option<&std::collections::BTreeSet<String>>,
+    referenced: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
-    let reach = referenced.and_then(|r| reachable_tables(session, dir, r));
+    let reach = reachable_tables(session, dir, referenced);
     for (name, body) in nest_view_bodies(dir) {
         if reach.as_ref().is_none_or(|r| r.contains(&name)) {
             crate::isolation::refuse_unlisted_functions(body.trim().trim_end_matches(';'))
@@ -4324,6 +4310,94 @@ fn schema_columns(dir: &Path) -> Vec<(String, Vec<(String, String)>)> {
 
 #[cfg(test)]
 mod tests {
+    /// The walk reads every view and entity the fixtures author, IGNORE NULLS included, so failing
+    /// closed on a parse refuses none of them.
+    #[test]
+    fn the_walk_parses_every_fixture_view_and_entity() {
+        fn sql_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    sql_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "sql") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sql_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+            &mut files,
+        );
+        let conn = crate::engine::bare();
+        let mut read = 0;
+        for f in &files {
+            let text = std::fs::read_to_string(f).unwrap();
+            for stmt in super::split_sql_statements(&text) {
+                let body = super::view_body(&stmt).unwrap_or(&stmt);
+                let body = body.trim().trim_end_matches(';');
+                read += 1;
+                if let Err(e) = super::reject_unknown_table_refs(conn.as_ref(), body) {
+                    panic!("{}: {e:#}", f.display());
+                }
+            }
+        }
+        assert!(read >= 100, "the fixtures stopped being read: {read}");
+    }
+
+    /// An entity's relation is bound beside a registration of its raw rows, which no statement may
+    /// name, whatever syntax of the engine's it is written in.
+    #[test]
+    fn an_entitys_raw_registration_is_refused_behind_engine_only_syntax() {
+        use crate::entity_expr::Type;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("entities")).unwrap();
+        std::fs::write(
+            dir.path().join("entities.toml"),
+            "[[entities]]\nname='totals'\nsql='entities/totals.sql'\nkey=['k']\nmax_rows=10\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("entities/totals.sql"),
+            "SELECT k, sum(v) AS n FROM t GROUP BY k",
+        )
+        .unwrap();
+        crate::entities::load(dir.path()).unwrap();
+        super::hold_relation_types(
+            dir.path(),
+            "totals",
+            &["k".into(), "n".into()],
+            &[Some(Type::Str), Some(Type::Int)],
+        );
+        let guard = super::QueryGuard {
+            timeout: std::time::Duration::from_secs(10),
+            max_rows: 10,
+            ..Default::default()
+        };
+        let hot: super::HotRows = [(
+            "totals".to_string(),
+            vec![serde_json::json!({"k": "a", "n": "5"})],
+        )]
+        .into_iter()
+        .collect();
+        let run = |sql: &str| super::query_hot_cold(dir.path(), sql, guard, &hot, u64::MAX, &[]);
+        run("SELECT * FROM totals WHERE k ^@ 'a'").unwrap();
+        for sql in [
+            "SELECT * FROM totals__raw",
+            "SELECT * FROM totals__raw WHERE 'a' ^@ 'a'",
+            "SELECT *, last_value(1 IGNORE NULLS) OVER () AS y FROM totals__raw",
+        ] {
+            let e = match run(sql) {
+                Ok(out) => panic!("{sql} answered {:?}", out.rows),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                e.contains("`totals__raw` is not a table this surface serves"),
+                "{sql}: {e}"
+            );
+        }
+    }
+
     /// #1598: an entity's relation takes the types its plan declares. It exists with no rows, and a
     /// sum past what a JSON number holds stays an integer rather than becoming text.
     #[test]
@@ -8357,8 +8431,8 @@ template="pool"
         let conn = crate::engine::bare();
         let referenced = reject_unknown_table_refs(&*conn, r#"SELECT "from" FROM "t__transfer""#)
             .unwrap()
-            .map(|(names, _)| expand_through_views(&*conn, &names))
-            .expect("the query names a table");
+            .0;
+        let referenced = expand_through_views(&*conn, &referenced);
         assert_eq!(
             crate::seal::segments_failing_verification(dir.path(), &referenced, None),
             std::collections::BTreeSet::from([victim.hash.clone()]),
@@ -8612,8 +8686,8 @@ template="pool"
     fn the_table_refs_walk_reports_what_the_statement_reached() {
         let conn = crate::engine::bare();
         let conn = &*conn;
-        let refs = |sql: &str| reject_unknown_table_refs(conn, sql).unwrap().unwrap().0;
-        let surveys = |sql: &str| reject_unknown_table_refs(conn, sql).unwrap().unwrap().1;
+        let refs = |sql: &str| reject_unknown_table_refs(conn, sql).unwrap().0;
+        let surveys = |sql: &str| reject_unknown_table_refs(conn, sql).unwrap().1;
 
         assert!(
             refs("SELECT CAST('x' AS INTEGER)").is_empty(),
@@ -9586,6 +9660,34 @@ events = ["Transfer"]
                 "a path in table position must be refused on {}: {q}",
                 conn.engine_version()
             );
+        }
+    }
+
+    /// A statement the walk cannot parse is refused with the parser's message, not let through
+    /// to whatever the engine makes of it.
+    #[test]
+    fn a_statement_that_will_not_parse_is_refused_with_the_parsers_message() {
+        let conn = crate::engine::bare();
+        for q in [
+            "SELECT * FROM usdc__transfer WHERE",
+            "SELECT (1 FROM usdc__transfer",
+        ] {
+            let e = reject_unknown_table_refs(conn.as_ref(), q).unwrap_err();
+            assert!(e.to_string().contains("Parser Error"), "{q}: {e:#}");
+        }
+        let e = reject_unknown_table_refs(conn.as_ref(), "SELECT * FROM t WHERE a GLOB 'x*'")
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("GLOB is not supported here"),
+            "{e:#}"
+        );
+        // Engine syntax a stock dialect does not read is walked, not refused.
+        for q in [
+            "SELECT * FROM usdc__transfer WHERE \"from\" ^@ '0x'",
+            "SELECT last_value(value_dec IGNORE NULLS) OVER () AS v FROM usdc__transfer",
+        ] {
+            let (tables, _) = reject_unknown_table_refs(conn.as_ref(), q).unwrap();
+            assert!(tables.contains("usdc__transfer"), "{q}: {tables:?}");
         }
     }
 
@@ -11140,5 +11242,58 @@ mod confinement {
                 grew >> 20
             );
         }
+    }
+
+    /// Syntax the engine reads and a stock dialect does not must not carry a statement past the
+    /// walk. Each is refused by it as its plain form is, and an ordinary one still answers.
+    #[test]
+    fn engine_only_syntax_is_walked_like_any_other_statement() {
+        let f = two_datasets();
+        let seg = f.b_segment.display().to_string();
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t__e".into(),
+            vec![json!({"table": "t__e", "block_number": 11, "log_index": 0, "x": "hot"})],
+        );
+        let targets = [
+            "t__e__raw".to_string(),
+            "t__e__hot".into(),
+            "t__e__union".into(),
+            format!("\"{seg}\""),
+            format!("\"file://{seg}\""),
+            format!("read_some_future_format('{seg}')"),
+        ];
+        let wraps: [fn(&str) -> String; 2] = [
+            |t| format!("SELECT * FROM {t} WHERE 'a' ^@ 'a'"),
+            |t| format!("SELECT *, last_value(1 IGNORE NULLS) OVER () AS y FROM {t}"),
+        ];
+        for tenant in [None, Some(Arc::<str>::from("a"))] {
+            for t in &targets {
+                for w in &wraps {
+                    let sql = w(t);
+                    let got = isolated(tenant.as_ref(), || {
+                        query_hot_cold(&f.a, &sql, guard(), &hot, 10, &[])
+                    });
+                    let e = match got {
+                        Ok(out) => panic!("{tenant:?} answered {sql}: {:?}", out.rows),
+                        Err(e) => format!("{e:#}"),
+                    };
+                    assert!(
+                        tenant.is_some() || e.contains("the SQL surface serves this nest's"),
+                        "{sql} was not refused by the walk: {e}"
+                    );
+                }
+            }
+        }
+        let out = query_hot_cold(
+            &f.a,
+            "SELECT x FROM t__e WHERE x ^@ 'mi'",
+            guard(),
+            &hot,
+            10,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(out.rows, vec![json!({"x": "mine"})]);
     }
 }

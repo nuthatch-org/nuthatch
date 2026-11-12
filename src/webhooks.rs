@@ -767,6 +767,28 @@ mod tests {
         );
     }
 
+    /// A `where` the SQL screen cannot parse is refused at load with the parser's message; one in
+    /// the engine's own syntax is read and accepted.
+    #[test]
+    fn a_where_the_screen_cannot_parse_is_refused_at_load_with_the_parsers_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = transfer_schema("t__transfer");
+        let mut engine_only = wh("w", "t__transfer", "registration");
+        engine_only.where_clause = Some("CAST(value AS VARCHAR) ^@ '1'".into());
+        refuse_unbound(dir.path(), &declared, &[engine_only], false)
+            .expect("engine syntax is read by the screen");
+        let mut broken = wh("w", "t__transfer", "registration");
+        broken.where_clause = Some("value >".into());
+        let err = format!(
+            "{:#}",
+            refuse_unbound(dir.path(), &declared, &[broken], false).unwrap_err()
+        );
+        assert!(
+            err.contains("`where = \"value >\"`") && err.contains("Parser Error"),
+            "{err}"
+        );
+    }
+
     fn transfer_schema(table: &str) -> Vec<crate::registry::TableSchema> {
         let mut columns = crate::registry::implicit_columns(false);
         columns.push(crate::registry::ColumnSchema {

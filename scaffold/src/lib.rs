@@ -178,7 +178,7 @@ pub fn schema_json(registry_hash: [u8; 32], schema: &[TableSchema]) -> Result<St
 /// outside the data identity. `-text` keeps a CRLF checkout from moving a clone's NID (#2199).
 pub const GITATTRIBUTES: &str = "* -text\n*.sql linguist-detectable\nabis/** linguist-generated\n";
 /// The store and the admin token are local state, not nest inputs (#2722).
-pub const GITIGNORE: &str = "data/\n.admin-token\n";
+pub const GITIGNORE: &str = "data/\n.admin-token\nnuthatch.redb\nsegments/\n";
 
 pub const VIEWS_README: &str =
         "# views/ - this nest's authored logic (RFC-0018 §1)\n\n\
@@ -377,7 +377,7 @@ mod tests {
         };
         let files = files(&nest).unwrap();
         let ignore = String::from_utf8(files[".gitignore"].clone()).unwrap();
-        for entry in ["data/", ".admin-token"] {
+        for entry in ["data/", ".admin-token", "nuthatch.redb", "segments/"] {
             assert!(
                 ignore.lines().any(|l| l == entry),
                 "{ignore:?} lacks {entry}"

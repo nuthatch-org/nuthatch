@@ -167,6 +167,36 @@ async fn golden_land_seal_query_is_deterministic() {
     );
 }
 
+/// What a solo nest writes beside its inputs is local state, so `git add .` after a first run must
+/// not pick it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scaffolded_gitignore_covers_what_a_solo_nest_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), nuthatch_scaffold::GITIGNORE).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    drive_land_seal_query(dir.path()).await;
+    assert!(
+        dir.path().join("nuthatch.redb").exists(),
+        "premise: the store is at the root"
+    );
+    let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+    for state in ["nuthatch.redb", "segments/"] {
+        assert!(
+            !status.lines().any(|l| l.contains(state)),
+            "git would add {state}:\n{status}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serves_over_real_http() {
     let dir = tempfile::tempdir().unwrap();
