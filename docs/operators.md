@@ -1313,9 +1313,23 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   list, so a client falls through to its next source. A range before `start_block` or past
   `end_block`, which it never will cover, answers `NUTHATCH_UNSUPPORTED`.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
-  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Off loopback,
+  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module), and there only from
+  this machine: a loopback `Host` (or one named by `--local-host`), no proxy header (`Forwarded`,
+  `Via`, `X-Forwarded-*`, `X-Real-IP` and the like), and no `Origin` or `Sec-Fetch-Site` naming
+  another site. Off loopback, or for a request that is not from this machine,
   `proxy/eth_blockNumber` answers the nest's own head and a watched account's balance is still read;
   everything else that would lend the RPC is refused. Keep it on loopback unless a client needs it.
+- **Host names on a loopback bind.** Every route, reads included, answers only a loopback `Host`
+  or one you declare, so a page that rebinds a DNS name to 127.0.0.1 reads nothing. Behind a reverse
+  proxy that passes the client's `Host`, start the nest with `--public-host <name>` (repeatable):
+  that name reads watched data and changes nothing. **A nest already behind such a proxy is
+  refused with 403 until it adds the flag**, and the 403 names the `Host` it saw. `--local-host
+  <name>` answers a name as this machine, such as `host.docker.internal` for rotki in a container on
+  Docker Desktop; a browser page cannot choose its `Host`, so declaring one does not let a page in.
+  One proxy no header can reveal: one that rewrites `Host` to a loopback address and adds no proxy
+  header, as nginx's plain `proxy_pass http://127.0.0.1:PORT` does, is indistinguishable from a
+  local process, so its callers can watch, unwatch and borrow the RPC. Configure such a proxy to
+  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.

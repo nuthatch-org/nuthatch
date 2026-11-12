@@ -4,12 +4,15 @@
 and uses it as the GitHub release body. Write that file on the release branch, alongside the
 `Cargo.toml` version bump, before tagging.
 
-If the file is missing when the tag is pushed, the `release-notes` job fails and nothing further
+The same release PR bumps the default image in `docker-compose.scaled.yml` and
+`docker-compose.writer-node.yml` to the new version: nothing rewrites them, and
+`tests/compose_image_is_current.rs` fails CI until they match `Cargo.toml`.
+
+If the notes file is missing when the tag is pushed, the `release-notes` job fails and nothing further
 runs - no build, no empty release to edit afterward. There is no fallback to an empty body; a
 missing notes file is a build failure, not a warning.
 
-On the release branch, `server.json` (the MCP Registry entry) is bumped with `Cargo.toml`: its `version` and
-its `ghcr.io/nuthatch-org/nuthatch:<version>` image tag. `scripts/version-check.sh` checks both, and a unit
+`server.json`, the MCP Registry entry, is bumped in the same PR: its `version` and its `ghcr.io/nuthatch-org/nuthatch:<version>` image tag. `scripts/version-check.sh` checks both, and a unit
 test fails the release PR's CI if they lag. Once the tag's image is published, run the manual `mcp registry`
 workflow to publish the entry.
 

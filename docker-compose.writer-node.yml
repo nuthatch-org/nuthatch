@@ -25,7 +25,7 @@
 
 services:
   writer:
-    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-org/nuthatch:1.0.2-scaled}
+    image: ${NUTHATCH_IMAGE:-ghcr.io/nuthatch-org/nuthatch:5.20.0-scaled}
     # No `depends_on`: the store lives on another machine and its readiness is not this host's to
     # judge. A worker that starts before the control plane is reachable retries - that is the
     # reconcile loop's job, and it is precisely the behaviour the partition test exercises.

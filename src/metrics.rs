@@ -2142,6 +2142,7 @@ impl Metrics {
         self.render_serving(&mut s);
         self.render_cursors(&mut s);
         crate::feed_metrics::metrics().render(&mut s);
+        s.push_str(&crate::webhooks::render_metrics());
         s
     }
 
@@ -3080,7 +3081,7 @@ mod tests {
 }
 
 /// A Prometheus label value: a tenant label is any string, so `\`, `"` and newline are escaped.
-fn label_value(v: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn label_value(v: &str) -> std::borrow::Cow<'_, str> {
     if !v.contains(['\\', '"', '\n']) {
         return std::borrow::Cow::Borrowed(v);
     }
