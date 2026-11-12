@@ -3233,6 +3233,46 @@ pub struct Hosts {
     pub public: Vec<String>,
 }
 
+impl Hosts {
+    /// The names given to `--local-host` and `--public-host`, refused when one could not do what it
+    /// says: a loopback name is always this machine, so it cannot be limited to reads.
+    pub fn declared(local: &[String], public: &[String]) -> Result<Self> {
+        let name = |flag: &str, raw: &String| -> Result<String> {
+            match authority_host(raw) {
+                Some(n)
+                    if raw
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .eq_ignore_ascii_case(&n) =>
+                {
+                    Ok(n)
+                }
+                _ => bail!("{flag} {raw:?} is not a host name; give the name alone, with no port"),
+            }
+        };
+        let local = local
+            .iter()
+            .map(|h| name("--local-host", h))
+            .collect::<Result<Vec<_>>>()?;
+        let public = public
+            .iter()
+            .map(|h| name("--public-host", h))
+            .collect::<Result<Vec<_>>>()?;
+        for p in &public {
+            if is_loopback_name(p) {
+                bail!(
+                    "--public-host {p} would do nothing: a loopback name is always answered as this \
+                     machine. Point the proxy at a name of its own, or have it add X-Forwarded-For"
+                );
+            }
+            if local.contains(p) {
+                bail!("{p} is given to both --local-host and --public-host; a name is one or the other");
+            }
+        }
+        Ok(Self { local, public })
+    }
+}
+
 /// Who a request is, decided once from its headers: this machine, or anyone else and why.
 #[derive(Clone, Debug)]
 pub struct Caller {
@@ -3379,7 +3419,9 @@ fn classify(loopback: bool, hosts: &Hosts, headers: &HeaderMap) -> Result<Caller
             if let Some(site) =
                 header("sec-fetch-site").filter(|v| !matches!(v.as_str(), "same-origin" | "none"))
             {
-                return Ok(Caller::remote(format!("it comes from a {site} page")));
+                return Ok(Caller::remote(format!(
+                    "its Sec-Fetch-Site is {site:?}, not same-origin"
+                )));
             }
         }
     }
@@ -4803,11 +4845,8 @@ fn refuse_event_flags(args: &crate::cli::DevArgs) -> Result<()> {
     Ok(())
 }
 
-fn hosts(args: &crate::cli::DevArgs) -> Hosts {
-    Hosts {
-        local: args.local_host.clone(),
-        public: args.public_host.clone(),
-    }
+fn hosts(args: &crate::cli::DevArgs) -> Result<Hosts> {
+    Hosts::declared(&args.local_host, &args.public_host)
 }
 
 /// `nuthatch dev` on a rotki-mode nest.
@@ -4821,6 +4860,7 @@ pub async fn dev(
         bail!("not an address-history nest");
     };
     refuse_event_flags(args)?;
+    let hosts = hosts(args)?;
     let poll_interval = poll_interval(args.poll_interval, ah)?;
     let (listener, loopback) = bind(&args.listen).await?;
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
@@ -4842,8 +4882,7 @@ pub async fn dev(
     };
     let nest = start_nest(dir, &config, rpcs, poll_interval, loopback).await?;
     let served =
-        crate::serve::serve_bound(listener, router_for(nest.state.clone(), hosts(args)), cors)
-            .await;
+        crate::serve::serve_bound(listener, router_for(nest.state.clone(), hosts), cors).await;
     nest.stop();
     served
 }
@@ -4914,6 +4953,7 @@ pub async fn dev_chains(
     cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     refuse_event_flags(args)?;
+    let hosts = hosts(args)?;
     if !args.rpc.is_empty() || !args.trace_rpc.is_empty() || !args.rpc_fallback.is_empty() {
         bail!(
             "a directory of chains reads each chain's RPCs from NUTHATCH_RPC_<chain id> and \
@@ -4972,12 +5012,8 @@ pub async fn dev_chains(
     );
     let states: BTreeMap<u64, Arc<ModeState>> =
         nests.iter().map(|(id, n)| (*id, n.state.clone())).collect();
-    let served = crate::serve::serve_bound(
-        listener,
-        chains_router_for(Arc::new(states), hosts(args)),
-        cors,
-    )
-    .await;
+    let served =
+        crate::serve::serve_bound(listener, chains_router_for(Arc::new(states), hosts), cors).await;
     for n in nests.values() {
         n.stop();
     }
@@ -8305,6 +8341,39 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
     }
 
+    /// A declared name that could not do what its flag says is refused at startup: a loopback name
+    /// is always local, so `--public-host localhost` would leave its callers fully local.
+    #[test]
+    fn a_host_declaration_that_would_do_nothing_is_refused() {
+        let s = |v: &[&str]| v.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        for public in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.2",
+            "[::1]",
+            "0.0.0.0",
+        ] {
+            let err = Hosts::declared(&[], &s(&[public])).unwrap_err().to_string();
+            assert!(
+                err.contains("--public-host") && err.contains("always answered as this machine"),
+                "{public}: {err}"
+            );
+        }
+        let err = Hosts::declared(&s(&["nest.example.com"]), &s(&["Nest.Example.com"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both --local-host and --public-host"), "{err}");
+        for bad in ["wallet.example.com:443", "a@b", ""] {
+            assert!(Hosts::declared(&[], &s(&[bad])).is_err(), "{bad:?}");
+            assert!(Hosts::declared(&s(&[bad]), &[]).is_err(), "{bad:?}");
+        }
+        let hosts =
+            Hosts::declared(&s(&["host.docker.internal"]), &s(&["Wallet.Example.com"])).unwrap();
+        assert_eq!(hosts.local, ["host.docker.internal"]);
+        assert_eq!(hosts.public, ["wallet.example.com"]);
+    }
+
     /// A refusal says what it saw and what to do about it.
     #[tokio::test]
     async fn a_refusal_names_the_host_or_header_it_saw() {
@@ -8330,6 +8399,20 @@ mod tests {
         .await;
         assert_eq!(code, 403);
         assert!(body.contains("x-forwarded-for"), "{body}");
+        let headers = vec![
+            format!("Host: 127.0.0.1:{}", addr.port()),
+            "Sec-Fetch-Site: ".into(),
+        ];
+        let (code, body) = raw(
+            addr,
+            "POST",
+            "/api/watch",
+            &headers,
+            Some(json!({ "address": BOB })),
+        )
+        .await;
+        assert_eq!(code, 403);
+        assert!(body.contains(r#"Sec-Fetch-Site is \"\""#), "{body}");
     }
 
     /// A directory of chains admits a request by the same rule as one chain.

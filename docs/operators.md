@@ -1326,6 +1326,10 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   refused with 403 until it adds the flag**, and the 403 names the `Host` it saw. `--local-host
   <name>` answers a name as this machine, such as `host.docker.internal` for rotki in a container on
   Docker Desktop; a browser page cannot choose its `Host`, so declaring one does not let a page in.
+  One proxy no header can reveal: one that rewrites `Host` to a loopback address and adds no proxy
+  header, as nginx's plain `proxy_pass http://127.0.0.1:PORT` does, is indistinguishable from a
+  local process, so its callers can watch, unwatch and borrow the RPC. Configure such a proxy to
+  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
