@@ -1948,11 +1948,12 @@ struct Quarantined {
     at: Instant,
 }
 
-/// What the start rebuilt derived state from: when, and through the last block then catalogued.
-#[derive(Clone, Copy)]
+/// What the start rebuilt derived state from: when, and through the last block each table then had
+/// catalogued.
+#[derive(Clone)]
 struct Rebuilt {
     at: Instant,
-    through: u64,
+    through: HashMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -1986,10 +1987,13 @@ fn record_quarantine(dir: &Path, store: Option<&Path>, table: &str, s: &Segment)
 /// its segments, after its integrity pass. A segment quarantined later leaves that state wrong.
 pub fn record_rebuild(dir: &Path) {
     let through = shared_manifest(dir)
-        .map(|m| m.tables.values().flatten().map(|s| s.to_block).max())
-        .ok()
-        .flatten()
-        .unwrap_or(0);
+        .map(|m| {
+            m.tables
+                .iter()
+                .filter_map(|(t, segs)| Some((t.clone(), segs.iter().map(|s| s.to_block).max()?)))
+                .collect()
+        })
+        .unwrap_or_default();
     findings()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2036,12 +2040,13 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
     }
     let me = lease_key(dir);
     let store = shared_store(dir).map(|s| lease_key(&s));
-    let rebuilt = f.rebuilt.get(&me).copied();
-    let stale = |at: Instant, from_block: u64| {
-        rebuilt.is_some_and(|r| at > r.at && from_block <= r.through)
+    let rebuilt = f.rebuilt.get(&me);
+    let stale = |at: Instant, table: &str, from_block: u64| {
+        rebuilt.is_some_and(|r| at > r.at && r.through.get(table).is_some_and(|t| from_block <= *t))
     };
     let manifest = shared_manifest(dir).ok();
     let mut out = Integrity::default();
+    let mut counted = BTreeSet::new();
     for q in &f.quarantined {
         let mine = q.dataset == me;
         if !mine && (q.store.is_none() || q.store != store) {
@@ -2055,13 +2060,13 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
                     .map(|s| (t.clone(), s.clone()))
             })
         });
-        let (table, provisional, from_block, file) = match (&named, mine) {
-            (Some((t, s)), _) => (t.clone(), s.provisional, s.from_block, Some(&s.file)),
-            (None, true) => (q.table.clone(), q.provisional, q.from_block, None),
+        let (table, provisional, from_block) = match (&named, mine) {
+            (Some((t, s)), _) => (t.clone(), s.provisional, s.from_block),
+            (None, true) => (q.table.clone(), q.provisional, q.from_block),
             (None, false) => continue,
         };
-        out.derived_stale |= stale(q.at, from_block);
-        if file.is_some_and(|file| segment_path(dir, file, &q.hash).exists()) {
+        out.derived_stale |= stale(q.at, &table, from_block);
+        if !counted.insert(q.hash.as_str()) {
             continue;
         }
         out.quarantined_segments += 1;

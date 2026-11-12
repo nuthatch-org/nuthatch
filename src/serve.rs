@@ -12051,7 +12051,8 @@ mod tests {
             Duration::ZERO,
         );
         let start = std::time::Instant::now();
-        while path.exists() && start.elapsed() < Duration::from_secs(30) {
+        // The record, not the rename: it is written just after.
+        while crate::seal::integrity(dir).is_none() && start.elapsed() < Duration::from_secs(30) {
             std::thread::sleep(Duration::from_millis(20));
         }
         alive.store(false, std::sync::atomic::Ordering::SeqCst);
