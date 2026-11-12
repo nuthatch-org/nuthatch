@@ -576,6 +576,7 @@ mod tests {
             "SELECT CAST(x AS BIGINT), EXTRACT(year FROM ts), SUBSTRING(s FROM 2) FROM t",
             "WITH c AS (SELECT coalesce(x, 0) AS x FROM t) SELECT avg(x) FROM c",
             "SELECT last_value(x IGNORE NULLS) OVER (ORDER BY y) FROM t WHERE s ^@ 'a'",
+            "SELECT COUNT(*), Sum(x), \"UPPER\"(s) FROM t",
         ] {
             refuse_unlisted_functions(sql).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
         }
