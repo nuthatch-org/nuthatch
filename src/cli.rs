@@ -1607,9 +1607,10 @@ pub struct DevArgs {
     )]
     pub trace_rpc: Vec<String>,
 
-    /// Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a
-    /// nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start
-    /// blocks, else from a default recent window.
+    /// Index only this many blocks back from the tip (recent-history mode). On a first run it overrides
+    /// a nest's vendored `start_block`s; a nest that has already indexed a block ignores it, so
+    /// remove its store first to start over. Omit to backfill from deployment when the nest declares
+    /// start blocks, else from a default recent window.
     #[arg(long)]
     pub backfill: Option<u64>,
 
