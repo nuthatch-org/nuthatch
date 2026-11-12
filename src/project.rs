@@ -1008,6 +1008,44 @@ pub(crate) fn write_if_changed(path: &Path, bytes: impl AsRef<[u8]>) -> std::io:
     Ok(true)
 }
 
+/// The agent docs that no longer describe `schema.json`'s tables, named; `None` when they agree or
+/// there is nothing to compare. `dev` never rewrites these (they are hashed into the NID), so this is
+/// how a real edit to `nuthatch.toml` is noticed.
+pub fn agent_docs_lag(dir: &Path) -> Option<String> {
+    let tables: std::collections::BTreeSet<String> =
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(dir.join("schema.json")).ok()?)
+            .ok()?
+            .get("tables")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| t.get("table")?.as_str().map(str::to_string))
+            .collect();
+    let mut stale = Vec::new();
+    if let Ok(llms) = std::fs::read_to_string(dir.join("llms.txt")) {
+        let listed: std::collections::BTreeSet<String> = llms
+            .lines()
+            .skip_while(|l| !l.starts_with("## Tables"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("## "))
+            .filter_map(|l| l.strip_prefix("- `")?.split('`').next().map(str::to_string))
+            .collect();
+        if listed != tables {
+            stale.push("llms.txt");
+        }
+    }
+    if let Ok(skill) = std::fs::read_to_string(dir.join(".claude/skills/nuthatch/SKILL.md")) {
+        let example = skill
+            .split("FROM ")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .map(str::trim);
+        if example.is_some_and(|e| !e.starts_with('<') && !tables.contains(e)) {
+            stale.push(".claude/skills/nuthatch/SKILL.md");
+        }
+    }
+    (!stale.is_empty()).then(|| stale.join(" and "))
+}
+
 /// Whether writing a nest's artifacts may replace the agent docs it already has.
 #[derive(Clone, Copy, PartialEq)]
 enum AgentDocs {

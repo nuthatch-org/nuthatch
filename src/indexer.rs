@@ -3382,6 +3382,14 @@ async fn build_nest(
             // to start over a derived file would be a worse failure than the one being fixed.
             Err(e) => tracing::warn!("could not refresh derived artifacts (continuing): {e:#}"),
         }
+        // `dev` leaves these alone (they are hashed into the NID), so say when an edit left them behind.
+        if let Some(files) = crate::project::agent_docs_lag(&dir) {
+            tracing::warn!(
+                "{files} no longer describe this nest's tables and are out of date; `dev` does not \
+                 rewrite them. Run `nuthatch schema --dir {}` to regenerate them (the NID changes).",
+                dir.display()
+            );
+        }
     }
     let registry = Arc::new(crate::registry::from_nest(&dir, config)?);
     let identity = hex::encode(crate::project::decode_identity(&dir, config, &registry)?);

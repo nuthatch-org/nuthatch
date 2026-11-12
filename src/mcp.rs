@@ -504,7 +504,7 @@ fn tool_specs(shape: &Shape) -> Value {
     // gate the balance view uses - so they never return an empty `{"count":0}` that an agent misreads
     // as "the index is empty".
     if shape.transfers {
-        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string). The result carries `complete_history`. When true the nest indexed from the contract's deployment and the figure is under `balance`. When false or null it is only the net of transfers since `indexed_from` and is returned as `net_flow_since_indexed_from` with a note: a negative figure is then not an error, and it must not be reported as a balance.",
+        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string). The result carries `complete_history`. When true the nest was indexed from its configured `start_block` with no `--backfill` (the contract's deployment if `start_block` is the deployment block, which `init` sets) and the figure is under `balance`. When false or null it is only the net of transfers since `indexed_from` and is returned as `net_flow_since_indexed_from` with a note: a negative figure is then not an error, and it must not be reported as a balance.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
         tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings). The result carries `complete_history`. When true these are holders (`holders`, `balance`). When false or null they are only net flows since `indexed_from` (`net_receivers`, `net_flow_since_indexed_from`, with a note) and must not be reported as holders or balances.",
           "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "default": 20 } } } }));
@@ -708,17 +708,22 @@ fn balance_result(body: &str, h: &History) -> String {
         let since = h.from.map_or("its first indexed block".to_string(), |b| {
             format!("block {b}")
         });
-        let why = if h.complete == Some(false) {
-            "this nest did not index from the contract's deployment"
-        } else if h.status_read {
-            "this nest does not record whether it indexed from the contract's deployment"
+        let lead = if h.complete == Some(false) {
+            "Not balances"
         } else {
-            "the nest's status could not be read to tell whether it indexed from the contract's deployment"
+            "Not known to be balances"
+        };
+        let why = if h.complete == Some(false) {
+            "this nest was indexed with `--backfill` or without a configured `start_block`"
+        } else if h.status_read {
+            "this nest does not record how its history began"
+        } else {
+            "the nest's status could not be read to tell how its history began"
         };
         answer.insert(
             "note".into(),
             json!(format!(
-                "Not balances: {why}, so each figure is only the net of transfers since {since}."
+                "{lead}: {why}, so each figure is only the net of transfers since {since}."
             )),
         );
         rename(&mut answer, "balance", "net_flow_since_indexed_from");
@@ -888,8 +893,8 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
     let kib = SQL_TEXT_BUDGET / 1024;
     let mut notice = match (text_cut, node_cut) {
         (true, true) => format!(
-            "showing {shown} of the {count} rows the node sent, and the node stopped there at its own \
-             bound: this bridge's {kib} KiB text bound cut first, so a larger `limit` cannot help."
+            "showing {shown} of the {count} rows the node sent, and the node stopped there at its row bound \
+             (the `limit` asked for, or its own cap): this bridge's {kib} KiB text bound cut first, so a larger `limit` cannot help."
         ),
         (true, false) => format!(
             "showing {shown} of {count} rows: this bridge's {kib} KiB text bound cut the rest."
@@ -2229,7 +2234,7 @@ mod tests {
             json!({
                 "address": "0x1111", "net_flow_since_indexed_from": "-4100",
                 "dropped_over_i128": 0, "complete_history": false, "indexed_from": 9800,
-                "note": "Not balances: this nest did not index from the contract's deployment, so each figure is only the net of transfers since block 9800."
+                "note": "Not balances: this nest was indexed with `--backfill` or without a configured `start_block`, so each figure is only the net of transfers since block 9800."
             })
         );
         let top = ask(base, "top_balances", json!({})).await;
@@ -2239,7 +2244,7 @@ mod tests {
                 "net_receivers": 2, "count": 1, "dropped_over_i128": 0,
                 "items": [{ "address": "0x1111", "net_flow_since_indexed_from": "-4100" }],
                 "complete_history": false, "indexed_from": 9800,
-                "note": "Not balances: this nest did not index from the contract's deployment, so each figure is only the net of transfers since block 9800."
+                "note": "Not balances: this nest was indexed with `--backfill` or without a configured `start_block`, so each figure is only the net of transfers since block 9800."
             })
         );
         for v in [&one, &top] {

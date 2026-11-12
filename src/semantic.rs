@@ -178,8 +178,8 @@ pub fn compose(
         if let Some(from) = c.first_indexed {
             let meaning = match (gates.transfers, c.history_from_deployment) {
                 (false, _) => "",
-                (true, Some(true)) => "; history starts at the contracts' deployment, so the `balances` view is complete",
-                (true, Some(false)) => "; history was cut short, so the `balances` view is the net flow since then, not a balance",
+                (true, Some(true)) => "; indexed from the configured start_block with no --backfill, so the `balances` view is complete if that is the deployment block (which `init` sets)",
+                (true, Some(false)) => "; history was cut short (--backfill, or no start_block), so the `balances` view is the net flow since then, not a balance",
                 (true, None) => "; this nest does not record whether that is the deployment, so read the `balances` view as a net flow since then, not a balance",
             };
             out.push_str(&format!(
@@ -192,7 +192,7 @@ pub fn compose(
     out.push_str(if gates.free_form {
         "TABLES (one per contract event; query via the `sql` tool)\n"
     } else {
-        "TABLES (one per contract event; this mount answers only its declared queries, not SQL - GET /queries lists them)\n"
+        "TABLES (one per contract event; this mount answers only its declared queries, not SQL - the `queries` tool, GET /queries, lists them)\n"
     });
     for t in schema {
         let ts = sem.and_then(|s| s.tables.get(&t.table));

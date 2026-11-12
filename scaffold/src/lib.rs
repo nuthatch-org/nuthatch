@@ -248,7 +248,7 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
     let (balance_routes, balance_tools) = if has_transfers(schema) {
         (
             "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true`\n\
-             - `GET /balance/{address}`   one address's derived balance, on the same condition (not so after `--backfill` or a later `start_block`)\n",
+             - `GET /balance/{address}`   one address's derived balance, on the same condition. That flag means indexed from the configured `start_block` with no `--backfill`: the deployment only if `start_block` is the deployment block, which `init` sets\n",
             ", balance, top_balances",
         )
     } else {
@@ -302,8 +302,10 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         ", "
     };
     let skill_balance_tools = if has_transfers(schema) {
-        " / `balance` / `top_balances` (read `complete_history` in their results: when false the \
-         figures are `net_flow_since_indexed_from`, not balances)"
+        " / `balance` / `top_balances` (read `complete_history` in their results: when false or null the \
+         figures are `net_flow_since_indexed_from`, not balances; true means indexed from the configured \
+         `start_block` with no `--backfill`, the deployment if `start_block` is the deployment block, \
+         which `init` sets)"
     } else {
         ""
     };
@@ -311,7 +313,9 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
     let skill_balance_http = if has_transfers(schema) {
         "- Balances: `GET /balances`, read with the status at `GET /`: \
          the figures are net flow since its `start_block`, balances only when it says \
-         `history_from_deployment: true`\n"
+         `history_from_deployment: true` (false or null means net flow). True means indexed from the \
+         configured `start_block` with no `--backfill`: the deployment only if `start_block` is the \
+         deployment block, which `init` sets\n"
     } else {
         ""
     };
