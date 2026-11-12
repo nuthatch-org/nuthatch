@@ -140,6 +140,8 @@ impl BurrmillSession {
             .register_rows(&raw, &rows)
             .and_then(|()| engine.register_view(table, &view))
             .map_err(engine_err);
+        // The view's plan holds the rows, so the name is only something more to reach.
+        engine.drop_relation(&raw);
         if let Err(e) = registered {
             // As in `bind_facts`: a retry binds from the same rows.
             self.restore_hot(table, staged);
@@ -1335,6 +1337,27 @@ mod tests {
             want.sort_by(|a, b| b.cmp(a));
             assert_eq!(seen.len(), 2_000, "{sql}");
             assert!(seen == want, "{sql} came back out of the view's order");
+        }
+    }
+
+    /// A bound relation leaves only its view registered, not the raw rows it was planned over, and
+    /// rebinding it reads the new rows.
+    #[test]
+    fn a_bound_relation_leaves_no_raw_registration() {
+        use crate::engine::{FactWindow, Session};
+        let s = super::BurrmillSession::new(None).unwrap();
+        let cols = [("n".to_string(), "HUGEINT")];
+        for n in ["7", "8"] {
+            let rows = [serde_json::json!({ "n": n })];
+            let refs: Vec<&serde_json::Value> = rows.iter().collect();
+            s.load_relation("r", &cols, &refs).unwrap();
+            assert!(s
+                .bind_facts("r", &[], &[], true, FactWindow::default())
+                .unwrap());
+            let tables = s.reader().tables();
+            assert!(!tables.iter().any(|t| t == "r__raw"), "{tables:?}");
+            let got = s.collect("SELECT n FROM r", None).ok().unwrap().rows;
+            assert_eq!(got, vec![serde_json::json!({ "n": n })]);
         }
     }
 
