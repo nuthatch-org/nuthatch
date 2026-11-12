@@ -513,6 +513,8 @@ pub struct Ready {
     pub undecoded: Value,
     pub seal_fault: Option<(u64, String)>,
     pub maintained: Option<Value>,
+    /// Each webhook's delivered block, backlog and last error; absent where none is declared.
+    pub webhooks: Option<Value>,
 }
 
 /// `/ready`: 503 while stalled.
@@ -587,6 +589,9 @@ pub fn ready(r: &Ready) -> Answer {
     }
     if let Some(maintained) = &r.maintained {
         body["maintained"] = maintained.clone();
+    }
+    if let Some(webhooks) = &r.webhooks {
+        body["webhooks"] = webhooks.clone();
     }
     Answer::json(if r.stalled { 503 } else { 200 }, &body)
 }

@@ -40,7 +40,9 @@ use nuthatch_core::window::{
 use nuthatch_seal::cut::CutScan;
 pub use nuthatch_seal::cut::{SEAL_DIRECT_BATCH, SEAL_DIRECT_BYTES};
 
-pub(crate) use nuthatch_core::store::{LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
+pub(crate) use nuthatch_core::store::{
+    HISTORY_FROM_DEPLOYMENT_KEY, LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY,
+};
 /// What this nest's stored data was indexed *with*: `"1"` if rows carry `block_timestamp`, `"0"` if
 /// not (RFC-0029 §6b). Written on first index and compared on every start.
 ///
@@ -73,10 +75,16 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     if config.address_history.is_some() {
         return crate::address_mode::dev(&dir, config, &args, cors).await;
     }
-    if !args.trace_rpc.is_empty() {
-        anyhow::bail!(
-            "--trace-rpc serves an address-history nest; this nest has no [address_history]"
-        );
+    for (flag, set) in [
+        ("--trace-rpc", !args.trace_rpc.is_empty()),
+        ("--public-host", !args.public_host.is_empty()),
+        ("--local-host", !args.local_host.is_empty()),
+    ] {
+        if set {
+            anyhow::bail!(
+                "{flag} serves an address-history nest; this nest has no [address_history]"
+            );
+        }
     }
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
@@ -3652,7 +3660,7 @@ async fn build_nest(
             tables.extend(calls.schema(&config.extract));
         }
         refuse_duplicate_tables(&tables)?;
-        crate::webhooks::refuse_unbound(&dir, &tables, &config.webhooks)?;
+        crate::webhooks::refuse_unbound(&dir, &tables, &config.webhooks, config.strict_isolation)?;
         crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
     };
 
@@ -7266,6 +7274,10 @@ impl NestIngest {
                 // Record where the backfill *began* once; a resume keeps the original origin.
                 if self.store.get_meta(START_BLOCK_KEY)?.is_none() {
                     self.store.set_meta(START_BLOCK_KEY, &origin.to_string())?;
+                    self.store.set_meta(
+                        HISTORY_FROM_DEPLOYMENT_KEY,
+                        history_flag(backfill.is_none() && self.start_block.is_some()),
+                    )?;
                 }
                 if resume_from > origin {
                     tracing::info!(
@@ -7437,8 +7449,10 @@ impl NestIngest {
                     )))
                 })?;
                 let start = cold_start_block(self.start_block, backfill, tip);
-                self.store.set_meta(START_BLOCK_KEY, &start.to_string())?;
                 let from_deployment = backfill.is_none() && self.start_block.is_some();
+                self.store.set_meta(START_BLOCK_KEY, &start.to_string())?;
+                self.store
+                    .set_meta(HISTORY_FROM_DEPLOYMENT_KEY, history_flag(from_deployment))?;
                 let src = if from_deployment {
                     " (from deployment)"
                 } else {
@@ -8454,6 +8468,14 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     match override_ {
         Some(w) if w > 0 => w,
         _ => chain_window,
+    }
+}
+
+fn history_flag(from_deployment: bool) -> &'static str {
+    if from_deployment {
+        "true"
+    } else {
+        "false"
     }
 }
 
@@ -12624,6 +12646,53 @@ template = "pool"
             next, 0,
             "cold start begins at block 0 when tip < DEFAULT_BACKFILL"
         );
+    }
+
+    /// The balance view is a balance only when history begins at deployment, and the store has to
+    /// remember which it was: the MCP bridge names its figures from it.
+    #[tokio::test]
+    async fn a_cold_start_records_whether_its_history_begins_at_deployment() {
+        use crate::rpc::Log;
+
+        struct Tip;
+        #[async_trait::async_trait]
+        impl Source for Tip {
+            async fn tip(&self) -> Result<u64> {
+                Ok(1_000)
+            }
+            async fn block_hash(&self, _n: u64) -> Result<Option<String>> {
+                Ok(None)
+            }
+            async fn logs(
+                &self,
+                _filter: &crate::source::LogFilter,
+                _from: u64,
+                _to: u64,
+            ) -> Result<Vec<Log>> {
+                Ok(Vec::new())
+            }
+        }
+
+        for (start, backfill, want) in [
+            (Some(10), None, "true"),
+            (Some(10), Some(200), "false"),
+            (None, None, "false"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut nest = build_contract_free_test_nest(dir.path()).await;
+            nest.start_block = start;
+            prepare_retrying(&mut nest, &Tip, backfill, false, 1, 5)
+                .await
+                .unwrap();
+            assert_eq!(
+                nest.store
+                    .get_meta(HISTORY_FROM_DEPLOYMENT_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some(want),
+                "start {start:?}, backfill {backfill:?}"
+            );
+        }
     }
 
     async fn build_test_nest(dir: &std::path::Path, addr: &str) -> NestIngest {

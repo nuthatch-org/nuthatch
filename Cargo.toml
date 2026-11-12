@@ -125,6 +125,7 @@ csv = "1"
 # MIT OR Apache-2.0, so it clears the licence allow-list unchanged.
 yaml-rust2 = "0.11"
 toml = "0.8"
+toml_edit = "0.22"
 serde_ignored = "0.1"
 redb = "2"
 arrow = { version = "59", features = ["ipc"] }

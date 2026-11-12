@@ -362,14 +362,20 @@ struct Nest {
     /// because a request holding a newer lease would not keep one alive.
     retired: HashSet<PathBuf>,
     feed: Option<Arc<Feed>>,
-    /// A strict runtime's nest builds nothing until a mount seats it: until then nothing says whose
-    /// partition and limits a build runs under (#2610).
+}
+
+/// Whose partition and limits a dataset's SQL runs under when no request carries it: maintained-view
+/// builds and webhook deliveries. Kept for every dataset a cursor attaches, held or not.
+#[derive(Default)]
+struct Seating {
+    /// A strict runtime's dataset runs nothing until a mount seats it: until then nothing says whose
+    /// partition and limits it runs under (#2610).
     needs_seat: bool,
     /// One per mount that seated it, by route, so an unmount takes back its own (#2636).
     seats: BTreeMap<String, Seat>,
 }
 
-impl Nest {
+impl Seating {
     /// The partition of the seated route that sorts first, under the tightest limits of all of them.
     fn seat(&self) -> Option<Seat> {
         let mut seats = self.seats.values();
@@ -387,9 +393,28 @@ impl Nest {
 
 /// Who a build runs as under strict isolation: a mounting tenant's partition and a request's guard.
 #[derive(Clone)]
-struct Seat {
-    tenant: Arc<str>,
-    guard: crate::analytics::QueryGuard,
+pub(crate) struct Seat {
+    pub(crate) tenant: Arc<str>,
+    pub(crate) guard: crate::analytics::QueryGuard,
+}
+
+fn seatings() -> &'static Mutex<HashMap<PathBuf, Seating>> {
+    static SEATINGS: OnceLock<Mutex<HashMap<PathBuf, Seating>>> = OnceLock::new();
+    SEATINGS.get_or_init(Default::default)
+}
+
+fn lock_seatings() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Seating>> {
+    seatings().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Who `dir`'s unrequested SQL runs as. `None` while a strict runtime has seated no mount on it, so
+/// nothing runs yet; `Some(None)` where no mount has seated it outside a strict runtime.
+pub(crate) fn runs_as(dir: &Path) -> Option<Option<Seat>> {
+    match lock_seatings().get(dir) {
+        Some(s) if s.needs_seat && s.seats.is_empty() => None,
+        Some(s) => Some(s.seat()),
+        None => Some(None),
+    }
 }
 
 /// The nest's current inputs, read as a request reads them: its hot rows and served watermark.
@@ -450,9 +475,6 @@ pub fn load(dir: &Path) -> Result<()> {
         .iter()
         .map(|v| (v.clone(), Arc::new(ViewStats::default())))
         .collect();
-    let (needs_seat, seats) = all.get(dir).map_or((false, BTreeMap::new()), |n| {
-        (n.needs_seat, n.seats.clone())
-    });
     all.insert(
         dir.to_path_buf(),
         Nest {
@@ -463,8 +485,6 @@ pub fn load(dir: &Path) -> Result<()> {
             failed: HashMap::new(),
             retired: HashSet::new(),
             feed: None,
-            needs_seat,
-            seats,
         },
     );
     Ok(())
@@ -682,25 +702,27 @@ pub fn attach(dir: &Path, gate: crate::serve::SqlGate, strict: bool) {
             }
         }
     };
+    lock_seatings()
+        .entry(dir.to_path_buf())
+        .or_default()
+        .needs_seat = strict;
     if let Some(n) = lock_nests().get_mut(dir) {
         n.cursor = Some(cursor);
-        n.needs_seat = strict;
     }
 }
 
-/// Run `dir`'s builds as `tenant`'s strict partition under `guard`, as a request from the mount at
-/// `route` runs (#2610). Several mounts of one dataset leave the tightest deadline and memory cap.
+/// Run `dir`'s builds and webhook deliveries as `tenant`'s strict partition under `guard`, as a
+/// request from the mount at `route` runs (#2610). Several mounts of one dataset leave the tightest
+/// deadline and memory cap.
 pub fn seat(dir: &Path, route: &str, tenant: Arc<str>, guard: crate::analytics::QueryGuard) {
     let first = {
-        let mut all = lock_nests();
-        let Some(n) = all.get_mut(dir) else {
-            return;
-        };
-        let first = n.seats.is_empty();
-        n.seats.insert(route.to_string(), Seat { tenant, guard });
+        let mut all = lock_seatings();
+        let s = all.entry(dir.to_path_buf()).or_default();
+        let first = s.seats.is_empty();
+        s.seats.insert(route.to_string(), Seat { tenant, guard });
         first
     };
-    if first {
+    if first && lock_nests().contains_key(dir) {
         changed(dir);
     }
 }
@@ -708,23 +730,26 @@ pub fn seat(dir: &Path, route: &str, tenant: Arc<str>, guard: crate::analytics::
 /// Take back the seat of the mount at `route`, which has gone (#2636). The builds run as a mount
 /// still holding the dataset, or, in a strict runtime, not at all until one seats it again.
 pub fn unseat(dir: &Path, route: &str) {
-    if let Some(n) = lock_nests().get_mut(dir) {
-        n.seats.remove(route);
+    if let Some(s) = lock_seatings().get_mut(dir) {
+        s.seats.remove(route);
     }
 }
 
 /// The partition `dir`'s next build would run as.
 #[cfg(test)]
 pub(crate) fn seated_tenant(dir: &Path) -> Option<Arc<str>> {
-    lock_nests().get(dir).and_then(Nest::seat).map(|s| s.tenant)
+    lock_seatings()
+        .get(dir)
+        .and_then(Seating::seat)
+        .map(|s| s.tenant)
 }
 
 /// The deadline `dir`'s next build would run under.
 #[cfg(test)]
 pub(crate) fn seated_timeout(dir: &Path) -> Option<std::time::Duration> {
-    lock_nests()
+    lock_seatings()
         .get(dir)
-        .and_then(Nest::seat)
+        .and_then(Seating::seat)
         .map(|s| s.guard.timeout)
 }
 
@@ -813,11 +838,8 @@ fn drain(cursor: Arc<Cursor>) {
             }
             Next::Build(job) => job,
         };
-        let seat = match lock_nests().get(&job.dir) {
-            Some(n) if n.needs_seat && n.seats.is_empty() => None,
-            Some(n) => Some(n.seat()),
-            None => None,
-        };
+        let held = lock_nests().contains_key(&job.dir);
+        let seat = runs_as(&job.dir).filter(|_| held);
         // Unseated in a strict runtime: dropped, and [`seat`] plans the nest again. A nest no
         // longer held declares nothing to build, and knows nothing of its seat.
         let Some(seat) = seat else {
