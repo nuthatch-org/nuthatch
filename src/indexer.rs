@@ -73,10 +73,16 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     if config.address_history.is_some() {
         return crate::address_mode::dev(&dir, config, &args, cors).await;
     }
-    if !args.trace_rpc.is_empty() {
-        anyhow::bail!(
-            "--trace-rpc serves an address-history nest; this nest has no [address_history]"
-        );
+    for (flag, set) in [
+        ("--trace-rpc", !args.trace_rpc.is_empty()),
+        ("--public-host", !args.public_host.is_empty()),
+        ("--local-host", !args.local_host.is_empty()),
+    ] {
+        if set {
+            anyhow::bail!(
+                "{flag} serves an address-history nest; this nest has no [address_history]"
+            );
+        }
     }
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
