@@ -1314,6 +1314,7 @@ async fn resolve_abi(
     address: &str,
     explorer: Option<&str>,
 ) -> Result<ResolvedAbi> {
+    require_contract_code(rpc, chain_id, address).await?;
     if let Some(implementation) = resolve_implementation(rpc, address).await {
         println!("  · proxy → implementation {implementation}");
         if let Ok(resolved) = abi::resolve(chain_id, &implementation, explorer).await {
@@ -1333,6 +1334,24 @@ async fn resolve_abi(
         implementation: None,
         contract_name: resolved.contract_name,
     })
+}
+
+/// An address with no code has no ABI to find; say so before an explorer lookup sends the user off
+/// for an API key. A failed read is not a verdict, so it falls through to resolution.
+async fn require_contract_code(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<()> {
+    let Ok(tip) = rpc.block_number().await else {
+        return Ok(());
+    };
+    match rpc.get_code(address, tip).await {
+        Ok(code) if is_empty_code(&code) => Err(no_contract_code(address, chain_id)),
+        _ => Ok(()),
+    }
+}
+
+fn no_contract_code(address: &str, chain_id: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no contract code at {address} on chain {chain_id}; check the address and --chain"
+    )
 }
 
 /// The pretty lines for a resolved ABI, in the same `→`/`✓`/`·` two-space-indented prose the rest of
@@ -1873,7 +1892,8 @@ fn found_nowhere(probe: &str, probed: &[(&'static chains::Chain, Option<bool>)])
     let names: Vec<&str> = probed.iter().map(|(c, _)| c.name).collect();
     anyhow::anyhow!(
         "couldn't find bytecode for {probe} on any known chain ({}).\n\
-         Pass --chain explicitly, or --rpc <url> for a custom endpoint.",
+         Pass --chain explicitly, or --rpc <url> for a custom endpoint. If the address is mistyped, \
+         or is not a contract, no chain will have code there.",
         names.join(", ")
     )
 }
@@ -2716,6 +2736,19 @@ mod tests {
             init_from(repo.to_str().unwrap(), &dir.path().join("out")).unwrap_err()
         );
         assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    #[test]
+    fn an_address_without_code_is_not_blamed_on_a_missing_api_key() {
+        let msg = no_contract_code("0xdead", 1).to_string();
+        assert!(
+            msg.contains("no contract code at 0xdead on chain 1"),
+            "{msg}"
+        );
+        assert!(!msg.contains("ETHERSCAN"), "{msg}");
+        let probed: Vec<_> = chains::all().iter().map(|c| (*c, Some(false))).collect();
+        let nowhere = found_nowhere("0xdead", &probed).to_string();
+        assert!(nowhere.contains("mistyped"), "{nowhere}");
     }
 
     // #2193: the failure names every chain that was probed.
