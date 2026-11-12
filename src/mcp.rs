@@ -404,9 +404,9 @@ fn tool_specs(shape: &Shape) -> Value {
     // gate the balance view uses - so they never return an empty `{"count":0}` that an agent misreads
     // as "the index is empty".
     if shape.transfers {
-        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string).",
+        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string). It is the net flow since `indexed_from`, the first block this nest indexed; it is the balance only if that is the contract's deployment block, so a negative figure on a `--backfill` nest is not an error.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
-        tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings).",
+        tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings). The net flow since `indexed_from`, the first block this nest indexed; these are holders only if that is the contract's deployment block.",
           "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "default": 20 } } } }));
     }
     // Compliance tools (RFC-0008): advertised only where compliance is configured (RFC-0025).
@@ -1086,6 +1086,25 @@ mod tests {
         };
         assert_eq!(names(&tool_specs(&full)).len(), 12);
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
+    }
+
+    #[test]
+    fn balance_tools_say_they_count_from_the_first_indexed_block() {
+        let token = Shape {
+            transfers: true,
+            compliance: false,
+        };
+        let specs = tool_specs(&token);
+        for name in ["balance", "top_balances"] {
+            let d = specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .and_then(|t| t["description"].as_str())
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert!(d.contains("indexed_from") && d.contains("net flow"), "{d}");
+        }
     }
 
     #[tokio::test]

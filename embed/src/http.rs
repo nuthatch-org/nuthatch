@@ -138,9 +138,9 @@ pub async fn reply(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> Rep
             }
             ("GET", ["balances"]) => {
                 let top = n.nest.balances.top(answer::listing_limit(number("limit")?));
-                answer::balances(&n.nest.balances, top)
+                answer::balances(&n.nest.balances, top, None)
             }
-            ("GET", ["balance", address]) => answer::balance(&n.nest.balances, address),
+            ("GET", ["balance", address]) => answer::balance(&n.nest.balances, address, None),
             ("GET", ["derived"]) => {
                 let head = dataset_head(n);
                 let items = n

@@ -118,6 +118,8 @@ pub fn drift(schema: &[TableSchema], sem: &Semantic) -> Vec<String> {
 pub struct Coverage {
     pub sealed_through: u64,
     pub tip: u64,
+    /// The first block indexed. Balances count from here, not from the contract's deployment.
+    pub first_indexed: Option<u64>,
 }
 
 /// Compose the enriched schema document from the four layers the RFC names: **structure** (registry),
@@ -162,9 +164,17 @@ pub fn compose(
     if let Some(c) = coverage {
         out.push_str(&format!(
             "COVERAGE\n  sealed_through = {} (rows at or below this block are sealed Parquet);\n  \
-             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n\n",
+             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n",
             c.sealed_through, c.tip
         ));
+        if let Some(from) = c.first_indexed {
+            out.push_str(&format!(
+                "  first_indexed = {from} - no block before it is in this nest, so the `balances` \
+                 view is the net flow since then, a balance only if this is the contract's \
+                 deployment block.\n"
+            ));
+        }
+        out.push('\n');
     }
 
     out.push_str("TABLES (one per contract event; query via the `sql` tool)\n");
@@ -761,6 +771,20 @@ mod tests {
             .unwrap_or_else(|| panic!("no snapshot label in:\n{doc}"));
         assert!(line.contains("offchain__prices"), "{line}");
         assert_eq!(doc.matches("reproducible by snapshot").count(), 1, "{doc}");
+    }
+
+    #[test]
+    fn coverage_names_the_first_indexed_block() {
+        let cov = |first_indexed| Coverage {
+            sealed_through: 90,
+            tip: 100,
+            first_indexed,
+        };
+        let doc = compose(&[transfer_table()], None, Some(&cov(Some(26_397_446))), &[]);
+        assert!(doc.contains("first_indexed = 26397446"), "{doc}");
+        assert!(doc.contains("net flow"), "{doc}");
+        let doc = compose(&[transfer_table()], None, Some(&cov(None)), &[]);
+        assert!(!doc.contains("first_indexed"), "{doc}");
     }
 
     #[test]

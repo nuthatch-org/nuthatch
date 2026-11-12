@@ -262,7 +262,7 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`, and each\n\
          \x20                            authored view (`views/*.sql`) answers by its own name\n\
          - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
-         - `GET /balance/{{address}}`   one address's derived balance\n\
+         - `GET /balance/{{address}}`   one address's derived balance. Both carry `indexed_from`: they are net flow since that block, a balance only if it is the contract's deployment block (not so after `--backfill` or a later `start_block`)\n\
          - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
          \x20                            `mounts.toml` (none on an open nest); `GET /q/{{name}}` runs one\n\
          - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
@@ -296,7 +296,8 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          \n\
          ## Preferred: MCP\n\
          If a `nuthatch` MCP server is configured, use its tools. Call `schema` first to learn the\n\
-         data model, then `sql` / `entity` / `balance` / `top_balances`.\n\
+         data model, then `sql` / `entity` / `balance` / `top_balances`. The balance tools report net flow since\n\
+         `indexed_from`, a balance only if that is the contract's deployment block.\n\
          \n\
          ## Fallback: HTTP (a `nuthatch dev` must be running)\n\
          - Recent rows:  `curl localhost:8288/entities?limit=20`\n\
