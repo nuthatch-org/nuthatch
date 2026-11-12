@@ -214,6 +214,8 @@ mod secret_isolation;
 mod semantic_layer;
 #[path = "shipped_endpoints.rs"]
 mod shipped_endpoints;
+#[path = "single_host_backfill.rs"]
+mod single_host_backfill;
 #[path = "tape_clean.rs"]
 mod tape_clean;
 #[path = "tip_gauges_are_published_per_nest.rs"]

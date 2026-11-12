@@ -437,7 +437,6 @@ async fn bring_up_live(
                 "arbitrum-one".to_string(),
                 tape as Arc<dyn nuthatch::source::Source>,
             )]),
-            endpoint_counts: std::collections::HashMap::from([("arbitrum-one".to_string(), 1)]),
             backfill: None,
             seal_direct: false,
             concurrency: 1,
