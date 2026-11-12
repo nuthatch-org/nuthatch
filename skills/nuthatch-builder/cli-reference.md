@@ -322,7 +322,7 @@ Re-key a contract alias: `nuthatch.toml`, the ABI file, and `semantic.toml`
 
 ## `nuthatch offchain`
 
-Seal a local file into the explicitly non-chain offchain namespace (RFC-0045 stage 1)
+Seal a local file, or a feed pulled once, into the explicitly non-chain offchain namespace (RFC-0045)
 
 
 ## `nuthatch offchain drop`
