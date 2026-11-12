@@ -16,7 +16,8 @@ USDC). If auto-detect can't find the contract (or you want a specific chain), pa
 registry name: `mainnet`, `arbitrum-one`, `base`, `bsc`, `polygon`, `gnosis`, `optimism`, `monad`,
 `robinhood`. `init` ends by printing the `nuthatch dev` line to run next and, for a long history, the
 same line with `--backfill N` for the recent window only. To index only recent history instead of
-from deployment: `nuthatch dev --backfill 100000` (last 100k blocks). Point at your own node with
+from deployment: `nuthatch dev --backfill 100000` (last 100k blocks) on a nest that has not indexed a
+block yet; once it has, the flag is ignored, so stop it and remove `nuthatch.redb` and `segments/` first. Point at your own node with
 `--rpc https://…` to dodge public-RPC limits.
 
 ## Index several contracts together
