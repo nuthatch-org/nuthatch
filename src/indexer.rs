@@ -4143,10 +4143,10 @@ pub const SEAL_DIRECT_IN_FLIGHT_LOGS: u32 = 32_000;
 /// `width`, narrowed so that at the last merged window's logs per 1,024 blocks it expects no
 /// more than [`SEAL_DIRECT_WINDOW_LOGS`].
 fn within_window_logs(width: u64, density: u64) -> u64 {
-    if density == u64::MAX || density == 0 {
+    if density == u64::MAX {
         return width;
     }
-    width.min((SEAL_DIRECT_WINDOW_LOGS as u64 * 1024 / density).max(1))
+    width.min((SEAL_DIRECT_WINDOW_LOGS as u64 * 1024 / density.max(1)).max(1))
 }
 
 /// [`SEAL_DIRECT_IN_FLIGHT_LOGS`] a window of `width` blocks is weighed at, against the last merged
@@ -6450,7 +6450,8 @@ pub async fn backfill_direct_pipelined_with(
             json,
             held,
         } = res?;
-        let seen = fetched.saturating_mul(1024) / (w_to - fetch_from + 1).max(1);
+        // Floored at one: an empty window is a measured density, not an unknown one.
+        let seen = (fetched.saturating_mul(1024) / (w_to - fetch_from + 1).max(1)).max(1);
         density.store(seen, std::sync::atomic::Ordering::Relaxed);
         // Feedback lags by up to `concurrency` windows - those are already in flight when this one
         // lands. That is fine and is not worth engineering away: the controller is damped to 4× per
@@ -12402,6 +12403,12 @@ template = "pool"
             SEAL_DIRECT_WINDOW_LOGS as u64 / 4
         );
         assert_eq!(window_weight(1, 1), 1);
+        // An empty window is a density of one, still narrowing and weighing what follows it.
+        assert_eq!(
+            within_window_logs(u64::MAX / 2, 1),
+            SEAL_DIRECT_WINDOW_LOGS as u64 * 1024
+        );
+        assert_eq!(window_weight(1_024_000, 1), 2_000);
     }
 
     /// One endpoint runs the concurrency asked for. Recorded for `/ready` only for a nest running a
