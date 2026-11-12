@@ -223,6 +223,20 @@ async fn read_cycle(client: &reqwest::Client, base: &str, cycle: u64) -> Vec<Rea
     reads
 }
 
+/// What a person is told when no read got any answer from the URL.
+fn unreachable_note(base: &str) -> String {
+    format!("cannot reach {base}: is `nuthatch dev` running? (--url to point elsewhere)")
+}
+
+/// How a bounded run ends: a run in which nothing ever answered is a failure, in either mode.
+fn finish(ever_answered: bool, base: &str) -> Result<()> {
+    if ever_answered {
+        Ok(())
+    } else {
+        bail!("nothing answered at {base}")
+    }
+}
+
 async fn run_lines(
     base: &str,
     interval: Option<u64>,
@@ -253,7 +267,7 @@ async fn run_lines(
         // Status 0 is a transport failure: nothing answered at the URL, which is not the same as an
         // endpoint that served nothing for a field.
         if !answered && !said_unreachable {
-            eprintln!("cannot reach {base}: is `nuthatch dev` running? (--url to point elsewhere)");
+            eprintln!("{}", unreachable_note(base));
             said_unreachable = true;
         }
         said_unreachable &= !answered;
@@ -271,10 +285,7 @@ async fn run_lines(
         );
         let wait = every.saturating_sub(began.elapsed());
         if exit_after.is_some_and(|s| started.elapsed() + wait > Duration::from_secs(s)) {
-            if !ever_answered {
-                bail!("nothing answered at {base}");
-            }
-            return Ok(());
+            return finish(ever_answered, base);
         }
         tokio::time::sleep(wait).await;
     }
@@ -385,9 +396,11 @@ async fn run_live_screen(
     let mut app = App::default();
     let mut terminal = ratatui::init();
     let started = Instant::now();
+    let mut ever_answered = false;
     let result = (|| -> Result<()> {
         loop {
             while let Ok(read) = rx.try_recv() {
+                ever_answered |= read.status != 0;
                 if let Some(file) = recorder.as_mut() {
                     writeln!(file, "{}", serde_json::to_string(&read)?)?;
                 }
@@ -403,7 +416,7 @@ async fn run_live_screen(
             };
             terminal.draw(|frame| screen.draw(frame))?;
             if exit_after.is_some_and(|s| started.elapsed() >= Duration::from_secs(s)) {
-                return Ok(());
+                return finish(ever_answered, base);
             }
             if !handle_keys(&mut app)? {
                 return Ok(());
@@ -411,6 +424,9 @@ async fn run_live_screen(
         }
     })();
     ratatui::restore();
+    if !ever_answered {
+        eprintln!("{}", unreachable_note(base));
+    }
     result
 }
 
