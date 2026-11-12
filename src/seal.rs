@@ -1793,6 +1793,12 @@ pub const QUARANTINE_DIR: &str = "quarantine";
 /// log loudly, then continue. A corrupt segment must *reduce* a table's cold data, never crash-loop the
 /// node. Sealed data is immutable and content-addressed, so a hash mismatch is unambiguous corruption.
 /// Returns the number of segments quarantined. Best-effort - never fatal (an IO error just logs).
+///
+/// A segment is hashed only when its file is not the one the last clean pass hashed: a different
+/// length, modification time, change time, inode or device. Any write, truncation, replacement or
+/// restore moves at least one of them, and the change time cannot be set back from user space. What
+/// this does not see is a change below the filesystem, a sector rotting under an unchanged inode,
+/// which the serving path's own check finds when a read fails.
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     let mut manifest = load_manifest(dir)?;
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
@@ -1801,6 +1807,8 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     // A bad provisional tail stays catalogued, so its loss stays visible, but is never folded or aged
     // again: both read its file, and the failed read stopped every later seal (#2172).
     let mut lost_tails = 0usize;
+    let before = verified_stamps(dir);
+    let mut verified = BTreeMap::new();
 
     for (table, segs) in &mut manifest.tables {
         for s in segs.iter_mut() {
@@ -1811,8 +1819,29 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             // segment is reported loudly and left in place; the operator decides, with the knowledge
             // that more than one dataset is affected.
             let is_shared = shared_store(dir).is_some_and(|st| path.starts_with(&st));
-            let reason = match std::fs::read(&path) {
-                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => continue, // intact
+            let key = path.to_string_lossy().into_owned();
+            // Taken before the read, so a write landing during it moves the stamp past this one.
+            let stamp = file_stamp(&path);
+            if let Some(unchanged) = stamp.filter(|s| before.get(&key) == Some(s)) {
+                verified.insert(key, unchanged);
+                continue;
+            }
+            let read = std::fs::read(&path);
+            #[cfg(test)]
+            if read.is_ok() {
+                *segments_hashed()
+                    .lock()
+                    .unwrap()
+                    .entry(dir.to_path_buf())
+                    .or_default() += 1;
+            }
+            let reason = match read {
+                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {
+                    if let Some(stamp) = stamp {
+                        verified.insert(key, stamp);
+                    }
+                    continue;
+                }
                 Ok(_) => "hash mismatch (corrupt or tampered)",
                 // Already gone from disk - nothing to move; `define_views` skips it. Not counted.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1861,6 +1890,11 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     if lost_tails > 0 {
         save_manifest(dir, &manifest)?;
     }
+    if verified != before {
+        if let Err(e) = save_verified_stamps(dir, &verified) {
+            tracing::warn!("could not record the segments verified intact: {e:#}");
+        }
+    }
     if quarantined > 0 {
         tracing::error!(
             "startup integrity: quarantined {quarantined} corrupt segment(s) - data is reduced, node \
@@ -1868,6 +1902,64 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
         );
     }
     Ok(quarantined)
+}
+
+/// Beside the catalogue: the stamp of every segment file the last startup pass hashed intact.
+const VERIFIED_FILE: &str = "verified.json";
+
+/// Length, modification and change times, inode and device.
+type FileStamp = (u64, i64, i64, i64, i64, u64, u64);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+        m.ino(),
+        m.dev(),
+    ))
+}
+
+/// Unreadable or torn reads as empty, and the pass then hashes everything.
+fn verified_stamps(dir: &Path) -> BTreeMap<String, FileStamp> {
+    std::fs::read(dir.join(SEGMENTS_DIR).join(VERIFIED_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_verified_stamps(dir: &Path, stamps: &BTreeMap<String, FileStamp>) -> Result<()> {
+    let path = dir.join(SEGMENTS_DIR).join(VERIFIED_FILE);
+    if stamps.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(stamps)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn segments_hashed() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static HASHED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    HASHED.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn segments_hashed_of(dir: &Path) -> usize {
+    segments_hashed()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// The segment's file is present and hashes to its catalogue entry.
@@ -3413,6 +3505,48 @@ mod tests {
         let before = inode();
         assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
         assert_eq!(inode(), before, "the catalogue was reinstalled");
+    }
+
+    #[test]
+    fn a_restart_rehashes_only_the_segments_changed_since_the_last_clean_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        let hashed = || segments_hashed_of(dir.path());
+
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert_eq!(hashed(), 2);
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert_eq!(hashed(), 2, "an unchanged segment was read again");
+
+        // Corrupt one in place at the same length and put its mtime back, so only the change
+        // time can see it. Linux stamps that from a coarse clock, hence the pause.
+        std::thread::sleep(Duration::from_millis(50));
+        let path = segment_path(dir.path(), &segs[0].file, &segs[0].hash);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4] ^= 0xFF;
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut &f, &bytes).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(f);
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert_eq!(hashed(), 3);
+
+        // A truncated one is found too, without reading the intact one again.
+        let path = segment_path(dir.path(), &segs[1].file, &segs[1].hash);
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert_eq!(hashed(), 4);
     }
 
     /// #2758: a catalogue that is there but cannot be read is an error, not an empty catalogue.
