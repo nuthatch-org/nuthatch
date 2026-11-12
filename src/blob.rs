@@ -1360,8 +1360,8 @@ abi = "abis/c.json"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut moved = Vec::new();
         for (nest, nid, data) in [
-            ("scaffold/pair", "b16e8851af12c79705c5851d41853834a2ad04b776bcd3fb356814530bb2e38c", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
-            ("scaffold/two", "c240187c22353206b88f0a2fb196693a56abd0ed70c29f5cedf14f9ec5c0c9d7", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
+            ("scaffold/pair", "f73f16a0bd8decbe68dcb43c48bf8c8de618387fe65a00e278ecca1e75f17178", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
+            ("scaffold/two", "3341b486e61513ab070ff7722b69977a7ccccdf69d9c54a898a5eff5e332c91b", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
             ("diff/control", "409f7c7db35d5dab9db410e849be7420e7ab69460c06d3114024df2d7fe1c164", "8a12eac0c6604e0df102425c78ce588b7ac1b58434208e561166b9cc4e19ceff"),
             ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
             ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),

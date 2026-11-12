@@ -309,7 +309,7 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
     };
 
     let skill_balance_http = if has_transfers(schema) {
-        "- Balances: `curl localhost:8288/balances`, read with the status from `curl localhost:8288/`: \
+        "- Balances: `GET /balances`, read with the status at `GET /`: \
          the figures are net flow since its `start_block`, balances only when it says \
          `history_from_deployment: true`\n"
     } else {
