@@ -7226,6 +7226,8 @@ impl NestIngest {
         concurrency: usize,
         window: u64,
     ) -> Result<u64> {
+        // Decided before the seal-direct step below, which writes LAST_BLOCK on a fresh store.
+        let had_blocks = self.store.get_meta(LAST_BLOCK_KEY)?.is_some();
         // User webhooks (RFC-0010 Part B): initialise each subscription's cursor before any sealing, so a
         // `since = "registration"` webhook starts at the tip and a `--seal-direct` backfill doesn't fire
         // its history. Best-effort - a tip lookup failure just defers registration to the first live tip.
@@ -7449,7 +7451,18 @@ impl NestIngest {
         // Resume from the last committed block; on a cold start, backfill from the nest's earliest
         // vendored deployment block (full history) if it has one, else from `--backfill` behind the tip.
         let next = match self.store.get_meta(LAST_BLOCK_KEY)? {
-            Some(v) => v.parse::<u64>().context("corrupt last_block")? + 1,
+            Some(v) => {
+                let last = v.parse::<u64>().context("corrupt last_block")?;
+                let from = self
+                    .store
+                    .get_meta(START_BLOCK_KEY)?
+                    .and_then(|s| s.parse::<u64>().ok());
+                let asked = backfill.filter(|_| had_blocks);
+                if let Some(note) = ignored_backfill(asked, from, last, &self.dir) {
+                    tracing::info!("{note}");
+                }
+                last + 1
+            }
             None => {
                 let tip = source.tip().await.map_err(|e| {
                     anyhow::Error::new(ColdStartUnreachable(format!(
@@ -7468,10 +7481,8 @@ impl NestIngest {
                 };
                 tracing::info!("cold start: backfilling from block {start}{src} (tip {tip})");
                 if let Some(span) = long_backfill(start, tip, window).filter(|_| from_deployment) {
-                    tracing::info!(
-                        "that is {span} blocks of history; `--backfill N` indexes only the last N \
-                         blocks instead"
-                    );
+                    let recent = window.saturating_mul(15);
+                    tracing::info!("{}", long_history_advice(span, recent, &self.dir));
                 }
                 start
             }
@@ -8476,6 +8487,75 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     match override_ {
         Some(w) if w > 0 => w,
         _ => chain_window,
+    }
+}
+
+/// `--backfill` only chooses where a cold start begins. Once the store holds a block it is ignored,
+/// and the operator is told so rather than left to find the full-history backfill resuming.
+fn ignored_backfill(
+    backfill: Option<u64>,
+    from: Option<u64>,
+    last: u64,
+    dir: &Path,
+) -> Option<String> {
+    let n = backfill?;
+    let range = match from {
+        Some(from) => format!("blocks {from} to {last}"),
+        None => format!("up to block {last}"),
+    };
+    let tail = match start_over(dir) {
+        StartOver::Remove(paths) => {
+            format!(" (to start over from tip minus {n}: stop, remove {paths}, and rerun)")
+        }
+        StartOver::Shared(shared) => format!(
+            " (its sealed segments are kept in {}, outside its directory and possibly shared, so \
+             starting over means a fresh nest directory)",
+            shared.display()
+        ),
+    };
+    Some(format!(
+        "--backfill {n} does not apply: this dataset has already indexed {range}, so it resumes \
+         from block {}{tail}",
+        last + 1
+    ))
+}
+
+/// Printed as a long cold-start backfill begins. It is read while the first window is already
+/// committing, so it says how to start over, which is what makes it true.
+fn long_history_advice(span: u64, recent: u64, dir: &Path) -> String {
+    match start_over(dir) {
+        StartOver::Remove(paths) => format!(
+            "that is {span} blocks of history; to index only the last {recent} instead, stop, \
+             remove {paths}, and rerun with `--backfill {recent}`"
+        ),
+        StartOver::Shared(shared) => format!(
+            "that is {span} blocks of history; `--backfill {recent}` indexes only the last \
+             {recent} blocks of a fresh dataset, and this one keeps its sealed segments in {}, \
+             outside its directory and possibly shared, so that means a fresh nest directory",
+            shared.display()
+        ),
+    }
+}
+
+enum StartOver {
+    /// The store and segment directory belong to this nest alone; removing them is a clean start.
+    Remove(String),
+    /// Sealed segments live outside the nest's directory, so nothing here is safe to delete.
+    Shared(PathBuf),
+}
+
+/// Deletion advice only where the segment files are inside the nest's own directory, asked of the
+/// same function that places them.
+fn start_over(dir: &Path) -> StartOver {
+    let segments = seal::segments_dir(dir);
+    if segments == dir.join(seal::SEGMENTS_DIR) {
+        StartOver::Remove(format!(
+            "{} and {}",
+            dir.join(DB_FILE).display(),
+            segments.display()
+        ))
+    } else {
+        StartOver::Shared(segments)
     }
 }
 
@@ -12345,6 +12425,48 @@ template = "pool"
     }
 
     #[test]
+    fn a_backfill_on_a_nest_with_blocks_is_reported_as_ignored() {
+        let solo = Path::new("/n/nest");
+        assert_eq!(ignored_backfill(None, Some(10), 50, solo), None);
+        let note = ignored_backfill(Some(300), Some(10), 50, solo).expect("flag was ignored");
+        assert!(note.contains("--backfill 300 does not apply"), "{note}");
+        assert!(note.contains("blocks 10 to 50"), "{note}");
+        assert!(note.contains("resumes from block 51"), "{note}");
+        assert!(
+            note.contains("/n/nest/nuthatch.redb and /n/nest/segments"),
+            "{note}"
+        );
+        let nid = "ab".repeat(32);
+        let shared_dir = PathBuf::from(format!("/r/data/{nid}"));
+        let shared = shared_dir.as_path();
+        let note = ignored_backfill(Some(300), Some(10), 50, shared).unwrap();
+        assert!(!note.contains("remove"), "{note}");
+        let advice = long_history_advice(5_000_000, 300, solo);
+        assert!(
+            advice.contains("stop, remove /n/nest/nuthatch.redb"),
+            "{advice}"
+        );
+        assert!(advice.contains("`--backfill 300`"), "{advice}");
+        assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
+
+        // A solo nest kept under a directory named `data` has its segments outside its own
+        // directory, shared with its siblings: no deletion advice, and the shared directory is named.
+        let root = tempfile::tempdir().unwrap();
+        let solo_in_data = root.path().join("data").join("solo");
+        std::fs::create_dir_all(&solo_in_data).unwrap();
+        let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
+        assert!(!note.contains("remove"), "{note}");
+        assert!(
+            note.contains(&root.path().join("segments").display().to_string())
+                && note.contains("possibly shared"),
+            "{note}"
+        );
+        let advice = long_history_advice(5_000_000, 300, &solo_in_data);
+        assert!(!advice.contains("remove"), "{advice}");
+        assert!(advice.contains("possibly shared"), "{advice}");
+    }
+
+    #[test]
     fn cold_start_origin_policy() {
         // No --backfill + vendored start_block → full history from deployment (clamped to tip).
         assert_eq!(
@@ -13064,6 +13186,89 @@ template = "pool"
             Some("100")
         );
         assert!(matches!(sup.states[1], NestState::Live));
+    }
+
+    /// The warning is raised by `prepare` itself, on a store that already holds blocks, and a cold
+    /// start with the same flag stays quiet.
+    #[tokio::test]
+    async fn prepare_warns_that_backfill_was_ignored_only_on_a_nest_with_blocks() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        if f.name() == "message" {
+                            let _ = write!(self.0, "{value:?}");
+                        }
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(lines.clone()),
+        );
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let ignored = || {
+            lines
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("--backfill") && l.contains("does not apply"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000007").await;
+        let src = ForkSource::new(300);
+        let cold = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(cold, 0, "premise: a cold start from tip minus 300");
+        assert!(ignored().is_empty(), "a cold start honours the flag");
+
+        nest.store.set_meta(START_BLOCK_KEY, "10").unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "50").unwrap();
+        let next = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(next, 51);
+        let warned = ignored();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("blocks 10 to 50"), "{warned:?}");
+
+        // A seal-direct backfill writes LAST_BLOCK inside `prepare`; that is this run's own work.
+        let d2 = tempfile::tempdir().unwrap();
+        let mut fresh =
+            build_test_nest(d2.path(), "0x0000000000000000000000000000000000000008").await;
+        fresh.prepare(&src, Some(200), true, 1, 100).await.unwrap();
+        assert!(
+            fresh.store.get_meta(LAST_BLOCK_KEY).unwrap().is_some(),
+            "premise: seal-direct ran"
+        );
+        assert_eq!(
+            ignored().len(),
+            1,
+            "a fresh seal-direct run did what was asked"
+        );
     }
 
     /// #2175: a `--seal-direct` backfill leaves a checkpoint at its watermark, so a one-block reorg
@@ -15487,6 +15692,8 @@ template = "pool"
         tip: std::sync::atomic::AtomicU64,
         fork: u64,
         forked: std::sync::atomic::AtomicBool,
+        /// Replace the chain once a read has taken its snapshot, as a reorg landing mid-call would.
+        flip_mid_read: std::sync::atomic::AtomicBool,
         canonical: Vec<crate::rpc::Log>,
         replacement: Vec<crate::rpc::Log>,
     }
@@ -15497,17 +15704,27 @@ template = "pool"
         }
 
         fn hash(&self, b: u64) -> String {
-            format!("0x{b:060x}{:04x}", u8::from(self.replaced(b)))
+            self.hash_on(self.forked.load(std::sync::atomic::Ordering::SeqCst), b)
+        }
+
+        fn hash_on(&self, forked: bool, b: u64) -> String {
+            format!("0x{b:060x}{:04x}", u8::from(forked && b >= self.fork))
         }
 
         fn chain(&self) -> Vec<crate::rpc::Log> {
             let forked = self.forked.load(std::sync::atomic::Ordering::SeqCst);
+            if self
+                .flip_mid_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.forked.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.canonical
                 .iter()
                 .filter(|l| !(forked && l.block_number >= self.fork))
                 .chain(self.replacement.iter().filter(|_| forked))
                 .map(|l| crate::rpc::Log {
-                    block_hash: self.hash(l.block_number),
+                    block_hash: self.hash_on(forked, l.block_number),
                     ..l.clone()
                 })
                 .collect()
@@ -15620,6 +15837,7 @@ template = "pool"
             tip: tip.into(),
             fork,
             forked: false.into(),
+            flip_mid_read: false.into(),
             canonical,
             replacement,
         }
@@ -15934,6 +16152,46 @@ template = "pool"
         if let Err(e) = run_reorg_case(&case, &want).await {
             panic!("did not converge:\n{e}");
         }
+    }
+
+    /// The property test's third counterexample, from CI: a replaced block's row survived the fork.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_depth_one_reorg_on_a_two_window_buffer_replaces_the_forked_row() {
+        let want = reorg_reference(REORG_TIP, 9).await;
+        let case = ReorgCase {
+            kind: CursorKind::Buffered(2),
+            fork: 9,
+            flip_at: 11,
+            delays_ms: [3, 15, 6],
+            window: 1,
+            slow_after_flip_ms: 0,
+            held_past_fork: false,
+        };
+        if let Err(e) = run_reorg_case(&case, &want).await {
+            panic!("did not converge:\n{e}");
+        }
+    }
+
+    /// That counterexample's cause was the fixture: a read straddling the flip took the replaced
+    /// chain's logs and stamped them with the replacement's hashes, a log no source ever serves.
+    #[tokio::test]
+    async fn a_reorg_fixture_read_straddling_the_flip_is_one_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), true).await;
+        let chain = reorg_chain(&nests[2], REORG_TIP, 9);
+        let read = |c: &ReorgChain| -> Vec<(u64, String, String)> {
+            c.chain()
+                .into_iter()
+                .map(|l| (l.block_number, l.data, l.block_hash))
+                .collect()
+        };
+        let before = read(&chain);
+        chain
+            .flip_mid_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let straddled = read(&chain);
+        assert!(chain.forked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(straddled, before);
     }
 
     proptest::proptest! {

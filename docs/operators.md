@@ -963,7 +963,7 @@ and `--concurrency`):
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. Under `dev` it needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says. `bench backfill` does not cap it. Low on rate-limited public RPC |
 | `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
-| `--backfill N` | index only the last N blocks (recent-history mode) |
+| `--backfill N` | index only the last N blocks (recent-history mode). Applies only to a nest with no blocks yet; an existing store resumes where it stopped and the flag is ignored |
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
 | `--fail-fast` | exit on first fault instead of quarantining. For CI and operators who prefer fail-stop |
 
