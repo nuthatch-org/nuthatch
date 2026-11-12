@@ -105,13 +105,139 @@ pub fn deliver_sealed(
     deliver_sealed_within(store, dir, webhooks, sealed_to, WEBHOOK_OUTBOX_MAX)
 }
 
+type Collectors = std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, (u64, tokio::sync::watch::Sender<u64>)>,
+>;
+
+fn collectors() -> &'static Collectors {
+    static C: std::sync::OnceLock<Collectors> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// How long a collector waits to retry a webhook that is held (an outbox with no room, a failed
+/// query), when no seal comes sooner.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The task that owns `dir`'s webhook outbox and cursors once the nest is running, so a seal only
+/// records how far it got ([`sealed`]) and the writer never waits on a delivery query. It is the
+/// only writer of those keys after startup (`init_cursors` runs before the first seal), and a
+/// cursor still moves only after its rows are queued, so delivery stays in order and exactly once
+/// across slices and restarts.
+pub struct Collector {
+    dir: std::path::PathBuf,
+    id: u64,
+    rx: tokio::sync::watch::Receiver<u64>,
+}
+
+/// Register a collector for `dir`, replacing one a previous mount of it left. Registered here, not
+/// when the task first runs, so a seal that lands before it is polled is not missed.
+pub fn collector(dir: &std::path::Path) -> Collector {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (tx, rx) = tokio::sync::watch::channel(0);
+    collectors()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(dir.to_path_buf(), (id, tx));
+    Collector {
+        dir: dir.to_path_buf(),
+        id,
+        rx,
+    }
+}
+
+impl Drop for Collector {
+    fn drop(&mut self) {
+        let mut all = collectors().lock().unwrap_or_else(|p| p.into_inner());
+        if all.get(&self.dir).is_some_and(|(id, _)| *id == self.id) {
+            all.remove(&self.dir);
+        }
+    }
+}
+
+/// Record that `dir` has sealed through `sealed_to`. Returns whether a collector took it; a caller
+/// with none delivers inline.
+pub fn sealed(dir: &std::path::Path, sealed_to: u64) -> bool {
+    let all = collectors().lock().unwrap_or_else(|p| p.into_inner());
+    let Some((_, tx)) = all.get(dir) else {
+        return false;
+    };
+    tx.send_if_modified(|through| {
+        let moved = sealed_to > *through;
+        if moved {
+            *through = sealed_to;
+        }
+        moved
+    });
+    true
+}
+
+impl Collector {
+    /// Deliver up to each sealed mark until the collector is dropped. A pass is a blocking one:
+    /// the queries run on the blocking pool, bounded by [`SEAL_BUDGET`], and a pass that leaves a
+    /// webhook behind runs again at once if only the budget ended it, or after [`RETRY`] if the
+    /// outbox or a query held it.
+    pub async fn run(
+        mut self,
+        store: std::sync::Arc<dyn HotStore>,
+        webhooks: std::sync::Arc<Vec<Webhook>>,
+    ) {
+        let mut pause = None;
+        loop {
+            match pause {
+                None => {
+                    if self.rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+                Some(pause) => {
+                    tokio::select! {
+                        changed = self.rx.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = tokio::time::sleep(pause) => {}
+                    }
+                }
+            }
+            let sealed_to = *self.rx.borrow_and_update();
+            let pass = {
+                let (store, dir, webhooks) = (store.clone(), self.dir.clone(), webhooks.clone());
+                tokio::task::spawn_blocking(move || {
+                    deliver_sealed(&store, &dir, &webhooks, sealed_to)
+                })
+            };
+            let failed = match pass.await {
+                Ok(Ok(_)) => false,
+                Ok(Err(e)) => {
+                    tracing::warn!("webhook delivery failed: {e:#}");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("webhook delivery task failed: {e}");
+                    true
+                }
+            };
+            let standing = standing(&self.dir);
+            pause = if standing.iter().any(|(_, s)| s.waiting_for_turn) {
+                Some(std::time::Duration::ZERO)
+            } else if failed || standing.iter().any(|(_, s)| s.backlog_blocks > 0) {
+                Some(RETRY)
+            } else {
+                None
+            };
+        }
+    }
+}
+
 /// Blocks one delivery query reads at most. A failing slice is halved, down to one block.
 const SLICE_BLOCKS: u64 = 10_000;
 /// Rows one delivery query returns at most, whatever room the outbox has.
 const SLICE_ROWS: u64 = 10_000;
-/// How long one seal's deliveries may hold the writer, across every webhook. A query is given what
-/// is left of it as its deadline, so a backlog drains a slice at a time rather than timing out whole.
-/// A cut statement takes a moment to stop, so the hook is held up to about 3 s, as measured.
+/// How long one delivery pass may run, across every webhook, so one pass does not hold a blocking-pool
+/// thread for a whole backlog. A query is given what is left of it as its deadline, so a backlog drains
+/// a slice at a time rather than timing out whole. A cut statement takes a moment to stop (about 3 s).
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`deliver_sealed`] with the outbox room as a parameter. A full outbox is back-pressure, never a
@@ -1048,6 +1174,86 @@ mod tests {
         );
         assert_eq!(s.last_error, None);
     }
+
+    /// Open the store, start a collector for `dir` and run it until `through` is delivered, with the
+    /// outbox drained as the delivery worker would. Returns what was drained, in order, and lets go
+    /// of the store as an unmount does.
+    async fn collect(dir: &std::path::Path, webhooks: &[Webhook], through: u64) -> Vec<(u64, u64)> {
+        let store = std::sync::Arc::new(Store::open(&dir.join("t.redb")).unwrap());
+        let task = tokio::spawn(collector(dir).run(
+            store.clone() as std::sync::Arc<dyn HotStore>,
+            std::sync::Arc::new(webhooks.to_vec()),
+        ));
+        assert!(sealed(dir, through), "a collector is registered");
+        let mut got = vec![];
+        let started = std::time::Instant::now();
+        while store
+            .get_meta(&cursor_key(&webhooks[0].name))
+            .unwrap()
+            .and_then(|s| s.parse::<u64>().ok())
+            != Some(through)
+            || store.outbox_len() > 0
+        {
+            got.extend(drain(&store));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(120),
+                "stuck after {} rows",
+                got.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        task.abort();
+        let _ = task.await;
+        got
+    }
+
+    /// Delivery is the collector's, not the caller's: `sealed` returns at once, rows arrive in order
+    /// and exactly once across slices, a block wider than a slice, and a store reopened between runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collector_delivers_in_order_exactly_once_across_slices_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let webhooks = vec![wh("w", "t__transfer", "genesis")];
+        {
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            init_cursors(&store, &webhooks, 0).unwrap();
+        }
+        // 12,000 rows in one block, and 5,015 more one to a block across 35,000 blocks.
+        let wide = 15_000u64;
+        let mut want: Vec<(u64, u64)> = (1..=5_015u64).map(|i| (i * 6 + 1, 0)).collect();
+        want.extend((0..12_000u64).map(|i| (wide, i)));
+        want.sort();
+        let rows: Vec<String> = want.iter().map(|(b, l)| transfer(*b, *l)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 35_000).unwrap();
+
+        let first = collect(dir.path(), &webhooks, 17_500).await;
+        let second = collect(dir.path(), &webhooks, 35_000).await;
+        let mut got = first;
+        got.extend(second);
+        assert_eq!(got.len(), want.len(), "every row once");
+        assert!(got == want, "in order, none repeated or skipped");
+        assert!(
+            standing(dir.path())
+                .iter()
+                .all(|(_, s)| s.backlog_blocks == 0),
+            "{:?}",
+            standing(dir.path())
+        );
+    }
+
+    /// With no collector registered a seal is delivered by the caller, as it was before.
+    #[test]
+    fn a_seal_with_no_collector_is_left_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!sealed(dir.path(), 10));
+        let c = collector(dir.path());
+        assert!(sealed(dir.path(), 10));
+        drop(c);
+        assert!(
+            !sealed(dir.path(), 11),
+            "a dropped collector is deregistered"
+        );
+    }
+
     /// Two nests may name a webhook alike: each keeps its own series under its mount, and an unmounted
     /// nest keeps none.
     #[test]
