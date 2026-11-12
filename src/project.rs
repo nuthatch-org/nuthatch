@@ -1350,7 +1350,8 @@ async fn require_contract_code(rpc: &RpcClient, chain_id: u64, address: &str) ->
 
 fn no_contract_code(address: &str, chain_id: u64) -> anyhow::Error {
     anyhow::anyhow!(
-        "no contract code at {address} on chain {chain_id}; check the address and --chain"
+        "no contract code at {address} on chain {chain_id}; check the address and --chain. If the \
+         contract self-destructed, pass --abi path/to.json to index its history anyway"
     )
 }
 
@@ -1573,7 +1574,7 @@ fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
             };
             eprintln!();
             eprintln!("  ⚠ {alias} ({address}): {seen}.");
-            eprintln!("    As configured this contract will index **zero rows**, silently.");
+            eprintln!("    As configured it may index no rows at all, silently.");
             eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
             eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
             eprintln!(
@@ -1592,8 +1593,8 @@ fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
                 "  ⚠ {alias} ({address}): pre-upgrade history (sampled near deployment) emitted"
             );
             eprintln!("    {sampled} log(s) matching none of the current implementation's events.");
-            eprintln!("    This contract appears to have been upgraded across an event rename or ABI change.");
-            eprintln!("    Pre-upgrade history will index **zero rows** under the current ABI.");
+            eprintln!("    This contract may have been upgraded across an event rename or ABI change; if so,");
+            eprintln!("    history from before the upgrade indexes no rows under the current ABI.");
             eprintln!("    Fix: add a second [[contracts]] entry at the same address with the legacy ABI, a new");
             eprintln!("    alias and an `events` allowlist of the events the current ABI lacks. There is no end");
             eprintln!(
@@ -1954,7 +1955,8 @@ async fn detect_chain_on_rpc(
         .context("could not read contract bytecode from --rpc")?;
     if is_empty_code(&code) {
         bail!(
-            "no bytecode for {probe} on {} via the supplied RPC endpoint(s)",
+            "no bytecode for {probe} on {} via the supplied RPC endpoint(s); the address may be \
+             mistyped, or the contract self-destructed (then pass --chain and --abi path/to.json)",
             chain.name
         );
     }
@@ -2749,6 +2751,37 @@ mod tests {
         let probed: Vec<_> = chains::all().iter().map(|c| (*c, Some(false))).collect();
         let nowhere = found_nowhere("0xdead", &probed).to_string();
         assert!(nowhere.contains("mistyped"), "{nowhere}");
+    }
+
+    /// The refusal sits in `resolve_abi` itself, so deleting the call there fails this.
+    #[tokio::test]
+    async fn resolving_an_address_with_no_code_refuses_before_any_explorer_lookup() {
+        let (url, server) = fake_code_rpc("0x").await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let err = resolve_abi(&rpc, 1, "0x000000000000000000000000000000000000dEaD", None)
+            .await
+            .err()
+            .expect("an address with no code has no ABI");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no contract code at"), "{msg}");
+        assert!(msg.contains("--abi"), "{msg}");
+        assert!(!msg.contains("ETHERSCAN"), "{msg}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn init_through_an_rpc_with_no_code_at_the_address_suggests_a_typo() {
+        let (url, server) = fake_code_rpc("0x").await;
+        let err = detect_chain_on_rpc(
+            &["0x000000000000000000000000000000000000dEaD".to_string()],
+            &[url],
+        )
+        .await
+        .err()
+        .expect("no code, no chain");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mistyped"), "{msg}");
+        server.abort();
     }
 
     // #2193: the failure names every chain that was probed.

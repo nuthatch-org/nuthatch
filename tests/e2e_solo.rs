@@ -184,6 +184,10 @@ async fn a_scaffolded_gitignore_covers_what_a_solo_nest_writes() {
     };
     git(&["init", "-q"]);
     drive_land_seal_query(dir.path()).await;
+    assert!(
+        dir.path().join("nuthatch.redb").exists(),
+        "premise: the store is at the root"
+    );
     let status = git(&["status", "--porcelain", "--untracked-files=all"]);
     for state in ["nuthatch.redb", "segments/"] {
         assert!(
