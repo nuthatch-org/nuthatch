@@ -571,5 +571,6 @@ fn ready(n: &Nest) -> Answer {
         undecoded,
         seal_fault: None,
         maintained: None,
+        webhooks: None,
     })
 }

@@ -1622,6 +1622,18 @@ pub struct DevArgs {
     )]
     pub trace_rpc: Vec<String>,
 
+    /// A `Host` name an address-history nest on a loopback bind answers as the public behind your
+    /// proxy (repeatable): watched data is read, nothing is changed and the RPC is not lent. Any
+    /// other name but loopback is refused.
+    #[arg(long = "public-host")]
+    pub public_host: Vec<String>,
+
+    /// A `Host` name an address-history nest on a loopback bind answers as this machine
+    /// (repeatable), such as `host.docker.internal` for a client in a container. A browser page
+    /// cannot choose its `Host`, so a name declared here does not let one in.
+    #[arg(long = "local-host")]
+    pub local_host: Vec<String>,
+
     /// Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a
     /// nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start
     /// blocks, else from a default recent window.
@@ -1636,7 +1648,8 @@ pub struct DevArgs {
     pub seal_direct: bool,
 
     /// Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency).
-    /// Try 8-16 against your own node; keep low on rate-limited public RPC.
+    /// Needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says.
+    /// Keep low on rate-limited public RPC.
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
 

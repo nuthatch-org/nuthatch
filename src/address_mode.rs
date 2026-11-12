@@ -11,8 +11,8 @@ use std::sync::Mutex;
 
 use crate::address_discovery::{Counted, Discoverer, Rpc};
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Extension, Query, State},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -51,8 +51,8 @@ pub struct ModeState {
     pub sweep: Option<crate::address_history::SweepConfig>,
     pub chain_id: u64,
     pub poll_interval: Duration,
-    /// Whether the bound socket is a loopback address. Watch and unwatch change what the nest asks its
-    /// RPC for, so they are refused on any other bind.
+    /// Whether the bound socket is a loopback address. Watch, unwatch and the RPC are a local caller's
+    /// only on such a bind, and only for a request [`classify`] finds local.
     pub loopback: bool,
     started: Instant,
     /// Milliseconds after `started` of the last successful poll, plus one; 0 for none yet. Monotonic,
@@ -3076,6 +3076,12 @@ fn supervise(
 }
 
 pub fn router(state: Arc<ModeState>) -> Router {
+    router_for(state, Hosts::default())
+}
+
+/// [`router`] with the host names the operator declared for a loopback bind.
+pub fn router_for(state: Arc<ModeState>, hosts: Hosts) -> Router {
+    let rule = Arc::new((state.loopback, hosts));
     Router::new()
         .route(
             "/api",
@@ -3096,6 +3102,7 @@ pub fn router(state: Arc<ModeState>) -> Router {
         .route("/diff", get(diff_route))
         .route("/metrics", get(metrics))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(rule, admit))
 }
 
 /// Run a store read off the async workers.
@@ -3216,31 +3223,256 @@ fn api_params(
     Ok(q)
 }
 
+/// Host names the operator declared for a loopback bind (`--local-host`, `--public-host`).
+#[derive(Clone, Debug, Default)]
+pub struct Hosts {
+    /// Answered as this machine, as `localhost` is: a Docker host alias, say.
+    pub local: Vec<String>,
+    /// Answered as the public, behind the operator's proxy: watched data is read, nothing is changed
+    /// or lent.
+    pub public: Vec<String>,
+}
+
+impl Hosts {
+    /// The names given to `--local-host` and `--public-host`, refused when one could not do what it
+    /// says: a loopback name is always this machine, so it cannot be limited to reads.
+    pub fn declared(local: &[String], public: &[String]) -> Result<Self> {
+        let name = |flag: &str, raw: &String| -> Result<String> {
+            match authority_host(raw) {
+                Some(n)
+                    if raw
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .eq_ignore_ascii_case(&n) =>
+                {
+                    Ok(n)
+                }
+                _ => bail!("{flag} {raw:?} is not a host name; give the name alone, with no port"),
+            }
+        };
+        let local = local
+            .iter()
+            .map(|h| name("--local-host", h))
+            .collect::<Result<Vec<_>>>()?;
+        let public = public
+            .iter()
+            .map(|h| name("--public-host", h))
+            .collect::<Result<Vec<_>>>()?;
+        for p in &public {
+            if is_loopback_name(p) {
+                bail!(
+                    "--public-host {p} would do nothing: a loopback name is always answered as this \
+                     machine. Point the proxy at a name of its own, or have it add X-Forwarded-For"
+                );
+            }
+            if local.contains(p) {
+                bail!("{p} is given to both --local-host and --public-host; a name is one or the other");
+            }
+        }
+        Ok(Self { local, public })
+    }
+}
+
+/// Who a request is, decided once from its headers: this machine, or anyone else and why.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    local: bool,
+    why: String,
+}
+
+impl Caller {
+    fn local() -> Self {
+        Self {
+            local: true,
+            why: String::new(),
+        }
+    }
+
+    fn remote(why: impl Into<String>) -> Self {
+        Self {
+            local: false,
+            why: why.into(),
+        }
+    }
+
+    /// As this caller reaches `s`, whose own bind may not be loopback.
+    fn on(&self, s: &ModeState) -> Self {
+        match s.loopback {
+            true => self.clone(),
+            false => Self::remote("this nest is not bound to loopback"),
+        }
+    }
+}
+
+/// Headers a proxy adds. Never complete: a proxy that keeps the client's `Host` is refused by the
+/// `Host` rule, and these catch one that rewrites it to loopback.
+const PROXY_HEADERS: &[&str] = &[
+    "forwarded",
+    "via",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-forwarded-server",
+    "x-real-ip",
+    "x-original-host",
+    "x-original-url",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+    "fly-client-ip",
+    "client-ip",
+    "x-cluster-client-ip",
+    "x-forwarded-prefix",
+    "x-envoy-external-address",
+    "x-azure-clientip",
+];
+
+/// The host of an authority that is `host[:digits]` and nothing else, lowercased.
+fn authority_host(authority: &str) -> Option<String> {
+    let (name, rest) = match authority.strip_prefix('[') {
+        Some(v6) => {
+            let (v6, rest) = v6.split_once(']')?;
+            v6.parse::<std::net::Ipv6Addr>().ok()?;
+            (v6, rest)
+        }
+        None => authority
+            .find(':')
+            .map_or((authority, ""), |i| (&authority[..i], &authority[i..])),
+    };
+    let port_ok = rest.is_empty()
+        || rest
+            .strip_prefix(':')
+            .is_some_and(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    let name_ok = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'));
+    (port_ok && name_ok).then(|| name.to_ascii_lowercase())
+}
+
+fn is_loopback_name(name: &str) -> bool {
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// A loopback bind cannot tell a local caller from a reverse proxy or a DNS-rebinding page by the
+/// socket, so the `Host` decides: a loopback or declared local name is this machine unless a proxy
+/// or another site shows, a declared public name is anyone, and any other name is refused.
+fn classify(loopback: bool, hosts: &Hosts, headers: &HeaderMap) -> Result<Caller, String> {
+    if !loopback {
+        return Ok(Caller::remote("this nest is not bound to loopback"));
+    }
+    let declared = |list: &[String], name: &str| list.iter().any(|h| h.eq_ignore_ascii_case(name));
+    let local_name = |name: &str| is_loopback_name(name) || declared(&hosts.local, name);
+    let mut all = headers.get_all(axum::http::header::HOST).iter();
+    let host = all.next();
+    if all.next().is_some() {
+        return Err("this request carries two Host headers, and is refused".into());
+    }
+    if let Some(raw) = host {
+        let raw = String::from_utf8_lossy(raw.as_bytes()).into_owned();
+        let Some(name) = authority_host(&raw) else {
+            return Err(format!(
+                "Host {raw:?} is not a host name and port, and is refused"
+            ));
+        };
+        if !local_name(&name) {
+            if declared(&hosts.public, &name) {
+                return Ok(Caller::remote(format!(
+                    "it was sent to Host {name}, a --public-host"
+                )));
+            }
+            return Err(format!(
+                "this nest is bound to loopback and does not answer Host {name}: start it with \
+                 --public-host {name} to serve reads to callers behind a proxy, or --local-host \
+                 {name} if that name is this machine"
+            ));
+        }
+    }
+    if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
+        return Ok(Caller::remote(format!(
+            "it carries {h}, so it came through a proxy"
+        )));
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    };
+    match header("origin") {
+        Some(origin) => {
+            let local = origin
+                .split_once("://")
+                .and_then(|(_, rest)| authority_host(rest))
+                .is_some_and(|name| local_name(&name));
+            if !local {
+                return Ok(Caller::remote(format!(
+                    "it comes from a page at Origin {origin}"
+                )));
+            }
+        }
+        // A no-cors GET from another site carries no Origin, but a browser marks it cross-site.
+        None => {
+            if let Some(site) =
+                header("sec-fetch-site").filter(|v| !matches!(v.as_str(), "same-origin" | "none"))
+            {
+                return Ok(Caller::remote(format!(
+                    "its Sec-Fetch-Site is {site:?}, not same-origin"
+                )));
+            }
+        }
+    }
+    Ok(Caller::local())
+}
+
+async fn admit(
+    State(rule): State<Arc<(bool, Hosts)>>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match classify(rule.0, &rule.1, req.headers()) {
+        Ok(caller) => {
+            req.extensions_mut().insert(caller);
+            next.run(req).await
+        }
+        Err(why) => failed(StatusCode::FORBIDDEN, why).into_response(),
+    }
+}
+
 async fn api(
     State(s): State<Arc<ModeState>>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     match api_params(q, HashMap::new()) {
-        Ok(q) => serve_api(s, q).await,
+        Ok(q) => serve_api(s, q, &caller).await,
         Err(refused) => Json(refused),
     }
 }
 
 async fn api_form(
     State(s): State<Arc<ModeState>>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<HashMap<String, String>>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> Json<Value> {
     match api_params(q, form) {
-        Ok(q) => serve_api(s, q).await,
+        Ok(q) => serve_api(s, q, &caller).await,
         Err(refused) => Json(refused),
     }
 }
 
-/// What a nest off a loopback bind answers without lending its RPC: `eth_blockNumber` from its own
+/// What a nest answers a caller that is not local without lending its RPC: `eth_blockNumber` from its own
 /// head, which a client reads before every range. `Ok(true)` lends the RPC for a balance of watched
 /// accounts only, the accounts the operator chose to follow.
-async fn off_loopback(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Result<bool, Value> {
+async fn off_loopback(
+    s: &Arc<ModeState>,
+    q: &HashMap<String, String>,
+    caller: &Caller,
+) -> Result<bool, Value> {
     let get = |k: &str| q.get(k).map(String::as_str);
     if get("chainid").is_some_and(|c| c.parse::<u64>().ok() != Some(s.chain_id)) {
         return Ok(false);
@@ -3269,16 +3501,18 @@ async fn off_loopback(s: &Arc<ModeState>, q: &HashMap<String, String>) -> Result
             if watched {
                 Ok(true)
             } else {
-                Err(crate::address_history::unsupported(
-                    "off a loopback bind only a watched account's balance is read",
-                ))
+                Err(crate::address_history::unsupported(&format!(
+                    "a balance is read only for watched accounts unless the caller is on this machine; this request is not one: {}",
+                    caller.why
+                )))
             }
         }
         _ => Ok(false),
     }
 }
 
-async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value> {
+async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>, caller: &Caller) -> Json<Value> {
+    let caller = &caller.on(&s);
     let conflict = |s: &ModeState| s.conflicted();
     if let Some(why) = conflict(&s) {
         return Json(crate::address_history::incomplete(&why));
@@ -3288,7 +3522,7 @@ async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value>
     // little short of it, so a range covered by then is still read and served under it.
     let ceiling = Instant::now() + s.deadline;
     let work = ceiling - s.deadline / 20;
-    let answer = match tokio::time::timeout_at(ceiling.into(), answer(&s, q, work)).await {
+    let answer = match tokio::time::timeout_at(ceiling.into(), answer(&s, q, work, caller)).await {
         Ok(a) => a,
         Err(_) => Json(crate::address_history::incomplete(&format!(
             "not answered within the {}s deadline; try again shortly",
@@ -3302,18 +3536,23 @@ async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>) -> Json<Value>
     }
 }
 
-async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instant) -> Json<Value> {
+async fn answer(
+    s: &Arc<ModeState>,
+    q: HashMap<String, String>,
+    deadline: Instant,
+    caller: &Caller,
+) -> Json<Value> {
     let s = s.clone();
-    let lend = if s.loopback {
+    let lend = if caller.local {
         true
     } else {
-        match off_loopback(&s, &q).await {
+        match off_loopback(&s, &q, caller).await {
             Ok(lend) => lend,
             Err(v) => return Json(v),
         }
     };
-    // The RPC behind the nest is the operator's; only a loopback bind lends it out, and off it only
-    // for a watched account's balance.
+    // The RPC behind the nest is the operator's; only a local caller on a loopback bind borrows it,
+    // and anyone else only for a watched account's balance.
     if let Some(forward) = s.forward.clone().filter(|_| lend) {
         let _permit = if q.get("module").map(String::as_str) == Some("logs") {
             match s.logs.try_acquire() {
@@ -3349,7 +3588,7 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
         return Json(validator_blocks(&s, &q).await);
     }
     if get("module") == Some("block") && get("action") == Some("getblocknobytime") {
-        return Json(block_by_time(&s, &q, deadline).await);
+        return Json(block_by_time(&s, &q, deadline, caller).await);
     }
     // A range outside the configured history is never covered here, so it is unsupported, in the one
     // wording a client reads to ask again from the start, whether or not it named a start.
@@ -3377,9 +3616,10 @@ async fn answer(s: &Arc<ModeState>, q: HashMap<String, String>, deadline: Instan
         .await;
         // Like the proxy, the operator's trace RPC and disk are lent to any hash only on a loopback
         // bind; off it, only a transaction the store holds for a watched account is traced.
-        if matches!(fresh, Ok((true, false))) && !s.loopback {
+        if matches!(fresh, Ok((true, false))) && !caller.local {
             return Json(crate::address_history::unsupported(&format!(
-                "{hash} is not a transaction of a watched account, and off a loopback bind only those are traced"
+                "{hash} is not a transaction of a watched account, and others are traced only for a caller on this machine; this request is not one: {}",
+                caller.why
             )));
         }
         if matches!(fresh, Ok((true, _))) {
@@ -3811,6 +4051,7 @@ async fn block_by_time(
     s: &Arc<ModeState>,
     q: &HashMap<String, String>,
     deadline: Instant,
+    caller: &Caller,
 ) -> Value {
     let first = respond(s, q).await;
     let unbracketed = first["result"]
@@ -3823,9 +4064,10 @@ async fn block_by_time(
         .get("timestamp")
         .and_then(|t| t.parse::<u64>().ok())
         .expect("respond validated the timestamp");
-    if !s.loopback {
+    if !caller.local {
         return crate::address_history::unsupported(&format!(
-            "no verified headers bracket timestamp {t}, and off a loopback bind the RPC is not searched"
+            "no verified headers bracket timestamp {t}, and the RPC is searched only for a caller on this machine; this request is not one: {}",
+            caller.why
         ));
     }
     let after = q.get("closest").map(String::as_str) == Some("after");
@@ -4087,23 +4329,34 @@ async fn watched(State(s): State<Arc<ModeState>>) -> (StatusCode, Json<Value>) {
 
 async fn watch(
     State(s): State<Arc<ModeState>>,
+    Extension(caller): Extension<Caller>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    dispatch(s, b, true).await
+    dispatch(s, b, true, &caller).await
 }
 
 async fn unwatch(
     State(s): State<Arc<ModeState>>,
+    Extension(caller): Extension<Caller>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    dispatch(s, b, false).await
+    dispatch(s, b, false, &caller).await
 }
 
-async fn dispatch(s: Arc<ModeState>, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
-    if !s.loopback {
+async fn dispatch(
+    s: Arc<ModeState>,
+    b: AddressBody,
+    add: bool,
+    caller: &Caller,
+) -> (StatusCode, Json<Value>) {
+    let caller = &caller.on(&s);
+    if !caller.local {
         return failed(
             StatusCode::FORBIDDEN,
-            "the watched set changes only on a loopback bind",
+            format!(
+                "the watched set changes only for a caller on this machine, and this request is not one: {}",
+                caller.why
+            ),
         );
     }
     if let Some(id) = b.chainid.filter(|id| *id != s.chain_id) {
@@ -4592,6 +4845,10 @@ fn refuse_event_flags(args: &crate::cli::DevArgs) -> Result<()> {
     Ok(())
 }
 
+fn hosts(args: &crate::cli::DevArgs) -> Result<Hosts> {
+    Hosts::declared(&args.local_host, &args.public_host)
+}
+
 /// `nuthatch dev` on a rotki-mode nest.
 pub async fn dev(
     dir: &Path,
@@ -4603,6 +4860,7 @@ pub async fn dev(
         bail!("not an address-history nest");
     };
     refuse_event_flags(args)?;
+    let hosts = hosts(args)?;
     let poll_interval = poll_interval(args.poll_interval, ah)?;
     let (listener, loopback) = bind(&args.listen).await?;
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
@@ -4623,7 +4881,8 @@ pub async fn dev(
         trace,
     };
     let nest = start_nest(dir, &config, rpcs, poll_interval, loopback).await?;
-    let served = crate::serve::serve_bound(listener, router(nest.state.clone()), cors).await;
+    let served =
+        crate::serve::serve_bound(listener, router_for(nest.state.clone(), hosts), cors).await;
     nest.stop();
     served
 }
@@ -4694,6 +4953,7 @@ pub async fn dev_chains(
     cors: Option<tower_http::cors::CorsLayer>,
 ) -> Result<()> {
     refuse_event_flags(args)?;
+    let hosts = hosts(args)?;
     if !args.rpc.is_empty() || !args.trace_rpc.is_empty() || !args.rpc_fallback.is_empty() {
         bail!(
             "a directory of chains reads each chain's RPCs from NUTHATCH_RPC_<chain id> and \
@@ -4752,7 +5012,8 @@ pub async fn dev_chains(
     );
     let states: BTreeMap<u64, Arc<ModeState>> =
         nests.iter().map(|(id, n)| (*id, n.state.clone())).collect();
-    let served = crate::serve::serve_bound(listener, chains_router(Arc::new(states)), cors).await;
+    let served =
+        crate::serve::serve_bound(listener, chains_router_for(Arc::new(states), hosts), cors).await;
     for n in nests.values() {
         n.stop();
     }
@@ -4764,6 +5025,13 @@ type Chains = Arc<BTreeMap<u64, Arc<ModeState>>>;
 /// One listener for a directory of chain nests: each route is the solo nest's, asked of the chain
 /// `chainid` names, or of every chain where the answer spans them.
 pub fn chains_router(chains: Chains) -> Router {
+    chains_router_for(chains, Hosts::default())
+}
+
+/// [`chains_router`] with the host names the operator declared for a loopback bind.
+pub fn chains_router_for(chains: Chains, hosts: Hosts) -> Router {
+    let loopback = chains.values().any(|s| s.loopback);
+    let rule = Arc::new((loopback, hosts));
     Router::new()
         .route(
             "/api",
@@ -4782,6 +5050,7 @@ pub fn chains_router(chains: Chains) -> Router {
         .route("/ready", get(chains_ready))
         .route("/metrics", get(chains_metrics))
         .with_state(chains)
+        .layer(axum::middleware::from_fn_with_state(rule, admit))
 }
 
 fn chain_list(c: &Chains) -> String {
@@ -4790,26 +5059,28 @@ fn chain_list(c: &Chains) -> String {
 
 async fn chains_api(
     State(c): State<Chains>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Json<Value> {
     match api_params(q, HashMap::new()) {
-        Ok(q) => chains_serve(c, q).await,
+        Ok(q) => chains_serve(c, q, &caller).await,
         Err(refused) => Json(refused),
     }
 }
 
 async fn chains_api_form(
     State(c): State<Chains>,
+    Extension(caller): Extension<Caller>,
     Query(q): Query<HashMap<String, String>>,
     axum::Form(form): axum::Form<HashMap<String, String>>,
 ) -> Json<Value> {
     match api_params(q, form) {
-        Ok(q) => chains_serve(c, q).await,
+        Ok(q) => chains_serve(c, q, &caller).await,
         Err(refused) => Json(refused),
     }
 }
 
-async fn chains_serve(c: Chains, q: HashMap<String, String>) -> Json<Value> {
+async fn chains_serve(c: Chains, q: HashMap<String, String>, caller: &Caller) -> Json<Value> {
     let asked = match q.get("chainid") {
         None if c.len() == 1 => c.values().next().cloned(),
         None => {
@@ -4821,7 +5092,7 @@ async fn chains_serve(c: Chains, q: HashMap<String, String>) -> Json<Value> {
         Some(id) => id.parse::<u64>().ok().and_then(|id| c.get(&id).cloned()),
     };
     match asked {
-        Some(s) => serve_api(s, q).await,
+        Some(s) => serve_api(s, q, caller).await,
         // Worded with `chainid`, which rotki reads as "not this indexer for that chain".
         None => Json(crate::address_history::unsupported(&format!(
             "chainid {} is not served here; this endpoint serves chains {}",
@@ -4862,7 +5133,12 @@ async fn chains_watched(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
 /// chain is asked even when one fails, because separate stores cannot change atomically: the answer
 /// reports each chain, fails if any did, and a repeat (watch and unwatch are idempotent) converges the
 /// rest.
-async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, Json<Value>) {
+async fn chains_dispatch(
+    c: Chains,
+    b: AddressBody,
+    add: bool,
+    caller: &Caller,
+) -> (StatusCode, Json<Value>) {
     if let Some(id) = b.chainid.filter(|id| !c.contains_key(id)) {
         return failed(
             StatusCode::BAD_REQUEST,
@@ -4892,7 +5168,7 @@ async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, J
     let mut first_ok: Option<Value> = None;
     let mut first_failure: Option<(StatusCode, u64)> = None;
     for (id, s) in targets {
-        let (code, Json(v)) = dispatch(s, b.clone(), add).await;
+        let (code, Json(v)) = dispatch(s, b.clone(), add, caller).await;
         if code == StatusCode::OK {
             first_ok.get_or_insert_with(|| v.clone());
         } else {
@@ -4920,16 +5196,18 @@ async fn chains_dispatch(c: Chains, b: AddressBody, add: bool) -> (StatusCode, J
 
 async fn chains_watch(
     State(c): State<Chains>,
+    Extension(caller): Extension<Caller>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    chains_dispatch(c, b, true).await
+    chains_dispatch(c, b, true, &caller).await
 }
 
 async fn chains_unwatch(
     State(c): State<Chains>,
+    Extension(caller): Extension<Caller>,
     Json(b): Json<AddressBody>,
 ) -> (StatusCode, Json<Value>) {
-    chains_dispatch(c, b, false).await
+    chains_dispatch(c, b, false, &caller).await
 }
 
 async fn chains_ready(State(c): State<Chains>) -> (StatusCode, Json<Value>) {
@@ -7823,6 +8101,345 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(s.history.watched().unwrap().len(), 1);
+    }
+
+    /// `app` on a real loopback listener, so headers reach it as a client sends them.
+    async fn listen(app: Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// One raw HTTP/1.1 request with exactly `headers`, and the status and body that came back.
+    async fn raw(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[String],
+        body: Option<Value>,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut req = format!("{method} {path} HTTP/1.1\r\n");
+        for h in headers {
+            req.push_str(h);
+            req.push_str("\r\n");
+        }
+        req.push_str("Connection: close\r\n");
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        if !body.is_empty() {
+            req.push_str(&format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            ));
+        }
+        req.push_str("\r\n");
+        req.push_str(&body);
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).await.unwrap();
+        let out = String::from_utf8_lossy(&out).into_owned();
+        let status = out
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {out:?}"));
+        let body = out
+            .split_once("\r\n\r\n")
+            .map_or("", |(_, b)| b)
+            .to_string();
+        (status, body)
+    }
+
+    enum Seen {
+        Refused,
+        Public,
+        Local,
+    }
+
+    /// On a loopback bind a reverse proxy and a DNS-rebinding page both connect from 127.0.0.1, so
+    /// the `Host` decides on every route: a loopback or declared local name is this machine unless a
+    /// proxy or another site shows, a declared public name reads, and any other name is refused.
+    #[tokio::test]
+    async fn a_loopback_bind_answers_each_host_as_declared_on_every_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, lent) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_forward(forward),
+        );
+        let hosts = Hosts {
+            local: vec!["host.docker.internal".into()],
+            public: vec!["wallet.example.com".into()],
+        };
+        let addr = listen(router_for(s.clone(), hosts)).await;
+        let port = addr.port();
+        let at = |name: &str| format!("Host: {name}:{port}");
+        let local_host = at("127.0.0.1");
+        let with = |extra: &str| vec![local_host.clone(), extra.to_string()];
+        let mut shapes: Vec<(Vec<String>, Seen)> = vec![
+            (vec![], Seen::Local),
+            (vec![at("127.0.0.1")], Seen::Local),
+            (vec![at("localhost")], Seen::Local),
+            (vec![at("[::1]")], Seen::Local),
+            (vec![at("0.0.0.0")], Seen::Local),
+            (vec![at("host.docker.internal")], Seen::Local),
+            (with("Origin: http://localhost:3000"), Seen::Local),
+            (with("Sec-Fetch-Site: same-origin"), Seen::Local),
+            (vec![at("wallet.example.com")], Seen::Public),
+            (with("Origin: http://attacker.example"), Seen::Public),
+            (with("Origin: null"), Seen::Public),
+            (with("Origin: file://"), Seen::Public),
+            (with("Origin: app://rotki"), Seen::Public),
+            (with("Sec-Fetch-Site: cross-site"), Seen::Public),
+            (vec!["Host: evil.com".into()], Seen::Refused),
+            (vec!["Host: ".into()], Seen::Refused),
+            (vec![at("localhost.")], Seen::Refused),
+            (vec![at("nest.localhost")], Seen::Refused),
+            (vec![at("localhost.attacker.example")], Seen::Refused),
+            (
+                vec![format!("Host: 127.0.0.1:{port}@evil.com")],
+                Seen::Refused,
+            ),
+            (vec!["Host: 127.0.0.1:evil.com".into()], Seen::Refused),
+            (
+                vec![local_host.clone(), "Host: evil.com".into()],
+                Seen::Refused,
+            ),
+        ];
+        for marker in PROXY_HEADERS {
+            shapes.push((with(&format!("{marker}: 203.0.113.9")), Seen::Public));
+        }
+        let txlist = format!("/api?module=account&action=txlist&address={ALICE}");
+        let proxy = "/api?module=proxy&action=eth_call&to=0x0000000000000000000000000000000000000001&data=0x";
+        for (headers, seen) in &shapes {
+            let (list, listed) = raw(addr, "GET", "/api/watch", headers, None).await;
+            let (history, _) = raw(addr, "GET", &txlist, headers, None).await;
+            let (_, lent_answer) = raw(addr, "GET", proxy, headers, None).await;
+            let (remove, why) = raw(
+                addr,
+                "POST",
+                "/api/unwatch",
+                headers,
+                Some(json!({ "address": ALICE })),
+            )
+            .await;
+            match seen {
+                Seen::Refused => {
+                    assert_eq!(
+                        (list, history, remove),
+                        (403, 403, 403),
+                        "{headers:?}: {listed}"
+                    );
+                    assert!(
+                        listed.contains("refused") || listed.contains("--public-host"),
+                        "{listed}"
+                    );
+                }
+                Seen::Public => {
+                    assert_eq!((list, history), (200, 200), "{headers:?}: {listed}");
+                    assert!(listed.contains("watched"), "{headers:?}: {listed}");
+                    assert_eq!(remove, 403, "{headers:?}");
+                    assert!(why.contains("this request is not one"), "{why}");
+                    assert!(
+                        lent_answer.contains("NUTHATCH_UNSUPPORTED"),
+                        "{headers:?}: {lent_answer}"
+                    );
+                }
+                Seen::Local => {
+                    assert_eq!((list, history), (200, 200), "{headers:?}");
+                    assert!(lent_answer.contains("0x10"), "{headers:?}: {lent_answer}");
+                    let (add, _) = raw(
+                        addr,
+                        "POST",
+                        "/api/watch",
+                        headers,
+                        Some(json!({ "address": BOB })),
+                    )
+                    .await;
+                    let (drop, _) = raw(
+                        addr,
+                        "POST",
+                        "/api/unwatch",
+                        headers,
+                        Some(json!({ "address": BOB })),
+                    )
+                    .await;
+                    assert_eq!((add, drop), (200, 200), "{headers:?}");
+                    // Put back what the shared probe above took.
+                    if remove == 200 {
+                        let (back, _) = raw(
+                            addr,
+                            "POST",
+                            "/api/watch",
+                            headers,
+                            Some(json!({ "address": ALICE })),
+                        )
+                        .await;
+                        assert_eq!(back, 200);
+                    }
+                }
+            }
+            assert!(
+                s.history.watched().unwrap().len() == 1,
+                "{headers:?} changed the watched set"
+            );
+        }
+        let lent_to = shapes
+            .iter()
+            .filter(|(_, s)| matches!(s, Seen::Local))
+            .count() as u64;
+        assert_eq!(
+            lent.load(Ordering::Relaxed),
+            lent_to,
+            "the RPC lent beyond local callers"
+        );
+    }
+
+    /// A caller that is not this machine, through a declared public host or a proxy that rewrites
+    /// `Host`, gets no trace of an unwatched hash and no timestamp search on the RPC.
+    #[tokio::test]
+    async fn a_remote_caller_on_a_loopback_bind_is_neither_traced_for_nor_searched_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_forward(forward)
+                .with_deadline(Duration::from_millis(200)),
+        );
+        let hosts = Hosts {
+            public: vec!["wallet.example.com".into()],
+            ..Default::default()
+        };
+        let addr = listen(router_for(s, hosts)).await;
+        let trace = format!(
+            "/api?module=account&action=txlistinternal&txhash=0x{}",
+            "cd".repeat(32)
+        );
+        let time = "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before";
+        for headers in [
+            vec!["Host: wallet.example.com".to_string()],
+            vec![
+                format!("Host: 127.0.0.1:{}", addr.port()),
+                "Via: 1.1 proxy".into(),
+            ],
+        ] {
+            for path in [trace.as_str(), time] {
+                let (code, body) = raw(addr, "GET", path, &headers, None).await;
+                assert_eq!(code, 200, "{headers:?}");
+                assert!(
+                    body.contains("NUTHATCH_UNSUPPORTED")
+                        && body.contains("this request is not one"),
+                    "{headers:?} {path}: {body}"
+                );
+            }
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
+    }
+
+    /// A declared name that could not do what its flag says is refused at startup: a loopback name
+    /// is always local, so `--public-host localhost` would leave its callers fully local.
+    #[test]
+    fn a_host_declaration_that_would_do_nothing_is_refused() {
+        let s = |v: &[&str]| v.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        for public in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.2",
+            "[::1]",
+            "0.0.0.0",
+        ] {
+            let err = Hosts::declared(&[], &s(&[public])).unwrap_err().to_string();
+            assert!(
+                err.contains("--public-host") && err.contains("always answered as this machine"),
+                "{public}: {err}"
+            );
+        }
+        let err = Hosts::declared(&s(&["nest.example.com"]), &s(&["Nest.Example.com"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both --local-host and --public-host"), "{err}");
+        for bad in ["wallet.example.com:443", "a@b", ""] {
+            assert!(Hosts::declared(&[], &s(&[bad])).is_err(), "{bad:?}");
+            assert!(Hosts::declared(&s(&[bad]), &[]).is_err(), "{bad:?}");
+        }
+        let hosts =
+            Hosts::declared(&s(&["host.docker.internal"]), &s(&["Wallet.Example.com"])).unwrap();
+        assert_eq!(hosts.local, ["host.docker.internal"]);
+        assert_eq!(hosts.public, ["wallet.example.com"]);
+    }
+
+    /// A refusal says what it saw and what to do about it.
+    #[tokio::test]
+    async fn a_refusal_names_the_host_or_header_it_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = listen(router(state(dir.path(), true))).await;
+        let (code, body) = raw(addr, "GET", "/api/watch", &["Host: evil.com".into()], None).await;
+        assert_eq!(code, 403);
+        assert!(
+            body.contains("Host evil.com") && body.contains("--public-host evil.com"),
+            "{body}"
+        );
+        let headers = vec![
+            format!("Host: 127.0.0.1:{}", addr.port()),
+            "X-Forwarded-For: 203.0.113.9".into(),
+        ];
+        let (code, body) = raw(
+            addr,
+            "POST",
+            "/api/watch",
+            &headers,
+            Some(json!({ "address": BOB })),
+        )
+        .await;
+        assert_eq!(code, 403);
+        assert!(body.contains("x-forwarded-for"), "{body}");
+        let headers = vec![
+            format!("Host: 127.0.0.1:{}", addr.port()),
+            "Sec-Fetch-Site: ".into(),
+        ];
+        let (code, body) = raw(
+            addr,
+            "POST",
+            "/api/watch",
+            &headers,
+            Some(json!({ "address": BOB })),
+        )
+        .await;
+        assert_eq!(code, 403);
+        assert!(body.contains(r#"Sec-Fetch-Site is \"\""#), "{body}");
+    }
+
+    /// A directory of chains admits a request by the same rule as one chain.
+    #[tokio::test]
+    async fn a_rebound_request_reads_and_changes_no_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains: Chains = Arc::new(
+            [56, 8453]
+                .into_iter()
+                .map(|id| (id, chain_state(dir.path(), id)))
+                .collect(),
+        );
+        let addr = listen(chains_router(chains.clone())).await;
+        let rebound = vec!["Host: wallet.example.com".to_string()];
+        let (list, _) = raw(addr, "GET", "/api/watch", &rebound, None).await;
+        let (remove, _) = raw(
+            addr,
+            "POST",
+            "/api/unwatch",
+            &rebound,
+            Some(json!({ "address": ALICE })),
+        )
+        .await;
+        assert_eq!((list, remove), (403, 403));
+        for s in chains.values() {
+            assert_eq!(s.history.watched().unwrap().len(), 1);
+        }
     }
 
     /// #2124: an account unwatched while its windows failed stayed in `stalled_backfill`, and once
