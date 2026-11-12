@@ -6,7 +6,7 @@ Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthat
 
 ## `nuthatch` (global - valid with any subcommand)
 
-- `--log-format <LOG_FORMAT>` - Log output format. `text` (default) is the human-readable line format; `json` emits one structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an operator can point a log aggregator at stdout instead of scraping text. `global = true` so it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`)
+- `--log-format <LOG_FORMAT>` - Log output format. `text` (default) is the human-readable line format; `json` emits one structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an operator can point a log aggregator at stdout instead of scraping text. Accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`)
 
 ## `nuthatch add`
 
@@ -81,7 +81,7 @@ Measure the read path: entity point-read latency (p50/p99) and the `/sql` hot∪
 - `--iters <ITERS>` - `/sql` query repetitions to time (the report is the p50/p99 across them)
 - `--out <OUT>` - Write the bench-report JSON here. Prints to stdout regardless
 - `--label <LABEL>` - A label for the report (e.g. "R1: horizon tip 12k rows")
-- `--max-point-read-p50-us <MAX_POINT_READ_P50_US>` - Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only reports; passed, it is a gate (CI uses it - CLAUDE.md: benchmark regressions fail the build)
+- `--max-point-read-p50-us <MAX_POINT_READ_P50_US>` - Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only reports; passed, it is a gate (CI uses it so a benchmark regression fails the build)
 - `--max-point-read-p99-us <MAX_POINT_READ_P99_US>` - Fail if the entity point-read p99 exceeds this many microseconds
 - `--min-reads <MIN_READS>` - Fail unless at least this many point-reads were actually timed. **Pass this whenever you pass a ceiling.** An empty nest samples no keys and reports p50 = 0µs, which is under every ceiling anyone would set - so without a floor the gate passes most confidently when it has measured nothing at all
 
@@ -95,7 +95,7 @@ Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected 
 
 ## `nuthatch control`
 
-Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run
+Run the control-plane API for scaled mode (RFC-0022 §3; scaled build only): declare what the fleet should run
 
 - `--listen <LISTEN>` - Address to bind the control-plane API to. Requires NUTHATCH_CONTROL_TOKEN on every bind and refuses to start without it
 - `--db <DB>` - The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state, **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's outage are different events
@@ -140,7 +140,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--trace-rpc <TRACE_RPC>` - Endpoint(s) answering `trace_filter` for an address-history nest (RFC-0063, repeatable). Defaults to the nest's RPC; give an index-backed trace API here when that one re-executes blocks to answer
 - `--backfill <BACKFILL>` - Index only this many blocks back from the tip (recent-history mode). Explicitly overrides a nest's vendored `start_block`s. Omit to backfill from deployment when the nest declares start blocks, else from a default recent window
 - `--seal-direct` - Backfill finalized history straight to Parquet (skip the hot store) before tip-following. Prerequisite for `--concurrency` pipelining, which is where the measured speedup is; the storage path alone is not "faster" - see `docs/benchmarks.md`. The near-tip window still uses the hot path; the IVM view is rebuilt from the sealed segments
-- `--concurrency <CONCURRENCY>` - Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency). Try 8-16 against your own node; keep low on rate-limited public RPC
+- `--concurrency <CONCURRENCY>` - Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency). Needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says. Keep low on rate-limited public RPC
 - `--ipfs-window-deadline <IPFS_WINDOW_DEADLINE>` - How long a `--seal-direct` backfill waits for one `[[ipfs]]` document before giving up on it so its window can seal. `300s`, `5m`, or bare seconds; `0` waits until its attempts run out. A document given up on is absent from the sealed segment and is not fetched again (#1410), so an operator with one gateway who would rather wait can raise this or turn it off
 - `--window <WINDOW>` - The widest `eth_getLogs` block range to ask for, and where the adaptive window starts. Without it the window starts at the chain default and grows over empty ranges, to 100000 blocks for a nest that reads only logs. With it no request spans more than this many blocks; the window still shrinks below it when a provider refuses a range or a range is dense. Set it to your provider's `getLogs` block-range limit, or high (e.g. 50000) to cross a sparse contract's history in few requests
 - `--poll-interval <POLL_INTERVAL>` - How long a caught-up cursor waits before asking for the tip again (RFC-0040 §3 knob 1). `2s`, `5m`, `1h`, or bare seconds. The default is 5 minutes: new rows can take that long to appear, so pass a shorter interval for a nest that must follow the tip closely. Every poll is paid for - a tip call, a reorg check, a checkpoint and a `finalized` probe per window, whether or not a block carried an event. A nest whose readers refresh on a cron of minutes can wait minutes here and index the same rows for roughly a hundredth of the requests. `/ready` reports the interval and scales its stall threshold to it
@@ -306,7 +306,7 @@ Print the nest's NID: the identity its data is stored under, `data/<nid>/` (RFC-
 
 ## `nuthatch nest publish`
 
-Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with on by default). A self-built bundle and `nest load <file|dir>` never need one. Prints the content address
+Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage (`s3://bucket/prefix`, configured with the usual `AWS_*` env; the `object-store` feature, on by default). A self-built bundle and `nest load <file|dir>` never need one. Prints the content address
 
 - `<BUNDLE>` - The `.bundle` file to publish (from `nuthatch nest bundle`)
 - `--registry <REGISTRY>` - The registry to publish to (RFC-0019). A filesystem path, or `s3://bucket/prefix` with configured via the usual `AWS_*` env (S3/MinIO/R2)
@@ -468,7 +468,7 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 
 - `--dir <DIR>` - Project directory (must contain a nuthatch.toml)
 - `--listen <LISTEN>` - Address to bind the HTTP API to
-- `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with `--features postgres-store`. Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
+- `--hot-store <HOT_STORE>` - Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires the scaled build (the `nuthatch-scaled-<target>.tar.gz` release asset or the `:<version>-scaled` image). Omit to serve the nest's local redb instead - but that store must already exist (`serve` never creates or writes to it), and redb's exclusive flock means exactly one process may hold it: local redb does not read-scale a box or share with `dev`, only `--hot-store` does
 - `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
 - `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`
@@ -516,7 +516,7 @@ Watch a running nest from the terminal: the tip, the seal, memory against its bu
 
 ## `nuthatch worker`
 
-Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane, take cursor leases, index what this worker is assigned
+Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): reconcile against the control plane, take cursor leases, index what this worker is assigned
 
 - `--control-db <CONTROL_DB>` - The control-plane Postgres URL - desired state and the worker registry
 - `--hot-store <HOT_STORE>` - The hot-store Postgres URL - where indexed state lives. Usually the same server as the control plane, but a distinct database: one holds *what should run*, the other holds *indexed data*
