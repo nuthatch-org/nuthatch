@@ -2006,8 +2006,10 @@ tail found corrupt in the background stops later seals until the next start reco
 into place, as across filesystems when `segments/` is a link onto another disk, the segment is copied
 there and removed; where it cannot be moved at all, it stays on disk refused, so no read uses it,
 until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it
-reads it for upload, once, and refuses one that does not match, quarantining it unless it is a
-provisional tail, so a corrupted segment is never mirrored. `nuthatch doctor --catalogue` checks the
+reads it for upload, once, and refuses one that does not match by name, exiting non-zero, so a
+corrupted segment is never mirrored. It quarantines the file itself only for a solo nest no running
+`dev` holds, and never a provisional tail; a shared segment, or one a running writer holds, is left
+for that writer's own pass. `nuthatch doctor --catalogue` checks the
 same thing and only reports.
 
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is

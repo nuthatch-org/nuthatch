@@ -1148,11 +1148,28 @@ async fn put_segment(
         .as_ref()
         .is_err_and(|e| e.downcast_ref::<NotItsAddress>().is_some())
     {
-        let (dir, table, seg) = (dir.to_path_buf(), table.to_string(), seg.clone());
-        tokio::task::spawn_blocking(move || seal::quarantine_mismatched(&dir, &table, &seg))
-            .await?;
+        let (dir, table, seg, src) = (
+            dir.to_path_buf(),
+            table.to_string(),
+            seg.clone(),
+            src.to_path_buf(),
+        );
+        tokio::task::spawn_blocking(move || {
+            // A shared file, or a nest a running writer holds, is the writer's to quarantine: moving it
+            // from here would pull it from under that writer, and its own passes find it in their cycle.
+            let own = src.starts_with(dir.join(seal::SEGMENTS_DIR));
+            if own && !crate::prune::store_is_held(&dir) {
+                seal::quarantine_mismatched(&dir, &table, &seg);
+            } else {
+                tracing::error!(
+                    "{} does not hash to its address; left for the writer's own integrity pass",
+                    src.display()
+                );
+            }
+        })
+        .await?;
     }
-    put
+    put.with_context(|| format!("refusing to publish {table}'s segment {}", seg.file))
 }
 
 /// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
@@ -2621,6 +2638,59 @@ abi = "abis/usdc.json"
             parquet_rows(&mirror.path().join(&report.dataset)),
             "mirrored parquet must carry the same rows as the sealed directory"
         );
+    }
+
+    /// Flip a byte of `dir`'s first final segment; its catalogue entry and path.
+    fn rot_first_final(dir: &Path) -> (seal::Segment, PathBuf) {
+        let manifest = seal::load_manifest(dir).unwrap();
+        let seg = manifest
+            .tables
+            .values()
+            .flatten()
+            .find(|s| !s.provisional)
+            .expect("a final segment")
+            .clone();
+        let path = seal::segment_path(dir, &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        (seg, path)
+    }
+
+    /// A publish beside a running writer refuses the bad segment by name and leaves it where it is:
+    /// moving it is that writer's business, for its own nest and for a runtime's shared store.
+    #[tokio::test]
+    async fn publish_beside_a_writer_refuses_a_bad_segment_and_leaves_it_in_place() {
+        let held = sealed_nest();
+        let root = tempfile::tempdir().unwrap();
+        let shared = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("d".repeat(64));
+        std::fs::create_dir_all(&shared).unwrap();
+        write_nest(&shared);
+        test_set_table_floor(&shared, 0);
+        seal_range(&shared, &[row(10, 5), row(11, 7)], 10, 11).unwrap();
+        assert!(seal::shared_store(&shared).is_some());
+        let _writer = crate::store::Store::open(&held.path().join(crate::config::DB_FILE)).unwrap();
+        for dir in [held.path(), shared.as_path()] {
+            let (seg, path) = rot_first_final(dir);
+            let bytes = std::fs::read(&path).unwrap();
+            let mirror = tempfile::tempdir().unwrap();
+            let err = sync(dir, mirror.path().to_str().unwrap(), false)
+                .await
+                .expect_err("a corrupt segment was published");
+            assert!(format!("{err:#}").contains(&seg.file), "{err:#}");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "{} was moved",
+                path.display()
+            );
+            assert!(!dir.join(seal::QUARANTINE_DIR).exists());
+            assert!(!root.path().join(seal::QUARANTINE_DIR).exists());
+        }
     }
 
     #[tokio::test]
