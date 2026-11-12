@@ -961,7 +961,7 @@ and `--concurrency`):
 | `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
 | `--rpc-fallback` | endpoint(s) asked only while every other endpoint is failing. Repeatable. Put a paid key here behind free endpoints and it bills only for what they could not answer. Otherwise endpoints share the load round-robin, so a paid key in `--rpc` takes its share of every call. Single-chain runtimes only |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
-| `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
+| `--concurrency` | concurrent window fetches during seal-direct backfill. Under `dev` it needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says. `bench backfill` does not cap it. Low on rate-limited public RPC |
 | `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
 | `--backfill N` | index only the last N blocks (recent-history mode). Applies only to a nest with no blocks yet; an existing store resumes where it stopped and the flag is ignored |
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
@@ -1313,9 +1313,23 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   list, so a client falls through to its next source. A range before `start_block` or past
   `end_block`, which it never will cover, answers `NUTHATCH_UNSUPPORTED`.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
-  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module). Off loopback,
+  a loopback bind, as are the RPC-backed actions (balances, the `proxy` module), and there only from
+  this machine: a loopback `Host` (or one named by `--local-host`), no proxy header (`Forwarded`,
+  `Via`, `X-Forwarded-*`, `X-Real-IP` and the like), and no `Origin` or `Sec-Fetch-Site` naming
+  another site. Off loopback, or for a request that is not from this machine,
   `proxy/eth_blockNumber` answers the nest's own head and a watched account's balance is still read;
   everything else that would lend the RPC is refused. Keep it on loopback unless a client needs it.
+- **Host names on a loopback bind.** Every route, reads included, answers only a loopback `Host`
+  or one you declare, so a page that rebinds a DNS name to 127.0.0.1 reads nothing. Behind a reverse
+  proxy that passes the client's `Host`, start the nest with `--public-host <name>` (repeatable):
+  that name reads watched data and changes nothing. **A nest already behind such a proxy is
+  refused with 403 until it adds the flag**, and the 403 names the `Host` it saw. `--local-host
+  <name>` answers a name as this machine, such as `host.docker.internal` for rotki in a container on
+  Docker Desktop; a browser page cannot choose its `Host`, so declaring one does not let a page in.
+  One proxy no header can reveal: one that rewrites `Host` to a loopback address and adds no proxy
+  header, as nginx's plain `proxy_pass http://127.0.0.1:PORT` does, is indistinguishable from a
+  local process, so its callers can watch, unwatch and borrow the RPC. Configure such a proxy to
+  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.

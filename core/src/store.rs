@@ -8,6 +8,10 @@ use std::sync::Arc;
 pub const LAST_BLOCK_KEY: &str = "last_block";
 pub const SEALED_THROUGH_KEY: &str = "sealed_through";
 pub const START_BLOCK_KEY: &str = "start_block";
+/// "true" when the cold start used the configured `start_block` with no `--backfill`, as the "from
+/// deployment" log line does (a `start_block` set by hand past the deployment cannot be told apart);
+/// "false" when it was cut short or the nest has none; absent in a store written before this.
+pub const HISTORY_FROM_DEPLOYMENT_KEY: &str = "history_from_deployment";
 
 /// Key entities as `{block:012}-{log_index:06}` so iteration is chain-ordered.
 pub fn entity_key(block: u64, log_index: u64) -> String {
