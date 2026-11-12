@@ -2780,11 +2780,11 @@ fn redact_config_text(name: &str, text: &str) -> String {
             .to_string();
     };
     let nuthatch = name == "nuthatch.toml";
-    let rule = |path: &str, value: &toml_edit::Value| {
+    let rule = |path: &[Seg], value: &toml_edit::Value| {
         if nuthatch {
-            if SHOWN_NUTHATCH_KEYS.contains(&path) {
+            if listed(SHOWN_NUTHATCH_KEYS, path) {
                 Shown::Value
-            } else if SHOWN_NUTHATCH_URLS.contains(&path) {
+            } else if listed(SHOWN_NUTHATCH_URLS, path) {
                 Shown::Url
             } else {
                 Shown::Type
@@ -2799,34 +2799,48 @@ fn redact_config_text(name: &str, text: &str) -> String {
         }
     };
     let mut out = toml_edit::DocumentMut::new();
-    *out.as_table_mut() = shown_table(doc.as_table(), "", &rule);
+    *out.as_table_mut() = shown_table(doc.as_table(), &[], &rule);
     out.to_string()
 }
 
-fn key_path(parent: &str, key: &str) -> String {
-    if parent.is_empty() {
-        key.to_string()
-    } else {
-        format!("{parent}.{key}")
-    }
+/// One step of a key path: a key, or `None` for an array element.
+type Seg = Option<String>;
+
+fn child(parent: &[Seg], seg: Seg) -> Vec<Seg> {
+    let mut path = parent.to_vec();
+    path.push(seg);
+    path
+}
+
+/// Whether `path` is one of `list`, compared segment by segment, so a quoted key that spells a
+/// dotted path or `*` matches nothing.
+fn listed(list: &[&str], path: &[Seg]) -> bool {
+    list.iter().any(|pattern| {
+        let parts: Vec<&str> = pattern.split('.').collect();
+        parts.len() == path.len()
+            && parts.iter().zip(path).all(|(p, seg)| match seg {
+                None => *p == "*",
+                Some(key) => *p != "*" && p == key,
+            })
+    })
 }
 
 fn shown_table(
     src: &toml_edit::Table,
-    path: &str,
-    rule: &dyn Fn(&str, &toml_edit::Value) -> Shown,
+    path: &[Seg],
+    rule: &dyn Fn(&[Seg], &toml_edit::Value) -> Shown,
 ) -> toml_edit::Table {
     let mut out = toml_edit::Table::new();
     out.set_implicit(src.is_implicit());
     out.set_dotted(src.is_dotted());
     for (key, item) in src.iter() {
-        let path = key_path(path, key);
+        let path = child(path, Some(key.to_string()));
         let item = match item {
             toml_edit::Item::Table(t) => toml_edit::Item::Table(shown_table(t, &path, rule)),
             toml_edit::Item::ArrayOfTables(a) => {
                 let mut shown = toml_edit::ArrayOfTables::new();
                 for t in a.iter() {
-                    shown.push(shown_table(t, &format!("{path}.*"), rule));
+                    shown.push(shown_table(t, &child(&path, None), rule));
                 }
                 toml_edit::Item::ArrayOfTables(shown)
             }
@@ -2840,22 +2854,25 @@ fn shown_table(
 
 fn shown_value(
     value: &toml_edit::Value,
-    path: &str,
-    rule: &dyn Fn(&str, &toml_edit::Value) -> Shown,
+    path: &[Seg],
+    rule: &dyn Fn(&[Seg], &toml_edit::Value) -> Shown,
 ) -> toml_edit::Value {
     use toml_edit::Value as V;
     match value {
         V::InlineTable(t) => {
             let mut shown = toml_edit::InlineTable::new();
             for (key, v) in t.iter() {
-                shown.insert(key, shown_value(v, &key_path(path, key), rule));
+                shown.insert(
+                    key,
+                    shown_value(v, &child(path, Some(key.to_string())), rule),
+                );
             }
             V::InlineTable(shown)
         }
         V::Array(a) => {
             let mut shown = toml_edit::Array::new();
             for v in a.iter() {
-                shown.push(shown_value(v, &format!("{path}.*"), rule));
+                shown.push(shown_value(v, &child(path, None), rule));
             }
             V::Array(shown)
         }
@@ -12592,6 +12609,20 @@ mod tests {
             "events = [\"Transfer\"]",
         ] {
             assert!(shown.contains(kept), "{kept} missing:\n{shown}");
+        }
+    }
+
+    /// A path is matched key by key, so a quoted key that spells an allowlisted path, or `*`, shows
+    /// nothing it should not.
+    #[test]
+    fn a_quoted_key_cannot_spell_an_allowlisted_path() {
+        for text in [
+            "\"nest.name\" = \"DOTTED-LEAK\"\n",
+            "[webhooks.\"*\"]\nwhere = \"STAR-LEAK\"\n",
+        ] {
+            let shown = redact_config_text("nuthatch.toml", text);
+            assert!(!shown.contains("LEAK"), "{shown}");
+            assert!(shown.contains("<redacted string>"), "{shown}");
         }
     }
 
