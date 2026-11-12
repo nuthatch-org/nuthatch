@@ -1621,7 +1621,8 @@ pub struct DevArgs {
     pub seal_direct: bool,
 
     /// Concurrent window fetches during the seal-direct history backfill (overlaps RPC latency).
-    /// Try 8-16 against your own node; keep low on rate-limited public RPC.
+    /// Needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says.
+    /// Keep low on rate-limited public RPC.
     #[arg(long, default_value_t = 1)]
     pub concurrency: usize,
 
