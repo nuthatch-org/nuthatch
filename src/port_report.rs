@@ -4146,6 +4146,50 @@ pub(crate) fn expr_concat_parts(
     Some(out)
 }
 
+/// `event.transaction.hash.concatI32(event.logIndex.toI32())`, the id `graph init` writes on every event
+/// entity, or `event.transaction.hash.concat(Bytes.fromI32(event.logIndex.toI32()))`: graph-ts defines
+/// `Bytes.concatI32(x)` as `concat(ByteArray.fromI32(x))`, and `Bytes.fromI32` as that same `ByteArray`.
+/// Either is the hash's bytes followed by the log index as an i32, little-endian.
+#[cfg(feature = "graph")]
+pub(crate) fn is_tx_log_bytes_id(
+    expr: &str,
+    func: &FunctionInfo,
+    functions: &BTreeMap<String, FunctionInfo>,
+) -> bool {
+    let e = collapse_ws(expr).trim().to_string();
+    let split = [".concatI32(", ".concat("].iter().find_map(|op| {
+        let at = e.find(op)?;
+        let open = at + op.len() - 1;
+        // The call must be the whole expression: `x.concatI32(y).toHex()` is a string, not these bytes.
+        (match_paren(&e, open)? == e.len() - 1)
+            .then(|| (*op, e[..at].trim(), e[open + 1..e.len() - 1].trim()))
+    });
+    let Some((op, receiver, arg)) = split else {
+        return false;
+    };
+    let int_expr = if op == ".concatI32(" {
+        arg
+    } else {
+        let open = "Bytes.fromI32".len();
+        match arg.strip_prefix("Bytes.fromI32(") {
+            Some(inner) if match_paren(arg, open) == Some(arg.len() - 1) => {
+                inner[..inner.len() - 1].trim()
+            }
+            _ => return false,
+        }
+    };
+    // `toI32()` is what fixes the width at four bytes. Neither side may carry another converter, which
+    // `expr_event_column` would strip: a hex string is not the hash's bytes.
+    let Some(index) = int_expr.strip_suffix(".toI32()").map(str::trim) else {
+        return false;
+    };
+    if [receiver, index].iter().any(|s| strip_converters(s) != *s) {
+        return false;
+    }
+    expr_event_column(receiver, func, functions).as_deref() == Some("tx_hash")
+        && expr_event_column(index, func, functions).as_deref() == Some("log_index")
+}
+
 /// A call to a helper whose whole body is one `return`, as that expression with the arguments in place.
 ///
 /// **One statement only.** A helper that does anything else - a branch, a load, a `save` - is not a pure
