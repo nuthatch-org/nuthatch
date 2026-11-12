@@ -114,3 +114,71 @@ fn the_bearer_is_sent_and_an_echo_of_it_is_redacted() {
         assert!(!all.contains(TOKEN), "{all}");
     }
 }
+
+#[test]
+fn malformed_json_gets_a_parse_error_and_the_stdio_loop_recovers() {
+    let mut child = nuthatch()
+        .args(["mcp", "--url", "http://127.0.0.1:1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "1999-01-01" }
+        })
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tables","arguments":{}}"#
+    )
+    .unwrap();
+    writeln!(stdin, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18" }
+        })
+    )
+    .unwrap();
+    drop(stdin);
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 4, "{stdout}");
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(responses[1]["id"], serde_json::Value::Null);
+    assert_eq!(responses[1]["error"]["code"], -32700);
+    assert_eq!(responses[1]["error"]["message"], "Parse error");
+    assert_eq!(
+        responses[2]["id"], 3,
+        "the loop handles the valid request after malformed input"
+    );
+    assert_eq!(responses[2]["result"], serde_json::json!({}));
+    assert_eq!(responses[3]["id"], 4);
+    assert_eq!(responses[3]["result"]["protocolVersion"], "2025-06-18");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("nuthatch mcp: malformed JSON-RPC message"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

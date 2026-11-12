@@ -132,10 +132,14 @@ pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
         if line.is_empty() {
             continue;
         }
-        let Ok(req) = serde_json::from_str::<Value>(line) else {
-            continue;
+        let resp = match serde_json::from_str::<Value>(line) {
+            Ok(req) => respond(&req, &client, &base, token.as_deref()).await,
+            Err(parse_error) => {
+                eprintln!("nuthatch mcp: malformed JSON-RPC message: {parse_error}");
+                Some(err(Value::Null, -32700, "Parse error"))
+            }
         };
-        if let Some(resp) = respond(&req, &client, &base, token.as_deref()).await {
+        if let Some(resp) = resp {
             stdout
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
@@ -250,11 +254,13 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
 }
 
 fn initialize_result(req: &Value) -> Value {
-    // Echo the client's requested protocol version when present.
-    let pv = req
+    let pv = match req
         .pointer("/params/protocolVersion")
         .and_then(Value::as_str)
-        .unwrap_or(PROTOCOL_VERSION);
+    {
+        Some(version) if version == PROTOCOL_VERSION => version,
+        _ => PROTOCOL_VERSION,
+    };
     json!({
         "protocolVersion": pv,
         // Advertise exactly what we implement - tools, resources, prompts; nothing else. When a future
@@ -1023,11 +1029,18 @@ mod tests {
         let resp = handle(&init, &client, "http://127.0.0.1:1").await.unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "nuthatch");
         assert_eq!(
-            resp["result"]["protocolVersion"], "2025-03-26",
-            "echoes client version"
+            resp["result"]["protocolVersion"], PROTOCOL_VERSION,
+            "unsupported client versions fall back to the version implemented by this server"
         );
 
-        let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+        let supported_init = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
+            "params": { "protocolVersion": PROTOCOL_VERSION } });
+        let supported = handle(&supported_init, &client, "http://127.0.0.1:1")
+            .await
+            .unwrap();
+        assert_eq!(supported["result"]["protocolVersion"], PROTOCOL_VERSION);
+
+        let list = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
         let resp = handle(&list, &client, "http://127.0.0.1:1").await.unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
