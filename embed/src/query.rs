@@ -152,12 +152,10 @@ impl TabQuery {
         for e in entities {
             bind_relation(&mut engine, e)?;
         }
-        for (path, text) in files {
-            if path.starts_with("views/") && path.ends_with(".sql") {
-                define_views(&mut engine, text)?;
-            }
+        // Children and labels before the authored views, which may read them, as the node binds them.
+        for (_, ddl) in children {
+            define_views(&mut engine, ddl)?;
         }
-        // As the node binds them after its authored views (RFC-0077 S5), and as best-effort.
         let labels = nuthatch_core::bind::label_rows(
             files
                 .iter()
@@ -169,8 +167,10 @@ impl TabQuery {
                 .register_rows("labels", &labels)
                 .map_err(engine_err)?;
         }
-        for (_, ddl) in children {
-            define_views(&mut engine, ddl)?;
+        for (path, text) in files {
+            if path.starts_with("views/") && path.ends_with(".sql") {
+                define_views(&mut engine, text)?;
+            }
         }
         Ok(TabQuery { engine })
     }
@@ -576,6 +576,41 @@ mod tests {
         ]);
         let got = referenced_tables("SELECT count(*) AS n FROM all_approvals", &files).unwrap();
         assert!(got.contains("tab__transfer"), "{got:?}");
+    }
+
+    fn bound(files: &NestFiles, entities: &[TabEntity], schema: &[TableSchema]) -> TabQuery {
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let store = Store::from_db(db, None).unwrap();
+        let cellar = Arc::new(Cellar::default());
+        crate::window::block_on(TabQuery::bind(
+            &store,
+            &cellar,
+            schema,
+            entities,
+            files,
+            TabBudget::default(),
+            &[],
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_authored_view_over_labels_answers() {
+        let files = files(&[
+            (
+                "labels/a.json",
+                r#"[{"address":"0x11","label":"mixer"},{"address":"0x22","label":"exchange"}]"#,
+            ),
+            (
+                "views/mixers.sql",
+                "CREATE VIEW mixers AS SELECT address FROM labels WHERE label = 'mixer'",
+            ),
+        ]);
+        let q = bound(&files, &[], &[]);
+        let rows = crate::window::block_on(q.rows("SELECT address FROM mixers")).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"address": "0x11"})]);
     }
 
     #[test]

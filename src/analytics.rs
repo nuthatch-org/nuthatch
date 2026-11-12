@@ -1714,15 +1714,7 @@ fn attempt(
         // Factory children views before the authored ones. A view in `views/*.sql` may read
         // `{template}__children`, and that relation has to exist when the authored view is planned (#2723).
         define_children_views(session, dir);
-        // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
-        // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
-        // this - they only touch the raw per-event tables.
-        if leaves.is_empty() {
-            define_nest_views(session, dir, wanted.as_ref());
-        } else {
-            let authored = wanted.as_ref().map(|w| w - &leaves);
-            define_nest_views(session, dir, authored.as_ref());
-        }
+        // Offchain snapshots and labels before the authored views too, which may read them.
         let offchain = if as_of.is_none() {
             define_offchain_views(session, dir, wanted.as_ref())?
         } else {
@@ -1735,6 +1727,15 @@ fn attempt(
             && wanted.as_ref().is_none_or(|w| w.contains("labels"))
         {
             slot.labels_bound = define_labels_view(session, dir);
+        }
+        // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
+        // analytical `/sql` surface sees them. Point-reads (`net_balances`, `get_row`) deliberately skip
+        // this - they only touch the raw per-event tables.
+        if leaves.is_empty() {
+            define_nest_views(session, dir, wanted.as_ref());
+        } else {
+            let authored = wanted.as_ref().map(|w| w - &leaves);
+            define_nest_views(session, dir, authored.as_ref());
         }
         // Every view this query could be reading now exists, so the names it used can be widened to the
         // tables behind them. This is the sweep's reachability bound (see `Attempt`), and it has to
@@ -6870,6 +6871,46 @@ template="pool"
             Some(1),
             "a warm session bound the same labels again"
         );
+    }
+
+    #[test]
+    fn an_authored_view_over_labels_answers_and_binds_them_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("labels.csv");
+        std::fs::write(&input, "0x1111111111111111111111111111111111111111,mixer\n").unwrap();
+        crate::labels::import(dir.path(), &input).unwrap();
+        let views = dir.path().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(
+            views.join("mixers.sql"),
+            "CREATE VIEW mixers AS SELECT address FROM labels WHERE label = 'mixer'",
+        )
+        .unwrap();
+        let binds = || label_binds().lock().unwrap().get(dir.path()).copied();
+        query(dir.path(), "SELECT 1 AS n").unwrap();
+        assert_eq!(binds(), None, "a statement that reads no labels bound them");
+        for _ in 0..2 {
+            let rows = query(dir.path(), "SELECT count(*) AS n FROM mixers").unwrap();
+            assert_eq!(rows[0]["n"], serde_json::json!(1));
+        }
+        assert_eq!(binds(), Some(1));
+    }
+
+    #[test]
+    fn an_authored_view_over_an_offchain_snapshot_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("prices.csv");
+        std::fs::write(&source, "symbol,price\nGRT,2\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &source, "prices").unwrap();
+        let views = dir.path().join("views");
+        std::fs::create_dir_all(&views).unwrap();
+        std::fs::write(
+            views.join("grt.sql"),
+            "CREATE VIEW grt AS SELECT price FROM offchain__prices WHERE symbol = 'GRT'",
+        )
+        .unwrap();
+        let rows = query(dir.path(), "SELECT count(*) AS n FROM grt").unwrap();
+        assert_eq!(rows[0]["n"], serde_json::json!(1));
     }
 
     #[test]
