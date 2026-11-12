@@ -8,6 +8,11 @@ The same release PR bumps the default image in `docker-compose.scaled.yml` and
 `docker-compose.writer-node.yml` to the new version: nothing rewrites them, and
 `tests/compose_image_is_current.rs` fails CI until they match `Cargo.toml`.
 
+The same PR bumps the two `docker run` image tags in `docs/operators.md` and, in `SECURITY.md`, the
+supported-versions sentence ("When 5.20.0 is released, 5.19 keeps receiving security fixes ..."), which
+names the new minor and the one before it. `scripts/version-check.sh` fails CI's `fmt · clippy · build
+(default)` job until both match `Cargo.toml`.
+
 If the notes file is missing when the tag is pushed, the `release-notes` job fails and nothing further
 runs - no build, no empty release to edit afterward. There is no fallback to an empty body; a
 missing notes file is a build failure, not a warning.

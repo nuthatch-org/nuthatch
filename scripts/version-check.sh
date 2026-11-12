@@ -94,10 +94,22 @@ echo
 current_minor=${WANT%.*}
 major=${current_minor%.*}
 minor=${current_minor#*.}
-previous_minor="$major.$((minor > 0 ? minor - 1 : 0))"
-stale_minors=$(sed -n '/^## Supported versions/,/^## /p' SECURITY.md \
-  | grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/' | sort -u \
-  | grep -vxF -e "$current_minor" -e "$previous_minor" | tr '\n' ' ')
+# The previous minor of X.Y is X.(Y-1). Of X.0 it is the last minor of the line before, which this
+# script cannot know, so any (X-1).* is accepted there.
+if [ "$minor" -gt 0 ]; then
+  previous_minor="$major.$((minor - 1))"
+  allowed="$current_minor $previous_minor"
+else
+  previous_minor="$((major - 1)).*"
+  allowed="$current_minor"
+fi
+stale_minors=""
+for named in $(sed -n '/^## Supported versions/,/^## /p' SECURITY.md \
+  | grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/' | sort -u); do
+  case " $allowed " in *" $named "*) continue ;; esac
+  [ "$minor" -eq 0 ] && [ "${named%%.*}" = "$((major - 1))" ] && continue
+  stale_minors="$stale_minors$named "
+done
 if [ -n "$stale_minors" ]; then
   echo "SECURITY.md supported versions: STALE (names ${stale_minors}; only $current_minor and $previous_minor may appear)"
   fail=$((fail + 1))
