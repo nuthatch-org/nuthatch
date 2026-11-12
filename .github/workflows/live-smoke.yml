@@ -19,8 +19,13 @@ on:
 
 jobs:
   smoke:
-    name: init to first row on mainnet within the limit
-    runs-on: ubuntu-latest
+    name: init to first row on mainnet within the limit (${{ matrix.runner }})
+    # The Intel Mac binary is cross-compiled on arm64 (release.yml), so this leg is the only place it runs.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       attestations: read
