@@ -963,7 +963,7 @@ and `--concurrency`):
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. Under `dev` it needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says. `bench backfill` does not cap it. Low on rate-limited public RPC |
 | `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
-| `--backfill N` | index only the last N blocks (recent-history mode) |
+| `--backfill N` | index only the last N blocks (recent-history mode). Applies only to a nest with no blocks yet; an existing store resumes where it stopped and the flag is ignored |
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
 | `--fail-fast` | exit on first fault instead of quarantining. For CI and operators who prefer fail-stop |
 
@@ -1982,8 +1982,10 @@ nest is built, read at no more than 64 MiB/s across the whole process, one datas
 again every 24 hours for as long as the nest runs. So a segment changed through the filesystem
 (written over, truncated, replaced, restored) is caught before the nest serves; one that rotted under
 unchanged metadata is caught within one background pass of a start, and within 24 hours of the last
-pass after that. Until then a corrupted segment that still decodes can answer a query wrongly or feed
-the views rebuilt at start, as one always could between restarts. A shared segment is reported and
+pass after that. Until then a corrupted segment that still decodes can answer a query wrongly. The views
+and balances rebuilt at start read segments before that pass has verified them, where before 5.21
+rot that happened before a restart was caught before the rebuild; and nothing retracts derived state
+built from a segment that is later quarantined, so it stays wrong until the next restart. A shared segment is reported and
 left in place. A provisional tail found corrupt in the background stops later seals until the next
 start records it as lost. `nuthatch publish` hashes every segment before it uploads it, and refuses
 (and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
