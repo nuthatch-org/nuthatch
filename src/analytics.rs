@@ -2970,6 +2970,11 @@ fn define_views_bound(
                             return None;
                         }
                         let p = crate::seal::segment_path(dir, &s.file, &s.hash);
+                        if crate::seal::refused(&p) {
+                            // Logged at `error!` when the integrity pass could not move it.
+                            degraded.insert(table.clone());
+                            return None;
+                        }
                         // Skip a manifest segment whose file is gone from disk (quarantined as corrupt
                         // by the startup integrity pass, or externally removed). Without this, one
                         // missing file makes `read_parquet` throw and the whole query fail; instead the

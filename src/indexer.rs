@@ -9141,6 +9141,11 @@ fn visit_sealed_columns(
     use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
     for segment in segments {
         let path = crate::seal::segment_path(dir, &segment.file, &segment.hash);
+        anyhow::ensure!(
+            !crate::seal::refused(&path),
+            "sealed segment {} does not hash to its address and is refused",
+            path.display()
+        );
         let file = std::fs::File::open(&path)
             .with_context(|| format!("opening sealed segment {}", path.display()))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)

@@ -187,11 +187,19 @@ impl SegmentSink for FsSink<'_> {
             }
             None => self.dir.join(SEGMENTS_DIR).join(&s.file),
         };
-        replace_durable(&target, bytes)
+        replace_durable(&target, bytes)?;
+        unrefuse(&target);
+        Ok(())
     }
 
     fn rows(&self, s: &Segment) -> Result<Vec<Value>> {
-        read_segment_rows(&segment_path(self.dir, &s.file, &s.hash))
+        let path = segment_path(self.dir, &s.file, &s.hash);
+        anyhow::ensure!(
+            !refused(&path),
+            "{} does not hash to its address and is refused",
+            path.display()
+        );
+        read_segment_rows(&path)
     }
 
     fn table_floor(&self) -> usize {
@@ -1843,6 +1851,7 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             }
             let reason = match read {
                 Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {
+                    unrefuse(&path);
                     if let Some(stamp) = stamp {
                         verified.stamps.insert(key, stamp);
                     }
@@ -1901,7 +1910,18 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
     };
     std::fs::create_dir_all(&quarantine).ok();
     let dest = quarantine.join(dest_name);
-    match std::fs::rename(path, &dest) {
+    // A rename cannot cross filesystems, as it must where `segments/` is a link onto another disk.
+    let rename = || {
+        #[cfg(test)]
+        if test_rename_fails().lock().unwrap().contains(path) {
+            return Err(std::io::ErrorKind::CrossesDevices.into());
+        }
+        std::fs::rename(path, &dest)
+    };
+    let moved = rename().or_else(|renaming| {
+        move_by_copy(path, &dest).map_err(|copying| format!("{renaming}; copying it: {copying}"))
+    });
+    match moved {
         Ok(()) => {
             tracing::error!(
                 "quarantined segment {} for table {table} ({reason}) → {} - cold data for {scope} \
@@ -1916,13 +1936,71 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
             true
         }
         Err(e) => {
+            refuse(path);
             tracing::error!(
-                "segment {} for {table} is {reason} but could not be quarantined: {e}",
-                s.file
+                "segment {} for {table} is {reason} but could not be quarantined ({e}): it is \
+                 refused in place, so cold data for {scope} is reduced until a copy hashing to {} \
+                 replaces it at {}",
+                s.file,
+                s.hash,
+                path.display()
             );
+            record_quarantine(dir, shared.as_deref(), table, s);
             false
         }
     }
+}
+
+/// [`std::fs::rename`] for two filesystems: a durable copy at `dest`, then the source removed.
+fn move_by_copy(from: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_copy_fails().lock().unwrap().contains(from) {
+        return Err(std::io::Error::other("copy refused by a test"));
+    }
+    let partial = dest.with_extension("parquet.partial");
+    std::fs::copy(from, &partial)?;
+    std::fs::File::open(&partial)?.sync_all()?;
+    std::fs::rename(&partial, dest)?;
+    std::fs::remove_file(from)
+}
+
+#[cfg(test)]
+fn test_rename_fails() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+#[cfg(test)]
+fn test_copy_fails() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+/// Segment files that failed their hash and could not be moved aside. Every reader skips them, and
+/// a pass that finds one intact again, or a seal that rewrites it, lets it back.
+fn refused_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+fn refuse(path: &Path) {
+    refused_paths()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+fn unrefuse(path: &Path) {
+    let mut r = refused_paths().lock().unwrap_or_else(|e| e.into_inner());
+    if !r.is_empty() {
+        r.remove(path);
+    }
+}
+
+/// Whether `path` holds bytes an integrity pass found wrong and could not move out of the way.
+pub fn refused(path: &Path) -> bool {
+    let r = refused_paths().lock().unwrap_or_else(|e| e.into_inner());
+    !r.is_empty() && r.contains(path)
 }
 
 /// One segment this process quarantined.
@@ -2050,7 +2128,10 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
             (None, false) => continue,
         };
         out.derived_stale |= stale(q.at, from_block);
-        if file.is_some_and(|file| segment_path(dir, file, &q.hash).exists()) {
+        if file.is_some_and(|file| {
+            let p = segment_path(dir, file, &q.hash);
+            p.exists() && !refused(&p)
+        }) {
             continue;
         }
         out.quarantined_segments += 1;
@@ -2140,6 +2221,7 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
             let reason = match hash_throttled(&path, &mut throttle, alive) {
                 Ok(None) => return Ok(None),
                 Ok(Some(hash)) if hash == s.hash => {
+                    unrefuse(&path);
                     if let Some(stamp) = stamp {
                         verified.stamps.insert(verified_key(&path, &s.hash), stamp);
                     }
@@ -4182,6 +4264,77 @@ mod tests {
         // The right bytes sealed again put the segment back, for both.
         seal_range(&b, &[transfer(100, 0, "5")], 100, 100).unwrap();
         assert_eq!(values(&a).0, ["5"]);
+    }
+
+    /// A segment `dir` names, replaced by another segment's valid bytes: rot that still decodes.
+    fn decodable_rot(dir: &Path) -> (Segment, PathBuf) {
+        std::fs::write(
+            dir.join("schema.json"),
+            r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+        )
+        .unwrap();
+        seal_range(dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir, &seg.file, &seg.hash);
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &path).unwrap();
+        (seg, path)
+    }
+
+    fn values_and_degraded(dir: &Path) -> (Vec<String>, BTreeSet<String>) {
+        let out = crate::analytics::query_guarded(
+            dir,
+            r#"SELECT value FROM "usdc__transfer""#,
+            Default::default(),
+        )
+        .unwrap();
+        let rows = out
+            .rows
+            .iter()
+            .map(|r| r["value"].as_str().unwrap_or_default().to_string())
+            .collect();
+        (rows, out.degraded_tables)
+    }
+
+    #[test]
+    fn a_quarantine_that_cannot_rename_across_filesystems_copies_the_segment_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seg, path) = decodable_rot(dir.path());
+        let bad = std::fs::read(&path).unwrap();
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert!(!path.exists(), "the corrupt segment is still served");
+        assert_eq!(
+            std::fs::read(dir.path().join(QUARANTINE_DIR).join(&seg.file)).unwrap(),
+            bad
+        );
+        let (rows, degraded) = values_and_degraded(dir.path());
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_moved_at_all_is_refused_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, path) = decodable_rot(dir.path());
+        assert_eq!(values_and_degraded(dir.path()).0, ["999"]);
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        test_copy_fails().lock().unwrap().insert(path.clone());
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert!(path.exists());
+
+        let (rows, degraded) = values_and_degraded(dir.path());
+        assert!(rows.is_empty(), "the refused bytes were served: {rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+        let found = integrity(dir.path()).expect("the refusal is reported");
+        assert_eq!(found.quarantined_segments, 1);
+
+        // The right rows sealed again overwrite the bad file, and it is served again.
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert!(!refused(&path));
+        assert_eq!(values_and_degraded(dir.path()).0, ["5"]);
     }
 
     /// The other half of the same guard: re-sealing identical rows must not disturb the stored copy.
