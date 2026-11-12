@@ -1311,7 +1311,7 @@ mod tests {
         );
 
         seat(dir.path(), std::time::Duration::from_secs(30));
-        while store.outbox_len() == 0 {
+        while store.outbox_len() == 0 || standing(dir.path())[0].1.last_error.is_some() {
             tokio::time::advance(std::time::Duration::from_secs(5)).await;
             tokio::task::spawn_blocking(|| {
                 std::thread::sleep(std::time::Duration::from_millis(20))
