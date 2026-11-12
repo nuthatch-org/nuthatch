@@ -8271,6 +8271,10 @@ async fn index_loop(
                         // reported 300. Reaching this iteration's ceiling is the moment the interval
                         // was asked for; a window that fell short is a backlog and loops at once.
                         if to == ceiling {
+                            if let Some(p) = progress.take() {
+                                p.finish(to, true);
+                            }
+                            caught_up = true;
                             sleep_for(nest.freshness.poll_interval).await;
                         }
                     }
@@ -14422,6 +14426,106 @@ template = "pool"
         ) -> Result<std::collections::HashMap<u64, u64>> {
             Ok(blocks.iter().map(|&b| (b, b * 1000)).collect())
         }
+    }
+
+    /// A source whose tip has moved on by the time it is asked again, as a live chain does.
+    struct MovingTip(OpenSource, std::sync::atomic::AtomicU64);
+
+    #[async_trait::async_trait]
+    impl Source for MovingTip {
+        async fn tip(&self) -> Result<u64> {
+            let moved = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.tip().await? + moved)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.0.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.0.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.0.block_timestamps(blocks).await
+        }
+    }
+
+    /// The first catch-up announces itself when its window reaches the ceiling, not after the poll
+    /// interval: on a live chain the tip has always moved by then, so the top-of-loop check never ran.
+    #[tokio::test]
+    async fn the_first_catch_up_is_announced_before_the_poll_interval_sleep() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        if f.name() == "message" {
+                            let _ = write!(self.0, "{value:?}");
+                        }
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(lines.clone()),
+        );
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+        let source = Arc::new(MovingTip(
+            OpenSource {
+                logs: vec![crate::rpc::Log {
+                    block_hash: format!("0x{:064x}", 7),
+                    ..transfer_log(7, 2)
+                }],
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+            std::sync::atomic::AtomicU64::new(0),
+        ));
+        let task = tokio::spawn(index_loop(source, nest, Some(5), false, 1, 50));
+        wait_for(
+            "the catch-up announcement",
+            std::time::Duration::from_secs(20),
+            || {
+                lines
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.contains("caught up to tip"))
+            },
+        )
+        .await;
+        task.abort();
     }
 
     /// Past the flip only the template's own events are asked for without an address. The factory's
