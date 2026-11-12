@@ -46,7 +46,7 @@ while IFS= read -r hit; do
     ./docs/releases/v[0-9]*.md) want=$(basename "$file" .md); want=${want#v} ;;
   esac
   case "$tag" in
-    "$want"|"$want"-*|'<version>'*|'{version}'*) verdict=OK ;;
+    "$want"|"$want"-*|'<version>'*|'{version}'*|*'$'*) verdict=OK ;;
     *) verdict=STALE; fail=$((fail + 1)) ;;
   esac
   tags_seen=$((tags_seen + 1))
@@ -55,7 +55,7 @@ while IFS= read -r hit; do
     ./docs/operators.md:*) operators_seen=$((operators_seen + 1)) ;;
   esac
   printf "  %-5s %s:%s: %s\n" "$verdict" "$file" "$line" "$tag"
-done < <(grep -rnoE "ghcr\.io/nuthatch-org/nuthatch:[A-Za-z0-9._<>{}-]*" --include="*.md" --include="docker-compose*.yml" \
+done < <(grep -rnoE "ghcr\.io/nuthatch-org/nuthatch:[A-Za-z0-9._<>{}\$-]*" --include="*.md" --include="docker-compose*.yml" \
   --exclude-dir=target --exclude-dir=.git --exclude-dir=rfcs . 2>/dev/null)
 
 # A check that finds nothing has stopped checking. operators.md is the document an operator follows
@@ -91,7 +91,8 @@ fi
 # restates the policy for itself ("when 5.20.0 is released, 5.19 keeps ..."), so the section may name
 # only the current minor and the one before it; any other line it names is a regression.
 echo
-current_minor=${WANT%.*}
+core=${WANT%%-*}  # a pre-release version has the release's minor
+current_minor=${core%.*}
 major=${current_minor%.*}
 minor=${current_minor#*.}
 # The previous minor of X.Y is X.(Y-1). Of X.0 it is the last minor of the line before, which this
@@ -105,7 +106,7 @@ else
 fi
 stale_minors=""
 for named in $(sed -n '/^## Supported versions/,/^## /p' SECURITY.md \
-  | grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/' | sort -u); do
+  | grep -oE '[0-9]+\.([0-9]+|x)(\.[0-9x]+)?' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/' | sort -u); do
   case " $allowed " in *" $named "*) continue ;; esac
   [ "$minor" -eq 0 ] && [ "${named%%.*}" = "$((major - 1))" ] && continue
   stale_minors="$stale_minors$named "
