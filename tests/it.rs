@@ -45,6 +45,8 @@ mod diff_story;
 mod doc_command_check;
 #[path = "e2e_bare_help.rs"]
 mod e2e_bare_help;
+#[path = "e2e_cli_output.rs"]
+mod e2e_cli_output;
 #[path = "e2e_crash_safety.rs"]
 mod e2e_crash_safety;
 #[path = "e2e_cursor_death_isolation.rs"]
