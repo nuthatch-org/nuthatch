@@ -7429,7 +7429,17 @@ impl NestIngest {
         // Resume from the last committed block; on a cold start, backfill from the nest's earliest
         // vendored deployment block (full history) if it has one, else from `--backfill` behind the tip.
         let next = match self.store.get_meta(LAST_BLOCK_KEY)? {
-            Some(v) => v.parse::<u64>().context("corrupt last_block")? + 1,
+            Some(v) => {
+                let last = v.parse::<u64>().context("corrupt last_block")?;
+                let from = self
+                    .store
+                    .get_meta(START_BLOCK_KEY)?
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let Some(note) = ignored_backfill(backfill, from, last) {
+                    tracing::warn!("{note}");
+                }
+                last + 1
+            }
             None => {
                 let tip = source.tip().await.map_err(|e| {
                     anyhow::Error::new(ColdStartUnreachable(format!(
@@ -8455,6 +8465,22 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
         Some(w) if w > 0 => w,
         _ => chain_window,
     }
+}
+
+/// `--backfill` only chooses where a cold start begins. Once the store holds a block it is ignored,
+/// and the operator is told so rather than left to find the full-history backfill resuming.
+fn ignored_backfill(backfill: Option<u64>, from: Option<u64>, last: u64) -> Option<String> {
+    let n = backfill?;
+    let range = match from {
+        Some(from) => format!("blocks {from} to {last}"),
+        None => format!("up to block {last}"),
+    };
+    Some(format!(
+        "--backfill {n} ignored: this nest has already indexed {range}, so it resumes from block {} \
+         (stop, delete nuthatch.redb and segments/ in the nest directory, and rerun to start over \
+         from tip minus {n})",
+        last + 1
+    ))
 }
 
 fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -> u64 {
@@ -12312,6 +12338,19 @@ template = "pool"
         assert_eq!(long_backfill(0, 20_000, 20), None);
         assert_eq!(long_backfill(0, 20_001, 20), Some(20_001));
         assert_eq!(long_backfill(500, 100, 20), None);
+    }
+
+    #[test]
+    fn a_backfill_on_a_nest_with_blocks_is_reported_as_ignored() {
+        assert_eq!(ignored_backfill(None, Some(10), 50), None);
+        let note = ignored_backfill(Some(300), Some(10), 50).expect("flag was ignored");
+        assert!(note.contains("--backfill 300 ignored"), "{note}");
+        assert!(note.contains("blocks 10 to 50"), "{note}");
+        assert!(note.contains("resumes from block 51"), "{note}");
+        assert!(
+            note.contains("delete nuthatch.redb and segments/"),
+            "{note}"
+        );
     }
 
     #[test]
