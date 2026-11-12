@@ -15479,6 +15479,8 @@ template = "pool"
         tip: std::sync::atomic::AtomicU64,
         fork: u64,
         forked: std::sync::atomic::AtomicBool,
+        /// Replace the chain once a read has taken its snapshot, as a reorg landing mid-call would.
+        flip_mid_read: std::sync::atomic::AtomicBool,
         canonical: Vec<crate::rpc::Log>,
         replacement: Vec<crate::rpc::Log>,
     }
@@ -15489,17 +15491,27 @@ template = "pool"
         }
 
         fn hash(&self, b: u64) -> String {
-            format!("0x{b:060x}{:04x}", u8::from(self.replaced(b)))
+            self.hash_on(self.forked.load(std::sync::atomic::Ordering::SeqCst), b)
+        }
+
+        fn hash_on(&self, forked: bool, b: u64) -> String {
+            format!("0x{b:060x}{:04x}", u8::from(forked && b >= self.fork))
         }
 
         fn chain(&self) -> Vec<crate::rpc::Log> {
             let forked = self.forked.load(std::sync::atomic::Ordering::SeqCst);
+            if self
+                .flip_mid_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.forked.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.canonical
                 .iter()
                 .filter(|l| !(forked && l.block_number >= self.fork))
                 .chain(self.replacement.iter().filter(|_| forked))
                 .map(|l| crate::rpc::Log {
-                    block_hash: self.hash(l.block_number),
+                    block_hash: self.hash_on(forked, l.block_number),
                     ..l.clone()
                 })
                 .collect()
@@ -15612,6 +15624,7 @@ template = "pool"
             tip: tip.into(),
             fork,
             forked: false.into(),
+            flip_mid_read: false.into(),
             canonical,
             replacement,
         }
@@ -15926,6 +15939,46 @@ template = "pool"
         if let Err(e) = run_reorg_case(&case, &want).await {
             panic!("did not converge:\n{e}");
         }
+    }
+
+    /// The property test's third counterexample, from CI: a replaced block's row survived the fork.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_depth_one_reorg_on_a_two_window_buffer_replaces_the_forked_row() {
+        let want = reorg_reference(REORG_TIP, 9).await;
+        let case = ReorgCase {
+            kind: CursorKind::Buffered(2),
+            fork: 9,
+            flip_at: 11,
+            delays_ms: [3, 15, 6],
+            window: 1,
+            slow_after_flip_ms: 0,
+            held_past_fork: false,
+        };
+        if let Err(e) = run_reorg_case(&case, &want).await {
+            panic!("did not converge:\n{e}");
+        }
+    }
+
+    /// That counterexample's cause was the fixture: a read straddling the flip took the replaced
+    /// chain's logs and stamped them with the replacement's hashes, a log no source ever serves.
+    #[tokio::test]
+    async fn a_reorg_fixture_read_straddling_the_flip_is_one_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), true).await;
+        let chain = reorg_chain(&nests[2], REORG_TIP, 9);
+        let read = |c: &ReorgChain| -> Vec<(u64, String, String)> {
+            c.chain()
+                .into_iter()
+                .map(|l| (l.block_number, l.data, l.block_hash))
+                .collect()
+        };
+        let before = read(&chain);
+        chain
+            .flip_mid_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let straddled = read(&chain);
+        assert!(chain.forked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(straddled, before);
     }
 
     proptest::proptest! {
