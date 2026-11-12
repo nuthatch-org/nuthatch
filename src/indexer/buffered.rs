@@ -940,6 +940,7 @@ impl Extraction<'_> {
         };
         let mut poll_failures = 0u32;
         let mut heartbeat = crate::progress::TipHeartbeat::new();
+        let mut announced = false;
         let mut reorg_gate = ReorgGate::default();
         let mut rx = self.shared.changed.subscribe();
         loop {
@@ -1048,6 +1049,7 @@ impl Extraction<'_> {
                 }
             }
             if next > ceiling {
+                announce_caught_up(&mut announced, ceiling);
                 sleep_for(self.freshness.poll_interval).await;
                 continue;
             }
@@ -1151,7 +1153,10 @@ impl Extraction<'_> {
                     // A pushed window counts as a check at its tip: its header was just read there.
                     reorg_gate.checked(tip, to + 1);
                     if to == ceiling {
+                        announce_caught_up(&mut announced, to);
                         sleep_for(self.freshness.poll_interval).await;
+                    } else {
+                        announced = false;
                     }
                 }
                 Err(e) if narrowing_can_help(&e, next, to) => {
