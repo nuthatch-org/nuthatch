@@ -8614,8 +8614,8 @@ mod tests {
         async fn put(&self, k: &str, b: &[u8]) -> Result<()> {
             self.inner.put(k, b).await
         }
-        async fn put_file(&self, k: &str, s: &Path) -> Result<()> {
-            self.inner.put_file(k, s).await
+        async fn put_file(&self, k: &str, s: &Path, x: Option<&str>) -> Result<()> {
+            self.inner.put_file(k, s, x).await
         }
         async fn put_if(&self, k: &str, b: &[u8], e: Option<&[u8]>) -> Result<()> {
             self.inner.put_if(k, b, e).await

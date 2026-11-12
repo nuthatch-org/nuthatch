@@ -2005,7 +2005,7 @@ tail found corrupt in the background stops later seals until the next start reco
 `/ready` answers `503` with `integrity.seals_stopped` from that moment. Where the quarantine cannot be renamed
 into place, as across filesystems when `segments/` is a link onto another disk, the segment is copied
 there and removed; where it cannot be moved at all, it stays on disk refused, so no read uses it,
-until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment before it uploads it, and refuses
+until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it reads it for upload, once, and refuses
 (and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
 --catalogue` checks the same thing and only reports.
 

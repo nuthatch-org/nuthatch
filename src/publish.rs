@@ -48,11 +48,51 @@ pub(crate) struct Head {
     pub(crate) e_tag: Option<String>,
 }
 
+/// The bytes an upload read did not hash to the address they were to be stored under.
+#[derive(Debug)]
+pub(crate) struct NotItsAddress {
+    pub(crate) src: PathBuf,
+    pub(crate) expected: String,
+    pub(crate) got: String,
+}
+
+impl std::fmt::Display for NotItsAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} does not hash to its address {} (it hashes to {})",
+            self.src.display(),
+            self.expected,
+            self.got
+        )
+    }
+}
+
+impl std::error::Error for NotItsAddress {}
+
+fn check_address(src: &Path, expect: Option<&str>, hasher: Sha256) -> Result<()> {
+    let Some(expected) = expect else {
+        return Ok(());
+    };
+    let got = hex::encode(hasher.finalize());
+    if got == expected {
+        return Ok(());
+    }
+    Err(NotItsAddress {
+        src: src.to_path_buf(),
+        expected: expected.to_string(),
+        got,
+    }
+    .into())
+}
+
 #[async_trait]
 pub(crate) trait Mirror: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     async fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
-    async fn put_file(&self, key: &str, src: &Path) -> Result<()>;
+    /// Store `src` under `key`, read once. With `expect`, the bytes as read must hash to it, or the
+    /// write fails with [`NotItsAddress`] and nothing is stored under `key`.
+    async fn put_file(&self, key: &str, src: &Path, expect: Option<&str>) -> Result<()>;
     /// Create if `expected` is `None`; otherwise replace only when the current bytes match.
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()>;
     async fn head(&self, key: &str) -> Result<Option<Head>>;
@@ -190,11 +230,31 @@ impl Mirror for FsMirror {
         self.write_whole(key, |f| f.write_all(bytes))
     }
 
-    async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
+    async fn put_file(&self, key: &str, src: &Path, expect: Option<&str>) -> Result<()> {
+        use std::io::{Read as _, Write as _};
         let mut from =
             std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
-        self.write_whole(key, |f| std::io::copy(&mut from, f).map(|_| ()))
-            .with_context(|| format!("copying {} to {}", src.display(), key))
+        let mut checked = Ok(());
+        let written = self.write_whole(key, |f| {
+            let mut hasher = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = from.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                f.write_all(&buf[..n])?;
+            }
+            // Before the rename that would install it.
+            checked = check_address(src, expect, hasher);
+            match &checked {
+                Ok(()) => Ok(()),
+                Err(_) => Err(std::io::ErrorKind::InvalidData.into()),
+            }
+        });
+        checked?;
+        written.with_context(|| format!("copying {} to {}", src.display(), key))
     }
 
     async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
@@ -341,7 +401,7 @@ impl Mirror for HttpMirror {
         bail!("an http mirror is read-only; cannot write {key}")
     }
 
-    async fn put_file(&self, key: &str, _src: &Path) -> Result<()> {
+    async fn put_file(&self, key: &str, _src: &Path, _: Option<&str>) -> Result<()> {
         bail!("an http mirror is read-only; cannot write {key}")
     }
 
@@ -424,20 +484,23 @@ impl Mirror for ObjMirror {
 
     /// Streams `src` in [`PART_BUFFER`] parts, one in flight, so an upload holds one part and never
     /// the segment (RFC-0052 §3.4's `publish_headroom`).
-    async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
+    async fn put_file(&self, key: &str, src: &Path, expect: Option<&str>) -> Result<()> {
         use object_store::ObjectStore as _;
         use std::io::Read as _;
-        let read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
+        let mut hasher = Sha256::new();
+        let mut read = |file: &mut std::fs::File| -> Result<Vec<u8>> {
             let mut part = Vec::with_capacity(PART_BUFFER);
             file.take(PART_BUFFER as u64)
                 .read_to_end(&mut part)
                 .with_context(|| format!("reading {}", src.display()))?;
+            hasher.update(&part);
             Ok(part)
         };
         let mut file =
             std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
         let first = read(&mut file)?;
         if first.len() < PART_BUFFER {
+            check_address(src, expect, hasher)?;
             return self.put(key, &first).await;
         }
         let loc = self.key(key);
@@ -459,6 +522,11 @@ impl Mirror for ObjMirror {
                     return Err(e.context(format!("uploading {key}")));
                 }
             }
+        }
+        // The parts stay invisible until the upload completes, so a mismatch stores nothing.
+        if let Err(e) = check_address(src, expect, hasher) {
+            let _ = upload.abort().await;
+            return Err(e);
         }
         upload
             .complete()
@@ -910,8 +978,7 @@ async fn put_follower_files(
                 // Folded after the catalogue was read; the seal wakes the next pass.
                 continue;
             }
-            refuse_unless_intact(dir, "provisional", s).await?;
-            mirror.put_file(&key, &src).await?;
+            put_segment(mirror, &key, dir, "provisional", s, &src).await?;
             put.push(provisional_key(&s.hash));
         }
         present.provisional.insert(s.hash.clone(), None);
@@ -958,11 +1025,8 @@ async fn put_follower_files(
         }
         let key = prefix(&offchain_key(&s.file));
         if mirror.head(&key).await?.is_none() {
-            let (path, hash) = (crate::offchain::segment_path(dir, s), s.hash.clone());
-            let checked = path.clone();
-            tokio::task::spawn_blocking(move || seal::check_segment_bytes(&checked, &hash))
-                .await??;
-            mirror.put_file(&key, &path).await?;
+            let path = crate::offchain::segment_path(dir, s);
+            mirror.put_file(&key, &path, Some(&s.hash)).await?;
             put.push(offchain_key(&s.file));
         }
         present.held.insert(id);
@@ -1069,14 +1133,29 @@ fn stopped_publisher(dir: &Path) -> (Option<u64>, u64) {
     (start, store.sealed_through())
 }
 
-/// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
-/// Hash a segment before it leaves for the mirror, refusing (and quarantining) bytes that are not
-/// the address they would be stored under.
-async fn refuse_unless_intact(dir: &Path, table: &str, seg: &seal::Segment) -> Result<()> {
-    let (dir, table, seg) = (dir.to_path_buf(), table.to_string(), seg.clone());
-    tokio::task::spawn_blocking(move || seal::check_or_quarantine(&dir, &table, &seg)).await?
+/// Upload a catalogued segment, hashed as it is read: bytes that are not the address they would be
+/// stored under are refused, and quarantined.
+async fn put_segment(
+    mirror: &dyn Mirror,
+    key: &str,
+    dir: &Path,
+    table: &str,
+    seg: &seal::Segment,
+    src: &Path,
+) -> Result<()> {
+    let put = mirror.put_file(key, src, Some(&seg.hash)).await;
+    if put
+        .as_ref()
+        .is_err_and(|e| e.downcast_ref::<NotItsAddress>().is_some())
+    {
+        let (dir, table, seg) = (dir.to_path_buf(), table.to_string(), seg.clone());
+        tokio::task::spawn_blocking(move || seal::quarantine_mismatched(&dir, &table, &seg))
+            .await?;
+    }
+    put
 }
 
+/// Write the seed snapshot: changed tails first, then the envelope naming them. Returns what it put.
 async fn put_seed(mirror: &dyn Mirror, dir: &Path, seed: &SeedEnvelope) -> Result<Vec<String>> {
     let prefix = |k: &str| format!("{}/{k}", seed.data_identity);
     let remote_bytes = mirror.get(&prefix(SEED_FILE)).await?;
@@ -1096,8 +1175,7 @@ async fn put_seed(mirror: &dyn Mirror, dir: &Path, seed: &SeedEnvelope) -> Resul
             return Ok(put);
         }
         let key = seed_tail_key(table);
-        refuse_unless_intact(dir, table, seg).await?;
-        mirror.put_file(&prefix(&key), &src).await?;
+        put_segment(mirror, &prefix(&key), dir, table, seg, &src).await?;
         put.push(key);
     }
     let bytes = serde_json::to_vec_pretty(seed)?;
@@ -1250,8 +1328,7 @@ async fn sync_pass(
                             src.display()
                         ),
                     };
-                    refuse_unless_intact(dir, table, seg).await?;
-                    mirror_ref.put_file(&key, &src).await?;
+                    put_segment(mirror_ref, &key, dir, table, seg, &src).await?;
                     if let Some(m) = metrics {
                         m.publish_uploaded(len);
                     }
@@ -1958,7 +2035,10 @@ pub(crate) mod tests {
             .collect();
         std::fs::write(&src, &bytes).unwrap();
 
-        mirror.put_file("t/segment.parquet", &src).await.unwrap();
+        mirror
+            .put_file("t/segment.parquet", &src, None)
+            .await
+            .unwrap();
 
         let got = store
             .inner
@@ -2019,8 +2099,8 @@ pub(crate) mod tests {
         async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
             self.0.put(key, bytes).await
         }
-        async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
-            self.0.put_file(key, src).await
+        async fn put_file(&self, key: &str, src: &Path, x: Option<&str>) -> Result<()> {
+            self.0.put_file(key, src, x).await
         }
         async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
             self.0.put_if(key, bytes, expected).await
@@ -2047,7 +2127,7 @@ pub(crate) mod tests {
         async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
             Ok(())
         }
-        async fn put_file(&self, _: &str, _: &Path) -> Result<()> {
+        async fn put_file(&self, _: &str, _: &Path, _: Option<&str>) -> Result<()> {
             std::thread::sleep(Duration::from_secs(5));
             Ok(())
         }
@@ -2069,7 +2149,7 @@ pub(crate) mod tests {
         async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
             Ok(())
         }
-        async fn put_file(&self, key: &str, _: &Path) -> Result<()> {
+        async fn put_file(&self, key: &str, _: &Path, _: Option<&str>) -> Result<()> {
             bail!("refusing {key}")
         }
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
@@ -2094,7 +2174,7 @@ pub(crate) mod tests {
         async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
             Ok(())
         }
-        async fn put_file(&self, _: &str, _: &Path) -> Result<()> {
+        async fn put_file(&self, _: &str, _: &Path, _: Option<&str>) -> Result<()> {
             let now = self.in_flight.fetch_add(1, SeqCst) + 1;
             self.most.fetch_max(now, SeqCst);
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2271,7 +2351,7 @@ pub(crate) mod tests {
         async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
             Ok(())
         }
-        async fn put_file(&self, key: &str, _: &Path) -> Result<()> {
+        async fn put_file(&self, key: &str, _: &Path, _: Option<&str>) -> Result<()> {
             let mut refused = self.refused.lock().unwrap();
             if refused.is_none() {
                 *refused = Some(key.to_string());
@@ -2375,8 +2455,8 @@ pub(crate) mod tests {
         async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
             self.inner.put(key, bytes).await
         }
-        async fn put_file(&self, key: &str, src: &Path) -> Result<()> {
-            self.inner.put_file(key, src).await
+        async fn put_file(&self, key: &str, src: &Path, x: Option<&str>) -> Result<()> {
+            self.inner.put_file(key, src, x).await
         }
         async fn put_if(&self, key: &str, bytes: &[u8], expected: Option<&[u8]>) -> Result<()> {
             self.inner.put_if(key, bytes, expected).await
@@ -3473,9 +3553,67 @@ abi = "abis/usdc.json"
             .map(|i| (i % 251) as u8)
             .collect();
         std::fs::write(&src, &bytes).unwrap();
-        mirror.put_file("t/segment.parquet", &src).await.unwrap();
+        mirror
+            .put_file("t/segment.parquet", &src, None)
+            .await
+            .unwrap();
         let head = mirror.head("t/segment.parquet").await.unwrap().unwrap();
         assert_eq!(head.e_tag, Some(s3_etag(&src).unwrap()));
+    }
+
+    /// `put_file` against `expect`: stored when the bytes it read hash to it, and nothing stored
+    /// under the key, with [`NotItsAddress`], when they do not.
+    async fn checks_what_it_reads(mirror: &dyn Mirror, len: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("segment.parquet");
+        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &bytes).unwrap();
+        let right = sha256_hex(&bytes);
+        let err = mirror
+            .put_file("t/bad.parquet", &src, Some(&"ab".repeat(32)))
+            .await
+            .expect_err("bytes that are not their address were stored");
+        assert_eq!(
+            err.downcast_ref::<NotItsAddress>().map(|e| &e.got),
+            Some(&right),
+            "{err:#}"
+        );
+        assert!(mirror.head("t/bad.parquet").await.unwrap().is_none());
+        mirror
+            .put_file("t/good.parquet", &src, Some(&right))
+            .await
+            .unwrap();
+        assert_eq!(
+            mirror.get("t/good.parquet").await.unwrap().as_deref(),
+            Some(bytes.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_filesystem_mirror_refuses_bytes_that_are_not_their_address() {
+        let root = tempfile::tempdir().unwrap();
+        let mirror = FsMirror {
+            root: root.path().to_path_buf(),
+        };
+        checks_what_it_reads(&mirror, 3 << 20).await;
+        let leftover: Vec<_> = files_under(root.path())
+            .into_iter()
+            .map(|(p, _)| p)
+            .filter(|p| !p.ends_with("good.parquet"))
+            .collect();
+        assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    #[cfg(feature = "object-store")]
+    #[tokio::test]
+    async fn an_object_store_mirror_refuses_bytes_that_are_not_their_address() {
+        for len in [1000, PART_BUFFER * 5 / 2] {
+            let mirror = ObjMirror {
+                inner: std::sync::Arc::new(object_store::memory::InMemory::new()),
+                prefix: object_store::path::Path::from("mirror"),
+            };
+            checks_what_it_reads(&mirror, len).await;
+        }
     }
 
     #[test]

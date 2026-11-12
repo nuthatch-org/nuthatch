@@ -2313,40 +2313,13 @@ fn hash_throttled(
     }
 }
 
-/// `Ok` when the file at `path` hashes to `expected`, for a caller about to hand the bytes on.
-pub fn check_segment_bytes(path: &Path, expected: &str) -> Result<()> {
-    let mut throttle = Throttle::new(u64::MAX);
-    let got = hash_throttled(path, &mut throttle, &|| true)
-        .with_context(|| format!("reading {}", path.display()))?
-        .expect("never interrupted");
-    anyhow::ensure!(
-        got == expected,
-        "{} does not hash to its address {expected} (it hashes to {got})",
-        path.display()
-    );
-    Ok(())
-}
-
-/// [`check_segment_bytes`] for a catalogued segment, quarantining it on a mismatch as the integrity
-/// passes do.
-pub fn check_or_quarantine(dir: &Path, table: &str, s: &Segment) -> Result<()> {
-    let path = segment_path(dir, &s.file, &s.hash);
-    let mut throttle = Throttle::new(u64::MAX);
-    // Only a read that completed is grounds for moving the file; a failed one is just refused.
-    let got = hash_throttled(&path, &mut throttle, &|| true)
-        .with_context(|| format!("reading {}", path.display()))?
-        .expect("never interrupted");
-    if got != s.hash {
-        if !s.provisional {
-            quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
-        }
-        anyhow::bail!(
-            "{} does not hash to its address {} (it hashes to {got})",
-            path.display(),
-            s.hash
-        );
+/// Quarantine a catalogued segment a caller read whole, to hand on, and found not to hash to its
+/// address. A provisional tail is left for the next start to record as lost.
+pub fn quarantine_mismatched(dir: &Path, table: &str, s: &Segment) {
+    if !s.provisional {
+        let path = segment_path(dir, &s.file, &s.hash);
+        quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
     }
-    Ok(())
 }
 
 /// Beside the catalogue: when every segment was last hashed, and the stamp of each segment file a
@@ -4379,7 +4352,6 @@ mod tests {
             return; // Running as root: nothing is unreadable.
         }
         assert_eq!(verify_and_quarantine(&dir).unwrap(), 0);
-        assert!(check_or_quarantine(&dir, "usdc__transfer", &seg).is_err());
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(shared.is_file(), "a readable-again segment was taken away");
         assert!(!root.path().join(QUARANTINE_DIR).exists());
