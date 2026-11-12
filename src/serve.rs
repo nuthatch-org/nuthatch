@@ -2666,19 +2666,69 @@ const ADMIN_CONFIG_FILES: &[&str] = &[
     crate::allowlist::CEILING_FILE,
 ];
 
-/// Config text with credentials taken out: every URL cut to `scheme://host`, and the value of any
-/// `secret`/`token`/`password`/`api_key` key replaced. On the text rather than the parsed config so
-/// comments survive, and so a URL in a comment is cut too.
-fn redact_config_text(text: &str) -> String {
-    const SECRET_KEYS: &[&str] = &["secret", "token", "password", "api_key", "apikey"];
+const SECRET_KEYS: &[&str] = &["secret", "token", "password", "api_key", "apikey"];
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_lowercase();
+    SECRET_KEYS.iter().any(|needle| key.contains(needle))
+}
+
+/// Config text with credentials taken out: every URL cut to `scheme://host`, and every value under a
+/// `secret`/`token`/`password`/`api_key` key replaced. A TOML file is redacted by its parsed
+/// structure, at any depth, and re-printed with its comments; one that does not parse is withheld.
+fn redact_config_text(name: &str, text: &str) -> String {
+    if !name.ends_with(".toml") {
+        return redact_config_lines(text);
+    }
+    match text.parse::<toml_edit::DocumentMut>() {
+        Ok(mut doc) => {
+            redact_toml_table(doc.as_table_mut(), false);
+            redact_urls(&doc.to_string())
+        }
+        Err(_) => "# not shown: this file does not parse as TOML, so its secrets cannot be found\n"
+            .to_string(),
+    }
+}
+
+fn redact_toml_table(table: &mut toml_edit::Table, secret: bool) {
+    for (key, item) in table.iter_mut() {
+        let secret = secret || is_secret_key(key.get());
+        match item {
+            toml_edit::Item::Value(v) => redact_toml_value(v, secret),
+            toml_edit::Item::Table(t) => redact_toml_table(t, secret),
+            toml_edit::Item::ArrayOfTables(a) => {
+                a.iter_mut().for_each(|t| redact_toml_table(t, secret))
+            }
+            toml_edit::Item::None => {}
+        }
+    }
+}
+
+fn redact_toml_value(value: &mut toml_edit::Value, secret: bool) {
+    match value {
+        toml_edit::Value::InlineTable(t) => {
+            for (key, v) in t.iter_mut() {
+                redact_toml_value(v, secret || is_secret_key(key.get()));
+            }
+        }
+        toml_edit::Value::Array(a) => a.iter_mut().for_each(|v| redact_toml_value(v, secret)),
+        _ if secret => {
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from("<redacted>");
+            *value.decor_mut() = decor;
+        }
+        _ => {}
+    }
+}
+
+/// [`redact_config_text`] for a file that is not TOML, line by line.
+fn redact_config_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
         let body = line.trim_end_matches(['\n', '\r']);
         let ending = &line[body.len()..];
         let key = body.split_once('=').map(|(k, _)| k.trim().to_lowercase());
-        let secret_key = key.is_some_and(|k| {
-            !k.starts_with('#') && SECRET_KEYS.iter().any(|needle| k.contains(needle))
-        });
+        let secret_key = key.is_some_and(|k| !k.starts_with('#') && is_secret_key(&k));
         if secret_key {
             let (k, _) = body.split_once('=').expect("a key was found");
             out.push_str(k);
@@ -2750,7 +2800,8 @@ async fn admin_config(
             .into_iter()
             .filter_map(|name| {
                 let text = std::fs::read_to_string(dir.join(&name)).ok()?;
-                Some(json!({ "name": name, "text": redact_config_text(&text) }))
+                let text = redact_config_text(&name, &text);
+                Some(json!({ "name": name, "text": text }))
             })
             .collect::<Vec<_>>()
     })
@@ -12316,16 +12367,55 @@ mod tests {
             "plain = \"https://rpc.example\"\n",
         );
         assert_eq!(
-            redact_config_text(text),
+            redact_config_text("nuthatch.toml", text),
             concat!(
                 "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/…\"] # see https://docs.example/…\n",
                 "url = \"https://hooks.slack.com/…\"\n",
                 "secret = \"<redacted>\"\n",
-                "api_key= \"<redacted>\"\n",
+                "api_key=\"<redacted>\"\n",
                 "key = [\"indexer\"]\n",
                 "plain = \"https://rpc.example\"\n",
             )
         );
+    }
+
+    /// A secret is found by where it sits in the parsed document, so neither an inline table nor a
+    /// multi-line string carries one past the redaction.
+    #[test]
+    fn config_text_redacts_a_secret_in_any_toml_shape() {
+        let text = concat!(
+            "webhooks = [{ name = \"w\", table = \"t\", url = \"https://hooks.example.com/abc\", secret = \"HMAC-INLINE\" }]\n",
+            "[alerts.webhook]\n",
+            "name = \"v\"\n",
+            "secret = \"\"\"\n",
+            "MULTILINE-SECRET\"\"\"\n",
+            "[alerts.slack]\n",
+            "Token = '''LITERAL-SECRET'''\n",
+            "nested = { inner = { api_key = \"DEEP-SECRET\" } }\n",
+            "passwords = [\"LIST-SECRET\", \"ANOTHER\"]\n",
+        );
+        let shown = redact_config_text("nuthatch.toml", text);
+        for leaked in [
+            "HMAC-INLINE",
+            "MULTILINE-SECRET",
+            "LITERAL-SECRET",
+            "DEEP-SECRET",
+            "LIST-SECRET",
+            "ANOTHER",
+            "/abc",
+        ] {
+            assert!(!shown.contains(leaked), "{leaked} shown:\n{shown}");
+        }
+        assert!(shown.contains("name = \"w\""), "{shown}");
+        assert!(shown.contains("[alerts.slack]"), "{shown}");
+        assert_eq!(shown.matches("<redacted>").count(), 6, "{shown}");
+    }
+
+    /// A file that does not parse cannot be searched for its secrets, so its text is not shown.
+    #[test]
+    fn config_text_that_does_not_parse_is_withheld() {
+        let shown = redact_config_text("nuthatch.toml", "secret = \"\"\"\nUNCLOSED-SECRET\n");
+        assert!(!shown.contains("UNCLOSED-SECRET"), "{shown}");
     }
 
     #[tokio::test]
