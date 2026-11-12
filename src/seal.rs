@@ -1912,6 +1912,7 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
                 s.hash,
                 path.display()
             );
+            record_quarantine(dir, shared.as_deref(), table, s);
             true
         }
         Err(e) => {
@@ -1922,6 +1923,143 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
             false
         }
     }
+}
+
+/// One segment this process quarantined.
+struct Quarantined {
+    dataset: PathBuf,
+    /// The shared store it was taken from, where every dataset naming its hash lost it too.
+    store: Option<PathBuf>,
+    table: String,
+    hash: String,
+    provisional: bool,
+    from_block: u64,
+    at: Instant,
+}
+
+/// What the start rebuilt derived state from: when, and through the last block then catalogued.
+#[derive(Clone, Copy)]
+struct Rebuilt {
+    at: Instant,
+    through: u64,
+}
+
+#[derive(Default)]
+struct Findings {
+    quarantined: Vec<Quarantined>,
+    rebuilt: HashMap<PathBuf, Rebuilt>,
+}
+
+fn findings() -> &'static Mutex<Findings> {
+    static F: OnceLock<Mutex<Findings>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+fn record_quarantine(dir: &Path, store: Option<&Path>, table: &str, s: &Segment) {
+    findings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .quarantined
+        .push(Quarantined {
+            dataset: lease_key(dir),
+            store: store.map(lease_key),
+            table: table.to_string(),
+            hash: s.hash.clone(),
+            provisional: s.provisional,
+            from_block: s.from_block,
+            at: Instant::now(),
+        });
+}
+
+/// The start is about to rebuild `dir`'s derived state (balances, exposure, velocity, entities) from
+/// its segments, after its integrity pass. A segment quarantined later leaves that state wrong.
+pub fn record_rebuild(dir: &Path) {
+    let through = shared_manifest(dir)
+        .map(|m| m.tables.values().flatten().map(|s| s.to_block).max())
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    findings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rebuilt
+        .insert(
+            lease_key(dir),
+            Rebuilt {
+                at: Instant::now(),
+                through,
+            },
+        );
+}
+
+/// What this process's integrity passes took from a dataset, for `/ready` and the answers derived
+/// from it. Holds until restart, which re-records a lost tail and rebuilds from what remains.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Integrity {
+    /// Tables whose cold data is reduced by a segment quarantined and not since restored.
+    pub reduced_tables: BTreeSet<String>,
+    pub quarantined_segments: usize,
+    /// Tables whose provisional tail was quarantined: every later seal fails reading it.
+    pub seals_stopped: BTreeSet<String>,
+    /// Derived state was rebuilt at start from a segment since quarantined.
+    pub derived_stale: bool,
+}
+
+impl Integrity {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "quarantined_segments": self.quarantined_segments,
+            "reduced_tables": self.reduced_tables,
+            "seals_stopped": !self.seals_stopped.is_empty(),
+            "seals_stopped_tables": self.seals_stopped,
+            "derived_state_stale": self.derived_stale,
+        })
+    }
+}
+
+/// [`Integrity`] for `dir`, `None` while nothing it names has been quarantined.
+pub fn integrity(dir: &Path) -> Option<Integrity> {
+    let f = findings().lock().unwrap_or_else(|e| e.into_inner());
+    if f.quarantined.is_empty() {
+        return None;
+    }
+    let me = lease_key(dir);
+    let store = shared_store(dir).map(|s| lease_key(&s));
+    let rebuilt = f.rebuilt.get(&me).copied();
+    let stale = |at: Instant, from_block: u64| {
+        rebuilt.is_some_and(|r| at > r.at && from_block <= r.through)
+    };
+    let manifest = shared_manifest(dir).ok();
+    let mut out = Integrity::default();
+    for q in &f.quarantined {
+        let mine = q.dataset == me;
+        if !mine && (q.store.is_none() || q.store != store) {
+            continue;
+        }
+        // Another dataset's find reaches this one only through a hash its own catalogue names.
+        let named = manifest.as_ref().and_then(|m| {
+            m.tables.iter().find_map(|(t, segs)| {
+                segs.iter()
+                    .find(|s| s.hash == q.hash)
+                    .map(|s| (t.clone(), s.clone()))
+            })
+        });
+        let (table, provisional, from_block, file) = match (&named, mine) {
+            (Some((t, s)), _) => (t.clone(), s.provisional, s.from_block, Some(&s.file)),
+            (None, true) => (q.table.clone(), q.provisional, q.from_block, None),
+            (None, false) => continue,
+        };
+        out.derived_stale |= stale(q.at, from_block);
+        if file.is_some_and(|file| segment_path(dir, file, &q.hash).exists()) {
+            continue;
+        }
+        out.quarantined_segments += 1;
+        if provisional {
+            out.seals_stopped.insert(table.clone());
+        }
+        out.reduced_tables.insert(table);
+    }
+    (out != Integrity::default()).then_some(out)
 }
 
 /// Bytes a background pass reads per second, across every dataset in the process: one pass runs at a

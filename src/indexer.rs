@@ -3437,6 +3437,7 @@ async fn build_nest(
         if let Err(e) = seal::verify_and_quarantine(&dir) {
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
+        seal::record_rebuild(&dir);
         let alive = Arc::downgrade(&store);
         seal::verify_in_background(
             dir.clone(),

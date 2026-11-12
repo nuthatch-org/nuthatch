@@ -1180,7 +1180,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 |---|---|
 | `GET /` | summary: nest identity, heights, table count |
 | `GET /health` | liveness. `200 "ok"` while the process serves |
-| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) or fails on every attempt for 15 minutes (`seal_faulted`) |
+| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) or fails on every attempt for 15 minutes (`seal_faulted`), or a quarantined provisional tail has stopped it (`integrity.seals_stopped`) |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
@@ -1835,6 +1835,17 @@ while sealing succeeds. Once it has lasted 15 minutes (or three poll intervals, 
 keeps every unsealed row meanwhile, so reads stay complete; the log line at each attempt is the same
 error.
 
+**What the integrity passes took is on `/ready`.** Once this process has quarantined a segment the
+nest names, `integrity` is `{"quarantined_segments", "reduced_tables", "seals_stopped",
+"seals_stopped_tables", "derived_state_stale"}`; it is absent until then, and holds until restart. A
+quarantined provisional tail stops every later seal, so `seals_stopped` turns true and the nest
+answers `503` at once, without waiting for `tip_seal_stalled`; the next start records the tail as lost
+and sealing resumes. `derived_state_stale` means the start rebuilt balances, exposure, velocity and
+entities from a segment since quarantined: they stay as built, the nest stays ready, and until a
+restart rebuilds them from what remains, `/balances`, `/balance`, `/exposure`, `/flags` and
+`/derived` answers carry `"derived_state_stale": true`, and a `/sql` answer naming an entity lists it
+in `degraded_tables` (#2898, #2900).
+
 **A log that matches a declared event and does not decode is counted, not dropped unseen.** `undecoded`
 is `{"total", "top"}`, `top` the five largest `{"contract", "topic0", "logs"}` pairs since start, and
 `GET /nest` carries the same block. It is a fact, not a verdict: a nest whose ABI no longer fits keeps
@@ -1985,11 +1996,13 @@ unchanged metadata is caught within one background pass of a start, and within 2
 pass after that. Until then a corrupted segment that still decodes can answer a query wrongly. The views
 and balances rebuilt at start read segments before that pass has verified them, where before 5.21
 rot that happened before a restart was caught before the rebuild; and nothing retracts derived state
-built from a segment that is later quarantined, so it stays wrong until the next restart. A segment
+built from a segment that is later quarantined, so it stays wrong until the next restart, and
+`/ready` and the answers drawn from it say so (`derived_state_stale`). A segment
 in a runtime's shared store (`<root>/segments/`) is moved to `<root>/quarantine/<hash>.parquet`: its
 bytes are wrong for every dataset that names that hash, so every mount of every such nest answers
-reduced from then on, and sealing the same rows again in any of them puts it back. A provisional tail found corrupt in the background stops later seals until the next
-start records it as lost. `nuthatch publish` hashes every segment before it uploads it, and refuses
+reduced from then on, and sealing the same rows again in any of them puts it back. A provisional
+tail found corrupt in the background stops later seals until the next start records it as lost, and
+`/ready` answers `503` with `integrity.seals_stopped` from that moment. `nuthatch publish` hashes every segment before it uploads it, and refuses
 (and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
 --catalogue` checks the same thing and only reports.
 
