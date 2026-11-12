@@ -1,4 +1,5 @@
-//! The head count (RFC-0054): an opt-in ping at `init`, off until a person answers yes.
+//! The head count (RFC-0054): an opt-in ping at `init` and one a week from a running nest,
+//! off until a person answers yes.
 //!
 //! Every line outside this file that reaches it ends in `RFC-0054 hook`, and
 //! `scripts/delete-count.sh` removes exactly those lines and this file. CI builds and tests what is
@@ -17,6 +18,10 @@ pub const TOTALS: &str = "https://www.nuthatch-indexer.com/count";
 const USER_AGENT: &str = "nuthatch-count/1";
 /// One ceiling for everything a single command sends, so `init` is never more than this slower.
 const CEILING: Duration = Duration::from_secs(2);
+const PAYLOAD_V: u8 = 2;
+/// How soon after start a running nest first looks at whether a week has passed, and how often.
+const ALIVE_CHECK: Duration = Duration::from_secs(3600);
+const ALIVE_EVERY_DAYS: u64 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,9 +73,22 @@ pub enum Event {
     /// `None` from `count on`, which has no nest; the keys are then absent, not null.
     Counted(Option<Nest>),
     Init(Nest),
+    /// The `/sql` queries this process accepted since it last said so, sent as a bucket.
+    Alive(u64),
 }
 
-/// The v1 payload. A new field is an RFC amendment and a `v` bump, and A3 fails until it is one.
+/// Orders of magnitude only: an exact count every week would be a fingerprint.
+pub fn bucket(queries: u64) -> &'static str {
+    match queries {
+        0 => "0",
+        1..=99 => "1+",
+        100..=9_999 => "100+",
+        10_000..=999_999 => "10k+",
+        _ => "1m+",
+    }
+}
+
+/// The v2 payload. A new field is an RFC amendment and a `v` bump, and A3 fails until it is one.
 #[derive(Debug, PartialEq, Serialize)]
 pub struct Payload {
     v: u8,
@@ -82,22 +100,26 @@ pub struct Payload {
     chain: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<Source>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queries: Option<&'static str>,
 }
 
 impl Event {
     pub fn payload(self) -> Payload {
-        let (event, nest) = match self {
-            Event::Counted(nest) => ("counted", nest),
-            Event::Init(nest) => ("init", Some(nest)),
+        let (event, nest, queries) = match self {
+            Event::Counted(nest) => ("counted", nest, None),
+            Event::Init(nest) => ("init", Some(nest), None),
+            Event::Alive(queries) => ("alive", None, Some(bucket(queries))),
         };
         Payload {
-            v: 1,
+            v: PAYLOAD_V,
             event,
             version: env!("CARGO_PKG_VERSION"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             chain: nest.map(|n| n.chain),
             source: nest.map(|n| n.source),
+            queries,
         }
     }
 
@@ -110,6 +132,15 @@ impl Event {
 pub struct Answer {
     pub counted: bool,
     pub asked_at: String,
+    /// The payload version this machine was last told about. Absent in a file written before v2.
+    #[serde(default = "v1")]
+    pub v: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alive_at: Option<String>,
+}
+
+fn v1() -> u8 {
+    1
 }
 
 impl Answer {
@@ -132,17 +163,34 @@ impl Answer {
         Answer {
             counted,
             asked_at: today(),
+            v: PAYLOAD_V,
+            alive_at: None,
+        }
+    }
+
+    /// ISO days compare as strings, so no date is parsed back.
+    fn alive_due(&self, today_days: u64) -> bool {
+        match &self.alive_at {
+            Some(at) => *at <= day(today_days.saturating_sub(ALIVE_EVERY_DAYS)),
+            None => true,
         }
     }
 }
 
-fn today() -> String {
-    let secs = std::time::SystemTime::now()
+fn today_days() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, m, d) = crate::publish::civil_from_days((secs / 86_400) as i64);
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+fn day(days: u64) -> String {
+    let (y, m, d) = crate::publish::civil_from_days(days as i64);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn today() -> String {
+    day(today_days())
 }
 
 /// `$XDG_CONFIG_HOME/nuthatch/count.toml`, else `$HOME/.config/nuthatch/count.toml`. `None` when
@@ -172,11 +220,13 @@ pub fn config_path() -> Option<PathBuf> {
 pub enum Decision {
     Silent,
     Ask,
+    /// Nobody is there to answer: one line saying how to be counted, and nothing sent.
+    Hint,
     Send,
 }
 
-/// `CI` and `NUTHATCH_NO_COUNT` silence a stored yes as well as the question: a CI job's `init`
-/// is a test run, not a nest someone made.
+/// `CI` and the opt-outs silence a stored yes as well as the question: a CI job's `init` is a
+/// test run, not a nest someone made.
 pub fn decide(stored: Option<&Answer>, interactive: bool, ci: bool, opted_out: bool) -> Decision {
     if ci || opted_out {
         return Decision::Silent;
@@ -185,21 +235,44 @@ pub fn decide(stored: Option<&Answer>, interactive: bool, ci: bool, opted_out: b
         Some(a) if a.counted => Decision::Send,
         Some(_) => Decision::Silent,
         None if interactive => Decision::Ask,
-        None => Decision::Silent,
+        None => Decision::Hint,
     }
+}
+
+/// `NUTHATCH_NO_COUNT` set at all, or `DO_NOT_TRACK` set to anything but empty or `0`.
+pub fn opted_out_from(
+    no_count: Option<std::ffi::OsString>,
+    dnt: Option<std::ffi::OsString>,
+) -> bool {
+    no_count.is_some() || dnt.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+fn silenced() -> (bool, bool) {
+    (
+        std::env::var_os("CI").is_some(),
+        opted_out_from(
+            std::env::var_os("NUTHATCH_NO_COUNT"),
+            std::env::var_os("DO_NOT_TRACK"),
+        ),
+    )
 }
 
 pub fn prompt_text(nest: Nest) -> String {
     format!(
         "\nnuthatch has no idea how many people use it. Can it count you?\n\n\
-         If you say yes it will send this, once now and once per future `init`, to\n\
-         {ENDPOINT} and nothing else, ever:\n\n  {}\n\n\
-         No identifier, no addresses. The handler stores no IP, header or body. The totals\n\
-         are public at {TOTALS}. `nuthatch count off` reverses\n\
-         this.\n\nCount me? [y/N] ",
-        Event::Init(nest).json()
+         If you say yes it will send this to {ENDPOINT},\n\
+         once now and once per future `init`:\n\n  {}\n\n\
+         and this once a week from a running nest, and nothing else, ever:\n\n  {}\n\n\
+         No identifier, no addresses, no query text. The handler stores no IP, header or\n\
+         body. The totals are public at {TOTALS}.\n\
+         `nuthatch count off` reverses this.\n\nCount me? [y/N] ",
+        Event::Init(nest).json(),
+        Event::Alive(0).json()
     )
 }
+
+pub const HINT: &str = "nuthatch has no idea how many people use it. `nuthatch count on` lets it \
+     count you, with no identifier; `nuthatch count payload` shows what is sent.\n";
 
 /// Asks once and stores the answer, whatever it is, so a no is never asked again.
 pub fn ask(path: &Path, nest: Nest, mut input: impl BufRead, mut output: impl Write) -> bool {
@@ -256,15 +329,12 @@ impl Pending {
         let interactive = std::io::stdin().is_terminal()
             && std::io::stdout().is_terminal()
             && !typed_ahead(&std::io::stdin());
-        let decision = decide(
-            Answer::load(&path).as_ref(),
-            interactive,
-            std::env::var_os("CI").is_some(),
-            std::env::var_os("NUTHATCH_NO_COUNT").is_some(),
-        );
+        let (ci, opted_out) = silenced();
+        let decision = decide(Answer::load(&path).as_ref(), interactive, ci, opted_out);
         let nest = Nest::new(chain_in(&self.dir), self.source);
         match decision {
             Decision::Silent => {}
+            Decision::Hint => eprint!("{HINT}"),
             Decision::Send => send_to(ENDPOINT, &[Event::Init(nest)]).await,
             Decision::Ask => {
                 if ask(&path, nest, std::io::stdin().lock(), std::io::stdout()) {
@@ -292,6 +362,58 @@ fn typed_ahead<T>(_: &T) -> bool {
     false
 }
 
+/// The `/sql` queries this process has accepted, kept here so deleting this file deletes it.
+static QUERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn query() {
+    QUERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Starts the weekly `alive` for a command that serves a nest, and does nothing for any other.
+pub fn alive(command: &crate::cli::Command) {
+    use crate::cli::Command;
+    if !matches!(command, Command::Dev(_) | Command::Serve(_)) {
+        return;
+    }
+    let Some(path) = config_path() else { return };
+    tokio::spawn(async move {
+        let mut sent = 0;
+        loop {
+            tokio::time::sleep(ALIVE_CHECK).await;
+            let (ci, opted_out) = silenced();
+            let queries = QUERIES.load(std::sync::atomic::Ordering::Relaxed);
+            if beat(ENDPOINT, &path, queries - sent, ci, opted_out, today_days()).await {
+                sent = queries;
+            }
+        }
+    });
+}
+
+/// One look at whether this machine owes an `alive`: only after a yes to the payload that has
+/// one, so a yes given under v1 sends none. The answer is read again each time, so a `count off`
+/// typed while the nest runs is honoured at the next look. `true` when one was sent.
+async fn beat(
+    url: &str,
+    path: &Path,
+    queries: u64,
+    ci: bool,
+    opted_out: bool,
+    today_days: u64,
+) -> bool {
+    let Some(mut answer) = Answer::load(path) else {
+        return false;
+    };
+    if ci || opted_out || !answer.counted || answer.v < PAYLOAD_V || !answer.alive_due(today_days) {
+        return false;
+    }
+    answer.alive_at = Some(day(today_days));
+    if answer.store(path).is_err() {
+        return false;
+    }
+    send_to(url, &[Event::Alive(queries)]).await;
+    true
+}
+
 /// Read back from what `init` wrote, so every arm of `init` is counted without each passing it on.
 fn chain_in(dir: &Path) -> u64 {
     std::fs::read_to_string(dir.join("nuthatch.toml"))
@@ -304,8 +426,9 @@ fn chain_in(dir: &Path) -> u64 {
 
 /// Opt in to, or out of, the head count (RFC-0054). Off until you say yes.
 ///
-/// With a yes, `nuthatch init` sends one small JSON object per nest created, with no identifier and
-/// no addresses: `nuthatch count payload` prints it. With no action, prints where things stand.
+/// With a yes, `nuthatch init` sends one small JSON object per nest created and a running nest sends
+/// one a week, with no identifier and no addresses: `nuthatch count payload` prints them. With no
+/// action, prints where things stand.
 #[derive(Debug, clap::Args)]
 pub struct CountArgs {
     #[command(subcommand)]
@@ -318,7 +441,7 @@ pub enum CountAction {
     On,
     /// Say no. Nothing is sent, ever, until you say `on`.
     Off,
-    /// Print both objects this machine can send, populated.
+    /// Print the three objects this machine can send, populated.
     Payload,
     /// Delete the stored answer, so the next `init` may ask again.
     Forget,
@@ -354,6 +477,7 @@ pub async fn run(args: CountArgs) -> anyhow::Result<()> {
         Some(CountAction::Payload) => {
             println!("{}", Event::Counted(None).json());
             println!("{}", Event::Init(cwd_nest()).json());
+            println!("{}", Event::Alive(0).json());
         }
         Some(CountAction::Forget) => match std::fs::remove_file(&path) {
             Ok(()) => println!("✓ forgot {}", path.display()),
@@ -438,7 +562,7 @@ mod tests {
 
     // A3: the field set is the RFC's, exactly. Adding one fails here until the RFC is amended.
     #[test]
-    fn an_init_payload_carries_exactly_the_v1_fields_for_every_chain_and_source() {
+    fn an_init_payload_carries_exactly_the_v2_fields_for_every_chain_and_source() {
         for chain in crate::chains::all() {
             for source in SOURCES {
                 let json = Event::Init(Nest::new(chain.chain_id, source)).json();
@@ -448,7 +572,7 @@ mod tests {
                     "{json}"
                 );
                 let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-                assert_eq!(v["v"], 1);
+                assert_eq!(v["v"], 2);
                 assert_eq!(v["event"], "init");
                 assert_eq!(v["chain"], chain.chain_id);
             }
@@ -490,27 +614,156 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_shows_the_payload_it_asks_about() {
+    fn an_alive_payload_carries_a_bucket_and_no_nest() {
+        let json = Event::Alive(12_345).json();
+        assert_eq!(
+            keys(&json),
+            set(&["v", "event", "version", "os", "arch", "queries"]),
+            "{json}"
+        );
+        assert!(json.contains(r#""event":"alive""#) && json.contains(r#""queries":"10k+""#));
+        for (n, want) in [
+            (0, "0"),
+            (1, "1+"),
+            (99, "1+"),
+            (100, "100+"),
+            (9_999, "100+"),
+            (10_000, "10k+"),
+            (999_999, "10k+"),
+            (1_000_000, "1m+"),
+            (u64::MAX, "1m+"),
+        ] {
+            assert_eq!(bucket(n), want, "{n}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_shows_the_payloads_it_asks_about() {
         let nest = Nest::new(1, Source::Addresses);
         let text = prompt_text(nest);
         assert!(text.contains(&Event::Init(nest).json()));
+        assert!(text.contains(&Event::Alive(0).json()));
         assert!(text.contains(ENDPOINT));
         assert!(text.trim_end().ends_with("[y/N]"));
     }
 
+    fn stored(counted: bool, v: u8) -> Answer {
+        Answer {
+            v,
+            ..Answer::new(counted)
+        }
+    }
+
     #[test]
-    fn nothing_is_asked_or_sent_without_a_terminal_or_under_ci_or_the_opt_out() {
+    fn nothing_is_asked_or_sent_under_ci_or_an_opt_out_and_no_terminal_gets_a_hint() {
         let yes = Answer::new(true);
         let no = Answer::new(false);
-        assert_eq!(decide(None, false, false, false), Decision::Silent);
+        assert_eq!(decide(None, false, false, false), Decision::Hint);
+        assert_eq!(decide(None, false, true, false), Decision::Silent);
+        assert_eq!(decide(None, false, false, true), Decision::Silent);
         assert_eq!(decide(None, true, true, false), Decision::Silent);
         assert_eq!(decide(None, true, false, true), Decision::Silent);
         assert_eq!(decide(Some(&yes), true, true, false), Decision::Silent);
         assert_eq!(decide(Some(&yes), true, false, true), Decision::Silent);
         assert_eq!(decide(Some(&no), true, false, false), Decision::Silent);
+        assert_eq!(decide(Some(&no), false, false, false), Decision::Silent);
         assert_eq!(decide(None, true, false, false), Decision::Ask);
         // A stored yes counts a scripted `init` too: the person already said yes.
         assert_eq!(decide(Some(&yes), false, false, false), Decision::Send);
+        assert_eq!(
+            decide(Some(&stored(true, 1)), true, false, false),
+            Decision::Send
+        );
+    }
+
+    #[test]
+    fn do_not_track_counts_unless_empty_or_zero() {
+        let o =
+            |n: Option<&str>, d: Option<&str>| opted_out_from(n.map(Into::into), d.map(Into::into));
+        assert!(!o(None, None));
+        assert!(o(Some(""), None));
+        assert!(o(None, Some("1")));
+        assert!(o(None, Some("true")));
+        assert!(!o(None, Some("0")));
+        assert!(!o(None, Some("")));
+    }
+
+    #[test]
+    fn a_file_written_before_v2_reads_as_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.toml");
+        std::fs::write(&path, "counted = true\nasked_at = \"2026-10-24\"\n").unwrap();
+        let a = Answer::load(&path).unwrap();
+        assert_eq!((a.counted, a.v, a.alive_at), (true, 1, None));
+    }
+
+    /// Answers 204 to every request and keeps the bodies.
+    async fn receiver() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = bodies.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((_, body)) = text.split_once("\r\n\r\n") {
+                        if body.ends_with('}') || n == 0 {
+                            break body.to_string();
+                        }
+                    }
+                };
+                seen.lock().unwrap().push(body);
+                sock.write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        (url, bodies)
+    }
+
+    fn events(bodies: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        bodies
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|b| {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                v["event"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_nest_says_alive_once_a_week_and_only_after_a_yes_to_v2() {
+        let (url, bodies) = receiver().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("count.toml");
+        let day0 = 20_000;
+
+        assert!(!beat(&url, &path, 5, false, false, day0).await);
+        assert!(!path.exists());
+        for silent in [stored(false, 2), stored(true, 1)] {
+            silent.store(&path).unwrap();
+            assert!(!beat(&url, &path, 5, false, false, day0).await);
+        }
+        stored(true, 2).store(&path).unwrap();
+        assert!(!beat(&url, &path, 5, true, false, day0).await);
+        assert!(!beat(&url, &path, 5, false, true, day0).await);
+        assert_eq!(events(&bodies), Vec::<String>::new());
+
+        assert!(beat(&url, &path, 5, false, false, day0).await);
+        assert_eq!(events(&bodies), ["alive"]);
+        assert_eq!(Answer::load(&path).unwrap().alive_at, Some(day(day0)));
+        assert!(!beat(&url, &path, 5, false, false, day0 + 6).await);
+        assert_eq!(events(&bodies), Vec::<String>::new());
+        assert!(beat(&url, &path, 5, false, false, day0 + 7).await);
+        assert_eq!(events(&bodies), ["alive"]);
     }
 
     #[test]
@@ -565,12 +818,14 @@ mod tests {
         Answer {
             counted: false,
             asked_at: "2026-09-11".into(),
+            v: 2,
+            alive_at: None,
         }
         .store(&path)
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "# nuthatch count - see `nuthatch count --help`\ncounted = false\nasked_at = \"2026-09-11\"\n"
+            "# nuthatch count - see `nuthatch count --help`\ncounted = false\nasked_at = \"2026-09-11\"\nv = 2\n"
         );
     }
 

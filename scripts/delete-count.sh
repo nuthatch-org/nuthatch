@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 # Every hook outside src/count.rs ends in this marker; finding fewer means one was reformatted onto
 # two lines or renamed, and deleting the rest would leave a half-hook that hides the fault.
 marker='// RFC-0054 hook'
-expected=7
+expected=9
 
 rm src/count.rs
 hooks=$(grep -rlF -- "$marker" src tests || true)

@@ -53,7 +53,12 @@ stored in `~/.config/nuthatch/count.toml` (or under `$XDG_CONFIG_HOME`), so it i
 again. With a yes, each later `init` sends one object - nuthatch version, OS, architecture, a
 built-in chain id (anything else is sent as 0) and which kind of `init` it was - with no identifier
 and no addresses, under a two-second ceiling, and nothing about a failure is ever printed. Nothing
-is asked or sent when `CI` or `NUTHATCH_NO_COUNT` is set. `nuthatch count` shows the state,
+is asked or sent when `CI` or `NUTHATCH_NO_COUNT` is set, or `DO_NOT_TRACK` is set to anything but empty
+or `0`. A yes given from 5.20 on covers one more object (a yes from before it does not, until you run
+`nuthatch count on` again): a nest running under `dev` or `serve` sends one a week carrying the number of `/sql` queries it
+served as an order of magnitude (`0`, `1+`, `100+`, `10k+`, `1m+`), and nothing about the queries
+themselves. An `init` with no terminal cannot ask, so it prints one line saying `nuthatch count on`
+exists and sends nothing. `nuthatch count` shows the state,
 `nuthatch count payload` prints the objects, and `nuthatch count off` stops it.
 
 ---

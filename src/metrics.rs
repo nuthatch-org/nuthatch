@@ -1132,6 +1132,7 @@ impl Metrics {
         });
     }
     pub fn inc_sql(&self) {
+        crate::count::query(); // RFC-0054 hook
         self.sql_queries.fetch_add(1, Relaxed);
         in_serving_scope(|s| {
             s.nest.sql_queries.fetch_add(1, Relaxed);

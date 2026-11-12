@@ -122,7 +122,7 @@ Say yes. Sends one `counted` event now, with no chain and no source
 
 ## `nuthatch count payload`
 
-Print both objects this machine can send, populated
+Print the three objects this machine can send, populated
 
 
 ## `nuthatch dev`

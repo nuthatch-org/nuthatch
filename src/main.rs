@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
             .init(),
     }
 
+    nuthatch::count::alive(&cli.command); // RFC-0054 hook
     match cli.command {
         cli::Command::Init(args) => project::init(args).await,
         cli::Command::Count(a) => nuthatch::count::run(a).await, // RFC-0054 hook

@@ -244,6 +244,9 @@ unconfigured.
 > tally public. §11 is settled with the RFC's own leanings: a single-purpose `count.toml`, the
 > receiver on the Helsinki host where we own the ingress log, `chain` kept under the registry-only
 > rule, and the number published early with its caveat in the same sentence.
+> **Amended 2026-11-12 by Chief** (RFC-0054 §12): still opt-in. A yes now also covers a weekly
+> `alive` from a running nest with a bucketed query count, and an `init` with no terminal prints
+> one line saying how to be counted. On-by-default was built and withdrawn the same day.
 >
 > **RFC-0063 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0063](docs/rfcs/0063-address-history.md) (address history) on 2026-10-09 for rotki, whose
