@@ -151,6 +151,7 @@ pub fn compose(
     sem: Option<&Semantic>,
     coverage: Option<&Coverage>,
     maintained: &[MaintainedRelation],
+    gates: Gates,
 ) -> String {
     let mut out = String::new();
     out.push_str("nuthatch data model\n\n");
@@ -169,10 +170,13 @@ pub fn compose(
         ));
         if let Some(from) = c.first_indexed {
             out.push_str(&format!(
-                "  first_indexed = {from} - no block before it is in this nest, so the `balances` \
-                 view is the net flow since then, a balance only if this is the contract's \
-                 deployment block.\n"
+                "  first_indexed = {from} - no block before it is in this nest"
             ));
+            out.push_str(if gates.transfers {
+                ", so the `balances` view is the net flow since then, a balance only if this is the contract's deployment block.\n"
+            } else {
+                ".\n"
+            });
         }
         out.push('\n');
     }
@@ -287,21 +291,46 @@ pub fn compose(
         }
     }
 
-    out.push_str(GENERAL_GUIDANCE);
+    if gates.transfers {
+        out.push_str(VIEWS_GUIDANCE);
+    }
+    if gates.compliance {
+        out.push_str(COMPLIANCE_GUIDANCE);
+    }
+    out.push_str(FACTORIES_GUIDANCE);
     out
 }
 
-/// Nest-independent guidance every composed schema carries - the derived views and compliance/factory
-/// surfaces an agent should know exist. Kept as a trailing appendix so the per-nest tables lead.
-const GENERAL_GUIDANCE: &str = r#"
+/// Which capability-gated surfaces a nest has, as `GET /shape` reports them (RFC-0025). `/schema` names
+/// only the views and tools that exist, as `tools/list` does.
+#[derive(Debug, Clone, Copy)]
+pub struct Gates {
+    pub transfers: bool,
+    pub compliance: bool,
+}
+
+impl Gates {
+    pub const ALL: Gates = Gates {
+        transfers: true,
+        compliance: true,
+    };
+}
+
+/// Nest-independent guidance the composed schema carries after the tables: the derived views, and the
+/// compliance and factory surfaces, each only where the nest has it.
+const VIEWS_GUIDANCE: &str = r#"
 VIEWS (incrementally maintained; reorgs retract automatically)
   balances - per-address net balance = Σ(received) − Σ(sent), i128 base units as decimal strings,
              for ERC-20 Transfer tables. Query via the `balance`/`top_balances` tools.
+"#;
 
+const COMPLIANCE_GUIDANCE: &str = r#"
 COMPLIANCE (RFC-0008; amounts are i128 base units as decimal strings)
   exposure       - an address's direct exposure to the labeled set (tool `exposure`).
   flags          - threshold and velocity flags (tool `flags`).
+"#;
 
+const FACTORIES_GUIDANCE: &str = r#"
 FACTORIES (RFC-0009; only in a nest with templates/factories)
   Children of a template share tables (`pool__swap`, …), distinguished by the `address` column. Each
   template has a `{template}__children` view: which children were discovered, when, by which parent.
@@ -737,7 +766,7 @@ mod tests {
                 description: "The addresses that received the most transfers.".into(),
             },
         );
-        let doc = compose(&schema, Some(&sem), None, &[]);
+        let doc = compose(&schema, Some(&sem), None, &[], Gates::ALL);
         assert!(doc.contains("AUTHORED VIEWS"));
         assert!(doc.contains("top_recipients - The addresses that received the most transfers."));
     }
@@ -764,6 +793,7 @@ mod tests {
                 relation("priced", &["offchain__prices"]),
                 relation("plain", &[]),
             ],
+            Gates::ALL,
         );
         let line = doc
             .lines()
@@ -774,16 +804,51 @@ mod tests {
     }
 
     #[test]
+    fn the_schema_names_only_the_views_and_tools_the_nest_has() {
+        let doc = |gates| compose(&[transfer_table()], None, None, &[], gates);
+        let bare = doc(Gates {
+            transfers: false,
+            compliance: false,
+        });
+        for absent in ["`balance`", "top_balances", "`exposure`", "`flags`"] {
+            assert!(
+                !bare.contains(absent),
+                "{absent} named on a nest without it:\n{bare}"
+            );
+        }
+        assert!(bare.contains("FACTORIES"), "{bare}");
+        let token = doc(Gates {
+            transfers: true,
+            compliance: false,
+        });
+        assert!(
+            token.contains("top_balances") && !token.contains("`exposure`"),
+            "{token}"
+        );
+        let full = doc(Gates::ALL);
+        assert!(
+            full.contains("top_balances") && full.contains("`exposure`"),
+            "{full}"
+        );
+    }
+
+    #[test]
     fn coverage_names_the_first_indexed_block() {
         let cov = |first_indexed| Coverage {
             sealed_through: 90,
             tip: 100,
             first_indexed,
         };
-        let doc = compose(&[transfer_table()], None, Some(&cov(Some(26_397_446))), &[]);
+        let doc = compose(
+            &[transfer_table()],
+            None,
+            Some(&cov(Some(26_397_446))),
+            &[],
+            Gates::ALL,
+        );
         assert!(doc.contains("first_indexed = 26397446"), "{doc}");
         assert!(doc.contains("net flow"), "{doc}");
-        let doc = compose(&[transfer_table()], None, Some(&cov(None)), &[]);
+        let doc = compose(&[transfer_table()], None, Some(&cov(None)), &[], Gates::ALL);
         assert!(!doc.contains("first_indexed"), "{doc}");
     }
 
