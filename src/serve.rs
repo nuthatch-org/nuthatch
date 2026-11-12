@@ -1523,12 +1523,8 @@ async fn etherscan_api(
     Json(answer)
 }
 
-/// The nest's capability *shape* (RFC-0025): which capability-gated MCP surfaces are live, so the
-/// `nuthatch mcp` bridge advertises only the tools that will actually return data - never, say,
-/// `top_balances` on a Uniswap-pool nest, which would answer `{"count":0}` and read to an agent as
-/// "the index is empty". Derived from what the nest *has* - a transfer-shaped decoder (the same gate
-/// the balance view uses) and whether RFC-0008 compliance is configured - so the surface stays honest
-/// by construction, with no operator knob.
+/// Which capability-gated surfaces this nest has: a transfer-shaped decoder (the balance view's own
+/// gate) and whether RFC-0008 compliance is configured.
 fn nest_gates(s: &AppState) -> crate::semantic::Gates {
     crate::semantic::Gates {
         transfers: s.tables.iter().any(|t| t.is_transfer_shaped()),
@@ -1539,6 +1535,12 @@ fn nest_gates(s: &AppState) -> crate::semantic::Gates {
     }
 }
 
+/// The nest's capability *shape* (RFC-0025): which capability-gated MCP surfaces are live, so the
+/// `nuthatch mcp` bridge advertises only the tools that will actually return data - never, say,
+/// `top_balances` on a Uniswap-pool nest, which would answer `{"count":0}` and read to an agent as
+/// "the index is empty". Derived from what the nest *has* - a transfer-shaped decoder (the same gate
+/// the balance view uses) and whether RFC-0008 compliance is configured - so the surface stays honest
+/// by construction, with no operator knob.
 async fn shape(State(s): State<AppState>) -> Json<Value> {
     let gates = nest_gates(&s);
     Json(json!({

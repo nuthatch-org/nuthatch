@@ -81,6 +81,9 @@ fn client_config_json(exe: &str, base: &str, token_env: Option<&str>) -> Value {
 /// than the 64 MiB a message may be.
 const SQL_TEXT_BUDGET: usize = 256 * 1024;
 
+/// The longest cell the text table carries; with the budget, no single row can exceed it.
+const MAX_CELL_CHARS: usize = 4096;
+
 /// One message in either direction. A `/sql` answer is capped at 64 MiB already, so nothing legitimate
 /// is larger, and an unbounded line is an unbounded allocation (#1661).
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -276,10 +279,10 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
 }
 
 /// A runtime serves each mount under `/<alias>` or `/<tenant>/<alias>` and nothing else at its root, so
-/// a bridge pointed at the root meets a bare 404 from every tool. When that is the whole error, ask
-/// `/nests` and name the URLs that would work.
+/// a bridge pointed at the root meets a bare 404 from every tool. After any 404, ask `/nests`, which
+/// only a runtime root answers, and name the URLs that would work.
 async fn explain_bare_404(error: String, client: &reqwest::Client, base: &str) -> String {
-    if error.trim() != "HTTP 404:" {
+    if !error.starts_with("HTTP 404:") {
         return error;
     }
     let mounts: Vec<String> = match get(client, &format!("{base}/nests")).await {
@@ -288,8 +291,12 @@ async fn explain_bare_404(error: String, client: &reqwest::Client, base: &str) -
             .and_then(|v| {
                 v.get("nests").and_then(Value::as_array).map(|n| {
                     n.iter()
-                        .filter_map(|e| e.get("name").and_then(Value::as_str))
-                        .map(|name| format!("{}/{name}", base.trim_end_matches('/')))
+                        .filter_map(|e| {
+                            let name = e.get("name").and_then(Value::as_str)?;
+                            let path = e.get("base_path").and_then(Value::as_str);
+                            let path = path.map_or_else(|| format!("/{name}"), str::to_string);
+                            Some(format!("{}{path}", base.trim_end_matches('/')))
+                        })
                         .collect()
                 })
             })
@@ -297,7 +304,7 @@ async fn explain_bare_404(error: String, client: &reqwest::Client, base: &str) -
         Err(_) => Vec::new(),
     };
     if mounts.is_empty() {
-        return format!("{error} - nothing is served at this URL; if it is a runtime's root, point --url at a mount (http://host:port/<alias>)");
+        return error;
     }
     format!(
         "{error} - this URL is a runtime's root, which serves no data; restart `nuthatch mcp` with --url set to one mount: {}",
@@ -716,7 +723,11 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
                 .map(|o| o.keys().cloned().collect())
                 .unwrap_or_default(),
         };
-        let mut w: Vec<usize> = cols.iter().map(String::len).collect();
+        let heads: Vec<String> = cols
+            .iter()
+            .map(|c| cell(&Value::String(c.clone())))
+            .collect();
+        let mut w: Vec<usize> = heads.iter().map(String::len).collect();
         for r in &rows {
             if let Some(o) = r.as_object() {
                 for (i, c) in cols.iter().enumerate() {
@@ -726,7 +737,7 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
         }
         let pad = |s: &str, i: usize| format!("{s:<width$}", width = w[i]);
         out.push_str(
-            &cols
+            &heads
                 .iter()
                 .enumerate()
                 .map(|(i, c)| pad(c, i))
@@ -800,7 +811,7 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
 /// line-separator character is JSON-quoted instead: chain data could otherwise end its row and
 /// write lines that pass for the bridge's own.
 fn cell(v: &Value) -> String {
-    match v {
+    clip(match v {
         Value::String(s)
             if s.chars()
                 .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) =>
@@ -820,6 +831,15 @@ fn cell(v: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
         other => other.to_string(),
+    })
+}
+
+/// `s`, or its first `MAX_CELL_CHARS` characters and a count of the rest. A row must fit the text budget
+/// whatever one cell holds; `substr` in the query reads the remainder.
+fn clip(s: String) -> String {
+    match s.char_indices().nth(MAX_CELL_CHARS) {
+        Some((at, _)) => format!("{}…[{} more characters]", &s[..at], s[at..].chars().count()),
+        None => s,
     }
 }
 
@@ -1872,9 +1892,11 @@ mod tests {
     #[tokio::test]
     async fn a_runtime_root_is_explained_instead_of_a_bare_404() {
         use axum::{routing::get, Router};
-        let app = Router::new().route(
+        let app = Router::new()
+            .fallback(|| async { (axum::http::StatusCode::NOT_FOUND, "no such route") })
+            .route(
             "/nests",
-            get(|| async { r#"{"runtime":"r","nests":[{"name":"acme/tokens"},{"name":"usdc"}]}"# }),
+            get(|| async { r#"{"runtime":"r","nests":[{"name":"acme/tokens","base_path":"/acme/tokens"},{"name":"usdc"}]}"# }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1886,6 +1908,38 @@ mod tests {
         assert!(text.contains(&format!("{base}/acme/tokens")), "{text}");
         assert!(text.contains(&format!("{base}/usdc")), "{text}");
         server.abort();
+    }
+
+    /// The control: a mount's own 404 (no `/nests` there) is relayed as sent.
+    #[tokio::test]
+    async fn a_mounts_own_404_is_relayed_as_sent() {
+        use axum::{routing::get, Router};
+        let app = Router::new().route(
+            "/entity/{id}",
+            get(|| async {
+                (
+                    axum::http::StatusCode::NOT_FOUND,
+                    r#"{"error":"not found"}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let out = call_named(&client, &base, "entity", json!({ "id": "x" })).await;
+        assert_eq!(tool_text(&out), r#"HTTP 404: {"error":"not found"}"#);
+        server.abort();
+    }
+
+    #[test]
+    fn one_enormous_cell_cannot_defeat_the_budget() {
+        let raw = json!({ "count": 1, "rows": [{ "calldata": "ab".repeat(2_000_000) }],
+            "provenance": { "as_of": 9, "sealed_through": 9, "source": "hot+sealed", "registry_hash": "0xabcd1234" } })
+        .to_string();
+        let out = format_sql_result(&raw, 200);
+        assert!(out.len() < SQL_TEXT_BUDGET, "{} bytes", out.len());
+        assert!(out.contains("more characters]"), "the cut is stated");
     }
 
     /// On a `--backfill` nest the balance view is a net flow over the window; the answer carries the

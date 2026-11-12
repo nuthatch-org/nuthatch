@@ -224,12 +224,12 @@ pub fn starter_view(schema: &[TableSchema]) -> String {
     )
 }
 
-/// `llms.txt`: how an AI agent queries this nest. `contracts` is (alias, address).
 /// Whether the nest has the ERC-20 Transfer shape that gives it the balance routes and tools.
 fn has_transfers(schema: &[TableSchema]) -> bool {
     schema.iter().any(TableSchema::is_transfer_shaped)
 }
 
+/// `llms.txt`: how an AI agent queries this nest. `contracts` is (alias, address).
 pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]) -> String {
     let list = contract_list(contracts);
     let tables: String = schema
@@ -296,7 +296,11 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         .first()
         .map(|t| t.table.as_str())
         .unwrap_or("<alias>__<event>");
-    let skill_balances = if has_transfers(schema) { ", balances, " } else { ", " };
+    let skill_balances = if has_transfers(schema) {
+        ", balances, "
+    } else {
+        ", "
+    };
     let skill_balance_tools = if has_transfers(schema) {
         " / `balance` / `top_balances` (net flow since `indexed_from`, a balance only if that is \
          the contract's deployment block)"
@@ -394,16 +398,23 @@ mod tests {
     /// advertises them, and `explain` is always listed.
     #[test]
     fn the_agent_docs_name_the_balance_tools_only_for_a_transfer_nest() {
-        let address = |name: &str| serde_json::json!({ "name": name, "type": "address", "indexed": true });
+        let address =
+            |name: &str| serde_json::json!({ "name": name, "type": "address", "indexed": true });
         let transfer = nest_with(serde_json::json!({
             "type": "event", "name": "Transfer", "anonymous": false,
             "inputs": [address("from"), address("to"),
                 { "name": "value", "type": "uint256", "indexed": false }]
         }));
         let (llms, skill) = agent_docs(&transfer);
-        assert!(llms.contains("top_balances") && llms.contains("/balance/{address}"), "{llms}");
+        assert!(
+            llms.contains("top_balances") && llms.contains("/balance/{address}"),
+            "{llms}"
+        );
         assert!(llms.contains("explain"), "{llms}");
-        assert!(skill.contains("top_balances") && skill.contains("indexed_from"), "{skill}");
+        assert!(
+            skill.contains("top_balances") && skill.contains("indexed_from"),
+            "{skill}"
+        );
 
         let pool = nest_with(serde_json::json!({
             "type": "event", "name": "Sync", "anonymous": false,
