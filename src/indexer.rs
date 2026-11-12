@@ -12600,21 +12600,18 @@ template = "pool"
         assert!(advice.contains("`--backfill 300`"), "{advice}");
         assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
 
-        // A solo nest kept under a directory named `data` has its segments outside its own
-        // directory, shared with its siblings: no deletion advice, and the shared directory is named.
+        // A solo nest kept under a directory named `data` holds its own segments, so the advice is
+        // the solo one; only a runtime's dataset shares a store.
         let root = tempfile::tempdir().unwrap();
         let solo_in_data = root.path().join("data").join("solo");
         std::fs::create_dir_all(&solo_in_data).unwrap();
         let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
-        assert!(!note.contains("remove"), "{note}");
         assert!(
-            note.contains(&root.path().join("segments").display().to_string())
-                && note.contains("possibly shared"),
+            note.contains(&solo_in_data.join("segments").display().to_string()),
             "{note}"
         );
         let advice = long_history_advice(5_000_000, 300, &solo_in_data);
-        assert!(!advice.contains("remove"), "{advice}");
-        assert!(advice.contains("possibly shared"), "{advice}");
+        assert!(advice.contains("remove"), "{advice}");
     }
 
     #[test]

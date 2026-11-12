@@ -41,18 +41,25 @@ pub const SEGMENTS_DIR: &str = "segments";
 /// The **shared segment store** for the runtime `dir` belongs to, if it has one (RFC-0033 §11a).
 ///
 /// Derived by convention rather than plumbed: a mounted dataset lives at `<root>/data/<nid>`, so its
-/// runtime root is two levels up and the store is `<root>/segments`. A solo `nuthatch dev` nest is
-/// not under a `data/` parent, gets `None`, and keeps its segments where they have always been -
-/// sharing is a property of a runtime hosting several nests, not of a nest.
+/// runtime root is two levels up and the store is `<root>/segments`. It is a runtime's only where
+/// something says so, a NID for a directory name or a `mounts.toml` at the root: a solo nest that
+/// merely sits in a directory called `data` keeps its segments beside it, not beside its siblings.
 ///
 /// The alternative was threading a root through every seal and query call site, which would have made
 /// the layout a parameter of functions that have no business knowing about it.
 pub fn shared_store(dir: &Path) -> Option<PathBuf> {
+    let root = data_root(dir)?;
+    (crate::runtime::MountTable::is_identity_keyed(dir)
+        || root.join(crate::runtime::MOUNTS_FILE).is_file())
+    .then(|| root.join(SEGMENTS_DIR))
+}
+
+/// `<root>` for a `dir` at `<root>/data/<name>`.
+fn data_root(dir: &Path) -> Option<&Path> {
     let parent = dir.parent()?;
-    if parent.file_name()? != crate::runtime::DATA_DIR {
-        return None;
-    }
-    Some(parent.parent()?.join(SEGMENTS_DIR))
+    (parent.file_name()? == crate::runtime::DATA_DIR)
+        .then(|| parent.parent())
+        .flatten()
 }
 
 /// The directory a nest's new segments are written to: the shared store when there is one, else
@@ -66,14 +73,23 @@ pub fn segments_dir(dir: &Path) -> PathBuf {
 /// **Falls back to the per-dataset path when the shared copy is absent**, so a dataset migrated
 /// before slice C still reads. A missing shared segment is not evidence of corruption; it is evidence
 /// of a layout that has not been relocated yet.
+///
+/// A solo nest under a `data/` directory sealed into `<root>/segments` before 5.21, so a file it
+/// does not hold itself is still read from there; it seals into its own `segments/` from now on.
 pub fn segment_path(dir: &Path, file: &str, hash: &str) -> PathBuf {
-    if let Some(store) = shared_store(dir) {
-        let shared = store.join(format!("{hash}.parquet"));
-        if shared.exists() {
-            return shared;
-        }
+    let own = dir.join(SEGMENTS_DIR).join(file);
+    let other = match shared_store(dir) {
+        Some(store) => store.join(format!("{hash}.parquet")),
+        None => match data_root(dir) {
+            Some(root) if !own.exists() => root.join(SEGMENTS_DIR).join(format!("{hash}.parquet")),
+            _ => return own,
+        },
+    };
+    if other.exists() {
+        other
+    } else {
+        own
     }
-    dir.join(SEGMENTS_DIR).join(file)
 }
 pub const MANIFEST_FILE: &str = "manifest.json";
 
@@ -1825,6 +1841,11 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     // again: both read its file, and the failed read stopped every later seal (#2172).
     let mut lost_tails = 0usize;
     let before = verified_record(dir);
+    let earlier = shared_store(dir)
+        .is_none()
+        .then(|| data_root(dir).map(|r| r.join(SEGMENTS_DIR)))
+        .flatten();
+    let mut read_from_earlier = 0usize;
     let mut verified = Verified {
         last_full: before.last_full,
         stamps: BTreeMap::new(),
@@ -1833,6 +1854,7 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     for (table, segs) in &mut manifest.tables {
         for s in segs.iter_mut() {
             let path = segment_path(dir, &s.file, &s.hash);
+            read_from_earlier += usize::from(earlier.as_ref().is_some_and(|e| path.starts_with(e)));
             let key = verified_key(&path, &s.hash);
             // Taken before the read, so a write landing during it moves the stamp past this one.
             let stamp = file_stamp(&path);
@@ -1882,6 +1904,15 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
         if let Err(e) = save_verified(dir, &verified) {
             tracing::warn!("could not record the segments verified intact: {e:#}");
         }
+    }
+    if let (Some(earlier), 1..) = (&earlier, read_from_earlier) {
+        tracing::warn!(
+            "{read_from_earlier} sealed segment(s) of {} are read from {}, where a nest under a `data` \
+             directory sealed before 5.21; new seals go to its own segments/. Leave them there: a \
+             sibling nest may read the same files",
+            dir.display(),
+            earlier.display()
+        );
     }
     if quarantined > 0 {
         tracing::error!(
@@ -3164,7 +3195,7 @@ mod retention_ledger {
 
     /// A mounted dataset `<root>/data/<nid>` with its shared store, followed by connection `conn`.
     fn followed_dataset(root: &Path, conn: u64) -> (PathBuf, PathBuf) {
-        let dir = root.join(crate::runtime::DATA_DIR).join("nid");
+        let dir = root.join(crate::runtime::DATA_DIR).join("3".repeat(64));
         let store = root.join(SEGMENTS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&store).unwrap();
@@ -4157,7 +4188,10 @@ mod tests {
         // `shared_store` is derived by convention: a dataset at `<root>/data/<nid>` shares
         // `<root>/segments`. A solo nest is not under a `data/` parent and takes the other arm.
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let store = shared_store(&dir).expect("a dataset under data/ has a shared store");
         assert_eq!(store, root.path().join(SEGMENTS_DIR));
@@ -4295,6 +4329,81 @@ mod tests {
         (rows, out.degraded_tables)
     }
 
+    /// A solo nest is not a runtime's for sitting in a directory called `data`: its segments stay in
+    /// it, and a sibling sealing the same rows holds its own copy.
+    #[test]
+    fn a_solo_nest_under_a_data_directory_keeps_its_segments_in_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (solo, sibling) = (data.join("solo"), data.join("sibling"));
+        for d in [&solo, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        }
+        assert!(shared_store(&solo).is_none());
+        assert!(
+            !root.path().join(SEGMENTS_DIR).exists(),
+            "sealed outside the nest"
+        );
+        let seg = load_manifest(&solo).unwrap().tables["usdc__transfer"][0].clone();
+        assert_eq!(
+            segment_path(&solo, &seg.file, &seg.hash),
+            solo.join(SEGMENTS_DIR).join(&seg.file)
+        );
+        std::fs::remove_dir_all(&sibling).unwrap();
+        assert_eq!(values_and_degraded(&solo).0, ["5"]);
+
+        // A runtime says so with its mounts file, whatever its datasets are called.
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join(crate::runtime::MOUNTS_FILE), "").unwrap();
+        let mounted = runtime.path().join(crate::runtime::DATA_DIR).join("usdc");
+        assert_eq!(
+            shared_store(&mounted),
+            Some(runtime.path().join(SEGMENTS_DIR))
+        );
+    }
+
+    /// A solo nest under `data/` that sealed before 5.21 wrote its files to `<root>/segments`. They are
+    /// still read from there, untouched, and what it seals next goes into the nest.
+    #[test]
+    fn a_solo_nest_sealed_in_the_earlier_layout_still_finds_its_segments() {
+        let root = tempfile::tempdir().unwrap();
+        let solo = root.path().join(crate::runtime::DATA_DIR).join("solo");
+        std::fs::create_dir_all(&solo).unwrap();
+        std::fs::write(
+            solo.join("schema.json"),
+            r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+        )
+        .unwrap();
+        test_set_table_floor(&solo, 0);
+        seal_range(&solo, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        // What 5.20 left: the file in the root's store, the catalogue in the nest.
+        let old = load_manifest(&solo).unwrap().tables["usdc__transfer"][0].clone();
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        let earlier = store.join(format!("{}.parquet", old.hash));
+        std::fs::rename(solo.join(SEGMENTS_DIR).join(&old.file), &earlier).unwrap();
+        let bytes = std::fs::read(&earlier).unwrap();
+
+        assert_eq!(verify_and_quarantine(&solo).unwrap(), 0);
+        assert_eq!(
+            values_and_degraded(&solo),
+            (vec!["5".to_string()], BTreeSet::new())
+        );
+
+        seal_range(&solo, &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let new = load_manifest(&solo).unwrap().tables["usdc__transfer"][1].clone();
+        assert!(solo.join(SEGMENTS_DIR).join(&new.file).is_file());
+        let mut values = values_and_degraded(&solo).0;
+        values.sort();
+        assert_eq!(values, ["5", "7"]);
+        assert_eq!(
+            std::fs::read(&earlier).unwrap(),
+            bytes,
+            "the earlier copy was touched"
+        );
+    }
+
     #[test]
     fn a_quarantine_that_cannot_rename_across_filesystems_copies_the_segment_aside() {
         let dir = tempfile::tempdir().unwrap();
@@ -4363,7 +4472,10 @@ mod tests {
     #[test]
     fn re_sealing_identical_rows_leaves_the_shared_segment_alone() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
 
@@ -4434,7 +4546,10 @@ mod tests {
         assert_seal_durable(solo.path(), &trace, solo.path().join(SEGMENTS_DIR));
 
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let trace = capture_durable(|| {
             seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4442,7 +4557,10 @@ mod tests {
         let store = shared_store(&dir).unwrap();
         assert_seal_durable(&dir, &trace, store.clone());
 
-        let other = root.path().join(crate::runtime::DATA_DIR).join("nid1");
+        let other = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("1".repeat(64));
         std::fs::create_dir_all(&other).unwrap();
         let again = capture_durable(|| {
             seal_range(&other, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4887,7 +5005,10 @@ mod tests {
     #[test]
     fn a_re_seal_replaces_a_corrupt_shared_segment_before_it_returns() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         test_set_table_floor(&dir, 0);
         seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4919,7 +5040,7 @@ mod tests {
     fn a_second_dataset_replaces_a_corrupt_shared_segment_it_seals_again() {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join(crate::runtime::DATA_DIR);
-        let (a, b) = (data.join("nid0"), data.join("nid1"));
+        let (a, b) = (data.join("0".repeat(64)), data.join("1".repeat(64)));
         for dir in [&a, &b] {
             std::fs::create_dir_all(dir).unwrap();
             test_set_table_floor(dir, 0);
@@ -5322,7 +5443,10 @@ mod tests {
         // the new file and deletes nothing; the manifest stops referencing the old hash and
         // `nuthatch prune` reclaims it from that.
         let root = tempfile::tempdir().unwrap();
-        let nest = root.path().join(crate::runtime::DATA_DIR).join("nid-1");
+        let nest = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("2".repeat(64));
         std::fs::create_dir_all(&nest).unwrap();
         seal_range(&nest, &[transfer(10, 0, "1")], 10, 10).unwrap();
         let first = only(&load_manifest(&nest).unwrap(), "usdc__transfer");
@@ -5662,7 +5786,10 @@ mod tests {
     #[test]
     fn creating_the_shared_store_syncs_its_parent_before_the_manifest() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let trace = capture_durable(|| {
             seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();

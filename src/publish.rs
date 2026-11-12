@@ -3719,7 +3719,7 @@ abi = "abis/usdc.json"
     async fn a_folded_provisional_segment_leaves_the_mirror_only_once_followers_move_on() {
         const GRACE: Duration = Duration::from_millis(100);
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("data").join("t");
+        let dir = root.path().join("data").join("e".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         write_nest(&dir);
         test_set_table_floor(&dir, 100);
@@ -3808,7 +3808,7 @@ abi = "abis/usdc.json"
     #[tokio::test]
     async fn offchain_snapshots_reach_a_remote_follower_verified() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("data").join("t");
+        let dir = root.path().join("data").join("e".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         write_nest(&dir);
         let csv = root.path().join("prices.csv");
@@ -3873,7 +3873,7 @@ abi = "abis/usdc.json"
     async fn without_followers_a_mirror_gets_exactly_what_it_did_before() {
         async fn run(followers: bool, name: &str) -> (Vec<String>, Vec<String>) {
             let root = tempfile::tempdir().unwrap();
-            let dir = root.path().join("data").join("t");
+            let dir = root.path().join("data").join("e".repeat(64));
             std::fs::create_dir_all(&dir).unwrap();
             write_nest(&dir);
             test_set_table_floor(&dir, 2);
