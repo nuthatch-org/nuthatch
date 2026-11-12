@@ -81,7 +81,7 @@ fn client_config_json(exe: &str, base: &str, token_env: Option<&str>) -> Value {
 /// than the 64 MiB a message may be.
 const SQL_TEXT_BUDGET: usize = 256 * 1024;
 
-/// The longest cell the text table carries; with the budget, no single row can exceed it.
+/// The longest cell the text table carries; a row is separately cut at half the budget.
 const MAX_CELL_CHARS: usize = 4096;
 
 /// One message in either direction. A `/sql` answer is capped at 64 MiB already, so nothing legitimate
@@ -735,7 +735,8 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
                 }
             }
         }
-        let pad = |s: &str, i: usize| format!("{s:<width$}", width = w[i]);
+        // Alignment only: a long cell must not pad every other row and the header to its width.
+        let pad = |s: &str, i: usize| format!("{s:<width$}", width = w[i].min(48));
         out.push_str(
             &heads
                 .iter()
@@ -753,6 +754,14 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
                 .map(|(i, c)| pad(&o.get(c).map(cell).unwrap_or_default(), i))
                 .collect::<Vec<_>>()
                 .join("  ");
+            // Half the budget for one row, so the first always fits whatever its cells hold.
+            let line = match line
+                .char_indices()
+                .find(|(at, _)| *at > SQL_TEXT_BUDGET / 2)
+            {
+                Some((at, _)) => format!("{}…[row cut]", &line[..at]),
+                None => line,
+            };
             if shown > 0 && out.len() + line.len() > SQL_TEXT_BUDGET {
                 break;
             }
@@ -1930,6 +1939,19 @@ mod tests {
         let out = call_named(&client, &base, "entity", json!({ "id": "x" })).await;
         assert_eq!(tool_text(&out), r#"HTTP 404: {"error":"not found"}"#);
         server.abort();
+    }
+
+    #[test]
+    fn a_row_of_many_wide_cells_is_cut_to_the_budget() {
+        let row: serde_json::Map<String, Value> = (0..200)
+            .map(|i| (format!("c{i:03}"), json!("z".repeat(4000))))
+            .collect();
+        let raw = json!({ "count": 1, "rows": [row],
+            "provenance": { "as_of": 9, "sealed_through": 9, "source": "hot+sealed", "registry_hash": "0xabcd1234" } })
+        .to_string();
+        let out = format_sql_result(&raw, 200);
+        assert!(out.len() < SQL_TEXT_BUDGET, "{} bytes", out.len());
+        assert!(out.contains("[row cut]"), "the cut is stated");
     }
 
     #[test]
