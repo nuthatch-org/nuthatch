@@ -355,11 +355,11 @@ impl<'a> Session<'a> {
 }
 
 /// The mounts `/nests` lists, as URLs under `base`: empty unless `base` is a runtime's root, and
-/// `None` when nothing answered.
+/// `None` when nothing answered, or a proxy's 5xx did, which may say nothing about `base`.
 async fn listed_mounts(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
     let body = match get(client, &format!("{base}/nests")).await {
         Ok(body) => body,
-        Err(e) if e.to_string().starts_with("HTTP ") => return Some(Vec::new()),
+        Err(e) if e.to_string().starts_with("HTTP 4") => return Some(Vec::new()),
         Err(_) => return None,
     };
     let nests = serde_json::from_str::<Value>(&body)
@@ -2319,17 +2319,19 @@ mod tests {
         server.abort();
     }
 
-    /// One session asks a mount's `/nests` once, however many 404s it meets, and a root's every time.
+    /// One session asks a mount's `/nests` once, however many 404s it meets; a root's, or one behind a
+    /// failing proxy, every time.
     #[tokio::test]
     async fn a_session_asks_whether_it_is_at_a_root_once() {
         use axum::{extract::State, http::Uri, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        for root in [false, true] {
+        for (root, status) in [(false, 404), (true, 404), (false, 503)] {
             let asked = Arc::new(AtomicUsize::new(0));
             let app = Router::new()
                 .fallback(
-                    |State((asked, root)): State<(Arc<AtomicUsize>, bool)>, uri: Uri| async move {
+                    |State((asked, root, status)): State<(Arc<AtomicUsize>, bool, u16)>,
+                     uri: Uri| async move {
                         use axum::response::IntoResponse;
                         if uri.path() == "/nests" {
                             asked.fetch_add(1, Ordering::SeqCst);
@@ -2337,6 +2339,8 @@ mod tests {
                                 return r#"{"runtime":"r","nests":[{"name":"usdc"}]}"#
                                     .into_response();
                             }
+                            let status = axum::http::StatusCode::from_u16(status).unwrap();
+                            return (status, "unavailable").into_response();
                         }
                         (
                             axum::http::StatusCode::NOT_FOUND,
@@ -2345,7 +2349,7 @@ mod tests {
                             .into_response()
                     },
                 )
-                .with_state((asked.clone(), root));
+                .with_state((asked.clone(), root, status));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2358,7 +2362,12 @@ mod tests {
                 let text = tool_text(&out);
                 assert_eq!(text.contains(&format!("{base}/usdc")), root, "{text}");
             }
-            assert_eq!(asked.load(Ordering::SeqCst), if root { 3 } else { 1 });
+            let once = !root && status < 500;
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                if once { 1 } else { 3 },
+                "{root} {status}"
+            );
             server.abort();
         }
     }
