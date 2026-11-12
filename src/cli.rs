@@ -171,7 +171,7 @@ pub enum Command {
     GraphValidate(GraphValidateArgs),
 
     /// Build checkpoints for a nest's folds over sealed history, or read a fold at a block
-    /// (RFC-0059). Hidden, and present only in a build with `--features folds`.
+    /// (RFC-0059). Hidden, and present only in a source build with the `folds` feature.
     #[cfg(feature = "folds")]
     #[command(hide = true, subcommand)]
     Fold(FoldCommand),

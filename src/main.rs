@@ -282,7 +282,9 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "counter"))]
             {
                 let _ = args;
-                anyhow::bail!("nuthatch settle needs a build with --features counter")
+                anyhow::bail!(
+                    "nuthatch settle needs a source build with the `counter` feature (no release carries it)"
+                )
             }
         }
         cli::Command::Check(args) => check::check(args),
