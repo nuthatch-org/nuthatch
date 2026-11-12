@@ -1634,6 +1634,14 @@ pub struct DevArgs {
     #[arg(long = "local-host")]
     pub local_host: Vec<String>,
 
+    /// Name of an environment variable holding a token an address-history nest then requires as
+    /// `Authorization: Bearer` for watch, unwatch, the `proxy` module, tracing by hash and the
+    /// timestamp search, even from this machine: for a reverse proxy that rewrites `Host` to loopback
+    /// and adds no forwarding header. Reads need no token. The token itself never goes on the command
+    /// line.
+    #[arg(long = "write-token-env", value_name = "VAR")]
+    pub write_token_env: Option<String>,
+
     /// Index only this many blocks back from the tip (recent-history mode). On a first run it overrides
     /// a nest's vendored `start_block`s; a nest that has already indexed a block ignores it, so
     /// remove its store first to start over. Omit to backfill from deployment when the nest declares

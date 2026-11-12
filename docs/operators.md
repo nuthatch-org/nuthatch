@@ -1329,7 +1329,15 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   One proxy no header can reveal: one that rewrites `Host` to a loopback address and adds no proxy
   header, as nginx's plain `proxy_pass http://127.0.0.1:PORT` does, is indistinguishable from a
   local process, so its callers can watch, unwatch and borrow the RPC. Configure such a proxy to
-  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`.
+  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`, or,
+  when you cannot be sure of the proxy, start the nest with `--write-token-env <VAR>`: the token in
+  that environment variable (at least 16 characters, such as `openssl rand -hex 32`) is then needed
+  as `Authorization: Bearer <token>` for watch, unwatch, the `proxy` module, tracing by hash and the
+  timestamp search, from this machine too, and reads need none. The token only adds a requirement: a
+  caller the rules above treat as remote stays remote with it. Without the flag nothing changes, so
+  rotki on the same machine needs no configuration; with it, rotki must send the token. The flag is
+  refused off a loopback bind, where those actions are refused to everyone, and on an event nest or
+  a runtime.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
