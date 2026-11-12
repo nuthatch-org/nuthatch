@@ -26,13 +26,18 @@ struct Ping {
     arch: String,
     chain: Option<u64>,
     source: Option<Source>,
+    queries: Option<String>,
 }
+
+/// The only values `queries` may take: anything else would be a free string in a public key.
+const QUERY_BUCKETS: [&str; 5] = ["0", "1+", "100+", "10k+", "1m+"];
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Event {
     Counted,
     Init,
+    Alive,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -60,10 +65,10 @@ fn token(s: &str, max: usize, extra: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || extra.contains(c))
 }
 
-/// The keys a valid ping increments, or `None` when it is not a v1 payload.
+/// The keys a valid ping increments, or `None` when it is not a v1 or v2 payload.
 pub fn keys_for(body: &[u8]) -> Option<Vec<String>> {
     let p: Ping = serde_json::from_slice(body).ok()?;
-    if p.v != 1
+    if !(1..=2).contains(&p.v)
         || !token(&p.version, 40, ".-+")
         || !token(&p.os, 16, "_")
         || !token(&p.arch, 16, "_")
@@ -80,6 +85,18 @@ pub fn keys_for(body: &[u8]) -> Option<Vec<String>> {
                 format!("init.os_arch.{}/{}", p.os, p.arch),
                 format!("init.chain.{chain}"),
                 format!("init.source.{}", source.name()),
+            ]
+        }
+        Event::Alive => {
+            let queries = p.queries?;
+            if p.v < 2 || !QUERY_BUCKETS.contains(&queries.as_str()) {
+                return None;
+            }
+            vec![
+                "alive".into(),
+                format!("alive.version.{}", p.version),
+                format!("alive.os_arch.{}/{}", p.os, p.arch),
+                format!("alive.queries.{queries}"),
             ]
         }
     })
@@ -272,9 +289,31 @@ mod tests {
     }
 
     #[test]
-    fn anything_but_a_v1_payload_is_refused() {
+    fn an_alive_increments_its_four_tallies_and_only_for_a_known_bucket() {
+        let alive = r#"{"v":2,"event":"alive","version":"5.20.0","os":"linux","arch":"x86_64","queries":"10k+"}"#;
+        assert_eq!(
+            keys_for(alive.as_bytes()).unwrap(),
+            [
+                "alive",
+                "alive.version.5.20.0",
+                "alive.os_arch.linux/x86_64",
+                "alive.queries.10k+"
+            ]
+        );
         for bad in [
-            INIT.replace(r#""v":1"#, r#""v":2"#),
+            alive.replace("10k+", "12345"),
+            alive.replace(r#","queries":"10k+""#, ""),
+            alive.replace(r#""v":2"#, r#""v":1"#),
+        ] {
+            assert!(keys_for(bad.as_bytes()).is_none(), "{bad}");
+        }
+        assert!(keys_for(INIT.replace(r#""v":1"#, r#""v":2"#).as_bytes()).is_some());
+    }
+
+    #[test]
+    fn anything_but_a_v1_or_v2_payload_is_refused() {
+        for bad in [
+            INIT.replace(r#""v":1"#, r#""v":3"#),
             INIT.replace(r#""chain":42161,"#, ""),
             INIT.replace("addresses", "elsewhere"),
             INIT.replace("linux", "Linux"),

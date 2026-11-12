@@ -60,7 +60,7 @@ If any of these is ❌ the release does not go out, full stop. These are the CLA
   neither subsumes the other.*
 - [ ] ✅ **No phone-home.** No telemetry by default, no mandatory tokens, AI degrades offline. - *Verify
   per release: grep for outbound calls not gated behind explicit user config / BYO-key; the head
-  count is the one call about the operator, opt-in, and the head-count-deleted CI leg must be green.*
+  count is the one call about the operator, on unless turned off, and the head-count-deleted CI leg must be green.*
 - [ ] ✅ **Determinism in the core.** Decode, reorg, entity derivation re-executable; no LLM output in
   the runtime data path. - *Golden tests + the RFC-0016/0017 hard fence. Re-assert on any new
   data-path code.*

@@ -13,6 +13,10 @@ What it stores, per UTC day, and nothing else:
 | `init.os_arch.<os>/<arch>` | `init` |
 | `init.chain.<id>` | `init` |
 | `init.source.<source>` | `init` |
+| `alive` | every valid `alive` event |
+| `alive.version.<version>` | `alive` |
+| `alive.os_arch.<os>/<arch>` | `alive` |
+| `alive.queries.<bucket>` | `alive`; the bucket is one of `0`, `1+`, `100+`, `10k+`, `1m+` |
 
 A `counted` event's `chain` and `source`, if present, are not tallied.
 

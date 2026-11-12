@@ -40,21 +40,24 @@ the binary, and there will not be: `CLAUDE.md` puts hosted-SaaS multi-tenancy ou
 permanently. A runtime does carry tenant labels: an opaque string per mount, with shared datasets
 reference-counted, and nothing more.
 
-**What it never does:** phone home unasked. No telemetry by default, no mandatory API tokens, no gated
+**What it never does:** phone home beyond the head count below. No mandatory API tokens, no gated
 data service. Every outbound connection is one you configured - your RPC endpoints, your webhook
 sinks, and (only when you run them by hand) the ABI resolvers and sanctions-list fetchers - with one
-exception you have to say yes to: the head count below.
+exception, on unless you turn it off: the head count below.
 
 ### The head count (RFC-0054)
 
-After the first successful `nuthatch init` on a machine with a terminal, nuthatch asks once whether
-it may count you, and shows the exact object it would send. The default is no, and the answer is
-stored in `~/.config/nuthatch/count.toml` (or under `$XDG_CONFIG_HOME`), so it is never asked
-again. With a yes, each later `init` sends one object - nuthatch version, OS, architecture, a
-built-in chain id (anything else is sent as 0) and which kind of `init` it was - with no identifier
-and no addresses, under a two-second ceiling, and nothing about a failure is ever printed. Nothing
-is asked or sent when `CI` or `NUTHATCH_NO_COUNT` is set. `nuthatch count` shows the state,
-`nuthatch count payload` prints the objects, and `nuthatch count off` stops it.
+The first successful `nuthatch init` on a machine prints, once, the exact objects nuthatch sends and
+how to stop it, then sends them; a nest started with `dev` or `serve` says the same in one log line
+an hour after start. From then on each `init` sends one object - nuthatch version, OS, architecture,
+a built-in chain id (anything else is sent as 0) and which kind of `init` it was - and a running nest
+sends one a week carrying the number of `/sql` queries it served as an order of magnitude (`0`, `1+`,
+`100+`, `10k+`, `1m+`). No identifier, no addresses, no query text, a two-second ceiling, and nothing
+about a failure is ever printed. The state is kept in `~/.config/nuthatch/count.toml` (or under
+`$XDG_CONFIG_HOME`); with nowhere to keep it, nothing is sent. Nothing is said or sent when `CI`,
+`NUTHATCH_NO_COUNT` or `DO_NOT_TRACK` is set, or after `nuthatch count off`, and an answer of no given
+before 5.20 still stands. `nuthatch count` shows the state and `nuthatch count payload` prints the
+objects.
 
 ---
 
