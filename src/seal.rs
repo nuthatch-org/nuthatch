@@ -54,6 +54,12 @@ pub fn shared_store(dir: &Path) -> Option<PathBuf> {
     .then(|| root.join(SEGMENTS_DIR))
 }
 
+/// The store outside `dir` its segment files may be read from: a runtime's shared store, or where a
+/// solo nest under a `data/` directory sealed before 5.21, which its siblings may name too.
+fn outer_store(dir: &Path) -> Option<PathBuf> {
+    shared_store(dir).or_else(|| data_root(dir).map(|r| r.join(SEGMENTS_DIR)))
+}
+
 /// `<root>` for a `dir` at `<root>/data/<name>`.
 fn data_root(dir: &Path) -> Option<&Path> {
     let parent = dir.parent()?;
@@ -1931,7 +1937,7 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
     // A shared file is addressed by its hash, so bytes that do not hash to it are wrong for every
     // dataset naming it, and moving it out of the store reduces them all at once. It goes beside the
     // store, not into this dataset, which may be unmounted while another still names the hash.
-    let shared = shared_store(dir).filter(|st| path.starts_with(st));
+    let shared = outer_store(dir).filter(|st| path.starts_with(st));
     // Only a read that completed proves the bytes wrong. An error may pass, and a shared file taken
     // away on one reduces every dataset in the runtime.
     if shared.is_some() && reason != HASH_MISMATCH {
@@ -1946,7 +1952,7 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
         Some(store) => (
             store.with_file_name(QUARANTINE_DIR),
             format!("{}.parquet", s.hash),
-            "every dataset in this runtime that names it",
+            "every dataset that names it",
         ),
         None => (dir.join(QUARANTINE_DIR), s.file.clone(), "this table"),
     };
@@ -2152,7 +2158,7 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
         return None;
     }
     let me = lease_key(dir);
-    let store = shared_store(dir).map(|s| lease_key(&s));
+    let store = outer_store(dir).map(|s| lease_key(&s));
     let rebuilt = f.rebuilt.get(&me);
     let stale = |at: Instant, table: &str, from_block: u64| {
         rebuilt.is_some_and(|r| at > r.at && r.through.get(table).is_some_and(|t| from_block <= *t))
@@ -4412,6 +4418,54 @@ mod tests {
             std::fs::read(&earlier).unwrap(),
             bytes,
             "the earlier copy was touched"
+        );
+    }
+
+    /// Two solo nests that sealed the same rows before 5.21 name one file in `<root>/segments`. Bad
+    /// bytes there are taken out of the store for both, and the one that did not find them says so.
+    #[test]
+    fn a_corrupt_earlier_layout_file_is_quarantined_for_every_solo_nest_naming_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (a, b) = (data.join("a"), data.join("b"));
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("schema.json"),
+                r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+            )
+            .unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+            let seg = load_manifest(d).unwrap().tables["usdc__transfer"][0].clone();
+            std::fs::rename(
+                d.join(SEGMENTS_DIR).join(&seg.file),
+                store.join(format!("{}.parquet", seg.hash)),
+            )
+            .unwrap();
+        }
+        let seg = load_manifest(&a).unwrap().tables["usdc__transfer"][0].clone();
+        let earlier = store.join(format!("{}.parquet", seg.hash));
+        assert_eq!(segment_path(&b, &seg.file, &seg.hash), earlier);
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &earlier).unwrap();
+
+        assert_eq!(verify_and_quarantine(&a).unwrap(), 1);
+        assert!(root
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(format!("{}.parquet", seg.hash))
+            .is_file());
+        let (rows, degraded) = values_and_degraded(&b);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+        assert_eq!(
+            integrity(&b).map(|i| i.quarantined_segments),
+            Some(1),
+            "the sibling is not told"
         );
     }
 
