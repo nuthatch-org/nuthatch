@@ -164,8 +164,8 @@ fn deliver_sealed_within(
         let sql = select(lo, hi, offset);
         let rows = match &seat {
             Some(seat) => {
-                // The row and byte caps stay off: a cut answer would move the cursor past rows never
-                // queued. The statement's own LIMIT bounds it.
+                // The row cap is the statement's own LIMIT, which a full answer reaches without being
+                // cut, and the byte cap is off: a cut answer would move the cursor past rows never queued.
                 let guard = crate::analytics::QueryGuard {
                     max_rows: usize::try_from(limit).unwrap_or(usize::MAX),
                     max_result_bytes: usize::MAX,
@@ -183,6 +183,14 @@ fn deliver_sealed_within(
         };
         let mut rows = match rows {
             Ok(r) => r,
+            // A seated query that fails is refused or out of budget, and fails again every seal.
+            Err(e) if seat.is_some() && first_failure(dir, &w.name) => {
+                tracing::warn!(
+                    "webhook '{}' delivers nothing until its query runs within the mount's limits: {e:#}",
+                    w.name
+                );
+                continue;
+            }
             Err(e) => {
                 tracing::debug!("webhook '{}' query skipped: {e:#}", w.name);
                 continue;
@@ -238,6 +246,18 @@ fn deliver_sealed_within(
         }
     }
     Ok(enqueued)
+}
+
+/// Whether this is the first failed query of `name` in `dir` this process has seen.
+fn first_failure(dir: &std::path::Path, name: &str) -> bool {
+    static FAILED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>>,
+    > = std::sync::OnceLock::new();
+    FAILED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert((dir.to_path_buf(), name.to_string()))
 }
 
 fn row_block(row: &serde_json::Value) -> Result<u64> {
@@ -602,6 +622,27 @@ mod tests {
         assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 0);
         seat(dir.path(), std::time::Duration::from_secs(30));
         assert_eq!(deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap(), 1);
+    }
+
+    /// A seated answer that fills the room exactly is whole, so the cursor moves and nothing is lost.
+    #[test]
+    fn a_seated_delivery_that_fills_the_room_loses_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut w = wh("g", "t__transfer", "genesis");
+        w.batch_max = Some(1);
+        let webhooks = vec![w];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        let rows: Vec<String> = (1..=7).map(|b| transfer(b, 0)).collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, 7).unwrap();
+        strict_nest(dir.path());
+        seat(dir.path(), std::time::Duration::from_secs(30));
+        let mut got = vec![];
+        for _ in 0..10 {
+            deliver_sealed_within(&store, dir.path(), &webhooks, 7, 3).unwrap();
+            got.extend(drain(&store));
+        }
+        assert_eq!(got, (1..=7).map(|b| (b, 0)).collect::<Vec<_>>());
     }
 
     /// Under strict a `where` may call only what a tenant's `/sql` may.
