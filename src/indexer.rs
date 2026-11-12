@@ -3595,12 +3595,10 @@ async fn build_nest(
         let sealed = store.sealed_through();
         let indexed = meta(START_BLOCK_KEY)?.map(|from| (from, sealed));
         let last = meta(LAST_BLOCK_KEY)?;
-        let tip = tokio::time::timeout(std::time::Duration::from_secs(2), source.tip())
+        let at_tip = boot_tip(config.nest.chain_id, source)
             .await
-            .ok()
-            .and_then(|r| r.ok());
-        let at_tip =
-            matches!((last, tip), (Some(l), Some(t)) if l.saturating_add(AT_TIP_WITHIN) >= t);
+            .zip(last)
+            .map(|(tip, last)| last.saturating_add(AT_TIP_WITHIN) >= tip);
         tracing::info!("{}", no_data_notice(&never_fired, indexed, at_tip));
     }
 
@@ -8493,16 +8491,44 @@ fn announce_caught_up(announced: &mut bool, block: u64) {
     }
 }
 
+/// The tip for the empty-table notice, read at most once per chain source per half minute, so a hung
+/// endpoint costs a runtime's boot one bounded wait and not one per dataset.
+async fn boot_tip(chain_id: u64, source: &Arc<dyn Source>) -> Option<u64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Reads = std::collections::HashMap<(u64, usize), (Instant, Option<u64>)>;
+    static TIPS: OnceLock<Mutex<Reads>> = OnceLock::new();
+    let key = (chain_id, Arc::as_ptr(source) as *const () as usize);
+    let cache = TIPS.get_or_init(Default::default);
+    if let Some((at, tip)) = cache.lock().unwrap().get(&key) {
+        if at.elapsed() < Duration::from_secs(30) {
+            return *tip;
+        }
+    }
+    let tip = tokio::time::timeout(Duration::from_secs(2), source.tip())
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    cache.lock().unwrap().insert(key, (Instant::now(), tip));
+    tip
+}
+
 /// Blocks behind the tip within which a nest counts as caught up for the empty-table notice.
 const AT_TIP_WITHIN: u64 = 1_000;
 
 /// With an indexed range on record the notice names it. A nest still short of the tip has not reached
 /// later events yet; one at the tip has covered the whole range, so the event may never have fired.
-fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>, at_tip: bool) -> String {
+/// `at_tip` is `None` when the tip could not be read, and then the notice claims neither.
+fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>, at_tip: Option<bool>) -> String {
     let n = tables.len();
     let names = tables.join(", ");
     match indexed {
-        Some((from, to)) if at_tip => format!(
+        Some((from, to)) if at_tip.is_none() => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to}; the tip could not be read \
+             to tell whether the nest has reached it: {names}. Each reads as an empty table, not an \
+             error."
+        ),
+        Some((from, to)) if at_tip == Some(true) => format!(
             "{n} declared table(s) have no data in blocks {from} to {to}, the whole sealed range; the \
              event may never have fired on this chain: {names}. Each reads as an empty table, not an \
              error, and starts populating the day it does."
@@ -12429,14 +12455,27 @@ template = "pool"
     #[test]
     fn a_partial_backfill_does_not_claim_an_event_never_fired() {
         let tables = vec!["usdc__pause".to_string()];
-        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)), false);
+        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)), Some(false));
         assert!(!partial.contains("never fired"), "{partial}");
         assert!(partial.contains("blocks 6082465 to 6783217"), "{partial}");
         assert!(partial.contains("usdc__pause"), "{partial}");
-        let complete = no_data_notice(&tables, Some((6_082_465, 26_000_000)), true);
+        let complete = no_data_notice(&tables, Some((6_082_465, 26_000_000)), Some(true));
         assert!(complete.contains("may never have fired"), "{complete}");
         assert!(!complete.contains("so far"), "{complete}");
-        assert!(no_data_notice(&tables, None, false).contains("likely never fired"));
+        let unknown = no_data_notice(&tables, Some((6_082_465, 26_000_000)), None);
+        assert!(unknown.contains("could not be read"), "{unknown}");
+        assert!(!unknown.contains("never have fired"), "{unknown}");
+        assert!(!unknown.contains("has not reached the tip"), "{unknown}");
+        assert!(no_data_notice(&tables, None, None).contains("likely never fired"));
+    }
+
+    #[tokio::test]
+    async fn the_boot_tip_is_read_once_per_source_not_once_per_dataset() {
+        let source = moving_tip_source();
+        let dynamic: Arc<dyn Source> = source.clone();
+        let first = boot_tip(7_001, &dynamic).await;
+        assert_eq!(boot_tip(7_001, &dynamic).await, first);
+        assert_eq!(source.1.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -14797,28 +14836,31 @@ template = "pool"
     #[tokio::test]
     async fn a_runtime_cursor_announces_its_catch_up_before_the_poll_interval_sleep() {
         let (lines, _guard) = Lines::capture();
-        let dir = tempfile::tempdir().unwrap();
-        let mut nest =
-            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
-        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
-        let task = spawn_test_cursor(
-            CursorKind::Shared,
-            moving_tip_source() as Arc<dyn Source>,
-            vec![nest],
-            Some(5),
-            50,
-            Arc::new(crate::health::RuntimeHealth::new()),
-            false,
-            None,
-        );
-        wait_for(
-            "the catch-up announcement",
-            std::time::Duration::from_secs(20),
-            || lines.count("caught up to tip") > 0,
-        )
-        .await;
-        assert_eq!(lines.count("caught up to tip"), 1);
-        task.abort();
+        for kind in BOTH_CURSORS {
+            let before = lines.count("caught up to tip");
+            let dir = tempfile::tempdir().unwrap();
+            let mut nest =
+                build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+            nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+            let task = spawn_test_cursor(
+                kind,
+                moving_tip_source() as Arc<dyn Source>,
+                vec![nest],
+                Some(5),
+                50,
+                Arc::new(crate::health::RuntimeHealth::new()),
+                false,
+                None,
+            );
+            wait_for(
+                "the catch-up announcement",
+                std::time::Duration::from_secs(20),
+                || lines.count("caught up to tip") > before,
+            )
+            .await;
+            assert_eq!(lines.count("caught up to tip"), before + 1, "{kind:?}");
+            task.abort();
+        }
     }
 
     /// Past the flip only the template's own events are asked for without an address. The factory's
