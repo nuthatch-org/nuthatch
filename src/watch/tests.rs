@@ -665,3 +665,10 @@ fn the_budget_follows_the_runtimes_ceiling() {
     app.apply(&read(now - 20, "/nests", 200, &nests.to_string()));
     assert_eq!(app.budget_bytes(), Some(4.0 * gib * cursors));
 }
+
+#[test]
+fn a_bounded_run_in_which_nothing_answered_fails_in_either_mode() {
+    assert!(super::finish(true, "http://x").is_ok());
+    let err = super::finish(false, "http://x").unwrap_err().to_string();
+    assert!(err.contains("nothing answered at http://x"), "{err}");
+}
