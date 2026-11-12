@@ -24,7 +24,7 @@ fail=0
 
 # 1. The copy-paste commands. These are what someone actually runs, so a stale tag here is not a
 #    documentation nit - it hands them an old binary that works, which is the hardest kind to notice.
-echo "container tags in docs (copy-paste commands):"
+echo "container tags in docs and compose defaults (copy-paste commands):"
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   case "$line" in
@@ -34,7 +34,7 @@ while IFS= read -r line; do
     *":$WANT"*|*':<version>'*|*':{version}'*) printf "  OK   %s\n" "$line" ;;
     *) printf "  STALE %s\n" "$line"; fail=$((fail + 1)) ;;
   esac
-done < <(grep -rn "ghcr.io/nuthatch-org/nuthatch:" --include="*.md" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
+done < <(grep -rn "ghcr.io/nuthatch-org/nuthatch:" --include="*.md" --include="docker-compose*.yml" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
 
 # 2. Cargo.toml is the source of truth and must agree with itself.
 have=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
