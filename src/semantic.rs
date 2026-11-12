@@ -120,6 +120,8 @@ pub struct Coverage {
     pub tip: u64,
     /// The first block indexed. Balances count from here, not from the contract's deployment.
     pub first_indexed: Option<u64>,
+    /// Whether that is the contracts' deployment; `None` when the store does not say.
+    pub history_from_deployment: Option<bool>,
 }
 
 /// Compose the enriched schema document from the four layers the RFC names: **structure** (registry),
@@ -169,14 +171,15 @@ pub fn compose(
             c.sealed_through, c.tip
         ));
         if let Some(from) = c.first_indexed {
+            let meaning = match (gates.transfers, c.history_from_deployment) {
+                (false, _) => "",
+                (true, Some(true)) => "; history starts at the contracts' deployment, so the `balances` view is complete",
+                (true, Some(false)) => "; history was cut short, so the `balances` view is the net flow since then, not a balance",
+                (true, None) => "; this nest does not record whether that is the deployment, so read the `balances` view as a net flow since then, not a balance",
+            };
             out.push_str(&format!(
-                "  first_indexed = {from} - no block before it is in this nest"
+                "  first_indexed = {from} - no block before it is in this nest{meaning}.\n"
             ));
-            out.push_str(if gates.transfers {
-                ", so the `balances` view is the net flow since then, a balance only if this is the contract's deployment block.\n"
-            } else {
-                ".\n"
-            });
         }
         out.push('\n');
     }
@@ -834,22 +837,30 @@ mod tests {
 
     #[test]
     fn coverage_names_the_first_indexed_block() {
-        let cov = |first_indexed| Coverage {
+        let cov = |first_indexed, history_from_deployment| Coverage {
             sealed_through: 90,
             tip: 100,
             first_indexed,
+            history_from_deployment,
         };
-        let doc = compose(
-            &[transfer_table()],
-            None,
-            Some(&cov(Some(26_397_446))),
-            &[],
-            Gates::ALL,
-        );
+        let say = |c| compose(&[transfer_table()], None, Some(&c), &[], Gates::ALL);
+        let doc = say(cov(Some(26_397_446), Some(false)));
         assert!(doc.contains("first_indexed = 26397446"), "{doc}");
-        assert!(doc.contains("net flow"), "{doc}");
-        let doc = compose(&[transfer_table()], None, Some(&cov(None)), &[], Gates::ALL);
-        assert!(!doc.contains("first_indexed"), "{doc}");
+        assert!(
+            doc.contains("net flow") && doc.contains("cut short"),
+            "{doc}"
+        );
+        let doc = say(cov(Some(26_397_446), None));
+        assert!(
+            doc.contains("does not record") && doc.contains("net flow"),
+            "{doc}"
+        );
+        let doc = say(cov(Some(9_000), Some(true)));
+        assert!(
+            doc.contains("complete") && !doc.contains("net flow"),
+            "{doc}"
+        );
+        assert!(!say(cov(None, None)).contains("first_indexed"));
     }
 
     #[test]
