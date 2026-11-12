@@ -2320,9 +2320,16 @@ fn hash_throttled(
 /// Quarantine a catalogued segment a caller read whole, to hand on, and found not to hash to its
 /// address. A provisional tail is left for the next start to record as lost.
 pub fn quarantine_mismatched(dir: &Path, table: &str, s: &Segment) {
-    if !s.provisional {
-        let path = segment_path(dir, &s.file, &s.hash);
-        quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+    if s.provisional {
+        return;
+    }
+    let path = segment_path(dir, &s.file, &s.hash);
+    // Read again: a seal may have restored the right bytes since the caller's read.
+    let mut throttle = Throttle::new(u64::MAX);
+    if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, &|| true) {
+        if got != s.hash {
+            quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+        }
     }
 }
 
