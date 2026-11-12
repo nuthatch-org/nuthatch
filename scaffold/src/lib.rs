@@ -224,6 +224,11 @@ pub fn starter_view(schema: &[TableSchema]) -> String {
     )
 }
 
+/// Whether the nest has the ERC-20 Transfer shape that gives it the balance routes and tools.
+fn has_transfers(schema: &[TableSchema]) -> bool {
+    schema.iter().any(TableSchema::is_transfer_shaped)
+}
+
 /// `llms.txt`: how an AI agent queries this nest. `contracts` is (alias, address).
 pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]) -> String {
     let list = contract_list(contracts);
@@ -240,6 +245,16 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
             format!("- `{}` - {} ({})\n", t.table, source, cols.join(", "))
         })
         .collect();
+    let (balance_routes, balance_tools) = if has_transfers(schema) {
+        (
+            "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true` (false or null means net flow)\n\
+             - `GET /balance/{address}`   one address's derived balance, on the same condition. That flag means indexed from the configured `start_block` with no `--backfill`: the deployment only if `start_block` is the deployment block, which `init` sets\n",
+            ", balance, top_balances",
+        )
+    } else {
+        ("", "")
+    };
+
     format!(
         "# nuthatch nest on {chain}\n\
          \n\
@@ -261,16 +276,15 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - `GET /entity/{{id}}`         one row by id (`{{block:012}}-{{logindex:06}}`)\n\
          - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{{alias}}__{{event}}`, and each\n\
          \x20                            authored view (`views/*.sql`) answers by its own name\n\
-         - `GET /balances?limit=N`    top holder balances (when an ERC-20 Transfer table is present)\n\
-         - `GET /balance/{{address}}`   one address's derived balance\n\
+         {balance_routes}\
          - `GET /queries`             the mount's SQL mode and the queries its operator declared in\n\
          \x20                            `mounts.toml` (none on an open nest); `GET /q/{{name}}` runs one\n\
          - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{{entity}}` reads one\n\
          - `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`\n\
          \n\
          ## MCP (for coding agents)\n\
-         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, entity, diff,\n\
-         balance, top_balances. Fully offline against the local instance; nothing phones home.\n"
+         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, explain, entity, diff{balance_tools}.\n\
+         Fully offline against the local instance; nothing phones home.\n"
     )
 }
 
@@ -282,10 +296,34 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         .first()
         .map(|t| t.table.as_str())
         .unwrap_or("<alias>__<event>");
+    let skill_balances = if has_transfers(schema) {
+        ", balances, "
+    } else {
+        ", "
+    };
+    let skill_balance_tools = if has_transfers(schema) {
+        " / `balance` / `top_balances` (read `complete_history` in their results: when false or null the \
+         figures are `net_flow_since_indexed_from`, not balances; true means indexed from the configured \
+         `start_block` with no `--backfill`, the deployment if `start_block` is the deployment block, \
+         which `init` sets)"
+    } else {
+        ""
+    };
+
+    let skill_balance_http = if has_transfers(schema) {
+        "- Balances: `GET /balances`, read with the status at `GET /`: \
+         the figures are net flow since its `start_block`, balances only when it says \
+         `history_from_deployment: true` (false or null means net flow). True means indexed from the \
+         configured `start_block` with no `--backfill`: the deployment only if `start_block` is the \
+         deployment block, which `init` sets\n"
+    } else {
+        ""
+    };
+
     format!(
         "---\n\
          name: nuthatch\n\
-         description: Query this self-hosted nuthatch nest on {chain} - decoded events, balances, \
+         description: Query this self-hosted nuthatch nest on {chain} - decoded events{skill_balances}\
          and read-only SQL. Use when asked about on-chain activity for these contracts.\n\
          ---\n\
          \n\
@@ -296,11 +334,12 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          \n\
          ## Preferred: MCP\n\
          If a `nuthatch` MCP server is configured, use its tools. Call `schema` first to learn the\n\
-         data model, then `sql` / `entity` / `balance` / `top_balances`.\n\
+         data model, then `sql` / `entity`{skill_balance_tools}.\n\
          \n\
          ## Fallback: HTTP (a `nuthatch dev` must be running)\n\
          - Recent rows:  `curl localhost:8288/entities?limit=20`\n\
          - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM {example}'`\n\
+         {skill_balance_http}\
          \n\
          `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
          `provenance.sealed_through` is the block through which this nest has sealed history; newer rows\n\
@@ -344,5 +383,64 @@ mod tests {
                 "{ignore:?} lacks {entry}"
             );
         }
+    }
+
+    fn nest_with(event: serde_json::Value) -> Nest {
+        Nest {
+            name: "demo".into(),
+            chain: "mainnet".into(),
+            chain_id: 1,
+            rpc_urls: Vec::new(),
+            block_timestamps: false,
+            contracts: vec![Contract {
+                alias: "tok".into(),
+                address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
+                start_block: None,
+                abi: serde_json::json!([event]),
+            }],
+        }
+    }
+
+    fn agent_docs(nest: &Nest) -> (String, String) {
+        let files = files(nest).unwrap();
+        let text = |p: &str| String::from_utf8(files[p].clone()).unwrap();
+        (text("llms.txt"), text(".claude/skills/nuthatch/SKILL.md"))
+    }
+
+    /// The balance routes and tools exist only where a Transfer table does, as the MCP bridge
+    /// advertises them, and `explain` is always listed.
+    #[test]
+    fn the_agent_docs_name_the_balance_tools_only_for_a_transfer_nest() {
+        let address =
+            |name: &str| serde_json::json!({ "name": name, "type": "address", "indexed": true });
+        let transfer = nest_with(serde_json::json!({
+            "type": "event", "name": "Transfer", "anonymous": false,
+            "inputs": [address("from"), address("to"),
+                { "name": "value", "type": "uint256", "indexed": false }]
+        }));
+        let (llms, skill) = agent_docs(&transfer);
+        assert!(
+            llms.contains("top_balances")
+                && llms.contains("/balance/{address}")
+                && llms.contains("history_from_deployment"),
+            "{llms}"
+        );
+        assert!(llms.contains("explain"), "{llms}");
+        assert!(
+            skill.contains("top_balances")
+                && skill.contains("complete_history")
+                && skill.contains("history_from_deployment"),
+            "{skill}"
+        );
+
+        let pool = nest_with(serde_json::json!({
+            "type": "event", "name": "Sync", "anonymous": false,
+            "inputs": [{ "name": "reserve0", "type": "uint112", "indexed": false }]
+        }));
+        let (llms, skill) = agent_docs(&pool);
+        for text in [&llms, &skill] {
+            assert!(!text.contains("balance"), "{text}");
+        }
+        assert!(llms.contains("explain"), "{llms}");
     }
 }

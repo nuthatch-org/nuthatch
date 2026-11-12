@@ -194,3 +194,50 @@ fn malformed_and_oversized_messages_get_parse_errors_and_stdio_recovers() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// JSON-RPC 2.0 §5.1: valid JSON that is not a request object, or an object with no method, is an
+/// Invalid Request answered with a null id, not silence; a client's response is not an error.
+#[test]
+fn a_message_that_is_not_a_request_gets_invalid_request_and_stdio_recovers() {
+    let mut child = nuthatch()
+        .args(["mcp", "--url", "http://127.0.0.1:1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for line in [
+        "42",
+        "\"str\"",
+        "[]",
+        r#"[{"jsonrpc":"2.0","id":9,"method":"ping"}]"#,
+        r#"{"jsonrpc":"2.0","id":6}"#,
+        r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+        r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#,
+    ] {
+        writeln!(stdin, "{line}").unwrap();
+    }
+    drop(stdin);
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 7, "{stdout}");
+    for invalid in &responses[..6] {
+        assert_eq!(invalid["id"], serde_json::Value::Null, "{stdout}");
+        assert_eq!(invalid["error"]["code"], -32600, "{stdout}");
+        assert_eq!(invalid["error"]["message"], "Invalid Request", "{stdout}");
+    }
+    assert_eq!(responses[6]["id"], 3, "the loop carries on: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nuthatch mcp: invalid JSON-RPC request"),
+        "{stderr}"
+    );
+}

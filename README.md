@@ -436,6 +436,8 @@ Or add it to Claude Code directly:
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 
+A runtime hosting several nests serves nothing at its root: point `--url` at one mount, `http://127.0.0.1:8288/<alias>` (or `/<tenant>/<alias>`). `GET /nests` lists them.
+
 A nest behind a gateway that wants a bearer token: `--token-env NEST_TOKEN` names the variable that
 holds it (`NUTHATCH_MCP_TOKEN` is read by default), so the token never goes on the command line.
 

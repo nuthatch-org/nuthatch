@@ -45,6 +45,18 @@ else
   echo "Cargo.toml: STALE ($have, expected $WANT)"; fail=$((fail + 1))
 fi
 
+# The MCP Registry entry names a release and its image. The release flow touches Cargo.toml, so this
+# is where a bump of server.json is made part of it; `mcp::tests::the_registry_entry_names_this_release`
+# fails the release PR's CI for the same reason.
+echo
+reg_version=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' server.json | head -1)
+reg_image=$(sed -n 's/.*ghcr.io\/nuthatch-org\/nuthatch:\([^"]*\)".*/\1/p' server.json | head -1)
+if [ "$reg_version" = "$WANT" ] && [ "$reg_image" = "$WANT" ]; then
+  echo "server.json: OK ($reg_version)"
+else
+  echo "server.json: STALE (version $reg_version, image tag $reg_image, expected $WANT)"; fail=$((fail + 1))
+fi
+
 # SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). The section names
 # no version at all now, so any number that appears in it is a regression.
 echo
