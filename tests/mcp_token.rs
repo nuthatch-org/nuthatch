@@ -235,5 +235,8 @@ fn a_message_that_is_not_a_request_gets_invalid_request_and_stdio_recovers() {
     }
     assert_eq!(responses[5]["id"], 3, "the loop carries on: {stdout}");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("nuthatch mcp: invalid JSON-RPC request"), "{stderr}");
+    assert!(
+        stderr.contains("nuthatch mcp: invalid JSON-RPC request"),
+        "{stderr}"
+    );
 }
