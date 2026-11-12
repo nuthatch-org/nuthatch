@@ -142,9 +142,10 @@ fn deliver_sealed_within(
         let predicate = w
             .where_clause
             .as_deref()
-            .map(|p| format!(" AND ({p})"))
+            .map(|p| format!(" AND ({p}\n)"))
             .unwrap_or_default();
         let select = |lo: u64, hi: u64, offset: u64| {
+            // The newline ends a `--` in `where` before the bounds, so a comment cannot drop them.
             format!(
                 "SELECT * FROM \"{}\" WHERE block_number > {lo} AND block_number <= {hi}{predicate} \
                  ORDER BY block_number, log_index LIMIT {limit} OFFSET {offset}",
@@ -164,8 +165,8 @@ fn deliver_sealed_within(
         let sql = select(lo, hi, offset);
         let rows = match &seat {
             Some(seat) => {
-                // The row cap is the statement's own LIMIT, which a full answer reaches without being
-                // cut, and the byte cap is off: a cut answer would move the cursor past rows never queued.
+                // The row cap is the LIMIT, which an answer of exactly that many rows is not cut at, and the
+                // byte cap is off: a cut answer would move the cursor past rows never queued.
                 let guard = crate::analytics::QueryGuard {
                     max_rows: usize::try_from(limit).unwrap_or(usize::MAX),
                     max_result_bytes: usize::MAX,
@@ -182,9 +183,12 @@ fn deliver_sealed_within(
             None => crate::analytics::query(dir, &sql),
         };
         let mut rows = match rows {
-            Ok(r) => r,
+            Ok(r) => {
+                failing(dir, &w.name, false);
+                r
+            }
             // A seated query that fails is refused or out of budget, and fails again every seal.
-            Err(e) if seat.is_some() && first_failure(dir, &w.name) => {
+            Err(e) if seat.is_some() && failing(dir, &w.name, true) => {
                 tracing::warn!(
                     "webhook '{}' delivers nothing until its query runs within the mount's limits: {e:#}",
                     w.name
@@ -248,16 +252,22 @@ fn deliver_sealed_within(
     Ok(enqueued)
 }
 
-/// Whether this is the first failed query of `name` in `dir` this process has seen.
-fn first_failure(dir: &std::path::Path, name: &str) -> bool {
+/// Record whether `name` in `dir` failed its last query; true when it has just started failing.
+fn failing(dir: &std::path::Path, name: &str, failed: bool) -> bool {
     static FAILED: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, String)>>,
     > = std::sync::OnceLock::new();
-    FAILED
+    let mut all = FAILED
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert((dir.to_path_buf(), name.to_string()))
+        .unwrap_or_else(|p| p.into_inner());
+    let key = (dir.to_path_buf(), name.to_string());
+    if failed {
+        all.insert(key)
+    } else {
+        all.remove(&key);
+        false
+    }
 }
 
 fn row_block(row: &serde_json::Value) -> Result<u64> {
@@ -317,7 +327,7 @@ pub fn refuse_unbound(
         }
         if let Some(p) = &w.where_clause {
             let sql = format!(
-                "SELECT * FROM \"{}\" WHERE block_number > 0 AND ({p}) ORDER BY block_number, log_index",
+                "SELECT * FROM \"{}\" WHERE block_number > 0 AND ({p}\n) ORDER BY block_number, log_index",
                 w.table
             );
             if let Err(e) = plan(&sql) {
@@ -595,6 +605,13 @@ mod tests {
             .unwrap_err()
         );
         assert!(err.contains("not a table name"), "{err}");
+
+        let mut commented = wh("w", "t__transfer", "registration");
+        commented.where_clause = Some("1=1) --".into());
+        assert!(
+            refuse_unbound(dir.path(), &declared, &[commented]).is_err(),
+            "a `where` that comments out the statement's bounds is refused"
+        );
     }
 
     fn strict_nest(dir: &std::path::Path) {
