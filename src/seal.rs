@@ -1795,8 +1795,9 @@ pub const QUARANTINE_DIR: &str = "quarantine";
 /// Returns the number of segments quarantined. Best-effort - never fatal (an IO error just logs).
 ///
 /// A segment is hashed only when its file is not the one the last clean pass hashed: a different
-/// length, modification time, change time, inode or device. Any write, truncation, replacement or
-/// restore moves at least one of them, and the change time cannot be set back from user space. What
+/// length, modification time, change time, inode or device, or a catalogue expecting other bytes.
+/// Any write, truncation, replacement or restore moves at least one of them, to the filesystem's
+/// timestamp resolution, and the change time cannot be set back from user space. What
 /// this does not see is a change below the filesystem, a sector rotting under an unchanged inode,
 /// which the serving path's own check finds when a read fails.
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
@@ -1819,7 +1820,8 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             // segment is reported loudly and left in place; the operator decides, with the knowledge
             // that more than one dataset is affected.
             let is_shared = shared_store(dir).is_some_and(|st| path.starts_with(&st));
-            let key = path.to_string_lossy().into_owned();
+            // The hash too: a restored catalogue may expect other bytes of the same file.
+            let key = format!("{}\n{}", path.display(), s.hash);
             // Taken before the read, so a write landing during it moves the stamp past this one.
             let stamp = file_stamp(&path);
             if let Some(unchanged) = stamp.filter(|s| before.get(&key) == Some(s)) {
@@ -3505,6 +3507,17 @@ mod tests {
         let before = inode();
         assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
         assert_eq!(inode(), before, "the catalogue was reinstalled");
+    }
+
+    #[test]
+    fn a_catalogue_expecting_other_bytes_of_an_unchanged_file_rehashes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        let mut m = load_manifest(dir.path()).unwrap();
+        m.tables.get_mut("usdc__transfer").unwrap()[0].hash = "ab".repeat(32);
+        save_manifest(dir.path(), &m).unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
     }
 
     #[test]
