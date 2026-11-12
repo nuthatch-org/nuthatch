@@ -8510,14 +8510,18 @@ fn long_history_advice(span: u64, recent: u64, dir: &Path) -> String {
     }
 }
 
-/// The store a solo nest keeps at its root; `None` under a runtime, whose dataset is not the
-/// operator's to delete on one nest's say-so.
+/// The store a solo nest owns, named from the paths it really uses; `None` for a runtime dataset
+/// (`data/<nid>` or anywhere under a `mounts.toml` root), which is not the operator's to delete on
+/// one nest's say-so. A parent merely named `data` does not make a nest a runtime's.
 fn solo_store_paths(dir: &Path) -> Option<String> {
-    seal::shared_store(dir).is_none().then(|| {
+    let runtime_root = dir.parent().and_then(Path::parent);
+    let runtime = crate::runtime::MountTable::is_identity_keyed(dir)
+        || runtime_root.is_some_and(|r| r.join(crate::runtime::MOUNTS_FILE).exists());
+    (!runtime).then(|| {
         format!(
             "{} and {}",
             dir.join(DB_FILE).display(),
-            dir.join(seal::SEGMENTS_DIR).display()
+            seal::segments_dir(dir).display()
         )
     })
 }
@@ -12391,7 +12395,9 @@ template = "pool"
             note.contains("/n/nest/nuthatch.redb and /n/nest/segments"),
             "{note}"
         );
-        let shared = Path::new("/r/data/abc");
+        let nid = "ab".repeat(32);
+        let shared_dir = PathBuf::from(format!("/r/data/{nid}"));
+        let shared = shared_dir.as_path();
         let note = ignored_backfill(Some(300), Some(10), 50, shared).unwrap();
         assert!(!note.contains("remove"), "{note}");
         let advice = long_history_advice(5_000_000, 300, solo);
@@ -12401,6 +12407,25 @@ template = "pool"
         );
         assert!(advice.contains("`--backfill 300`"), "{advice}");
         assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
+
+        // A solo nest whose parent happens to be called `data` is still a solo nest, and its
+        // remedy names where its store and segments really are.
+        let root = tempfile::tempdir().unwrap();
+        let solo_in_data = root.path().join("data").join("solo");
+        std::fs::create_dir_all(&solo_in_data).unwrap();
+        let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
+        assert!(
+            note.contains(&format!(
+                "{} and {}",
+                solo_in_data.join("nuthatch.redb").display(),
+                root.path().join("segments").display()
+            )),
+            "{note}"
+        );
+        // A mounts.toml root makes anything under its data/ a runtime dataset.
+        std::fs::write(root.path().join("mounts.toml"), "").unwrap();
+        let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
+        assert!(!note.contains("remove"), "{note}");
     }
 
     #[test]

@@ -55,6 +55,12 @@ pub fn shared_store(dir: &Path) -> Option<PathBuf> {
     Some(parent.parent()?.join(SEGMENTS_DIR))
 }
 
+/// The directory a nest's new segments are written to: the shared store when there is one, else
+/// `segments/` beside the nest.
+pub fn segments_dir(dir: &Path) -> PathBuf {
+    shared_store(dir).unwrap_or_else(|| dir.join(SEGMENTS_DIR))
+}
+
 /// Where a segment's bytes actually live: the shared store when there is one, else beside the nest.
 ///
 /// **Falls back to the per-dataset path when the shared copy is absent**, so a dataset migrated
