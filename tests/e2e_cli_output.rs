@@ -97,12 +97,15 @@ fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
     assert_ne!(code, 0, "{err}");
     let body = err.trim_start_matches("Error: ");
     assert!(body.starts_with("no table `transfer`"), "{err}");
-    assert!(!err.contains("`schema` tool"), "{err}");
+    assert!(
+        err.contains("`.tables`") && !err.contains("`schema` tool") && !err.contains("/schema"),
+        "{err}"
+    );
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let reply = serde_json::json!({
-        "error": "no segments: Catalog Error: Table with name transfer does not exist!\n\nhint: no table `transfer`. Call the `schema` tool for the list of tables."
+        "error": "no segments: Catalog Error: Table with name transfer does not exist!\n\nhint: no table `transfer`. `GET /schema` lists the tables."
     })
     .to_string();
     std::thread::spawn(move || {
@@ -132,5 +135,35 @@ fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
             .starts_with("no table `transfer`"),
         "{err}"
     );
-    assert!(!err.contains("`schema` tool"), "{err}");
+    assert!(
+        err.contains("`.tables`") && !err.contains("`schema` tool") && !err.contains("/schema"),
+        "{err}"
+    );
+}
+
+/// `check` prints a broken view's hint to a terminal, so it points at the REPL as `sql` does.
+#[test]
+fn check_points_a_broken_views_hint_at_the_repl() {
+    let nest = tempfile::tempdir().unwrap();
+    std::fs::write(
+        nest.path().join("nuthatch.toml"),
+        "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(nest.path().join("views")).unwrap();
+    std::fs::write(
+        nest.path().join("views/10-broken.sql"),
+        "CREATE VIEW broken AS SELECT * FROM nonexistent_table;",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["check", "--dir", nest.path().to_str().unwrap()]);
+    assert_ne!(code, 0, "{out}{err}");
+    assert!(
+        out.contains("hint: no table `nonexistent_table`") && out.contains("`.tables`"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("/schema") && !out.contains("`schema` tool"),
+        "{out}"
+    );
 }

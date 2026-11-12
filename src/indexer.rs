@@ -3598,7 +3598,10 @@ async fn build_nest(
     // loads fault-isolated (a bad one never disables its siblings or the query surface).
     for issue in crate::analytics::validate_nest_views(&dir, &served) {
         match &issue.hint {
-            Some(h) => tracing::warn!("view {} failed to load: {} - {h}", issue.file, issue.error),
+            Some(h) => {
+                let h = crate::sql_errors::for_surface(h, crate::sql_errors::Surface::Repl);
+                tracing::warn!("view {} failed to load: {} - {h}", issue.file, issue.error)
+            }
             None => tracing::warn!("view {} failed to load: {}", issue.file, issue.error),
         }
     }

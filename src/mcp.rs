@@ -6,6 +6,7 @@
 //! Bridging (rather than reopening the redb/segments) means the MCP server never contends with the
 //! indexer for the single-writer store, and it automatically reflects the live IVM views.
 
+use crate::sql_errors;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -262,6 +263,7 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
                 Ok(text) => Some(ok(id, content(&text, false))),
                 Err(e) => {
                     let text = explain_bare_404(format!("{e:#}"), client, base).await;
+                    let text = sql_errors::for_surface(&text, sql_errors::Surface::Mcp);
                     Some(ok(id, content(&text, true)))
                 }
             }
@@ -789,7 +791,7 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
         Err(_) => return bound(raw.to_string()),
     };
     if let Some(err) = v.get("error").and_then(Value::as_str) {
-        return bound(err.to_string());
+        return bound(sql_errors::for_surface(err, sql_errors::Surface::Mcp));
     }
     let rows = v
         .get("rows")
@@ -1676,6 +1678,49 @@ mod tests {
         let raw = r#"{"error":"Binder Error: …\n\nhint: use value_dec"}"#;
         let out = format_sql_result(raw, 200);
         assert!(out.contains("hint: use value_dec"));
+    }
+
+    /// The node writes its hints for HTTP callers; an agent is pointed at its own `schema` tool.
+    #[tokio::test]
+    async fn a_refused_query_points_an_agent_at_the_schema_tool() {
+        use axum::{response::IntoResponse, routing::get, Router};
+        let hinted = |raw: &str| {
+            let hint = sql_errors::enrich(raw, "", &[]).expect("a hint");
+            format!("{raw}\n\nhint: {hint}")
+        };
+        let table = hinted("no segments: Catalog Error: Table with name nope does not exist!");
+        let column = hinted(
+            "plan error: Binder Error: Referenced column \"nope\" not found in FROM clause!",
+        );
+        let reply = |a: nuthatch_core::answer::Answer| {
+            (
+                axum::http::StatusCode::from_u16(a.status).unwrap(),
+                [("content-type", "application/json")],
+                a.body,
+            )
+                .into_response()
+        };
+        let sql = nuthatch_core::answer::Answer::json(400, &json!({ "error": column }));
+        let explain = nuthatch_core::answer::explain_invalid(&table);
+        let app = Router::new()
+            .route("/sql", get(move || async move { reply(sql) }))
+            .route("/explain", get(move || async move { reply(explain) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (tool, said) in [
+            ("sql", "Call the `schema` tool for each table's columns."),
+            ("explain", "Call the `schema` tool for the list of tables."),
+        ] {
+            let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": tool, "arguments": { "query": "SELECT nope FROM nope" } } });
+            let out = handle(&req, &client, &base).await.unwrap().to_string();
+            assert!(
+                out.contains(said) && !out.contains("/schema"),
+                "{tool}: {out}"
+            );
+        }
     }
 
     #[tokio::test]
