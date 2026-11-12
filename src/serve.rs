@@ -2673,52 +2673,212 @@ fn is_secret_key(key: &str) -> bool {
     SECRET_KEYS.iter().any(|needle| key.contains(needle))
 }
 
-/// Config text with credentials taken out: every URL cut to `scheme://host`, and every value under a
-/// `secret`/`token`/`password`/`api_key` key replaced. A TOML file is redacted by its parsed
-/// structure, at any depth, and re-printed with its comments; one that does not parse is withheld.
+/// `nuthatch.toml` key paths whose values the Config tab shows as written, from the settings structs
+/// (`Config` and what it holds). `*` is one array element, of `[[x]]` or `x = [...]` alike. Every
+/// other value, including one under a key the config does not know, is shown by its type alone.
+const SHOWN_NUTHATCH_KEYS: &[&str] = &[
+    "nest.name",
+    "nest.chain",
+    "nest.chain_id",
+    "nest.schema_version",
+    "nest.block_timestamps",
+    "contracts.*.alias",
+    "contracts.*.address",
+    "contracts.*.start_block",
+    "contracts.*.abi",
+    "contracts.*.events.*",
+    "templates.*.name",
+    "templates.*.abi",
+    "templates.*.filter",
+    "templates.*.events.*",
+    "factories.*.watch",
+    "factories.*.event",
+    "factories.*.child_param",
+    "factories.*.template",
+    "factories.*.start",
+    "flags.threshold",
+    "flags.velocity_amount",
+    "flags.velocity_window",
+    "extract.blocks",
+    "extract.traces",
+    "extract.top_level_calls",
+    "extract.state",
+    "extract.contracts.*",
+    "extract.selectors.*",
+    "extract.unbounded",
+    "alerts.*.kinds.*",
+    "alerts.*.format",
+    "webhooks.*.name",
+    "webhooks.*.table",
+    "webhooks.*.where",
+    "webhooks.*.batch_max",
+    "webhooks.*.finality",
+    "webhooks.*.since",
+    "calls.*.name",
+    "calls.*.contract",
+    "calls.*.calldata",
+    "calls.*.on",
+    "calls.*.on_any.*",
+    "calls.*.canonical",
+    "calls.*.signature",
+    "calls.*.args.*",
+    "calls.*.contract_column",
+    "calls.*.every",
+    "calls.*.start",
+    "ipfs.*.name",
+    "ipfs.*.on",
+    "ipfs.*.cid_column",
+    "ipfs.*.cid_json_path",
+    "address_history.addresses.*",
+    "address_history.start_block",
+    "address_history.end_block",
+    "address_history.poll_interval",
+    "address_history.mev_relays",
+    "address_history.request_deadline",
+    "address_history.validators.*",
+];
+
+/// Shown as `scheme://host[:port]`: a provider's key often sits in the path or the userinfo.
+const SHOWN_NUTHATCH_URLS: &[&str] = &["nest.rpc_urls.*"];
+
+#[derive(Clone, Copy)]
+enum Shown {
+    Value,
+    Url,
+    Type,
+}
+
+/// Config text as the Config tab shows it. A TOML file is parsed and printed again from its values
+/// alone, so no comment survives; `nuthatch.toml` shows only [`SHOWN_NUTHATCH_KEYS`]. The other
+/// TOML files declare no credential, so their values are shown, but any URL-shaped one is cut as a
+/// URL or hidden. One that does not parse is withheld.
 fn redact_config_text(name: &str, text: &str) -> String {
     if !name.ends_with(".toml") {
         return redact_config_lines(text);
     }
-    match text.parse::<toml_edit::DocumentMut>() {
-        Ok(mut doc) => {
-            redact_toml_table(doc.as_table_mut(), false);
-            redact_urls(&doc.to_string())
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return "# not shown: this file does not parse as TOML, so its secrets cannot be found\n"
+            .to_string();
+    };
+    let nuthatch = name == "nuthatch.toml";
+    let rule = |path: &str, value: &toml_edit::Value| {
+        if nuthatch {
+            if SHOWN_NUTHATCH_KEYS.contains(&path) {
+                Shown::Value
+            } else if SHOWN_NUTHATCH_URLS.contains(&path) {
+                Shown::Url
+            } else {
+                Shown::Type
+            }
+        } else if value
+            .as_str()
+            .is_some_and(|s| s.contains("://") || s.contains('@'))
+        {
+            Shown::Url
+        } else {
+            Shown::Value
         }
-        Err(_) => "# not shown: this file does not parse as TOML, so its secrets cannot be found\n"
-            .to_string(),
+    };
+    let mut out = toml_edit::DocumentMut::new();
+    *out.as_table_mut() = shown_table(doc.as_table(), "", &rule);
+    out.to_string()
+}
+
+fn key_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_string()
+    } else {
+        format!("{parent}.{key}")
     }
 }
 
-fn redact_toml_table(table: &mut toml_edit::Table, secret: bool) {
-    for (key, item) in table.iter_mut() {
-        let secret = secret || is_secret_key(key.get());
-        match item {
-            toml_edit::Item::Value(v) => redact_toml_value(v, secret),
-            toml_edit::Item::Table(t) => redact_toml_table(t, secret),
+fn shown_table(
+    src: &toml_edit::Table,
+    path: &str,
+    rule: &dyn Fn(&str, &toml_edit::Value) -> Shown,
+) -> toml_edit::Table {
+    let mut out = toml_edit::Table::new();
+    out.set_implicit(src.is_implicit());
+    out.set_dotted(src.is_dotted());
+    for (key, item) in src.iter() {
+        let path = key_path(path, key);
+        let item = match item {
+            toml_edit::Item::Table(t) => toml_edit::Item::Table(shown_table(t, &path, rule)),
             toml_edit::Item::ArrayOfTables(a) => {
-                a.iter_mut().for_each(|t| redact_toml_table(t, secret))
+                let mut shown = toml_edit::ArrayOfTables::new();
+                for t in a.iter() {
+                    shown.push(shown_table(t, &format!("{path}.*"), rule));
+                }
+                toml_edit::Item::ArrayOfTables(shown)
             }
-            toml_edit::Item::None => {}
+            toml_edit::Item::Value(v) => toml_edit::Item::Value(shown_value(v, &path, rule)),
+            toml_edit::Item::None => continue,
+        };
+        out.insert(key, item);
+    }
+    out
+}
+
+fn shown_value(
+    value: &toml_edit::Value,
+    path: &str,
+    rule: &dyn Fn(&str, &toml_edit::Value) -> Shown,
+) -> toml_edit::Value {
+    use toml_edit::Value as V;
+    match value {
+        V::InlineTable(t) => {
+            let mut shown = toml_edit::InlineTable::new();
+            for (key, v) in t.iter() {
+                shown.insert(key, shown_value(v, &key_path(path, key), rule));
+            }
+            V::InlineTable(shown)
+        }
+        V::Array(a) => {
+            let mut shown = toml_edit::Array::new();
+            for v in a.iter() {
+                shown.push(shown_value(v, &format!("{path}.*"), rule));
+            }
+            V::Array(shown)
+        }
+        leaf => {
+            let kind = match leaf {
+                V::String(_) => "string",
+                V::Integer(_) => "integer",
+                V::Float(_) => "float",
+                V::Boolean(_) => "boolean",
+                _ => "datetime",
+            };
+            let hidden = || V::from(format!("<redacted {kind}>"));
+            match (rule(path, leaf), leaf) {
+                (Shown::Value, V::String(s)) => V::from(s.value().as_str()),
+                (Shown::Value, V::Integer(i)) => V::from(*i.value()),
+                (Shown::Value, V::Float(f)) => V::from(*f.value()),
+                (Shown::Value, V::Boolean(b)) => V::from(*b.value()),
+                (Shown::Value, V::Datetime(d)) => V::from(*d.value()),
+                (Shown::Url, V::String(s)) => shown_url(s.value()).map_or_else(hidden, V::from),
+                _ => hidden(),
+            }
         }
     }
 }
 
-fn redact_toml_value(value: &mut toml_edit::Value, secret: bool) {
-    match value {
-        toml_edit::Value::InlineTable(t) => {
-            for (key, v) in t.iter_mut() {
-                redact_toml_value(v, secret || is_secret_key(key.get()));
-            }
-        }
-        toml_edit::Value::Array(a) => a.iter_mut().for_each(|v| redact_toml_value(v, secret)),
-        _ if secret => {
-            let decor = value.decor().clone();
-            *value = toml_edit::Value::from("<redacted>");
-            *value.decor_mut() = decor;
-        }
-        _ => {}
+/// `scheme://host[:port]`, and `/…` where a path or query was cut; `None` for anything that does
+/// not parse cleanly as an http(s) or ws(s) URL with a host.
+fn shown_url(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss")
+        || raw.chars().any(char::is_whitespace)
+    {
+        return None;
     }
+    let host = url.host_str()?;
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    let cut = url.path() != "/" || url.query().is_some() || url.fragment().is_some();
+    Some(format!(
+        "{}://{host}{port}{}",
+        url.scheme(),
+        if cut { "/…" } else { "" }
+    ))
 }
 
 /// [`redact_config_text`] for a file that is not TOML, line by line.
@@ -12376,59 +12536,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// The values the config schema says are safe are shown as written, an RPC URL is cut to its
+    /// host, and everything else is shown by key and type, comments dropped.
     #[test]
-    fn config_text_is_shown_without_its_credentials() {
+    fn config_text_shows_only_what_the_schema_allows() {
         let text = concat!(
-            "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/v2/KEYKEYKEY\"] # see https://u:p@docs.example/x?k=1\n",
-            "url = \"https://hooks.slack.com/services/T00/B00/XXXX\"\n",
-            "secret = \"hunter2\"\n",
-            "api_key=\"abc\"\n",
-            "key = [\"indexer\"]\n",
-            "plain = \"https://rpc.example\"\n",
-        );
-        assert_eq!(
-            redact_config_text("nuthatch.toml", text),
-            concat!(
-                "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/…\"] # see https://docs.example/…\n",
-                "url = \"https://hooks.slack.com/…\"\n",
-                "secret = \"<redacted>\"\n",
-                "api_key=\"<redacted>\"\n",
-                "key = [\"indexer\"]\n",
-                "plain = \"https://rpc.example\"\n",
-            )
-        );
-    }
-
-    /// A secret is found by where it sits in the parsed document, so neither an inline table nor a
-    /// multi-line string carries one past the redaction.
-    #[test]
-    fn config_text_redacts_a_secret_in_any_toml_shape() {
-        let text = concat!(
+            "# operator note: key is KEYKEYKEY\n",
+            "[nest]\n",
+            "name = \"demo\" # was OLD-NAME\n",
+            "chain_id = 1\n",
+            "rpc_urls = [\"https://arb-mainnet.g.alchemy.com/v2/KEYKEYKEY\", \"http://127.0.0.1:8545\"]\n",
+            "future_secret = \"FUTURE-LEAK\"\n",
+            "[[contracts]]\n",
+            "alias = \"usdc\"\n",
+            "events = [\"Transfer\"]\n",
             "webhooks = [{ name = \"w\", table = \"t\", url = \"https://hooks.example.com/abc\", secret = \"HMAC-INLINE\" }]\n",
-            "[alerts.webhook]\n",
-            "name = \"v\"\n",
-            "secret = \"\"\"\n",
-            "MULTILINE-SECRET\"\"\"\n",
-            "[alerts.slack]\n",
-            "Token = '''LITERAL-SECRET'''\n",
-            "nested = { inner = { api_key = \"DEEP-SECRET\" } }\n",
-            "passwords = [\"LIST-SECRET\", \"ANOTHER\"]\n",
         );
         let shown = redact_config_text("nuthatch.toml", text);
         for leaked in [
+            "KEYKEYKEY",
+            "OLD-NAME",
+            "operator note",
+            "FUTURE-LEAK",
             "HMAC-INLINE",
-            "MULTILINE-SECRET",
-            "LITERAL-SECRET",
-            "DEEP-SECRET",
-            "LIST-SECRET",
-            "ANOTHER",
             "/abc",
         ] {
             assert!(!shown.contains(leaked), "{leaked} shown:\n{shown}");
         }
-        assert!(shown.contains("name = \"w\""), "{shown}");
-        assert!(shown.contains("[alerts.slack]"), "{shown}");
-        assert_eq!(shown.matches("<redacted>").count(), 6, "{shown}");
+        for kept in [
+            "name = \"demo\"",
+            "chain_id = 1",
+            "\"https://arb-mainnet.g.alchemy.com/…\"",
+            "\"http://127.0.0.1:8545\"",
+            "future_secret = \"<redacted string>\"",
+            "alias = \"usdc\"",
+            "events = [\"Transfer\"]",
+        ] {
+            assert!(shown.contains(kept), "{kept} missing:\n{shown}");
+        }
+    }
+
+    /// The independent review's probes: keys a denylist never knew, comments, and URLs a text
+    /// scan cuts in the wrong place. None leaks, whether the key is unknown, an RPC URL, or in a file
+    /// whose values are otherwise shown.
+    #[test]
+    fn config_text_leaks_none_of_the_review_probes() {
+        let cases: &[(&str, &str)] = &[
+            ("private_key = \"0xPRIVKEY-LEAK\"\n", "PRIVKEY-LEAK"),
+            ("passphrase = \"PASSPHRASE-LEAK\"\n", "PASSPHRASE-LEAK"),
+            ("authorization = \"Bearer AUTHZ-LEAK\"\n", "AUTHZ-LEAK"),
+            ("headers = { Authorization = \"Bearer HDR-LEAK\" }\n", "HDR-LEAK"),
+            ("\"api key\" = \"SPACEKEY-LEAK\"\n", "SPACEKEY-LEAK"),
+            ("hmac = \"HMAC-LEAK\"\n", "HMAC-LEAK"),
+            ("credentials = \"CRED-LEAK\"\n", "CRED-LEAK"),
+            ("[[webhooks]]\nname = \"w\"\n# secret = \"COMMENT-LEAK\"\n", "COMMENT-LEAK"),
+            ("[[webhooks]]\nname = \"w\"\nsecret = \"x\" # was OLDSECRET-LEAK\n", "OLDSECRET-LEAK"),
+            ("url = \"https://user:pa#HASH-LEAK@host/x\"\n", "user:pa"),
+            ("url = \"https://user:p,COMMA-LEAK@host/\"\n", "COMMA-LEAK"),
+            ("url = \"https://user:p)PAREN-LEAK@host/\"\n", "PAREN-LEAK"),
+            ("url = \"https://user:p/SLASH-LEAK@host/\"\n", "user:p"),
+            ("url = 'https://u:LIT\"QUOTE-LEAK@host/'\n", "QUOTE-LEAK"),
+            ("url = \"https\\u003a//u:ESC-LEAK@host/\"\n", "ESC-LEAK"),
+            ("url = \"\"\"https://u:CONT\\\n  LEAK2@host/\"\"\"\n", "LEAK2"),
+            ("dsn = \"host=db user=x password=DSN-LEAK\"\n", "DSN-LEAK"),
+            ("rpc = \"user:NOSCHEME-LEAK@host:8545\"\n", "NOSCHEME-LEAK"),
+            ("url = \"https://u:p @SPACE-LEAK.host/\"\n", "SPACE-LEAK"),
+            (
+                "[alerts]\nslack.webhook_url = \"https://hooks.slack.com/services/T0/B0/SLACK-LEAK\"\n",
+                "SLACK-LEAK",
+            ),
+            ("alerts.webhook.secret = \"DOTTED-LEAK\"\n", "DOTTED-LEAK"),
+            ("[[a.b]]\nsecret = \"AOT-LEAK\"\n", "AOT-LEAK"),
+            ("x = [[\"SECRET\", \"NESTED-ARR-LEAK\"]]\n", "NESTED-ARR-LEAK"),
+            ("\"s\\u0065cret\" = \"ESCKEY-LEAK\"\n", "ESCKEY-LEAK"),
+        ];
+        for (text, needle) in cases {
+            let shown = redact_config_text("nuthatch.toml", text);
+            assert!(!shown.contains(needle), "{needle}: {shown}");
+            // The same URL as an RPC URL, the one URL-shaped key whose value is shown at all.
+            if let Some(url) = text.strip_prefix("url = ") {
+                let as_rpc = format!("[nest]\nrpc_urls = [{}]\n", url.trim_end());
+                let shown = redact_config_text("nuthatch.toml", &as_rpc);
+                assert!(!shown.contains(needle), "rpc {needle}: {shown}");
+            }
+            // A file whose values are shown still drops its comments and cuts or hides its URLs.
+            if ["#", "@", "://", "\\u003a"]
+                .iter()
+                .any(|m| text.contains(m))
+            {
+                let shown = redact_config_text("semantic.toml", text);
+                assert!(!shown.contains(needle), "semantic {needle}: {shown}");
+            }
+        }
     }
 
     /// A file that does not parse cannot be searched for its secrets, so its text is not shown.
@@ -12443,7 +12642,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("nuthatch.toml"),
-            "rpc_urls = [\"https://rpc.example/v2/KEYKEYKEY\"]\n",
+            "[nest]\nrpc_urls = [\"https://rpc.example/v2/KEYKEYKEY\"]\n",
         )
         .unwrap();
         std::fs::create_dir_all(tmp.path().join("views")).unwrap();
@@ -12502,7 +12701,10 @@ mod tests {
         let files = v["files"].as_array().unwrap();
         let names: Vec<&str> = files.iter().map(|f| f["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["nuthatch.toml", "views/10-a.sql"]);
-        assert_eq!(files[0]["text"], "rpc_urls = [\"https://rpc.example/…\"]\n");
+        assert_eq!(
+            files[0]["text"],
+            "[nest]\nrpc_urls = [\"https://rpc.example/…\"]\n"
+        );
         assert_eq!(v["running"]["sql"]["max_rows"], SQL_MAX_ROWS);
 
         let v = body(storage(state.clone(), Some("s3cret"), Some("t__e")).await).await;
