@@ -337,18 +337,19 @@ fn note(
     s.waiting_for_turn = waiting;
 }
 
-/// The index this run of `dir`'s `n` webhooks starts at, one on from the last run's.
-fn next_turn(dir: &std::path::Path, n: usize) -> usize {
+fn next_turns() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>> {
     static NEXT: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
     > = std::sync::OnceLock::new();
+    NEXT.get_or_init(Default::default)
+}
+
+/// The index this run of `dir`'s `n` webhooks starts at, one on from the last run's.
+fn next_turn(dir: &std::path::Path, n: usize) -> usize {
     if n == 0 {
         return 0;
     }
-    let mut all = NEXT
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut all = next_turns().lock().unwrap_or_else(|p| p.into_inner());
     let next = all.entry(dir.to_path_buf()).or_default();
     let first = *next % n;
     *next = first + 1;
@@ -366,39 +367,59 @@ pub fn standing(dir: &std::path::Path) -> Vec<(String, Standing)> {
         .collect()
 }
 
-/// `/metrics` lines for every webhook this process delivers, labelled by name alone.
-pub fn render_metrics() -> String {
+/// `/metrics` lines for the webhooks of each nest in `nests` (its metrics label and dataset), the
+/// same `nest=` label the neighbouring series use, so two nests' webhooks of one name stay apart.
+pub fn render_metrics(nests: &[(String, std::path::PathBuf)]) -> String {
     let all = standings().lock().unwrap_or_else(|p| p.into_inner());
-    if all.is_empty() {
+    let rows: Vec<(&str, &str, &Standing)> = nests
+        .iter()
+        .flat_map(|(nest, dir)| {
+            all.range((dir.clone(), String::new())..)
+                .take_while(move |((d, _), _)| d == dir)
+                .map(move |((_, name), s)| (nest.as_str(), name.as_str(), s))
+        })
+        .collect();
+    if rows.is_empty() {
         return String::new();
     }
-    let mut by_name: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
-    for ((_, name), s) in all.iter() {
-        let e = by_name.entry(name).or_default();
-        e.0 += s.backlog_blocks;
-        e.1 += s.failures;
-    }
-    let mut out = String::from(
-        "# HELP nuthatch_webhook_backlog_blocks Sealed blocks a webhook has yet to deliver.\n\
-         # TYPE nuthatch_webhook_backlog_blocks gauge\n",
-    );
-    for (name, (backlog, _)) in &by_name {
-        out.push_str(&format!(
-            "nuthatch_webhook_backlog_blocks{{webhook=\"{}\"}} {backlog}\n",
-            crate::metrics::label_value(name)
-        ));
-    }
-    out.push_str(
-        "# HELP nuthatch_webhook_failures_total Delivery runs that ended on a failed query.\n\
-         # TYPE nuthatch_webhook_failures_total counter\n",
-    );
-    for (name, (_, failures)) in &by_name {
-        out.push_str(&format!(
-            "nuthatch_webhook_failures_total{{webhook=\"{}\"}} {failures}\n",
-            crate::metrics::label_value(name)
-        ));
+    let mut out = String::new();
+    for (metric, help, kind, pick) in [
+        (
+            "nuthatch_webhook_backlog_blocks",
+            "Sealed blocks a webhook has yet to deliver.",
+            "gauge",
+            (|s: &Standing| s.backlog_blocks) as fn(&Standing) -> u64,
+        ),
+        (
+            "nuthatch_webhook_failures_total",
+            "Delivery runs that ended on a failed query.",
+            "counter",
+            |s| s.failures,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {metric} {help}\n# TYPE {metric} {kind}\n"));
+        for (nest, name, s) in &rows {
+            out.push_str(&format!(
+                "{metric}{{nest=\"{}\",webhook=\"{}\"}} {}\n",
+                crate::metrics::label_value(nest),
+                crate::metrics::label_value(name),
+                pick(s)
+            ));
+        }
     }
     out
+}
+
+/// Drop what a departed dataset's webhooks left behind: their standings and their place in the rota.
+pub fn forget(dir: &std::path::Path) {
+    standings()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(d, _), _| d != dir);
+    next_turns()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(dir);
 }
 
 /// A relation name as a SQL identifier, whatever characters an alias gave it.
@@ -940,10 +961,12 @@ mod tests {
             ("w", 0, 5)
         );
         assert!(s.last_error.is_some() && s.failures == 1, "{s:?}");
+        let nests = [("n".to_string(), dir.path().to_path_buf())];
         assert!(
-            render_metrics().contains("nuthatch_webhook_backlog_blocks{webhook=\"w\"}"),
+            render_metrics(&nests)
+                .contains("nuthatch_webhook_backlog_blocks{nest=\"n\",webhook=\"w\"}"),
             "{}",
-            render_metrics()
+            render_metrics(&nests)
         );
     }
 
@@ -1024,5 +1047,35 @@ mod tests {
             (3 * SLICE_BLOCKS, 0)
         );
         assert_eq!(s.last_error, None);
+    }
+    /// Two nests may name a webhook alike: each keeps its own series under its mount, and an unmounted
+    /// nest keeps none.
+    #[test]
+    fn webhook_series_are_per_nest_and_leave_with_the_nest() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let w = wh("alerts", "t__transfer", "genesis");
+        note(a.path(), &w, 90, 100, None, false);
+        note(b.path(), &w, 40, 100, Some("boom"), false);
+        let m = crate::metrics::Metrics::new();
+        m.nest("one").set_dataset_dir(a.path().to_path_buf());
+        m.nest("two").set_dataset_dir(b.path().to_path_buf());
+        let out = m.render();
+        for line in [
+            "nuthatch_webhook_backlog_blocks{nest=\"one\",webhook=\"alerts\"} 10\n",
+            "nuthatch_webhook_backlog_blocks{nest=\"two\",webhook=\"alerts\"} 60\n",
+            "nuthatch_webhook_failures_total{nest=\"one\",webhook=\"alerts\"} 0\n",
+            "nuthatch_webhook_failures_total{nest=\"two\",webhook=\"alerts\"} 1\n",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in:\n{out}");
+        }
+        m.remove_nest("two");
+        let out = m.render();
+        assert!(!out.contains("nest=\"two\",webhook"), "{out}");
+        assert!(out.contains("nest=\"one\",webhook"), "{out}");
+        assert!(
+            standing(b.path()).is_empty(),
+            "the departed nest's standing is dropped"
+        );
+        assert!(!standing(a.path()).is_empty());
     }
 }
