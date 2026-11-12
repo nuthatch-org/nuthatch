@@ -348,7 +348,7 @@ fn render_prompt(name: &str, args: &Value) -> Option<Value> {
             let a = args.get("address").and_then(Value::as_str).unwrap_or("<address>");
             format!(
                 "Investigate the address {a}. Use `balance` for its token balance (read \
-                 `complete_history` in its answer: when false the figure is a net flow since \
+                 `complete_history` in its answer: when false or null the figure is a net flow since \
                  `indexed_from`, not a balance), `exposure` for its \
                  exposure to labeled addresses, and `flags` for threshold/velocity flags. Then \
                  summarise the risk picture, citing blocks."
@@ -530,15 +530,19 @@ struct History {
     from: Option<u64>,
     /// Whether that is the contracts' deployment; `None` when the nest does not say.
     complete: Option<bool>,
+    /// The status answered; false when it could not be read at all.
+    status_read: bool,
 }
 
 async fn history(client: &reqwest::Client, base: &str) -> History {
     let status = get(client, &format!("{base}/"))
         .await
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(Value::Null);
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let status_read = status.is_some();
+    let status = status.unwrap_or(Value::Null);
     History {
+        status_read,
         from: match &status["start_block"] {
             Value::String(b) => b.parse().ok(),
             other => other.as_u64(),
@@ -565,8 +569,10 @@ fn balance_result(body: &str, h: &History) -> String {
         });
         let why = if h.complete == Some(false) {
             "this nest did not index from the contract's deployment"
-        } else {
+        } else if h.status_read {
             "this nest does not record whether it indexed from the contract's deployment"
+        } else {
+            "the nest's status could not be read to tell whether it indexed from the contract's deployment"
         };
         answer.insert(
             "note".into(),
@@ -1656,6 +1662,17 @@ mod tests {
         assert_eq!(top["holders"], 2, "{top}");
         assert_eq!(top["items"][0]["balance"], "-4100", "{top}");
         assert_eq!(top["complete_history"], true, "{top}");
+        server.abort();
+
+        // A status that cannot be read is said to be unreadable, not unrecorded.
+        let (base, server) = serve("not json").await;
+        let one = ask(base, "balance", json!({ "address": "0x1111" })).await;
+        assert_eq!(one["complete_history"], Value::Null, "{one}");
+        assert!(
+            one["note"].as_str().unwrap().contains("could not be read"),
+            "{one}"
+        );
+        assert!(one.get("balance").is_none(), "{one}");
         server.abort();
 
         // A store written before the record existed: never claimed as a balance.
