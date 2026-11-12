@@ -2507,6 +2507,7 @@ async fn runtime_index_loop(
     // cursor's shared `global_next` - the position every co-tenant on this chain has cleared.
     let mut heartbeat = crate::progress::TipHeartbeat::new();
     let mut reorg_gate = ReorgGate::default();
+    let mut announced = false;
     let mut topic0_refused = false;
     loop {
         // Apply any lifecycle commands *here* - the top of an iteration, between windows, which is the
@@ -2650,6 +2651,7 @@ async fn runtime_index_loop(
 
         heartbeat.maybe_log(global_next, tip);
         if global_next > ceiling {
+            announce_caught_up(&mut announced, ceiling);
             check_live_health(&nests, &mut sup, &live)?;
             republish_idle(&mut nests, &mut sup, &live).await?;
             sleep_for(freshness.poll_interval).await;
@@ -2788,9 +2790,12 @@ async fn runtime_index_loop(
                 // Caught up as of this iteration's tip: wait the interval here as well as at the
                 // top, for the reason the solo loop gives (#1190).
                 if to == ceiling {
+                    announce_caught_up(&mut announced, to);
                     let live = sup.live();
                     check_live_health(&nests, &mut sup, &live)?;
                     sleep_for(freshness.poll_interval).await;
+                } else {
+                    announced = false;
                 }
             }
             Err(e) if narrowing_can_help(&e, global_next, to) => {
@@ -3263,9 +3268,9 @@ pub fn refuse_duplicate_tables(tables: &[crate::registry::TableSchema]) -> Resul
 /// this once per nest.
 #[allow(clippy::too_many_arguments)]
 async fn build_nest(
-    // Unused by the single-nest build (which leaves spawning the tip loop to the caller); kept in the
-    // signature per the RFC-0012 contract so a runtime driver can `build_nest` then `index_loop(source, …)`.
-    _source: &Arc<dyn Source>,
+    // The single-nest build leaves spawning the tip loop to the caller; it reads the tip once, for the
+    // empty-table notice, so a runtime driver can still `build_nest` then `index_loop(source, …)`.
+    source: &Arc<dyn Source>,
     dir: PathBuf,
     config: &Config,
     window_override: Option<u64>,
@@ -3584,12 +3589,18 @@ async fn build_nest(
     // this line simply stops naming that table, which is as much of an answer as the day it started.
     let never_fired = crate::analytics::declared_but_never_sealed(&dir, &served);
     if !never_fired.is_empty() {
-        tracing::info!(
-            "{} declared table(s) have no data yet - the event has likely never fired on this chain: \
-             {}. Each reads as an empty table, not an error, and starts populating the day it does.",
-            never_fired.len(),
-            never_fired.join(", "),
-        );
+        let meta = |key: &str| -> Result<Option<u64>> {
+            Ok(store.get_meta(key)?.and_then(|v| v.parse::<u64>().ok()))
+        };
+        // The manifest only speaks for what has sealed, so the range ends there, not at LAST_BLOCK.
+        let sealed = store.sealed_through();
+        let indexed = meta(START_BLOCK_KEY)?.map(|from| (from, sealed));
+        let last = meta(LAST_BLOCK_KEY)?;
+        let at_tip = boot_tip(config.nest.chain_id, source)
+            .await
+            .zip(last)
+            .map(|(tip, last)| last.saturating_add(AT_TIP_WITHIN) >= tip);
+        tracing::info!("{}", no_data_notice(&never_fired, indexed, at_tip));
     }
 
     // Grafting (RFC-0033): tell the author up front what will and will not be reusable, rather than
@@ -7272,6 +7283,8 @@ impl NestIngest {
         concurrency: usize,
         window: u64,
     ) -> Result<u64> {
+        // Decided before the seal-direct step below, which writes LAST_BLOCK on a fresh store.
+        let had_blocks = self.store.get_meta(LAST_BLOCK_KEY)?.is_some();
         // User webhooks (RFC-0010 Part B): initialise each subscription's cursor before any sealing, so a
         // `since = "registration"` webhook starts at the tip and a `--seal-direct` backfill doesn't fire
         // its history. Best-effort - a tip lookup failure just defers registration to the first live tip.
@@ -7495,7 +7508,18 @@ impl NestIngest {
         // Resume from the last committed block; on a cold start, backfill from the nest's earliest
         // vendored deployment block (full history) if it has one, else from `--backfill` behind the tip.
         let next = match self.store.get_meta(LAST_BLOCK_KEY)? {
-            Some(v) => v.parse::<u64>().context("corrupt last_block")? + 1,
+            Some(v) => {
+                let last = v.parse::<u64>().context("corrupt last_block")?;
+                let from = self
+                    .store
+                    .get_meta(START_BLOCK_KEY)?
+                    .and_then(|s| s.parse::<u64>().ok());
+                let asked = backfill.filter(|_| had_blocks);
+                if let Some(note) = ignored_backfill(asked, from, last, &self.dir) {
+                    tracing::info!("{note}");
+                }
+                last + 1
+            }
             None => {
                 let tip = source.tip().await.map_err(|e| {
                     anyhow::Error::new(ColdStartUnreachable(format!(
@@ -7514,10 +7538,8 @@ impl NestIngest {
                 };
                 tracing::info!("cold start: backfilling from block {start}{src} (tip {tip})");
                 if let Some(span) = long_backfill(start, tip, window).filter(|_| from_deployment) {
-                    tracing::info!(
-                        "that is {span} blocks of history; `--backfill N` indexes only the last N \
-                         blocks instead"
-                    );
+                    let recent = window.saturating_mul(15);
+                    tracing::info!("{}", long_history_advice(span, recent, &self.dir));
                 }
                 start
             }
@@ -8339,6 +8361,10 @@ async fn index_loop(
                         // reported 300. Reaching this iteration's ceiling is the moment the interval
                         // was asked for; a window that fell short is a backlog and loops at once.
                         if to == ceiling {
+                            if let Some(p) = progress.take() {
+                                p.finish(to, true);
+                            }
+                            caught_up = true;
                             sleep_for(nest.freshness.poll_interval).await;
                         }
                     }
@@ -8498,6 +8524,137 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     match override_ {
         Some(w) if w > 0 => w,
         _ => chain_window,
+    }
+}
+
+/// One "caught up" line per catch-up for a runtime cursor, which has no progress reporter: the latch
+/// is cleared by the next window that falls short of the ceiling.
+fn announce_caught_up(announced: &mut bool, block: u64) {
+    if !std::mem::replace(announced, true) {
+        tracing::info!("✓ caught up to tip at block {block}; now following");
+    }
+}
+
+/// The tip for the empty-table notice, read at most once per chain source per half minute, so a hung
+/// endpoint costs a runtime's boot one bounded wait and not one per dataset.
+async fn boot_tip(chain_id: u64, source: &Arc<dyn Source>) -> Option<u64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Reads = std::collections::HashMap<(u64, usize), (Instant, Option<u64>)>;
+    static TIPS: OnceLock<Mutex<Reads>> = OnceLock::new();
+    let key = (chain_id, Arc::as_ptr(source) as *const () as usize);
+    let cache = TIPS.get_or_init(Default::default);
+    if let Some((at, tip)) = cache.lock().unwrap().get(&key) {
+        if at.elapsed() < Duration::from_secs(30) {
+            return *tip;
+        }
+    }
+    let tip = tokio::time::timeout(Duration::from_secs(2), source.tip())
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    cache.lock().unwrap().insert(key, (Instant::now(), tip));
+    tip
+}
+
+/// Blocks behind the tip within which a nest counts as caught up for the empty-table notice.
+const AT_TIP_WITHIN: u64 = 1_000;
+
+/// With an indexed range on record the notice names it. A nest still short of the tip has not reached
+/// later events yet; one at the tip has covered the whole range, so the event may never have fired.
+/// `at_tip` is `None` when the tip could not be read, and then the notice claims neither.
+fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>, at_tip: Option<bool>) -> String {
+    let n = tables.len();
+    let names = tables.join(", ");
+    match indexed {
+        Some((from, to)) if at_tip.is_none() => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to}; the tip could not be read \
+             to tell whether the nest has reached it: {names}. Each reads as an empty table, not an \
+             error."
+        ),
+        Some((from, to)) if at_tip == Some(true) => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to}, the whole sealed range; the \
+             event may never have fired on this chain: {names}. Each reads as an empty table, not an \
+             error, and starts populating the day it does."
+        ),
+        Some((from, to)) => format!(
+            "{n} declared table(s) have no data in blocks {from} to {to} so far, and the nest has not \
+             reached the tip: {names}. Each reads as an empty table, not an error, and fills as the \
+             nest reaches events."
+        ),
+        None => format!(
+            "{n} declared table(s) have no data yet - the event has likely never fired on this chain: \
+             {names}. Each reads as an empty table, not an error, and starts populating the day it does."
+        ),
+    }
+}
+
+/// `--backfill` only chooses where a cold start begins. Once the store holds a block it is ignored,
+/// and the operator is told so rather than left to find the full-history backfill resuming.
+fn ignored_backfill(
+    backfill: Option<u64>,
+    from: Option<u64>,
+    last: u64,
+    dir: &Path,
+) -> Option<String> {
+    let n = backfill?;
+    let range = match from {
+        Some(from) => format!("blocks {from} to {last}"),
+        None => format!("up to block {last}"),
+    };
+    let tail = match start_over(dir) {
+        StartOver::Remove(paths) => {
+            format!(" (to start over from tip minus {n}: stop, remove {paths}, and rerun)")
+        }
+        StartOver::Shared(shared) => format!(
+            " (its sealed segments are kept in {}, outside its directory and possibly shared, so \
+             starting over means a fresh nest directory)",
+            shared.display()
+        ),
+    };
+    Some(format!(
+        "--backfill {n} does not apply: this dataset has already indexed {range}, so it resumes \
+         from block {}{tail}",
+        last + 1
+    ))
+}
+
+/// Printed as a long cold-start backfill begins. It is read while the first window is already
+/// committing, so it says how to start over, which is what makes it true.
+fn long_history_advice(span: u64, recent: u64, dir: &Path) -> String {
+    match start_over(dir) {
+        StartOver::Remove(paths) => format!(
+            "that is {span} blocks of history; to index only the last {recent} instead, stop, \
+             remove {paths}, and rerun with `--backfill {recent}`"
+        ),
+        StartOver::Shared(shared) => format!(
+            "that is {span} blocks of history; `--backfill {recent}` indexes only the last \
+             {recent} blocks of a fresh dataset, and this one keeps its sealed segments in {}, \
+             outside its directory and possibly shared, so that means a fresh nest directory",
+            shared.display()
+        ),
+    }
+}
+
+enum StartOver {
+    /// The store and segment directory belong to this nest alone; removing them is a clean start.
+    Remove(String),
+    /// Sealed segments live outside the nest's directory, so nothing here is safe to delete.
+    Shared(PathBuf),
+}
+
+/// Deletion advice only where the segment files are inside the nest's own directory, asked of the
+/// same function that places them.
+fn start_over(dir: &Path) -> StartOver {
+    let segments = seal::segments_dir(dir);
+    if segments == dir.join(seal::SEGMENTS_DIR) {
+        StartOver::Remove(format!(
+            "{} and {}",
+            dir.join(DB_FILE).display(),
+            segments.display()
+        ))
+    } else {
+        StartOver::Shared(segments)
     }
 }
 
@@ -12363,11 +12520,79 @@ template = "pool"
     }
 
     #[test]
+    fn a_partial_backfill_does_not_claim_an_event_never_fired() {
+        let tables = vec!["usdc__pause".to_string()];
+        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)), Some(false));
+        assert!(!partial.contains("never fired"), "{partial}");
+        assert!(partial.contains("blocks 6082465 to 6783217"), "{partial}");
+        assert!(partial.contains("usdc__pause"), "{partial}");
+        let complete = no_data_notice(&tables, Some((6_082_465, 26_000_000)), Some(true));
+        assert!(complete.contains("may never have fired"), "{complete}");
+        assert!(!complete.contains("so far"), "{complete}");
+        let unknown = no_data_notice(&tables, Some((6_082_465, 26_000_000)), None);
+        assert!(unknown.contains("could not be read"), "{unknown}");
+        assert!(!unknown.contains("never have fired"), "{unknown}");
+        assert!(!unknown.contains("has not reached the tip"), "{unknown}");
+        assert!(no_data_notice(&tables, None, None).contains("likely never fired"));
+    }
+
+    #[tokio::test]
+    async fn the_boot_tip_is_read_once_per_source_not_once_per_dataset() {
+        let source = moving_tip_source();
+        let dynamic: Arc<dyn Source> = source.clone();
+        let first = boot_tip(7_001, &dynamic).await;
+        assert_eq!(boot_tip(7_001, &dynamic).await, first);
+        assert_eq!(source.1.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_backfill_is_long_past_a_thousand_windows() {
         assert_eq!(long_backfill(6_082_465, 26_096_175, 20), Some(20_013_710));
         assert_eq!(long_backfill(0, 20_000, 20), None);
         assert_eq!(long_backfill(0, 20_001, 20), Some(20_001));
         assert_eq!(long_backfill(500, 100, 20), None);
+    }
+
+    #[test]
+    fn a_backfill_on_a_nest_with_blocks_is_reported_as_ignored() {
+        let solo = Path::new("/n/nest");
+        assert_eq!(ignored_backfill(None, Some(10), 50, solo), None);
+        let note = ignored_backfill(Some(300), Some(10), 50, solo).expect("flag was ignored");
+        assert!(note.contains("--backfill 300 does not apply"), "{note}");
+        assert!(note.contains("blocks 10 to 50"), "{note}");
+        assert!(note.contains("resumes from block 51"), "{note}");
+        assert!(
+            note.contains("/n/nest/nuthatch.redb and /n/nest/segments"),
+            "{note}"
+        );
+        let nid = "ab".repeat(32);
+        let shared_dir = PathBuf::from(format!("/r/data/{nid}"));
+        let shared = shared_dir.as_path();
+        let note = ignored_backfill(Some(300), Some(10), 50, shared).unwrap();
+        assert!(!note.contains("remove"), "{note}");
+        let advice = long_history_advice(5_000_000, 300, solo);
+        assert!(
+            advice.contains("stop, remove /n/nest/nuthatch.redb"),
+            "{advice}"
+        );
+        assert!(advice.contains("`--backfill 300`"), "{advice}");
+        assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
+
+        // A solo nest kept under a directory named `data` has its segments outside its own
+        // directory, shared with its siblings: no deletion advice, and the shared directory is named.
+        let root = tempfile::tempdir().unwrap();
+        let solo_in_data = root.path().join("data").join("solo");
+        std::fs::create_dir_all(&solo_in_data).unwrap();
+        let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
+        assert!(!note.contains("remove"), "{note}");
+        assert!(
+            note.contains(&root.path().join("segments").display().to_string())
+                && note.contains("possibly shared"),
+            "{note}"
+        );
+        let advice = long_history_advice(5_000_000, 300, &solo_in_data);
+        assert!(!advice.contains("remove"), "{advice}");
+        assert!(advice.contains("possibly shared"), "{advice}");
     }
 
     #[test]
@@ -13096,6 +13321,89 @@ template = "pool"
             Some("100")
         );
         assert!(matches!(sup.states[1], NestState::Live));
+    }
+
+    /// The warning is raised by `prepare` itself, on a store that already holds blocks, and a cold
+    /// start with the same flag stays quiet.
+    #[tokio::test]
+    async fn prepare_warns_that_backfill_was_ignored_only_on_a_nest_with_blocks() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Msg<'a>(&'a mut String);
+                impl tracing::field::Visit for Msg<'_> {
+                    fn record_debug(
+                        &mut self,
+                        f: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write as _;
+                        if f.name() == "message" {
+                            let _ = write!(self.0, "{value:?}");
+                        }
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Msg(&mut line));
+                self.0.lock().unwrap().push(line);
+            }
+        }
+
+        let lines = Lines::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(lines.clone()),
+        );
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let ignored = || {
+            lines
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains("--backfill") && l.contains("does not apply"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0x0000000000000000000000000000000000000007").await;
+        let src = ForkSource::new(300);
+        let cold = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(cold, 0, "premise: a cold start from tip minus 300");
+        assert!(ignored().is_empty(), "a cold start honours the flag");
+
+        nest.store.set_meta(START_BLOCK_KEY, "10").unwrap();
+        nest.store.set_meta(LAST_BLOCK_KEY, "50").unwrap();
+        let next = nest.prepare(&src, Some(300), false, 1, 100).await.unwrap();
+        assert_eq!(next, 51);
+        let warned = ignored();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("blocks 10 to 50"), "{warned:?}");
+
+        // A seal-direct backfill writes LAST_BLOCK inside `prepare`; that is this run's own work.
+        let d2 = tempfile::tempdir().unwrap();
+        let mut fresh =
+            build_test_nest(d2.path(), "0x0000000000000000000000000000000000000008").await;
+        fresh.prepare(&src, Some(200), true, 1, 100).await.unwrap();
+        assert!(
+            fresh.store.get_meta(LAST_BLOCK_KEY).unwrap().is_some(),
+            "premise: seal-direct ran"
+        );
+        assert_eq!(
+            ignored().len(),
+            1,
+            "a fresh seal-direct run did what was asked"
+        );
     }
 
     /// #2175: a `--seal-direct` backfill leaves a checkpoint at its watermark, so a one-block reorg
@@ -14533,6 +14841,145 @@ template = "pool"
         }
     }
 
+    /// A source whose tip has moved on by the time it is asked again, as a live chain does.
+    struct MovingTip(OpenSource, std::sync::atomic::AtomicU64);
+
+    #[async_trait::async_trait]
+    impl Source for MovingTip {
+        async fn tip(&self) -> Result<u64> {
+            let moved = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.0.tip().await? + moved)
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.0.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.0.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.0.block_timestamps(blocks).await
+        }
+    }
+
+    /// Captures INFO-and-above messages for as long as the returned guard lives (single-threaded
+    /// tokio tests only: the subscriber is thread-local).
+    #[derive(Clone, Default)]
+    struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Lines {
+        fn capture() -> (Self, tracing::dispatcher::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let lines = Lines::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry()
+                    .with(tracing_subscriber::filter::LevelFilter::INFO)
+                    .with(lines.clone()),
+            );
+            (lines, tracing::dispatcher::set_default(&dispatch))
+        }
+
+        fn count(&self, needle: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Lines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(&mut self, f: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    use std::fmt::Write as _;
+                    if f.name() == "message" {
+                        let _ = write!(self.0, "{value:?}");
+                    }
+                }
+            }
+            let mut line = String::new();
+            event.record(&mut Msg(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    fn moving_tip_source() -> Arc<MovingTip> {
+        Arc::new(MovingTip(
+            OpenSource {
+                logs: vec![crate::rpc::Log {
+                    block_hash: format!("0x{:064x}", 7),
+                    ..transfer_log(7, 2)
+                }],
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+            std::sync::atomic::AtomicU64::new(0),
+        ))
+    }
+
+    /// The first catch-up announces itself when its window reaches the ceiling, not after the poll
+    /// interval: on a live chain the tip has always moved by then, so the top-of-loop check never ran.
+    #[tokio::test]
+    async fn the_first_catch_up_is_announced_before_the_poll_interval_sleep() {
+        let (lines, _guard) = Lines::capture();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+        let task = tokio::spawn(index_loop(moving_tip_source(), nest, Some(5), false, 1, 50));
+        wait_for(
+            "the catch-up announcement",
+            std::time::Duration::from_secs(20),
+            || lines.count("caught up to tip") > 0,
+        )
+        .await;
+        task.abort();
+    }
+
+    /// A mounts runtime has no progress reporter, so its cursor says "caught up" itself, once.
+    #[tokio::test]
+    async fn a_runtime_cursor_announces_its_catch_up_before_the_poll_interval_sleep() {
+        let (lines, _guard) = Lines::capture();
+        for kind in BOTH_CURSORS {
+            let before = lines.count("caught up to tip");
+            let dir = tempfile::tempdir().unwrap();
+            let mut nest =
+                build_test_nest(dir.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+            nest.freshness.poll_interval = std::time::Duration::from_secs(300);
+            let task = spawn_test_cursor(
+                kind,
+                moving_tip_source() as Arc<dyn Source>,
+                vec![nest],
+                Some(5),
+                50,
+                Arc::new(crate::health::RuntimeHealth::new()),
+                false,
+                None,
+            );
+            wait_for(
+                "the catch-up announcement",
+                std::time::Duration::from_secs(20),
+                || lines.count("caught up to tip") > before,
+            )
+            .await;
+            assert_eq!(lines.count("caught up to tip"), before + 1, "{kind:?}");
+            task.abort();
+        }
+    }
+
     /// Past the flip only the template's own events are asked for without an address. The factory's
     /// event, declared on a static contract, stays address-filtered: were it a generic event, an
     /// ERC-721 `Transfer` say, the address-less fetch would be every such log on the chain.
@@ -15519,6 +15966,8 @@ template = "pool"
         tip: std::sync::atomic::AtomicU64,
         fork: u64,
         forked: std::sync::atomic::AtomicBool,
+        /// Replace the chain once a read has taken its snapshot, as a reorg landing mid-call would.
+        flip_mid_read: std::sync::atomic::AtomicBool,
         canonical: Vec<crate::rpc::Log>,
         replacement: Vec<crate::rpc::Log>,
     }
@@ -15529,17 +15978,27 @@ template = "pool"
         }
 
         fn hash(&self, b: u64) -> String {
-            format!("0x{b:060x}{:04x}", u8::from(self.replaced(b)))
+            self.hash_on(self.forked.load(std::sync::atomic::Ordering::SeqCst), b)
+        }
+
+        fn hash_on(&self, forked: bool, b: u64) -> String {
+            format!("0x{b:060x}{:04x}", u8::from(forked && b >= self.fork))
         }
 
         fn chain(&self) -> Vec<crate::rpc::Log> {
             let forked = self.forked.load(std::sync::atomic::Ordering::SeqCst);
+            if self
+                .flip_mid_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.forked.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.canonical
                 .iter()
                 .filter(|l| !(forked && l.block_number >= self.fork))
                 .chain(self.replacement.iter().filter(|_| forked))
                 .map(|l| crate::rpc::Log {
-                    block_hash: self.hash(l.block_number),
+                    block_hash: self.hash_on(forked, l.block_number),
                     ..l.clone()
                 })
                 .collect()
@@ -15652,6 +16111,7 @@ template = "pool"
             tip: tip.into(),
             fork,
             forked: false.into(),
+            flip_mid_read: false.into(),
             canonical,
             replacement,
         }
@@ -15966,6 +16426,46 @@ template = "pool"
         if let Err(e) = run_reorg_case(&case, &want).await {
             panic!("did not converge:\n{e}");
         }
+    }
+
+    /// The property test's third counterexample, from CI: a replaced block's row survived the fork.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_depth_one_reorg_on_a_two_window_buffer_replaces_the_forked_row() {
+        let want = reorg_reference(REORG_TIP, 9).await;
+        let case = ReorgCase {
+            kind: CursorKind::Buffered(2),
+            fork: 9,
+            flip_at: 11,
+            delays_ms: [3, 15, 6],
+            window: 1,
+            slow_after_flip_ms: 0,
+            held_past_fork: false,
+        };
+        if let Err(e) = run_reorg_case(&case, &want).await {
+            panic!("did not converge:\n{e}");
+        }
+    }
+
+    /// That counterexample's cause was the fixture: a read straddling the flip took the replaced
+    /// chain's logs and stamped them with the replacement's hashes, a log no source ever serves.
+    #[tokio::test]
+    async fn a_reorg_fixture_read_straddling_the_flip_is_one_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let nests = s0_nests(root.path(), true).await;
+        let chain = reorg_chain(&nests[2], REORG_TIP, 9);
+        let read = |c: &ReorgChain| -> Vec<(u64, String, String)> {
+            c.chain()
+                .into_iter()
+                .map(|l| (l.block_number, l.data, l.block_hash))
+                .collect()
+        };
+        let before = read(&chain);
+        chain
+            .flip_mid_read
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let straddled = read(&chain);
+        assert!(chain.forked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(straddled, before);
     }
 
     proptest::proptest! {

@@ -1314,6 +1314,7 @@ async fn resolve_abi(
     address: &str,
     explorer: Option<&str>,
 ) -> Result<ResolvedAbi> {
+    require_contract_code(rpc, chain_id, address).await?;
     if let Some(implementation) = resolve_implementation(rpc, address).await {
         println!("  · proxy → implementation {implementation}");
         if let Ok(resolved) = abi::resolve(chain_id, &implementation, explorer).await {
@@ -1333,6 +1334,25 @@ async fn resolve_abi(
         implementation: None,
         contract_name: resolved.contract_name,
     })
+}
+
+/// An address with no code has no ABI to find; say so before an explorer lookup sends the user off
+/// for an API key. A failed read is not a verdict, so it falls through to resolution.
+async fn require_contract_code(rpc: &RpcClient, chain_id: u64, address: &str) -> Result<()> {
+    let Ok(tip) = rpc.block_number().await else {
+        return Ok(());
+    };
+    match rpc.get_code(address, tip).await {
+        Ok(code) if is_empty_code(&code) => Err(no_contract_code(address, chain_id)),
+        _ => Ok(()),
+    }
+}
+
+fn no_contract_code(address: &str, chain_id: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no contract code at {address} on chain {chain_id}; check the address and --chain. If the \
+         contract self-destructed, pass --abi path/to.json to index its history anyway"
+    )
 }
 
 /// The pretty lines for a resolved ABI, in the same `→`/`✓`/`·` two-space-indented prose the rest of
@@ -1518,13 +1538,30 @@ fn fit_from_sample(topic0s: &[String], sample: &[Option<&str>]) -> AbiFit {
         // is perfectly fine.
         .any(|t| topic0s.iter().any(|k| k.eq_ignore_ascii_case(t)));
     if hit {
-        AbiFit::Fits
+        return AbiFit::Fits;
+    }
+    // A proxy's own admin logs say nothing about the implementation ABI (USDC's first window holds
+    // only its AdminChanged), so they cannot make a window a mismatch.
+    let sampled = sample
+        .iter()
+        .flatten()
+        .filter(|t| !PROXY_ADMIN_TOPICS.iter().any(|p| p.eq_ignore_ascii_case(t)))
+        .count()
+        + sample.iter().filter(|t| t.is_none()).count();
+    if sampled == 0 {
+        AbiFit::NoSample
     } else {
-        AbiFit::Mismatch {
-            sampled: sample.len(),
-        }
+        AbiFit::Mismatch { sampled }
     }
 }
+
+/// topic0 of the EIP-1967 `Upgraded(address)`, `AdminChanged(address,address)` and
+/// `BeaconUpgraded(address)`.
+const PROXY_ADMIN_TOPICS: [&str; 3] = [
+    "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b",
+    "0x7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f",
+    "0x1cf3b03a6cf19fa2baba4df148e9dcabedea7f8a5c07840e207e5c089be95d3e",
+];
 
 /// Print the verdict from [`check_abi_fits`].
 fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
@@ -1537,7 +1574,7 @@ fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
             };
             eprintln!();
             eprintln!("  ⚠ {alias} ({address}): {seen}.");
-            eprintln!("    As configured this contract will index **zero rows**, silently.");
+            eprintln!("    As configured it may index no rows at all, silently.");
             eprintln!("    The usual cause is a proxy: the public ABI resolvers return the *proxy's* ABI,");
             eprintln!("    while the events are defined by the implementation behind it. nuthatch follows");
             eprintln!(
@@ -1556,8 +1593,8 @@ fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
                 "  ⚠ {alias} ({address}): pre-upgrade history (sampled near deployment) emitted"
             );
             eprintln!("    {sampled} log(s) matching none of the current implementation's events.");
-            eprintln!("    This contract appears to have been upgraded across an event rename or ABI change.");
-            eprintln!("    Pre-upgrade history will index **zero rows** under the current ABI.");
+            eprintln!("    This contract may have been upgraded across an event rename or ABI change; if so,");
+            eprintln!("    history from before the upgrade indexes no rows under the current ABI.");
             eprintln!("    Fix: add a second [[contracts]] entry at the same address with the legacy ABI, a new");
             eprintln!("    alias and an `events` allowlist of the events the current ABI lacks. There is no end");
             eprintln!(
@@ -1856,7 +1893,8 @@ fn found_nowhere(probe: &str, probed: &[(&'static chains::Chain, Option<bool>)])
     let names: Vec<&str> = probed.iter().map(|(c, _)| c.name).collect();
     anyhow::anyhow!(
         "couldn't find bytecode for {probe} on any known chain ({}).\n\
-         Pass --chain explicitly, or --rpc <url> for a custom endpoint.",
+         Pass --chain explicitly, or --rpc <url> for a custom endpoint. If the address is mistyped, \
+         or is not a contract, no chain will have code there.",
         names.join(", ")
     )
 }
@@ -1917,7 +1955,8 @@ async fn detect_chain_on_rpc(
         .context("could not read contract bytecode from --rpc")?;
     if is_empty_code(&code) {
         bail!(
-            "no bytecode for {probe} on {} via the supplied RPC endpoint(s)",
+            "no bytecode for {probe} on {} via the supplied RPC endpoint(s); the address may be \
+             mistyped, or the contract self-destructed (then pass --chain and --abi path/to.json)",
             chain.name
         );
     }
@@ -2701,6 +2740,49 @@ mod tests {
         assert!(err.contains("symbolic link"), "{err}");
     }
 
+    #[test]
+    fn an_address_without_code_is_not_blamed_on_a_missing_api_key() {
+        let msg = no_contract_code("0xdead", 1).to_string();
+        assert!(
+            msg.contains("no contract code at 0xdead on chain 1"),
+            "{msg}"
+        );
+        assert!(!msg.contains("ETHERSCAN"), "{msg}");
+        let probed: Vec<_> = chains::all().iter().map(|c| (*c, Some(false))).collect();
+        let nowhere = found_nowhere("0xdead", &probed).to_string();
+        assert!(nowhere.contains("mistyped"), "{nowhere}");
+    }
+
+    /// The refusal sits in `resolve_abi` itself, so deleting the call there fails this.
+    #[tokio::test]
+    async fn resolving_an_address_with_no_code_refuses_before_any_explorer_lookup() {
+        let (url, server) = fake_code_rpc("0x").await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let err = resolve_abi(&rpc, 1, "0x000000000000000000000000000000000000dEaD", None)
+            .await
+            .err()
+            .expect("an address with no code has no ABI");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no contract code at"), "{msg}");
+        assert!(msg.contains("--abi"), "{msg}");
+        assert!(!msg.contains("ETHERSCAN"), "{msg}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn init_through_an_rpc_with_no_code_at_the_address_suggests_a_typo() {
+        let (url, server) = fake_code_rpc("0x").await;
+        let err = detect_chain_on_rpc(
+            &["0x000000000000000000000000000000000000dEaD".to_string()],
+            &[url],
+        )
+        .await
+        .expect_err("no code, no chain");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mistyped"), "{msg}");
+        server.abort();
+    }
+
     // #2193: the failure names every chain that was probed.
     #[test]
     fn found_nowhere_names_every_probed_chain() {
@@ -2777,6 +2859,30 @@ mod tests {
             fit_from_sample(&topic0s_of(IMPL_ABI), &[Some(&other), Some(&bond)]),
             AbiFit::Fits,
             "a contract may emit events its ABI omits; only a total miss is the silent failure"
+        );
+    }
+
+    /// #2855: USDC's first window after deployment holds only the proxy's own `AdminChanged`. That is
+    /// no evidence about the implementation ABI, so it is not a mismatch; a real stranger beside it is.
+    #[test]
+    fn a_proxys_own_admin_logs_are_not_a_mismatch() {
+        use alloy_primitives::keccak256;
+        for (sig, topic) in [
+            ("Upgraded(address)", PROXY_ADMIN_TOPICS[0]),
+            ("AdminChanged(address,address)", PROXY_ADMIN_TOPICS[1]),
+            ("BeaconUpgraded(address)", PROXY_ADMIN_TOPICS[2]),
+        ] {
+            assert_eq!(format!("0x{}", hex::encode(keccak256(sig))), topic, "{sig}");
+        }
+        let abi = topic0s_of(IMPL_ABI);
+        assert_eq!(
+            fit_from_sample(&abi, &[Some(PROXY_ADMIN_TOPICS[1])]),
+            AbiFit::NoSample
+        );
+        let stranger = "0xdeadbeef".repeat(8);
+        assert_eq!(
+            fit_from_sample(&abi, &[Some(PROXY_ADMIN_TOPICS[1]), Some(&stranger)]),
+            AbiFit::Mismatch { sampled: 1 }
         );
     }
 

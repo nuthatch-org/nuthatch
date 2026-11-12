@@ -102,7 +102,9 @@ fn unreal_flags(
     for line in text.lines() {
         for flag in flags_in(line) {
             // A cargo flag in a build instruction (`--features flight`), not one of nuthatch's.
-            if flag == "--features" {
+            if flag == "--features"
+                && (line.contains("cargo") || line.to_lowercase().contains("built with"))
+            {
                 continue;
             }
             if real.contains(&flag) {
@@ -155,6 +157,18 @@ fn feature_gated_flags(src: &str) -> std::collections::BTreeMap<String, String> 
         }
     }
     out
+}
+
+#[test]
+fn the_features_skip_is_for_build_instructions_only() {
+    let real: BTreeSet<String> = ["--chain".to_string()].into();
+    let gated = std::collections::BTreeMap::new();
+    assert_eq!(
+        unreal_flags("Pass `--features flight` to dev.", &real, &gated),
+        ["--features"]
+    );
+    assert!(unreal_flags("cargo build --features flight", &real, &gated).is_empty());
+    assert!(unreal_flags("Built with `--features flight`.", &real, &gated).is_empty());
 }
 
 #[test]
