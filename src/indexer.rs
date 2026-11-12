@@ -3583,12 +3583,16 @@ async fn build_nest(
     // this line simply stops naming that table, which is as much of an answer as the day it started.
     let never_fired = crate::analytics::declared_but_never_sealed(&dir, &served);
     if !never_fired.is_empty() {
-        tracing::info!(
-            "{} declared table(s) have no data yet - the event has likely never fired on this chain: \
-             {}. Each reads as an empty table, not an error, and starts populating the day it does.",
-            never_fired.len(),
-            never_fired.join(", "),
-        );
+        let indexed = store
+            .get_meta(LAST_BLOCK_KEY)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .zip(
+                store
+                    .get_meta(START_BLOCK_KEY)?
+                    .and_then(|v| v.parse::<u64>().ok()),
+            )
+            .map(|(last, from)| (from, last));
+        tracing::info!("{}", no_data_notice(&never_fired, indexed));
     }
 
     // Grafting (RFC-0033): tell the author up front what will and will not be reusable, rather than
@@ -8461,6 +8465,23 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     }
 }
 
+/// A restart partway through a backfill has not reached later events yet, so with an indexed range on
+/// record the notice names that range instead of claiming the event never fired.
+fn no_data_notice(tables: &[String], indexed: Option<(u64, u64)>) -> String {
+    let n = tables.len();
+    let names = tables.join(", ");
+    match indexed {
+        Some((from, last)) => format!(
+            "{n} declared table(s) have no data in blocks {from} to {last}, the range indexed so far: \
+             {names}. Each reads as an empty table, not an error, and fills as the nest reaches events."
+        ),
+        None => format!(
+            "{n} declared table(s) have no data yet - the event has likely never fired on this chain: \
+             {names}. Each reads as an empty table, not an error, and starts populating the day it does."
+        ),
+    }
+}
+
 fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -> u64 {
     match (backfill, start_block) {
         (Some(n), _) => tip.saturating_sub(n),
@@ -12308,6 +12329,16 @@ template = "pool"
         assert_eq!(children.template_of(pool_addr), Some("pool"));
         // The child registry rolls the pool back on a reorg to before its creation block.
         assert_eq!(children.clone().rollback_to(99), 1);
+    }
+
+    #[test]
+    fn a_partial_backfill_does_not_claim_an_event_never_fired() {
+        let tables = vec!["usdc__pause".to_string()];
+        let partial = no_data_notice(&tables, Some((6_082_465, 6_783_217)));
+        assert!(!partial.contains("never fired"), "{partial}");
+        assert!(partial.contains("blocks 6082465 to 6783217"), "{partial}");
+        assert!(partial.contains("usdc__pause"), "{partial}");
+        assert!(no_data_notice(&tables, None).contains("likely never fired"));
     }
 
     #[test]
