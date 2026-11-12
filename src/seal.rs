@@ -1083,17 +1083,17 @@ pub fn unfollow(dir: &Path) {
 
 /// The catalogue's bytes: the serving copy's where it carries one, else the file, which is never
 /// read for a directory a follower holds.
-fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
+fn read_catalogue(dir: &Path) -> std::io::Result<Arc<[u8]>> {
     if let Some(s) = current_serving().filter(|s| s.dir == dir) {
         return match (s.store.served_catalogue(), &s.catalogue) {
-            (Some(Some(raw)), _) => Ok(raw.as_bytes().to_vec()),
+            (Some(Some(raw)), _) => Ok(Arc::from(raw)),
             (Some(None), _) => Err(std::io::ErrorKind::NotFound.into()),
             (None, Some(pinned)) => match &pinned.raw {
-                Some(raw) => Ok(raw.to_vec()),
+                Some(raw) => Ok(raw.clone()),
                 None => Err(std::io::ErrorKind::NotFound.into()),
             },
             // The writer's own store outside a snapshot: its catalogue is the file.
-            (None, None) => std::fs::read(manifest_path(dir)),
+            (None, None) => std::fs::read(manifest_path(dir)).map(Arc::from),
         };
     }
     let held = followed()
@@ -1106,7 +1106,120 @@ fn read_catalogue(dir: &Path) -> std::io::Result<Vec<u8>> {
             dir.display()
         )));
     }
-    std::fs::read(manifest_path(dir))
+    std::fs::read(manifest_path(dir)).map(Arc::from)
+}
+
+/// The catalogue last parsed for one dataset, and the exact bytes it was parsed from.
+struct Parsed {
+    raw: Arc<[u8]>,
+    manifest: Arc<Manifest>,
+    hash: OnceLock<String>,
+}
+
+/// Catalogue file bytes the cache keeps, summed over datasets, least recently used out first. An
+/// entry holds its file and the parsed form, about 2.4 times the file, so this holds under 80 MiB, a
+/// twenty-fifth of one cursor's 2 GiB, while still fitting three 38,000-segment catalogues of
+/// 10.5 MB. A catalogue larger than this is parsed per read and never kept.
+const PARSED_CATALOGUE_BYTES: usize = 32 << 20;
+
+/// Each with the tick it was last used at.
+type ParsedCatalogues = Mutex<HashMap<PathBuf, (Arc<Parsed>, u64)>>;
+
+fn parsed_catalogues() -> &'static ParsedCatalogues {
+    static PARSED: OnceLock<ParsedCatalogues> = OnceLock::new();
+    PARSED.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn catalogue_parses() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    PARSES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn catalogue_parses_of(dir: &Path) -> usize {
+    catalogue_parses()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The catalogue as [`read_catalogue`] sees it, parsed once per distinct content: reading it is
+/// still needed to know it is unchanged, but a catalogue of tens of thousands of segments costs
+/// several times more to parse than to read and compare. `None` when nothing has sealed.
+fn parsed_catalogue(dir: &Path) -> Result<Option<Arc<Parsed>>> {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let raw = match read_catalogue(dir) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("failed to read manifest"),
+    };
+    let tick = TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut cache = parsed_catalogues()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((hit, used)) = cache.get_mut(dir) {
+            if hit.raw == raw {
+                *used = tick;
+                return Ok(Some(hit.clone()));
+            }
+        }
+    }
+    #[cfg(test)]
+    {
+        *catalogue_parses()
+            .lock()
+            .unwrap()
+            .entry(dir.to_path_buf())
+            .or_default() += 1;
+    }
+    let manifest = checked(serde_json::from_slice(&raw).context("corrupt segments manifest")?)?;
+    let parsed = Arc::new(Parsed {
+        raw,
+        manifest: Arc::new(manifest),
+        hash: OnceLock::new(),
+    });
+    let mut cache = parsed_catalogues()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if parsed.raw.len() > PARSED_CATALOGUE_BYTES {
+        cache.remove(dir);
+        return Ok(Some(parsed));
+    }
+    cache.insert(dir.to_path_buf(), (parsed.clone(), tick));
+    while cache.values().map(|(p, _)| p.raw.len()).sum::<usize>() > PARSED_CATALOGUE_BYTES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (_, used))| *used)
+            .map(|(d, _)| d.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    Ok(Some(parsed))
+}
+
+/// [`load_manifest`], shared rather than owned, and parsed only when its bytes have changed.
+pub fn shared_manifest(dir: &Path) -> Result<Arc<Manifest>> {
+    Ok(parsed_catalogue(dir)?.map_or_else(Default::default, |p| p.manifest.clone()))
+}
+
+/// [`load_manifest_with_hash`], as [`shared_manifest`].
+pub fn shared_manifest_with_hash(dir: &Path) -> Result<(Arc<Manifest>, Option<String>)> {
+    Ok(match parsed_catalogue(dir)? {
+        Some(p) => {
+            let hash = p
+                .hash
+                .get_or_init(|| hex::encode(Sha256::digest(&p.raw)))
+                .clone();
+            (p.manifest.clone(), Some(hash))
+        }
+        None => (Default::default(), None),
+    })
 }
 
 /// Load the segment catalogue (empty if none yet).
@@ -1692,26 +1805,50 @@ pub const QUARANTINE_DIR: &str = "quarantine";
 /// log loudly, then continue. A corrupt segment must *reduce* a table's cold data, never crash-loop the
 /// node. Sealed data is immutable and content-addressed, so a hash mismatch is unambiguous corruption.
 /// Returns the number of segments quarantined. Best-effort - never fatal (an IO error just logs).
+///
+/// A segment is hashed here only when its file is not the one the last pass hashed: a different
+/// length, modification time, change time, inode or device, or a catalogue expecting other bytes.
+/// Any write, truncation, replacement or restore moves at least one of them, to the filesystem's
+/// timestamp resolution. A change below the filesystem moves none of them, which is why
+/// [`verify_in_background`] still hashes every segment once the nest is serving.
 pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     let mut manifest = load_manifest(dir)?;
-    // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
-    let quarantine = dir.join(QUARANTINE_DIR);
     let mut quarantined = 0usize;
     // A bad provisional tail stays catalogued, so its loss stays visible, but is never folded or aged
     // again: both read its file, and the failed read stopped every later seal (#2172).
     let mut lost_tails = 0usize;
+    let before = verified_record(dir);
+    let mut verified = Verified {
+        last_full: before.last_full,
+        stamps: BTreeMap::new(),
+    };
 
     for (table, segs) in &mut manifest.tables {
         for s in segs.iter_mut() {
             let path = segment_path(dir, &s.file, &s.hash);
-            // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and
-            // in the shared store those bytes belong to every dataset referencing them - one nest's
-            // integrity pass must not yank data out from under its neighbours. A corrupt shared
-            // segment is reported loudly and left in place; the operator decides, with the knowledge
-            // that more than one dataset is affected.
-            let is_shared = shared_store(dir).is_some_and(|st| path.starts_with(&st));
-            let reason = match std::fs::read(&path) {
-                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => continue, // intact
+            let key = verified_key(&path, &s.hash);
+            // Taken before the read, so a write landing during it moves the stamp past this one.
+            let stamp = file_stamp(&path);
+            if let Some(unchanged) = stamp.filter(|s| before.stamps.get(&key) == Some(s)) {
+                verified.stamps.insert(key, unchanged);
+                continue;
+            }
+            let read = std::fs::read(&path);
+            #[cfg(test)]
+            if read.is_ok() {
+                *segments_hashed()
+                    .lock()
+                    .unwrap()
+                    .entry(dir.to_path_buf())
+                    .or_default() += 1;
+            }
+            let reason = match read {
+                Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {
+                    if let Some(stamp) = stamp {
+                        verified.stamps.insert(key, stamp);
+                    }
+                    continue;
+                }
                 Ok(_) => "hash mismatch (corrupt or tampered)",
                 // Already gone from disk - nothing to move; `define_views` skips it. Not counted.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1727,38 +1864,16 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                 s.provisional = false;
                 lost_tails += 1;
             }
-            if is_shared {
-                tracing::error!(
-                    "shared segment {} for table {table} is {reason} - left in place because other \
-                     datasets reference it. Remove it deliberately once you know what else breaks.",
-                    s.hash
-                );
-                continue;
-            }
-            std::fs::create_dir_all(&quarantine).ok();
-            let dest = quarantine.join(&s.file);
-            match std::fs::rename(&path, &dest) {
-                Ok(()) => {
-                    tracing::error!(
-                        "quarantined segment {} for table {table} ({reason}) → {} - cold data for this \
-                         table is reduced. Its rows left the hot store when it was sealed, so nuthatch \
-                         cannot re-seal them: restore a copy hashing to {} at {}, or re-index the nest",
-                        s.file,
-                        dest.display(),
-                        s.hash,
-                        path.display()
-                    );
-                    quarantined += 1;
-                }
-                Err(e) => tracing::error!(
-                    "segment {} for {table} is {reason} but could not be quarantined: {e}",
-                    s.file
-                ),
-            }
+            quarantined += usize::from(quarantine_segment(dir, table, s, &path, reason));
         }
     }
     if lost_tails > 0 {
         save_manifest(dir, &manifest)?;
+    }
+    if verified != before {
+        if let Err(e) = save_verified(dir, &verified) {
+            tracing::warn!("could not record the segments verified intact: {e:#}");
+        }
     }
     if quarantined > 0 {
         tracing::error!(
@@ -1767,6 +1882,303 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
         );
     }
     Ok(quarantined)
+}
+
+/// Move a segment that does not hash to its address into `quarantine/`, so `define_views` skips it.
+/// True when it was moved.
+fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason: &str) -> bool {
+    // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and in the
+    // shared store those bytes belong to every dataset referencing them - one nest's integrity pass
+    // must not yank data out from under its neighbours. A corrupt shared segment is reported loudly
+    // and left in place; the operator decides, with the knowledge that more than one dataset is
+    // affected.
+    if shared_store(dir).is_some_and(|st| path.starts_with(&st)) {
+        tracing::error!(
+            "shared segment {} for table {table} is {reason} - left in place because other \
+             datasets reference it. Remove it deliberately once you know what else breaks.",
+            s.hash
+        );
+        return false;
+    }
+    // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
+    let quarantine = dir.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&quarantine).ok();
+    let dest = quarantine.join(&s.file);
+    match std::fs::rename(path, &dest) {
+        Ok(()) => {
+            tracing::error!(
+                "quarantined segment {} for table {table} ({reason}) → {} - cold data for this \
+                 table is reduced. Its rows left the hot store when it was sealed, so nuthatch \
+                 cannot re-seal them: restore a copy hashing to {} at {}, or re-index the nest",
+                s.file,
+                dest.display(),
+                s.hash,
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "segment {} for {table} is {reason} but could not be quarantined: {e}",
+                s.file
+            );
+            false
+        }
+    }
+}
+
+/// Bytes a background pass reads per second, across every dataset in the process: one pass runs at a
+/// time, so a runtime of many nests shares this rather than multiplying it.
+pub const BACKGROUND_VERIFY_BYTES_PER_SEC: u64 = 64 << 20;
+/// How long after a nest is built its first background pass starts, so a restart's cursor and first
+/// queries have the disk to themselves.
+pub const BACKGROUND_VERIFY_DELAY: Duration = Duration::from_secs(60);
+/// The longest a running nest goes between full passes.
+pub const FULL_VERIFY_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+const VERIFY_CHUNK: usize = 1 << 20;
+
+/// Hash every segment of `dir` on a thread of its own, after `delay` and then every
+/// [`FULL_VERIFY_EVERY`], quarantining any that do not match as the startup pass does, until `alive`
+/// says the nest is gone. Reads are throttled to [`BACKGROUND_VERIFY_BYTES_PER_SEC`].
+///
+/// This is what catches a segment that rotted under unchanged file metadata, which the startup pass
+/// no longer reads. Until it reaches such a segment, a query or the view rebuild may read it, as one
+/// could at any time between restarts before. The catalogue is never written from here: a quarantined
+/// provisional tail stops later seals until the next start records it as lost.
+pub fn verify_in_background(
+    dir: PathBuf,
+    alive: impl Fn() -> bool + Send + 'static,
+    delay: Duration,
+) -> std::thread::JoinHandle<()> {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    std::thread::Builder::new()
+        .name("segment-verify".into())
+        .spawn(move || {
+            let mut wait = delay;
+            loop {
+                if !sleep_while(wait, &alive) {
+                    return;
+                }
+                let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+                match background_pass(&dir, &alive) {
+                    Ok(Some(n)) if n > 0 => tracing::error!(
+                        "background integrity: quarantined {n} corrupt segment(s) in {} - data is \
+                         reduced; investigate disk health, then restore the files or re-index the nest",
+                        dir.display()
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "background segment verification of {} failed: {e:#}",
+                        dir.display()
+                    ),
+                }
+                drop(one);
+                wait = FULL_VERIFY_EVERY;
+            }
+        })
+        .expect("spawning the segment verifier")
+}
+
+/// Sleep `d` in short steps, false as soon as `alive` stops holding.
+fn sleep_while(d: Duration, alive: &impl Fn() -> bool) -> bool {
+    let until = Instant::now() + d;
+    while alive() {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(Duration::from_secs(1)));
+    }
+    false
+}
+
+/// One full pass. `None` when the nest went away part way; the next start runs a whole pass again.
+fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize>> {
+    let manifest = load_manifest(dir)?;
+    let mut verified = Verified::default();
+    let mut quarantined = 0;
+    let mut throttle = Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC);
+    for (table, segs) in &manifest.tables {
+        for s in segs {
+            let path = segment_path(dir, &s.file, &s.hash);
+            let stamp = file_stamp(&path);
+            let reason = match hash_throttled(&path, &mut throttle, alive) {
+                Ok(None) => return Ok(None),
+                Ok(Some(hash)) if hash == s.hash => {
+                    if let Some(stamp) = stamp {
+                        verified.stamps.insert(verified_key(&path, &s.hash), stamp);
+                    }
+                    continue;
+                }
+                Ok(Some(_)) => "hash mismatch (corrupt or tampered)",
+                // Folded away or pruned since the catalogue was read, or already quarantined.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => "unreadable",
+            };
+            if s.provisional {
+                tracing::error!(
+                    "provisional segment {} for table {table} is {reason}: seals stop until the next \
+                     start records it as lost",
+                    s.file
+                );
+            }
+            quarantined += usize::from(quarantine_segment(dir, table, s, &path, reason));
+        }
+    }
+    verified.last_full = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs());
+    save_verified(dir, &verified)?;
+    Ok(Some(quarantined))
+}
+
+/// Paces reads to a byte rate measured from its creation.
+struct Throttle {
+    started: Instant,
+    bytes: u64,
+    per_sec: u64,
+}
+
+impl Throttle {
+    fn new(per_sec: u64) -> Self {
+        Throttle {
+            started: Instant::now(),
+            bytes: 0,
+            per_sec,
+        }
+    }
+
+    fn read(&mut self, n: usize) {
+        self.bytes += n as u64;
+        let due = Duration::from_secs_f64(self.bytes as f64 / self.per_sec as f64);
+        let ahead = due.saturating_sub(self.started.elapsed());
+        if !ahead.is_zero() {
+            std::thread::sleep(ahead);
+        }
+    }
+}
+
+/// The file's sha256, read [`VERIFY_CHUNK`] at a time under `throttle`. `Ok(None)` when `alive` stopped
+/// holding part way.
+fn hash_throttled(
+    path: &Path,
+    throttle: &mut Throttle,
+    alive: &impl Fn() -> bool,
+) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; VERIFY_CHUNK];
+    loop {
+        if !alive() {
+            return Ok(None);
+        }
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(Some(hex::encode(hasher.finalize())));
+        }
+        hasher.update(&buf[..n]);
+        throttle.read(n);
+    }
+}
+
+/// `Ok` when the file at `path` hashes to `expected`, for a caller about to hand the bytes on.
+pub fn check_segment_bytes(path: &Path, expected: &str) -> Result<()> {
+    let mut throttle = Throttle::new(u64::MAX);
+    let got = hash_throttled(path, &mut throttle, &|| true)
+        .with_context(|| format!("reading {}", path.display()))?
+        .expect("never interrupted");
+    anyhow::ensure!(
+        got == expected,
+        "{} does not hash to its address {expected} (it hashes to {got})",
+        path.display()
+    );
+    Ok(())
+}
+
+/// [`check_segment_bytes`] for a catalogued segment, quarantining it on a mismatch as the integrity
+/// passes do.
+pub fn check_or_quarantine(dir: &Path, table: &str, s: &Segment) -> Result<()> {
+    let path = segment_path(dir, &s.file, &s.hash);
+    let checked = check_segment_bytes(&path, &s.hash);
+    if checked.is_err() && path.exists() && !s.provisional {
+        quarantine_segment(dir, table, s, &path, "hash mismatch (corrupt or tampered)");
+    }
+    checked
+}
+
+/// Beside the catalogue: when every segment was last hashed, and the stamp of each segment file a
+/// pass has hashed intact since.
+const VERIFIED_FILE: &str = "verified.json";
+
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Verified {
+    /// Unix seconds at the end of the last whole background pass.
+    #[serde(default)]
+    last_full: Option<u64>,
+    #[serde(default)]
+    stamps: BTreeMap<String, FileStamp>,
+}
+
+/// Length, modification and change times, inode and device.
+type FileStamp = (u64, i64, i64, i64, i64, u64, u64);
+
+/// The hash too: a restored catalogue may expect other bytes of the same file.
+fn verified_key(path: &Path, hash: &str) -> String {
+    format!("{}\n{hash}", path.display())
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((
+        m.len(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+        m.ino(),
+        m.dev(),
+    ))
+}
+
+/// Unreadable or torn reads as empty, and the startup pass then hashes everything.
+fn verified_record(dir: &Path) -> Verified {
+    std::fs::read(dir.join(SEGMENTS_DIR).join(VERIFIED_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_verified(dir: &Path, verified: &Verified) -> Result<()> {
+    let path = dir.join(SEGMENTS_DIR).join(VERIFIED_FILE);
+    if verified.stamps.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(verified)?)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn segments_hashed() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static HASHED: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    HASHED.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn segments_hashed_of(dir: &Path) -> usize {
+    segments_hashed()
+        .lock()
+        .unwrap()
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// The segment's file is present and hashes to its catalogue entry.
@@ -1787,8 +2199,8 @@ pub fn unpruned_fold(dir: &Path, sealed_through: u64) -> Result<Option<(u64, u64
     nuthatch_core::seal::unpruned_fold(&mut *FsSinks(dir).open(), sealed_through)
 }
 
-/// What [`check_catalogue`] found. Diagnostic: it does not move files. Startup quarantine is
-/// [`verify_and_quarantine`].
+/// What [`check_catalogue`] found. Diagnostic: it does not move files. Quarantine is
+/// [`verify_and_quarantine`] at startup and [`verify_in_background`] once serving.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CatalogueCheck {
     pub manifest_version: u32,
@@ -3225,6 +3637,50 @@ mod tests {
     }
 
     #[test]
+    fn a_catalogue_is_parsed_once_until_its_bytes_change() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        for _ in 0..3 {
+            assert_eq!(shared_manifest(dir.path()).unwrap().tables.len(), 1);
+            shared_manifest_with_hash(dir.path()).unwrap();
+        }
+        assert_eq!(catalogue_parses_of(dir.path()), 1);
+
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = |dir: &Path| shared_manifest(dir).unwrap().tables["usdc__transfer"].len();
+        assert_eq!(
+            segs(dir.path()),
+            2,
+            "a new seal was served from the old parse"
+        );
+        assert_eq!(catalogue_parses_of(dir.path()), 2);
+
+        // The same length and modification time, different bytes: only the content can tell.
+        let path = manifest_path(dir.path());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut m = load_manifest(dir.path()).unwrap();
+        m.tables.get_mut("usdc__transfer").unwrap()[1].to_block = 102;
+        let before = std::fs::metadata(&path).unwrap().len();
+        save_manifest(dir.path(), &m).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+        let (shared, hash) = shared_manifest_with_hash(dir.path()).unwrap();
+        let (fresh, fresh_hash) = load_manifest_with_hash(dir.path()).unwrap();
+        assert_eq!(shared.tables["usdc__transfer"][1].to_block, 102);
+        assert_eq!(
+            serde_json::to_value(&*shared).unwrap(),
+            serde_json::to_value(&fresh).unwrap()
+        );
+        assert_eq!(hash, fresh_hash);
+    }
+
+    #[test]
     fn verify_quarantines_a_corrupt_segment_and_leaves_intact_ones() {
         let dir = tempfile::tempdir().unwrap();
         // One segment per seal: this is about a damaged file, not about the table floor (#1150).
@@ -3268,6 +3724,105 @@ mod tests {
         let before = inode();
         assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
         assert_eq!(inode(), before, "the catalogue was reinstalled");
+    }
+
+    /// A sector that rots moves no file stamp, so the start passes it and the background pass, which
+    /// begins only after its delay, is what quarantines it.
+    #[test]
+    fn rot_under_unchanged_stamps_is_quarantined_by_the_background_pass_after_its_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        let rows: Vec<String> = (0..300u64)
+            .map(|i| transfer(100 + i / 3, i % 3, &format!("{}", 1_000_003 * (i + 7))))
+            .collect();
+        seal_range(dir.path(), &rows, 100, 199).unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let mut record = verified_record(dir.path());
+        record
+            .stamps
+            .insert(verified_key(&path, &seg.hash), file_stamp(&path).unwrap());
+        save_verified(dir.path(), &record).unwrap();
+        assert_eq!(
+            verify_and_quarantine(dir.path()).unwrap(),
+            0,
+            "the start rehashed a segment whose stamp did not move"
+        );
+
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        verify_in_background(
+            dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_millis(500),
+        );
+        assert!(path.exists(), "the background pass ran before its delay");
+        let quarantined = dir.path().join(QUARANTINE_DIR).join(&seg.file);
+        let start = Instant::now();
+        while !quarantined.exists() && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(quarantined.exists(), "the background pass missed the rot");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_catalogue_expecting_other_bytes_of_an_unchanged_file_rehashes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        let mut m = load_manifest(dir.path()).unwrap();
+        m.tables.get_mut("usdc__transfer").unwrap()[0].hash = "ab".repeat(32);
+        save_manifest(dir.path(), &m).unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_restart_rehashes_only_the_segments_changed_since_the_last_clean_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        let hashed = || segments_hashed_of(dir.path());
+
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert_eq!(hashed(), 2);
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert_eq!(hashed(), 2, "an unchanged segment was read again");
+
+        // Corrupt one in place at the same length and put its mtime back, so only the change
+        // time can see it. Linux stamps that from a coarse clock, hence the pause.
+        std::thread::sleep(Duration::from_millis(50));
+        let path = segment_path(dir.path(), &segs[0].file, &segs[0].hash);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4] ^= 0xFF;
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut &f, &bytes).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        drop(f);
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert_eq!(hashed(), 3);
+
+        // A truncated one is found too, without reading the intact one again.
+        let path = segment_path(dir.path(), &segs[1].file, &segs[1].hash);
+        let len = std::fs::metadata(&path).unwrap().len();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert_eq!(hashed(), 4);
     }
 
     /// #2758: a catalogue that is there but cannot be read is an error, not an empty catalogue.

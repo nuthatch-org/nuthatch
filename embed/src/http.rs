@@ -277,9 +277,8 @@ async fn route_sql(
         })
     };
     let referenced = match referenced_tables(&q.q, n.files) {
-        None => None,
-        Some(Ok(tables)) => Some(tables),
-        Some(Err(e)) => return refuse(engine_error(&e, &q.q, n)),
+        Ok(tables) => tables,
+        Err(e) => return refuse(engine_error(&e, &q.q, n)),
     };
     let scope = n.scope.unwrap_or(&NO_SCOPE);
     let unbound = (!scope.unbound_views.is_empty())
@@ -365,25 +364,20 @@ async fn route_sql(
         }
     };
     let head = dataset_head(n);
-    let entities = match &referenced {
-        None => Value::Null,
-        Some(names) => {
-            let used: Vec<Value> = n
-                .nest
-                .entities
-                .iter()
-                .filter(|e| names.contains(&e.name_lower()))
-                .map(|e| {
-                    let (_, applied) = e.lane().len_and_watermark();
-                    answer::sql_entity_item(&e.facts(), applied.through, head, &applied)
-                })
-                .collect();
-            if used.is_empty() {
-                Value::Null
-            } else {
-                Value::Array(used)
-            }
-        }
+    let used: Vec<Value> = n
+        .nest
+        .entities
+        .iter()
+        .filter(|e| referenced.contains(&e.name_lower()))
+        .map(|e| {
+            let (_, applied) = e.lane().len_and_watermark();
+            answer::sql_entity_item(&e.facts(), applied.through, head, &applied)
+        })
+        .collect();
+    let entities = if used.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(used)
     };
     let registry_hash = format!("0x{}", hex::encode(n.nest.registry().hash()));
     let mut envelope = answer::sql_envelope(
@@ -442,8 +436,8 @@ fn narrowed(sql: &str, n: &Nest, filtered: &BTreeSet<String>, whole: bool) -> Va
         .map(|t| t.table.to_ascii_lowercase())
         .collect();
     let read = match referenced_tables(sql, n.files) {
-        Some(Ok(t)) => Some(own.intersection(&t).cloned().collect()),
-        _ => None,
+        Ok(t) => Some(own.intersection(&t).cloned().collect()),
+        Err(_) => None,
     };
     let unfiltered = read
         .as_ref()

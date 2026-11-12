@@ -1971,6 +1971,24 @@ history is untouched. For one below the seal the sealed rows are themselves on t
 they are served until the check runs and then the nest halts; the only protection is a finality depth
 the chain actually honours.
 
+**A sealed segment that stops hashing to its address is quarantined**, moved to `quarantine/` beside
+`segments/`, and that table's cold data is reduced, loudly; the node keeps running. At start the pass
+rereads only segment files whose length, modification or change time, inode or device differ from
+when a pass last hashed them intact (`segments/verified.json`), so a nest serves and ingests at once
+after a restart. Every segment is then hashed again in the background, starting a minute after the
+nest is built, read at no more than 64 MiB/s across the whole process, one dataset at a time, and
+again every 24 hours for as long as the nest runs. So a segment changed through the filesystem
+(written over, truncated, replaced, restored) is caught before the nest serves; one that rotted under
+unchanged metadata is caught within one background pass of a start, and within 24 hours of the last
+pass after that. Until then a corrupted segment that still decodes can answer a query wrongly. The views
+and balances rebuilt at start read segments before that pass has verified them, where before 5.21
+rot that happened before a restart was caught before the rebuild; and nothing retracts derived state
+built from a segment that is later quarantined, so it stays wrong until the next restart. A shared segment is reported and
+left in place. A provisional tail found corrupt in the background stops later seals until the next
+start records it as lost. `nuthatch publish` hashes every segment before it uploads it, and refuses
+(and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
+--catalogue` checks the same thing and only reports.
+
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
 duplicates.
