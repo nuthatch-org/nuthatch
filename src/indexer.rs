@@ -89,19 +89,14 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     {
         tracing::warn!("{note}");
     }
-    let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
     // Every endpoint must be on this nest's chain before a single block is indexed (issue #150): a
     // wrong-network endpoint in the pool corrupts silently, because failover hides it.
     rpc.verify_chain_ids(config.nest.chain_id).await?;
     config.freshness = config.freshness.for_chain(&config.nest.chain, &rpc).await;
     let source: Arc<dyn Source> = Arc::new(rpc);
-    let concurrency = backfill_concurrency_for(
-        endpoint_count,
-        args.concurrency,
-        args.seal_direct,
-        &[&config.nest.name],
-    );
+    let concurrency =
+        backfill_concurrency_for(args.concurrency, args.seal_direct, &[&config.nest.name]);
     let publish = args
         .publish_target
         .clone()
@@ -248,12 +243,10 @@ pub async fn upgrade(
 
     // Neither a compatible nor a breaking update changes chains, so one source feeds both indexers.
     let rpc_urls = crate::rpc::select_rpcs(&rpc_override, old_config.nest.rpc_urls.clone());
-    let endpoint_count = rpc_urls.len();
     let rpc = RpcClient::new(rpc_urls)?;
     rpc.verify_chain_ids(old_config.nest.chain_id).await?;
     let source: Arc<dyn Source> = Arc::new(rpc);
     let concurrency = backfill_concurrency_for(
-        endpoint_count,
         concurrency,
         seal_direct,
         &[&old_config.nest.name, &new_config.nest.name],
@@ -8393,48 +8386,18 @@ async fn detect_reorg(
     nuthatch_core::cursor::detect_reorg(source, store, last).await
 }
 
-/// Where a cold start begins backfilling. An explicit `--backfill N` always wins - "index the last N
-/// blocks", overriding a vendored deploy block (this is what keeps the recent-history use working on
-/// a nest that declares start blocks). Otherwise, the nest's earliest vendored `start_block` gives
-/// full history from deployment; failing that, a default recent window. Pure, so it's unit-testable.
-/// The seal-direct backfill concurrency that's safe for the configured endpoints. A *single* RPC host
-/// can't absorb a high-concurrency backfill: many concurrent requests to one host stall the whole
-/// tokio runtime - a lost wakeup that parks every worker and never fires, so even the per-request
-/// timeout can't rescue it, and the backfill hangs forever (reproduced at `--concurrency 8` to one
-/// host; multiple hosts spread the load over separate connections and never hit it). So a single
-/// endpoint is capped to sequential; two or more keep the requested parallelism. The caller logs the
-/// cap so the operator knows to add endpoints for a faster backfill.
-pub fn safe_backfill_concurrency(endpoint_count: usize, requested: usize) -> usize {
-    if endpoint_count <= 1 {
-        1
-    } else {
-        requested
-    }
-}
-
-/// [`safe_backfill_concurrency`], warned when it caps and recorded for each nest's `/ready` (#1399).
-pub fn backfill_concurrency_for(
-    endpoint_count: usize,
-    requested: usize,
-    seal_direct: bool,
-    nests: &[&str],
-) -> usize {
-    let effective = safe_backfill_concurrency(endpoint_count, requested);
-    if effective < requested {
-        tracing::warn!(
-            "single RPC endpoint: capping seal-direct backfill concurrency {requested} → {effective} \
-             (high concurrency to one host can stall the runtime); configure multiple rpc_urls for a \
-             parallel backfill"
-        );
-    }
+/// The seal-direct backfill concurrency, recorded for each nest's `/ready`. One RPC endpoint runs
+/// it as asked: the stall it was once capped for was a timed-out window ending an ingest task
+/// nothing awaited, and a timed-out window is now retried and a dead task surfaces.
+pub fn backfill_concurrency_for(requested: usize, seal_direct: bool, nests: &[&str]) -> usize {
     if seal_direct {
         for nest in nests {
             METRICS
                 .nest(nest)
-                .set_seal_direct_concurrency(requested, effective);
+                .set_seal_direct_concurrency(requested, requested);
         }
     }
-    effective
+    requested
 }
 
 /// Where a seal-direct backfill starts: one past the last durably-sealed block if a prior run left a
@@ -8457,6 +8420,10 @@ fn effective_window(override_: Option<u64>, chain_window: u64) -> u64 {
     }
 }
 
+/// Where a cold start begins backfilling. An explicit `--backfill N` always wins - "index the last N
+/// blocks", overriding a vendored deploy block (this is what keeps the recent-history use working on
+/// a nest that declares start blocks). Otherwise, the nest's earliest vendored `start_block` gives
+/// full history from deployment; failing that, a default recent window. Pure, so it's unit-testable.
 fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -> u64 {
     match (backfill, start_block) {
         (Some(n), _) => tip.saturating_sub(n),
@@ -12355,32 +12322,16 @@ template = "pool"
         assert_eq!(resume_from_watermark(Some(u64::MAX), 100), u64::MAX);
     }
 
+    /// One endpoint runs the concurrency asked for. Recorded for `/ready` only for a nest running a
+    /// seal-direct pass, since the number describes nothing else.
     #[test]
-    fn single_endpoint_backfill_is_capped_to_sequential() {
-        // One endpoint → forced sequential regardless of the requested concurrency (deadlock guard).
-        assert_eq!(safe_backfill_concurrency(1, 8), 1);
-        assert_eq!(safe_backfill_concurrency(0, 8), 1);
-        assert_eq!(safe_backfill_concurrency(1, 1), 1);
-        // Two or more endpoints → the requested concurrency is honored.
-        assert_eq!(safe_backfill_concurrency(3, 8), 8);
-        assert_eq!(safe_backfill_concurrency(2, 4), 4);
-    }
-
-    /// #1399: the cap was a startup warning alone. It is recorded where `/ready` reads it, and only for a
-    /// nest running a seal-direct pass, since the number describes nothing else.
-    #[test]
-    fn a_seal_direct_concurrency_is_recorded_for_ready_with_its_cap() {
-        assert_eq!(backfill_concurrency_for(1, 6, true, &["capped-1399"]), 1);
+    fn a_seal_direct_concurrency_is_recorded_for_ready_as_asked() {
+        assert_eq!(backfill_concurrency_for(6, true, &["one-endpoint-2880"]), 6);
         assert_eq!(
-            METRICS.nest("capped-1399").seal_direct_concurrency(),
-            Some((6, 1))
-        );
-        assert_eq!(backfill_concurrency_for(2, 6, true, &["parallel-1399"]), 6);
-        assert_eq!(
-            METRICS.nest("parallel-1399").seal_direct_concurrency(),
+            METRICS.nest("one-endpoint-2880").seal_direct_concurrency(),
             Some((6, 6))
         );
-        assert_eq!(backfill_concurrency_for(1, 6, false, &["hot-1399"]), 1);
+        assert_eq!(backfill_concurrency_for(6, false, &["hot-1399"]), 6);
         assert_eq!(METRICS.nest("hot-1399").seal_direct_concurrency(), None);
     }
 
