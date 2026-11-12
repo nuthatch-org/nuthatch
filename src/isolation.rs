@@ -459,37 +459,20 @@ pub(crate) fn unlisted(registered: &[String]) -> Vec<String> {
 }
 
 /// Refuse a statement that calls a function the allow-list does not name, or that cannot be parsed
-/// well enough to say. Read from Burrmill's canonical text, so a list comprehension is seen as the
-/// calls it becomes.
+/// well enough to say. Burrmill reads the calls as the engine parses the statement, a list
+/// comprehension as the calls it becomes.
 pub(crate) fn refuse_unlisted_functions(sql: &str) -> Result<()> {
-    use sqlparser::ast::{visit_expressions, Expr};
-    use std::ops::ControlFlow;
-    let unreadable = || {
+    let calls = burrmill::inspect::calls(sql).ok_or_else(|| {
         anyhow!("strict isolation refuses a statement it cannot parse for the functions it calls")
-    };
-    let canonical = burrmill::inspect::canonical(sql).ok_or_else(unreadable)?;
-    let statements =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::DuckDbDialect {}, &canonical)
-            .map_err(|_| unreadable())?;
-    let mut refused = None;
-    let _ = visit_expressions(&statements, |e| {
-        if let Expr::Function(f) = e {
-            let parts = &f.name.0;
-            let name = parts
-                .last()
-                .map(|p| p.to_string().trim_matches('"').to_lowercase())
-                .unwrap_or_default();
-            if parts.len() != 1 || !allowed(&name) {
-                refused = Some(f.name.to_string());
-                return ControlFlow::Break(());
-            }
-        }
-        ControlFlow::Continue(())
-    });
+    })?;
+    let refused = calls
+        .iter()
+        .find(|name| !matches!(name.as_slice(), [f] if allowed(f)));
     if let Some(name) = refused {
         bail!(
-            "function `{name}` is not on this runtime's allow-list (isolation = \"strict\"); \
-             docs/security/shared-runtime.md lists what is"
+            "function `{}` is not on this runtime's allow-list (isolation = \"strict\"); \
+             docs/security/shared-runtime.md lists what is",
+            name.join(".")
         );
     }
     Ok(())
@@ -564,6 +547,22 @@ mod tests {
         }
     }
 
+    /// The network nest's views use IGNORE NULLS, which only the engine's dialect reads.
+    #[cfg(feature = "graph")]
+    #[test]
+    fn strict_reads_the_network_nests_views() {
+        let dir = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/network-nest"
+        ));
+        let bodies = crate::analytics::nest_view_bodies(dir);
+        assert!(bodies.len() > 10, "{}", bodies.len());
+        for (name, body) in bodies {
+            refuse_unlisted_functions(body.trim().trim_end_matches(';'))
+                .unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        }
+    }
+
     #[test]
     fn strict_allows_ordinary_analytical_sql() {
         for sql in [
@@ -576,6 +575,7 @@ mod tests {
             "SELECT [lower(x) FOR x IN ['A', 'B']]",
             "SELECT CAST(x AS BIGINT), EXTRACT(year FROM ts), SUBSTRING(s FROM 2) FROM t",
             "WITH c AS (SELECT coalesce(x, 0) AS x FROM t) SELECT avg(x) FROM c",
+            "SELECT last_value(x IGNORE NULLS) OVER (ORDER BY y) FROM t WHERE s ^@ 'a'",
         ] {
             refuse_unlisted_functions(sql).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
         }

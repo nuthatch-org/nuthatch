@@ -11184,6 +11184,40 @@ mod confinement {
         run(Some("a"), "SELECT * FROM v").unwrap();
     }
 
+    /// Strict reads a statement's calls as the engine parses it, so syntax only the engine's
+    /// dialect reads is checked, not refused as unparseable.
+    #[test]
+    fn strict_answers_engine_only_syntax_in_statements_and_views() {
+        let f = two_datasets();
+        std::fs::write(
+            f.a.join("views").join("n.sql"),
+            "CREATE VIEW n AS SELECT last_value(x IGNORE NULLS) OVER () AS y FROM t__e;\n",
+        )
+        .unwrap();
+        let tenant: Arc<str> = Arc::from("a");
+        for sql in [
+            "SELECT * FROM n",
+            "SELECT x ^@ 'mi' AS s FROM t__e",
+            "SELECT last_value(x IGNORE NULLS) OVER () AS y FROM t__e",
+        ] {
+            isolated(Some(&tenant), || {
+                query_hot_cold(&f.a, sql, guard(), &HotRows::new(), 10, &[])
+            })
+            .unwrap_or_else(|e| panic!("strict: {sql}: {e:#}"));
+        }
+        let refused = isolated(Some(&tenant), || {
+            query_hot_cold(
+                &f.a,
+                "SELECT last_value(version() IGNORE NULLS) OVER () FROM t__e",
+                guard(),
+                &HotRows::new(),
+                10,
+                &[],
+            )
+        });
+        assert!(format!("{:#}", refused.unwrap_err()).contains("`version`"));
+    }
+
     /// FR8 review: explaining a missing view replayed every authored statement in a fresh engine,
     /// outside the request's permit and isolation, `CREATE TABLE … AS` included, and an error that
     /// merely quoted an authored view's name was enough to ask for it. A served request is explained
