@@ -2331,11 +2331,22 @@ pub fn check_segment_bytes(path: &Path, expected: &str) -> Result<()> {
 /// passes do.
 pub fn check_or_quarantine(dir: &Path, table: &str, s: &Segment) -> Result<()> {
     let path = segment_path(dir, &s.file, &s.hash);
-    let checked = check_segment_bytes(&path, &s.hash);
-    if checked.is_err() && path.exists() && !s.provisional {
-        quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+    let mut throttle = Throttle::new(u64::MAX);
+    // Only a read that completed is grounds for moving the file; a failed one is just refused.
+    let got = hash_throttled(&path, &mut throttle, &|| true)
+        .with_context(|| format!("reading {}", path.display()))?
+        .expect("never interrupted");
+    if got != s.hash {
+        if !s.provisional {
+            quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+        }
+        anyhow::bail!(
+            "{} does not hash to its address {} (it hashes to {got})",
+            path.display(),
+            s.hash
+        );
     }
-    checked
+    Ok(())
 }
 
 /// Beside the catalogue: when every segment was last hashed, and the stamp of each segment file a
@@ -4368,6 +4379,7 @@ mod tests {
             return; // Running as root: nothing is unreadable.
         }
         assert_eq!(verify_and_quarantine(&dir).unwrap(), 0);
+        assert!(check_or_quarantine(&dir, "usdc__transfer", &seg).is_err());
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(shared.is_file(), "a readable-again segment was taken away");
         assert!(!root.path().join(QUARANTINE_DIR).exists());
