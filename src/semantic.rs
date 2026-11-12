@@ -165,9 +165,14 @@ pub fn compose(
     }
 
     if let Some(c) = coverage {
+        let reads = if gates.free_form {
+            "the `sql` tool reads both the sealed rows and the live tip above them"
+        } else {
+            "the declared queries read both the sealed rows and the live tip above them"
+        };
         out.push_str(&format!(
             "COVERAGE\n  sealed_through = {} (rows at or below this block are sealed Parquet);\n  \
-             tip = {} - the `sql` tool reads both the sealed rows and the live tip above them.\n",
+             tip = {} - {reads}.\n",
             c.sealed_through, c.tip
         ));
         if let Some(from) = c.first_indexed {
@@ -184,7 +189,11 @@ pub fn compose(
         out.push('\n');
     }
 
-    out.push_str("TABLES (one per contract event; query via the `sql` tool)\n");
+    out.push_str(if gates.free_form {
+        "TABLES (one per contract event; query via the `sql` tool)\n"
+    } else {
+        "TABLES (one per contract event; this mount answers only its declared queries, not SQL - GET /queries lists them)\n"
+    });
     for t in schema {
         let ts = sem.and_then(|s| s.tables.get(&t.table));
         out.push_str(&format!("\n  {} - {}\n", t.table, describe_table(t, ts)));
@@ -310,12 +319,15 @@ pub fn compose(
 pub struct Gates {
     pub transfers: bool,
     pub compliance: bool,
+    /// The mount answers arbitrary SQL; false on `sql = "allowlist"` or `"deny"`.
+    pub free_form: bool,
 }
 
 impl Gates {
     pub const ALL: Gates = Gates {
         transfers: true,
         compliance: true,
+        free_form: true,
     };
 }
 
@@ -812,6 +824,7 @@ mod tests {
         let bare = doc(Gates {
             transfers: false,
             compliance: false,
+            free_form: true,
         });
         for absent in ["`balance`", "top_balances", "`exposure`", "`flags`"] {
             assert!(
@@ -823,6 +836,7 @@ mod tests {
         let token = doc(Gates {
             transfers: true,
             compliance: false,
+            free_form: true,
         });
         assert!(
             token.contains("top_balances") && !token.contains("`exposure`"),
@@ -833,6 +847,25 @@ mod tests {
             full.contains("top_balances") && full.contains("`exposure`"),
             "{full}"
         );
+    }
+
+    #[test]
+    fn the_schema_of_a_declared_queries_mount_does_not_send_the_agent_to_sql() {
+        let cov = Coverage {
+            sealed_through: 90,
+            tip: 100,
+            first_indexed: None,
+            history_from_deployment: None,
+        };
+        let gates = Gates {
+            free_form: false,
+            ..Gates::ALL
+        };
+        let doc = compose(&[transfer_table()], None, Some(&cov), &[], gates);
+        assert!(!doc.contains("`sql` tool"), "{doc}");
+        assert!(doc.contains("declared queries"), "{doc}");
+        let open = compose(&[transfer_table()], None, Some(&cov), &[], Gates::ALL);
+        assert!(open.contains("`sql` tool"), "{open}");
     }
 
     #[test]

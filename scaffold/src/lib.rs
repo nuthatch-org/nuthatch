@@ -247,8 +247,8 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         .collect();
     let (balance_routes, balance_tools) = if has_transfers(schema) {
         (
-            "- `GET /balances?limit=N`    top holder balances\n\
-             - `GET /balance/{address}`   one address's derived balance. Net flow since `start_block` (see `GET /`), a balance only if that is the contract's deployment block (not so after `--backfill` or a later `start_block`)\n",
+            "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true`\n\
+             - `GET /balance/{address}`   one address's derived balance, on the same condition (not so after `--backfill` or a later `start_block`)\n",
             ", balance, top_balances",
         )
     } else {
@@ -302,8 +302,16 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
         ", "
     };
     let skill_balance_tools = if has_transfers(schema) {
-        " / `balance` / `top_balances` (net flow since `indexed_from`, a balance only if that is \
-         the contract's deployment block)"
+        " / `balance` / `top_balances` (read `complete_history` in their results: when false the \
+         figures are `net_flow_since_indexed_from`, not balances)"
+    } else {
+        ""
+    };
+
+    let skill_balance_http = if has_transfers(schema) {
+        "- Balances: `curl localhost:8288/balances`, read with the status from `curl localhost:8288/`: \
+         the figures are net flow since its `start_block`, balances only when it says \
+         `history_from_deployment: true`\n"
     } else {
         ""
     };
@@ -327,6 +335,7 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          ## Fallback: HTTP (a `nuthatch dev` must be running)\n\
          - Recent rows:  `curl localhost:8288/entities?limit=20`\n\
          - Read-only SQL: `curl -G localhost:8288/sql --data-urlencode 'q=SELECT count(*) FROM {example}'`\n\
+         {skill_balance_http}\
          \n\
          `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
          `provenance.sealed_through` is the block through which this nest has sealed history; newer rows\n\
@@ -407,12 +416,16 @@ mod tests {
         }));
         let (llms, skill) = agent_docs(&transfer);
         assert!(
-            llms.contains("top_balances") && llms.contains("/balance/{address}"),
+            llms.contains("top_balances")
+                && llms.contains("/balance/{address}")
+                && llms.contains("history_from_deployment"),
             "{llms}"
         );
         assert!(llms.contains("explain"), "{llms}");
         assert!(
-            skill.contains("top_balances") && skill.contains("indexed_from"),
+            skill.contains("top_balances")
+                && skill.contains("complete_history")
+                && skill.contains("history_from_deployment"),
             "{skill}"
         );
 

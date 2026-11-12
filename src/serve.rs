@@ -1532,6 +1532,7 @@ fn nest_gates(s: &AppState) -> crate::semantic::Gates {
             || s.velocity_threshold.is_some()
             || s.dir.join(crate::labels::LABELS_DIR).is_dir()
             || s.dir.join(crate::lists::LISTS_DIR).is_dir(),
+        free_form: s.surface.free_form_allowed(),
     }
 }
 

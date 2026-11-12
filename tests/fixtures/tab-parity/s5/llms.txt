@@ -23,8 +23,8 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /entity/{id}`         one row by id (`{block:012}-{logindex:06}`)
 - `GET /sql?q=SELECT...`     read-only SQL; each table is a view named `{alias}__{event}`, and each
                              authored view (`views/*.sql`) answers by its own name
-- `GET /balances?limit=N`    top holder balances
-- `GET /balance/{address}`   one address's derived balance. Net flow since `start_block` (see `GET /`), a balance only if that is the contract's deployment block (not so after `--backfill` or a later `start_block`)
+- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true`
+- `GET /balance/{address}`   one address's derived balance, on the same condition (not so after `--backfill` or a later `start_block`)
 - `GET /queries`             the mount's SQL mode and the queries its operator declared in
                              `mounts.toml` (none on an open nest); `GET /q/{name}` runs one
 - `GET /derived`             the nest's incremental entities (`entities.toml`); `GET /derived/{entity}` reads one
