@@ -6,7 +6,7 @@ Every subcommand and flag the `nuthatch` binary exposes. Regenerate with `nuthat
 
 ## `nuthatch` (global - valid with any subcommand)
 
-- `--log-format <LOG_FORMAT>` - Log output format. `text` (default) is the human-readable line format; `json` emits one structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an operator can point a log aggregator at stdout instead of scraping text. `global = true` so it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`)
+- `--log-format <LOG_FORMAT>` - Log output format. `text` (default) is the human-readable line format; `json` emits one structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an operator can point a log aggregator at stdout instead of scraping text. Accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`)
 
 ## `nuthatch add`
 
@@ -95,7 +95,7 @@ Run a nest's invariant/parity checks (`checks/*.sql`) against recorded expected 
 
 ## `nuthatch control`
 
-Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run
+Run the control-plane API for scaled mode (RFC-0022 §3; scaled build only): declare what the fleet should run
 
 - `--listen <LISTEN>` - Address to bind the control-plane API to. Requires NUTHATCH_CONTROL_TOKEN on every bind and refuses to start without it
 - `--db <DB>` - The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state, **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's outage are different events
@@ -306,7 +306,7 @@ Print the nest's NID: the identity its data is stored under, `data/<nid>/` (RFC-
 
 ## `nuthatch nest publish`
 
-Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with on by default). A self-built bundle and `nest load <file|dir>` never need one. Prints the content address
+Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage (`s3://bucket/prefix`, configured with the usual `AWS_*` env; the `object-store` feature, on by default). A self-built bundle and `nest load <file|dir>` never need one. Prints the content address
 
 - `<BUNDLE>` - The `.bundle` file to publish (from `nuthatch nest bundle`)
 - `--registry <REGISTRY>` - The registry to publish to (RFC-0019). A filesystem path, or `s3://bucket/prefix` with configured via the usual `AWS_*` env (S3/MinIO/R2)
@@ -516,7 +516,7 @@ Watch a running nest from the terminal: the tip, the seal, memory against its bu
 
 ## `nuthatch worker`
 
-Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane, take cursor leases, index what this worker is assigned
+Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): reconcile against the control plane, take cursor leases, index what this worker is assigned
 
 - `--control-db <CONTROL_DB>` - The control-plane Postgres URL - desired state and the worker registry
 - `--hot-store <HOT_STORE>` - The hot-store Postgres URL - where indexed state lives. Usually the same server as the control plane, but a distinct database: one holds *what should run*, the other holds *indexed data*

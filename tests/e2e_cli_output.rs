@@ -30,6 +30,15 @@ fn worker_and_control_name_the_scaled_build_without_asking_for_their_flags() {
     }
 }
 
+#[test]
+fn help_does_not_expose_clap_wiring_or_a_deleted_feature_name() {
+    let (_, nest, _) = run(&["nest", "--help"]);
+    assert!(!nest.contains("needs a build with"), "{nest}");
+    let (_, dev, _) = run(&["dev", "--help"]);
+    assert!(dev.contains("--log-format"), "{dev}");
+    assert!(!dev.contains("global = true"), "{dev}");
+}
+
 #[cfg(feature = "watch")]
 #[test]
 fn watch_says_nothing_answered_and_fails_when_the_url_is_dead() {

@@ -11,9 +11,8 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     /// Log output format. `text` (default) is the human-readable line format; `json` emits one
     /// structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an
-    /// operator can point a log aggregator at stdout instead of scraping text. `global = true` so
-    /// it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch
-    /// dev --log-format json`).
+    /// operator can point a log aggregator at stdout instead of scraping text. Accepted before or
+    /// after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`).
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     pub log_format: LogFormat,
 
@@ -648,8 +647,8 @@ pub enum NestWhat {
     Load(NestLoadArgs),
     /// Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The
     /// registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage
-    /// (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with
-    /// on by default). A self-built bundle and `nest load <file|dir>` never need one.
+    /// (`s3://bucket/prefix`, configured with the usual `AWS_*` env; the `object-store`
+    /// feature, on by default). A self-built bundle and `nest load <file|dir>` never need one.
     /// Prints the content address.
     Publish(NestPublishArgs),
     /// Re-key a contract alias: `nuthatch.toml`, the ABI file, and `semantic.toml`.
