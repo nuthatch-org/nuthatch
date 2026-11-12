@@ -211,6 +211,10 @@ jobs:
             exit 1
           fi
           echo "$notes present, $(wc -c < "$notes") bytes"
+      # A stale image tag in what an operator copies starts up perfectly well, so nothing else fails.
+      # A step here for the reason above: this job is a required check and a new one would not be.
+      - name: no stale version in what a reader copies and pastes
+        run: scripts/version-check.sh
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
