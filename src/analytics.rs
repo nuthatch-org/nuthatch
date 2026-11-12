@@ -269,6 +269,14 @@ fn retain_session_cache(
     mut cache: std::sync::MutexGuard<'static, std::collections::HashMap<SessionKey, SessionCache>>,
     slot: SessionCache,
 ) {
+    // The watermark only moves forward, so a session at any other, a cold reader's aside, is dead.
+    let cold = slot.sealed_through == u64::MAX;
+    cache.retain(|(dir, tenant, at), _| {
+        cold || *at == u64::MAX
+            || *at == slot.sealed_through
+            || dir != &slot.dir
+            || tenant != &slot.tenant
+    });
     cache.insert(
         (slot.dir.clone(), slot.tenant.clone(), slot.sealed_through),
         slot,
@@ -6586,6 +6594,30 @@ template="pool"
             2,
             "alternating the two watermarks must reuse both sessions"
         );
+    }
+
+    /// A session at a watermark the nest has moved past is never asked for again, and kept, it
+    /// evicts a co-tenant's warm one.
+    #[test]
+    fn a_moved_watermark_drops_the_session_it_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = QueryGuard {
+            timeout: Duration::from_secs(5),
+            max_rows: 1000,
+            ..Default::default()
+        };
+        let hot = HotRows::new();
+        query_guarded(dir.path(), "SELECT 1 AS n", guard).unwrap();
+        for watermark in 10..22 {
+            query_hot_cold(dir.path(), "SELECT 1 AS n", guard, &hot, watermark, &[]).unwrap();
+        }
+        // Other tests share the cache and may evict a survivor, so only the dead ones are asserted.
+        let dead: Vec<u64> = session_cache_lock()
+            .keys()
+            .filter(|(d, _, w)| d == dir.path() && *w != 21 && *w != u64::MAX)
+            .map(|(_, _, w)| *w)
+            .collect();
+        assert_eq!(dead, Vec::<u64>::new());
     }
 
     /// #825: a cached connection is valid only for the authored inputs it was built from. Both an
