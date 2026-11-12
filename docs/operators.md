@@ -961,7 +961,7 @@ and `--concurrency`):
 | `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
 | `--rpc-fallback` | endpoint(s) asked only while every other endpoint is failing. Repeatable. Put a paid key here behind free endpoints and it bills only for what they could not answer. Otherwise endpoints share the load round-robin, so a paid key in `--rpc` takes its share of every call. Single-chain runtimes only |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
-| `--concurrency` | concurrent window fetches during seal-direct backfill. Under `dev` it needs two or more RPC endpoints: with one, the backfill runs sequentially whatever this says. `bench backfill` does not cap it. Low on rate-limited public RPC |
+| `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
 | `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
 | `--backfill N` | index only the last N blocks (recent-history mode). Applies only to a nest with no blocks yet; an existing store resumes where it stopped and the flag is ignored |
 | `--no-admin` | remove the admin UI routes entirely. Use it when you front your own dashboard |
@@ -1842,11 +1842,9 @@ answering and stays ready. Each window with failures logs one `warn` line with i
 error (RFC-0073 FR14).
 
 **A seal-direct pass reports the concurrency it runs at.** `seal_direct_concurrency` is
-`{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. With a
-single RPC endpoint the pass runs one window at a time whatever `--concurrency` says, to avoid a stall
-of the whole runtime, and `capped_by` then reads `single_rpc_endpoint` (#1399). Add a second endpoint
-to get the concurrency you asked for. A nest mounted into a running runtime is held to the same cap,
-counted on the endpoints of its chain's cursor, which is the source it fetches through.
+`{"requested", "effective", "capped_by"}`, and `null` for a nest not started with `--seal-direct`. It runs
+at the `--concurrency` asked for, on one RPC endpoint as on several, so `effective` equals `requested` and
+`capped_by` is `null`. Earlier releases capped a single endpoint to one window at a time (#2880).
 
 **One IPFS document holds a seal-direct window for at most five minutes by default.** A window seals
 only once every document it names is fetched or given up on. A failed fetch is tried again with a

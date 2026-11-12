@@ -20,8 +20,11 @@
 # instead of calling `init`, which removes the ABI-resolution round trip too. Every run indexes
 # exactly the same logs, so a change in peak RSS is a change in nuthatch.
 #
+# With SEAL_DIRECT=N it measures a `--seal-direct --concurrency N` backfill of the whole 100,000-block
+# chain over the one endpoint instead: the in-flight bound is what keeps that near the sequential peak.
+#
 # Env: BIN (default target/release/nuthatch), MAX_RSS_MB (default 256), PORT (default 8288),
-#      RPC_PORT (default 8545).
+#      RPC_PORT (default 8545), SEAL_DIRECT (unset).
 set -euo pipefail
 
 BIN="${BIN:-target/release/nuthatch}"
@@ -31,7 +34,9 @@ RPC_PORT="${RPC_PORT:-8545}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RPC_BIN="$(bash "$HERE/../../scripts/fixture-rpc.sh")"
-"$RPC_BIN" footprint "$RPC_PORT" &
+SEAL_DIRECT="${SEAL_DIRECT:-}"
+if [ -n "$SEAL_DIRECT" ]; then TIP=100000; else TIP=20000; fi
+"$RPC_BIN" footprint "$RPC_PORT" --tip "$TIP" &
 RPC_PID=$!
 trap 'kill "$RPC_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 40); do
@@ -74,20 +79,25 @@ JSON
 # number depend on how fast the machine happened to be, which is the comparability this check exists
 # to provide.
 BACKFILL_BLOCKS=2000
+WAIT_SECS=80
+if [ -n "$SEAL_DIRECT" ]; then BACKFILL_BLOCKS=$TIP; WAIT_SECS=600; fi
 # `--backfill N` indexes the last N blocks *inclusive of the tip*, and the mock serves 4 logs per
 # block - hence N*4 + 4. Measured, not derived: the first version of this asserted N*4 and failed at
 # 8004 of 8000, which is the fixture being right and the arithmetic being wrong.
 EXPECT=$(( BACKFILL_BLOCKS * 4 + 4 ))
-TIP=20000
+# The seal-direct pass starts at block 1, not 0.
+if [ -n "$SEAL_DIRECT" ]; then EXPECT=$(( BACKFILL_BLOCKS * 4 )); fi
 
 # Prints "<peak_rss_kb> <entities>" to stdout; all logs go to stderr.
 measure() {
   local dir peak=0 rss last rows pid
   dir="$(mktemp -d)"
   write_nest "$dir"
-  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" --poll-interval 12s >"$dir/dev.log" 2>&1 &
+  # shellcheck disable=SC2086
+  "$BIN" dev --dir "$dir" --listen "127.0.0.1:$PORT" --backfill "$BACKFILL_BLOCKS" --poll-interval 12s \
+    ${SEAL_DIRECT:+--seal-direct --concurrency $SEAL_DIRECT} >"$dir/dev.log" 2>&1 &
   pid=$!
-  for _ in $(seq 1 80); do
+  for _ in $(seq 1 "$WAIT_SECS"); do
     sleep 1
     kill -0 "$pid" 2>/dev/null || break
     rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')"
