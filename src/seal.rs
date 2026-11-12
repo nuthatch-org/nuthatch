@@ -560,7 +560,10 @@ fn write_ledgers(r: &Retention) {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    // Unique per write: two writers of one ledger sharing a temp name would rename each other's half.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
@@ -1911,7 +1914,7 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
         None => (dir.join(QUARANTINE_DIR), s.file.clone(), "this table"),
     };
     std::fs::create_dir_all(&quarantine).ok();
-    let dest = quarantine.join(dest_name);
+    let dest = keep_earlier(quarantine.join(dest_name));
     match std::fs::rename(path, &dest) {
         Ok(()) => {
             tracing::error!(
@@ -2076,6 +2079,22 @@ pub fn integrity(dir: &Path) -> Option<Integrity> {
         out.reduced_tables.insert(table);
     }
     (out != Integrity::default()).then_some(out)
+}
+
+/// `dest`, or where it already holds an earlier quarantined copy, the same name stamped with now.
+fn keep_earlier(dest: PathBuf) -> PathBuf {
+    if !dest.exists() {
+        return dest;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
+    dest.with_file_name(format!(
+        "{stem}.{}.{:09}.parquet",
+        at.as_secs(),
+        at.subsec_nanos()
+    ))
 }
 
 /// Bytes a background pass reads per second, across every dataset in the process: one pass runs at a
@@ -3840,6 +3859,50 @@ mod tests {
             serde_json::to_value(&fresh).unwrap()
         );
         assert_eq!(hash, fresh_hash);
+    }
+
+    #[test]
+    fn a_segment_quarantined_twice_keeps_both_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let good = std::fs::read(&path).unwrap();
+        for flip in [1u8, 2] {
+            let mut bad = good.clone();
+            let mid = bad.len() / 2;
+            bad[mid] ^= flip;
+            std::fs::write(&path, &bad).unwrap();
+            assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+            std::fs::write(&path, &good).unwrap();
+        }
+        let kept: BTreeSet<Vec<u8>> = std::fs::read_dir(dir.path().join(QUARANTINE_DIR))
+            .unwrap()
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(kept.len(), 2, "the second quarantine overwrote the first");
+    }
+
+    /// Writers of one ledger at once each install a whole file: none renames another's temp.
+    #[test]
+    fn concurrent_ledger_writes_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RETAINED_FILE);
+        let writers: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_atomic(&path, &[i; 64]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("a write failed");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() == 64 && bytes.iter().all(|b| *b == bytes[0]));
     }
 
     #[test]
