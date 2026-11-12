@@ -137,12 +137,11 @@ fn malformed_json_gets_a_parse_error_and_the_stdio_loop_recovers() {
         })
     )
     .unwrap();
-    writeln!(
-        stdin,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tables","arguments":{}}"#
-    )
-    .unwrap();
-    writeln!(stdin, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).unwrap();
+    // Raw text, not `json!`: the first line is missing its closing brace on purpose.
+    let malformed = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"tables","arguments":{}}"#;
+    let ping = r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#;
+    writeln!(stdin, "{malformed}").unwrap();
+    writeln!(stdin, "{ping}").unwrap();
     writeln!(
         stdin,
         "{}",
