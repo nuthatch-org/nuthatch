@@ -2528,6 +2528,7 @@ fn webhook_status(dir: &std::path::Path) -> Option<Value> {
                     "delivered_through": s.delivered_through,
                     "backlog_blocks": s.backlog_blocks,
                     "last_error": s.last_error,
+                    "waiting_for_turn": s.waiting_for_turn,
                 })
             })
             .collect()

@@ -110,7 +110,8 @@ const SLICE_BLOCKS: u64 = 10_000;
 /// Rows one delivery query returns at most, whatever room the outbox has.
 const SLICE_ROWS: u64 = 10_000;
 /// How long one seal's deliveries may hold the writer, across every webhook. A query is given what
-/// is left of it, so a backlog drains a slice at a time rather than timing out whole.
+/// is left of it as its deadline, so a backlog drains a slice at a time rather than timing out whole.
+/// A cut statement takes a moment to stop, so the hook is held up to about 3 s, as measured.
 pub const SEAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// [`deliver_sealed`] with the outbox room as a parameter. A full outbox is back-pressure, never a
@@ -127,7 +128,10 @@ fn deliver_sealed_within(
     // `table` and `where` come from the bundle, which a tenant writes: they run as a request from a
     // mount of this dataset runs, and in a strict runtime not before one has said whose they are.
     let seat = crate::maintained::runs_as(dir);
-    for w in webhooks.iter().filter(|w| is_sealed(w)) {
+    let sealed: Vec<&Webhook> = webhooks.iter().filter(|w| is_sealed(w)).collect();
+    // Each run starts one webhook further on, so one that spends the whole budget cannot starve the rest.
+    let first = next_turn(dir, sealed.len());
+    for w in sealed[first..].iter().chain(&sealed[..first]).copied() {
         let cursor = |store: &dyn HotStore| -> Result<u64> {
             Ok(store
                 .get_meta(&cursor_key(&w.name))?
@@ -141,15 +145,21 @@ fn deliver_sealed_within(
                 cursor(store)?,
                 sealed_to,
                 Some("no mount has seated this dataset yet"),
+                false,
             );
             continue;
         };
         let mut span = SLICE_BLOCKS;
         let mut error = None;
+        let mut waiting = false;
         loop {
             let from = cursor(store)?;
             let left = SEAL_BUDGET.saturating_sub(started.elapsed());
-            if from >= sealed_to || left.is_zero() {
+            if from >= sealed_to {
+                break;
+            }
+            if left.is_zero() {
+                waiting = true;
                 break;
             }
             let room = outbox_max.saturating_sub(store.outbox_len());
@@ -240,7 +250,7 @@ fn deliver_sealed_within(
         if let Some(e) = &error {
             tracing::debug!("webhook '{}' query failed: {e}", w.name);
         }
-        note(dir, w, cursor(store)?, sealed_to, error.as_deref());
+        note(dir, w, cursor(store)?, sealed_to, error.as_deref(), waiting);
     }
     Ok(enqueued)
 }
@@ -289,6 +299,8 @@ pub struct Standing {
     pub backlog_blocks: u64,
     pub last_error: Option<String>,
     pub failures: u64,
+    /// The seal's budget was spent before this webhook's turn finished; it goes earlier next time.
+    pub waiting_for_turn: bool,
 }
 
 fn standings(
@@ -299,7 +311,14 @@ fn standings(
     S.get_or_init(Default::default)
 }
 
-fn note(dir: &std::path::Path, w: &Webhook, through: u64, sealed_to: u64, error: Option<&str>) {
+fn note(
+    dir: &std::path::Path,
+    w: &Webhook,
+    through: u64,
+    sealed_to: u64,
+    error: Option<&str>,
+    waiting: bool,
+) {
     let mut all = standings().lock().unwrap_or_else(|p| p.into_inner());
     let s = all.entry((dir.to_path_buf(), w.name.clone())).or_default();
     if error.is_some() && s.last_error.is_none() {
@@ -315,6 +334,25 @@ fn note(dir: &std::path::Path, w: &Webhook, through: u64, sealed_to: u64, error:
     s.delivered_through = through;
     s.backlog_blocks = sealed_to.saturating_sub(through);
     s.last_error = error.map(str::to_string);
+    s.waiting_for_turn = waiting;
+}
+
+/// The index this run of `dir`'s `n` webhooks starts at, one on from the last run's.
+fn next_turn(dir: &std::path::Path, n: usize) -> usize {
+    static NEXT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, usize>>,
+    > = std::sync::OnceLock::new();
+    if n == 0 {
+        return 0;
+    }
+    let mut all = NEXT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let next = all.entry(dir.to_path_buf()).or_default();
+    let first = *next % n;
+    *next = first + 1;
+    first
 }
 
 /// Each webhook of `dir` by name, as its last delivery left it; empty before the first.
@@ -905,6 +943,39 @@ mod tests {
             err.contains("webhook 'w'") && err.contains("version"),
             "{err}"
         );
+    }
+
+    /// A webhook that spends the whole budget is not served first every run, so one behind it is
+    /// delivered within two runs and, while it waits, says so.
+    #[test]
+    fn a_webhook_behind_one_that_spends_the_budget_gets_its_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let mut slow = wh("slow", "t__transfer", "genesis");
+        slow.where_clause = Some(
+            "(SELECT sum(a.range * b.range) FROM range(1000000) a CROSS JOIN range(1000000) b) > 0"
+                .into(),
+        );
+        let webhooks = vec![slow, wh("cheap", "t__transfer", "genesis")];
+        init_cursors(&store, &webhooks, 1000).unwrap();
+        crate::seal::seal_range(dir.path(), &[transfer(5, 0)], 5, 5).unwrap();
+        let cheap = || {
+            standing(dir.path())
+                .into_iter()
+                .find(|(n, _)| n == "cheap")
+                .map(|(_, s)| s)
+        };
+        let mut delivered = 0;
+        for _ in 0..2 {
+            delivered += deliver_sealed(&store, dir.path(), &webhooks, 5).unwrap();
+            if delivered == 0 {
+                let s = cheap().expect("a waiting webhook has a standing");
+                assert!(s.waiting_for_turn && s.backlog_blocks == 5, "{s:?}");
+            }
+        }
+        assert_eq!(delivered, 1, "the cheap webhook was starved");
+        let s = cheap().unwrap();
+        assert!(!s.waiting_for_turn && s.backlog_blocks == 0, "{s:?}");
     }
 
     /// A backlog wider than one slice drains in slices, each advancing the cursor, within one seal.
