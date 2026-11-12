@@ -1848,7 +1848,7 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
                     }
                     continue;
                 }
-                Ok(_) => "hash mismatch (corrupt or tampered)",
+                Ok(_) => HASH_MISMATCH,
                 // Already gone from disk - nothing to move; `define_views` skips it. Not counted.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if s.provisional {
@@ -1883,6 +1883,8 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     Ok(quarantined)
 }
 
+const HASH_MISMATCH: &str = "hash mismatch (corrupt or tampered)";
+
 /// Move a segment that does not hash to its address into `quarantine/`, so `define_views` skips it.
 /// True when it was moved.
 fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason: &str) -> bool {
@@ -1890,6 +1892,15 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
     // dataset naming it, and moving it out of the store reduces them all at once. It goes beside the
     // store, not into this dataset, which may be unmounted while another still names the hash.
     let shared = shared_store(dir).filter(|st| path.starts_with(st));
+    // Only a read that completed proves the bytes wrong. An error may pass, and a shared file taken
+    // away on one reduces every dataset in the runtime.
+    if shared.is_some() && reason != HASH_MISMATCH {
+        tracing::error!(
+            "shared segment {} for table {table} is {reason}; left in place for the next pass",
+            s.hash
+        );
+        return false;
+    }
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
     let (quarantine, dest_name, scope) = match &shared {
         Some(store) => (
@@ -2145,7 +2156,7 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
                     }
                     continue;
                 }
-                Ok(Some(_)) => "hash mismatch (corrupt or tampered)",
+                Ok(Some(_)) => HASH_MISMATCH,
                 // Folded away or pruned since the catalogue was read, or already quarantined.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => "unreadable",
@@ -2238,7 +2249,7 @@ pub fn check_or_quarantine(dir: &Path, table: &str, s: &Segment) -> Result<()> {
     let path = segment_path(dir, &s.file, &s.hash);
     let checked = check_segment_bytes(&path, &s.hash);
     if checked.is_err() && path.exists() && !s.provisional {
-        quarantine_segment(dir, table, s, &path, "hash mismatch (corrupt or tampered)");
+        quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
     }
     checked
 }
@@ -4182,6 +4193,29 @@ mod tests {
         // The right bytes sealed again put the segment back, for both.
         seal_range(&b, &[transfer(100, 0, "5")], 100, 100).unwrap();
         assert_eq!(values(&a).0, ["5"]);
+    }
+
+    /// A read that fails proves nothing about the bytes, so a shared file stays for the next pass.
+    #[test]
+    fn a_shared_segment_that_will_not_read_is_left_for_the_next_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("c".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(&dir).unwrap().tables["usdc__transfer"][0].clone();
+        let shared = segment_path(&dir, &seg.file, &seg.hash);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&shared).is_ok() {
+            return; // Running as root: nothing is unreadable.
+        }
+        assert_eq!(verify_and_quarantine(&dir).unwrap(), 0);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(shared.is_file(), "a readable-again segment was taken away");
+        assert!(!root.path().join(QUARANTINE_DIR).exists());
     }
 
     /// The other half of the same guard: re-sealing identical rows must not disturb the stored copy.
