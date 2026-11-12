@@ -388,6 +388,8 @@ Rules, mirroring RFC-0032 §5's refcount:
 - **Tenancy.** Two tenants may reference one segment for the same reason they may share a dataset: the
   bytes are provably identical, so there is nothing to leak that either did not already have.
 
+*(Annotated 2026-11-12: a shared segment that fails its hash is now quarantined, for every dataset that names it; see [the 5.21 release notes](../releases/v5.21.0.md).)*
+
 ### Slices
 
 | # | Slice | Ends with |
