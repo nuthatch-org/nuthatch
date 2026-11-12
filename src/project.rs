@@ -1518,13 +1518,30 @@ fn fit_from_sample(topic0s: &[String], sample: &[Option<&str>]) -> AbiFit {
         // is perfectly fine.
         .any(|t| topic0s.iter().any(|k| k.eq_ignore_ascii_case(t)));
     if hit {
-        AbiFit::Fits
+        return AbiFit::Fits;
+    }
+    // A proxy's own admin logs say nothing about the implementation ABI (USDC's first window holds
+    // only its AdminChanged), so they cannot make a window a mismatch.
+    let sampled = sample
+        .iter()
+        .flatten()
+        .filter(|t| !PROXY_ADMIN_TOPICS.iter().any(|p| p.eq_ignore_ascii_case(t)))
+        .count()
+        + sample.iter().filter(|t| t.is_none()).count();
+    if sampled == 0 {
+        AbiFit::NoSample
     } else {
-        AbiFit::Mismatch {
-            sampled: sample.len(),
-        }
+        AbiFit::Mismatch { sampled }
     }
 }
+
+/// topic0 of the EIP-1967 `Upgraded(address)`, `AdminChanged(address,address)` and
+/// `BeaconUpgraded(address)`.
+const PROXY_ADMIN_TOPICS: [&str; 3] = [
+    "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b",
+    "0x7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f",
+    "0x1cf3b03a6cf19fa2baba4df148e9dcabedea7f8a5c07840e207e5c089be95d3e",
+];
 
 /// Print the verdict from [`check_abi_fits`].
 fn report_abi_fit(fit: AbiFit, alias: &str, address: &str) {
@@ -2777,6 +2794,30 @@ mod tests {
             fit_from_sample(&topic0s_of(IMPL_ABI), &[Some(&other), Some(&bond)]),
             AbiFit::Fits,
             "a contract may emit events its ABI omits; only a total miss is the silent failure"
+        );
+    }
+
+    /// #2855: USDC's first window after deployment holds only the proxy's own `AdminChanged`. That is
+    /// no evidence about the implementation ABI, so it is not a mismatch; a real stranger beside it is.
+    #[test]
+    fn a_proxys_own_admin_logs_are_not_a_mismatch() {
+        use alloy_primitives::keccak256;
+        for (sig, topic) in [
+            ("Upgraded(address)", PROXY_ADMIN_TOPICS[0]),
+            ("AdminChanged(address,address)", PROXY_ADMIN_TOPICS[1]),
+            ("BeaconUpgraded(address)", PROXY_ADMIN_TOPICS[2]),
+        ] {
+            assert_eq!(format!("0x{}", hex::encode(keccak256(sig))), topic, "{sig}");
+        }
+        let abi = topic0s_of(IMPL_ABI);
+        assert_eq!(
+            fit_from_sample(&abi, &[Some(PROXY_ADMIN_TOPICS[1])]),
+            AbiFit::NoSample
+        );
+        let stranger = "0xdeadbeef".repeat(8);
+        assert_eq!(
+            fit_from_sample(&abi, &[Some(PROXY_ADMIN_TOPICS[1]), Some(&stranger)]),
+            AbiFit::Mismatch { sampled: 1 }
         );
     }
 
