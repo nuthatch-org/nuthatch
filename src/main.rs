@@ -32,7 +32,7 @@ use nuthatch::{
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -99,6 +99,14 @@ async fn main() -> Result<()> {
             .with_env_filter(filter())
             .with_writer(writer())
             .with_target(false)
+            .with_ansi(log_ansi(
+                if data_on_stdout {
+                    std::io::stderr().is_terminal()
+                } else {
+                    std::io::stdout().is_terminal()
+                },
+                std::env::var_os("NO_COLOR").as_deref(),
+            ))
             .init(),
         // One JSON object per line for a log aggregator. Every `tracing::info!(block = .., tip = ..,
         // "…")` field (the at-tip heartbeat, RFC #302) lands as its own JSON key instead of being
@@ -205,15 +213,17 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Worker(_) => anyhow::bail!(
-            "the writer-worker role needs a build with `--features postgres-store`. The default \
-             binary is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+            "`nuthatch worker` is part of the scaled build, which this embedded binary is not. Use \
+             the `nuthatch-scaled-<target>.tar.gz` attached to the release, or the \
+             `ghcr.io/nuthatch-org/nuthatch:<version>-scaled` image."
         ),
         #[cfg(feature = "postgres-store")]
         cli::Command::Control(args) => nuthatch::control_api::run(&args.listen, &args.db).await,
         #[cfg(not(feature = "postgres-store"))]
         cli::Command::Control(_) => anyhow::bail!(
-            "the control plane needs a build with `--features postgres-store`. The default binary \
-             is the embedded one and carries no database driver (CLAUDE.md non-negotiable 1)."
+            "`nuthatch control` is part of the scaled build, which this embedded binary is not. Use \
+             the `nuthatch-scaled-<target>.tar.gz` attached to the release, or the \
+             `ghcr.io/nuthatch-org/nuthatch:<version>-scaled` image."
         ),
         cli::Command::Sql(args) => run_sql(args).await,
         #[cfg(feature = "watch")]
@@ -278,7 +288,9 @@ async fn main() -> Result<()> {
             #[cfg(not(feature = "counter"))]
             {
                 let _ = args;
-                anyhow::bail!("nuthatch settle needs a build with --features counter")
+                anyhow::bail!(
+                    "nuthatch settle needs a source build with the `counter` feature (no release carries it)"
+                )
             }
         }
         cli::Command::Check(args) => check::check(args),
@@ -862,6 +874,53 @@ fn caveats(out: &analytics::QueryOutput) -> Vec<String> {
     lines
 }
 
+/// Whether text logs may carry colour codes: only to a terminal, and never when `NO_COLOR` is set
+/// to anything non-empty (no-color.org). A redirected log with escapes in it defeats `grep`.
+fn log_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// A failed `nuthatch sql` query as the terminal shows it: the hint first, then one line of the
+/// engine's own words, with DataFusion's bug-report request dropped. The hints are written for MCP
+/// agents and the HTTP API, so the pointers at the `schema` tool become the REPL's dot-commands.
+fn sql_failure_message(raw: &str) -> String {
+    const BUG_REPORT: &str = "This issue was likely caused by a bug in DataFusion";
+    let (engine, hint) = match raw.split_once("\n\nhint: ") {
+        Some((engine, hint)) => (engine, Some(hint)),
+        None => (raw, None),
+    };
+    let engine = match engine.find(BUG_REPORT) {
+        Some(at) => {
+            let end = engine[at..].find('\n').map_or(engine.len(), |n| at + n);
+            format!("{}{}", &engine[..at], &engine[end..])
+        }
+        None => engine.to_string(),
+    };
+    let engine = engine.trim();
+    let Some(hint) = hint else {
+        return engine.to_string();
+    };
+    let hint = hint
+        .replace(
+            "Call the `schema` tool for the full list.",
+            "`.tables` in the `nuthatch sql` REPL lists them.",
+        )
+        .replace(
+            "Call the `schema` tool for the list of tables.",
+            "`.tables` in the `nuthatch sql` REPL lists them.",
+        )
+        .replace(
+            "Call `schema` for this table's columns.",
+            "`.schema <table>` in the REPL lists its columns.",
+        )
+        .replace(
+            "Call `schema` for the columns.",
+            "`.schema <table>` in the REPL lists the columns.",
+        );
+    let first = engine.lines().next().unwrap_or_default();
+    format!("{hint}\n\n{first}")
+}
+
 /// Where `nuthatch sql` queries run: the local store (when `dev` is stopped) or the running instance's
 /// HTTP API (when `dev` holds the single-writer redb). Opened once, so a REPL reuses one connection.
 enum SqlBackend {
@@ -1078,10 +1137,11 @@ impl SqlBackend {
                         let hint = offline_entity_hint(dir, &raw).or_else(|| {
                             nuthatch::analytics::enrich_query_error(dir, &raw, sql, &declared)
                         });
-                        match hint {
-                            Some(h) => anyhow::bail!("{raw}\n\nhint: {h}"),
-                            None => anyhow::bail!("{raw}"),
-                        }
+                        let full = match hint {
+                            Some(h) => format!("{raw}\n\nhint: {h}"),
+                            None => raw,
+                        };
+                        anyhow::bail!("{}", sql_failure_message(&full))
                     }
                 }
             }
@@ -1112,9 +1172,11 @@ impl SqlBackend {
                 if !status.is_success() {
                     anyhow::bail!(
                         "{}",
-                        body.get("error")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("query failed")
+                        sql_failure_message(
+                            body.get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("query failed")
+                        )
                     );
                 }
                 let rows = body
@@ -1359,6 +1421,68 @@ mod tests {
         assert!(tikv_jemalloc_ctl::opt::background_thread::read().unwrap());
         let dirty = unsafe { tikv_jemalloc_ctl::raw::read::<isize>(b"opt.dirty_decay_ms\0") };
         assert_eq!(dirty.unwrap(), 1000);
+    }
+
+    #[test]
+    fn text_logs_are_coloured_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsStr;
+        assert!(log_ansi(true, None));
+        assert!(log_ansi(true, Some(OsStr::new(""))));
+        assert!(!log_ansi(false, None));
+        assert!(!log_ansi(true, Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn no_help_page_exposes_clap_wiring_or_an_internal_document() {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<String>) {
+            let help = cmd.clone().render_long_help().to_string();
+            for bad in [
+                "[default: \"\"]",
+                "global = true",
+                "CLAUDE.md",
+                "--features ",
+            ] {
+                if help.contains(bad) {
+                    out.push(format!("`{path}` help contains {bad:?}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut found = Vec::new();
+        walk(&cli::Cli::command(), "nuthatch", &mut found);
+        assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    #[test]
+    fn a_sql_failure_leads_with_its_hint_and_points_at_the_repl() {
+        let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. Call the `schema` tool for the full list.";
+        let out = sql_failure_message(raw);
+        assert!(
+            out.starts_with("no table `transfer`; the closest is `weth__transfer`."),
+            "{out}"
+        );
+        assert!(
+            out.contains("`.tables`") && !out.contains("`schema` tool"),
+            "{out}"
+        );
+        assert_eq!(out.lines().count(), 3, "{out}");
+    }
+
+    #[test]
+    fn a_sql_failure_drops_the_datafusion_bug_report_request() {
+        let raw = "plan error: Internal error: Function 'sum' failed to match.\nThis issue was likely caused by a bug in DataFusion's code. Please help us to resolve this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues\n\nhint: wad is an exact-text big integer; use wad_dec";
+        let out = sql_failure_message(raw);
+        assert!(
+            !out.contains("bug report") && !out.contains("datafusion/issues"),
+            "{out}"
+        );
+        assert!(out.starts_with("wad is an exact-text big integer"), "{out}");
+        let bare = sql_failure_message(
+            "Internal error: x.\nThis issue was likely caused by a bug in DataFusion's code. Please file.",
+        );
+        assert_eq!(bare, "Internal error: x.");
     }
 
     #[test]
