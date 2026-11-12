@@ -76,11 +76,12 @@ the view with the reason.
 - **Call-derived and fixed-point fields are classified, not computed.** The report tells you which
   fields they are. Their values are not checked.
 - **It is not a GraphQL test endpoint.** The `nuthatch-graph` build serves `/subgraphs/id/…`, but on
-  this scaffold it answered no entity query at all: `graph init` gives every entity the id
+  this scaffold 5.19.0 answered no entity query at all: `graph init` gives every entity the id
   `event.transaction.hash.concatI32(event.logIndex.toI32())`, no decoded column corresponds to it, and
-  `port-emit` reported `0 of 27 fields` answered (#2843). On hand-written subgraphs the pinned ports
-  answered 38% (Uniswap V4) and 44% (Carbon) of exact fields, and a query naming one refused field
-  fails whole. [What the compatibility surface is, and is not](graph-compatibility-what-it-is.md) has
+  `port-emit` reported `0 of 27 fields` answered (#2843). From 5.21 the `nuthatch-graph` build's
+  `port-emit` renders that id from `tx_hash` and `log_index` as the hex graph-node serves, and answers
+  all 27; the default build's still reports 0. On hand-written subgraphs the pinned ports answered 38% (Uniswap V4) and
+  44% (Carbon) of exact fields, and a query naming one refused field fails whole. [What the compatibility surface is, and is not](graph-compatibility-what-it-is.md) has
   the detail.
 
 So a clean run here means the subgraph is pointed at the right contract, from the right block, with
