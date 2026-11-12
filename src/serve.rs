@@ -12121,10 +12121,13 @@ mod tests {
     /// built from it say so until a restart rebuilds them, and `/ready` says so without going down.
     #[tokio::test]
     async fn derived_state_rebuilt_from_a_segment_since_quarantined_is_marked_stale() {
-        let (tmp, state) = sealed_transfer_nest("derived-stale", false);
+        let (tmp, mut state) = sealed_transfer_nest("derived-stale", false);
         crate::seal::record_rebuild(tmp.path());
+        state.entities = Arc::new(vec![two_row_entity("e")]);
         let router = router(SharedNest::new(state.clone()));
         let body = |b: Vec<u8>| serde_json::from_slice::<Value>(&b).unwrap();
+        const SQL: &str = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20e";
+        let degraded = |b: Value| b["degraded_tables"].clone();
         for route in [
             "/balances",
             "/balance/0xb",
@@ -12139,8 +12142,17 @@ mod tests {
             );
             assert!(body(b).get("derived_state_stale").is_none(), "{route}");
         }
+        let (code, b) = get(router.clone(), SQL).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(degraded(body(b)), json!([]));
 
         rot_and_verify_in_background(tmp.path());
+        let (_, b) = get(router.clone(), SQL).await;
+        assert_eq!(
+            degraded(body(b)),
+            json!(["e"]),
+            "an entity answer read stale state"
+        );
         for route in [
             "/balances",
             "/balance/0xb",
