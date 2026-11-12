@@ -3471,6 +3471,26 @@ fn graph_unserved(
     compiled: &crate::graph_query::Compiled,
     err: &str,
 ) -> Option<String> {
+    if let Some(alias) = err
+        .split_once("Table \"")
+        .and_then(|(_, rest)| rest.split_once("\" does not have a column named \"id\""))
+        .map(|(alias, _)| alias)
+    {
+        // `b` is the root entity's view; any other alias is a relation's, whose entity the engine
+        // does not name.
+        let which = if alias == "b" {
+            format!(
+                "its `{}` view",
+                crate::subgraph_import::to_alias(&compiled.entity)
+            )
+        } else {
+            "a view it reads".to_string()
+        };
+        return Some(format!(
+            "`{}` is not served by this nest: {which} has no `id` column",
+            root.name
+        ));
+    }
     let view = crate::analytics::missing_table_of(err)?;
     let entity = schema
         .entities
@@ -15703,6 +15723,33 @@ type Signer @entity {
         // And the collection that has a view still answers.
         let body = graph_ask("/graphql", "{ pools { id } }", state).await;
         assert_eq!(body["data"]["pools"], json!([{"id": "p"}]), "{body}");
+    }
+
+    /// A view with no `id` column is refused by name, not with the engine's binder error.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn a_view_with_no_id_column_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("graph")).unwrap();
+        std::fs::create_dir_all(dir.path().join("views")).unwrap();
+        std::fs::write(
+            dir.path().join("graph/schema.graphql"),
+            "type Pool @entity { id: ID! size: Int! }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("views/pool.sql"),
+            "CREATE VIEW pool AS SELECT 3 AS size;",
+        )
+        .unwrap();
+        let state = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+
+        let body = graph_ask("/graphql", "{ pools { size } }", state).await;
+        assert_eq!(
+            body["errors"][0]["message"],
+            "`pools` is not served by this nest: its `pool` view has no `id` column",
+            "{body}"
+        );
     }
 
     /// The S0 schemas whose descriptions hold colons (#1948): every request to the nest panicked in the
