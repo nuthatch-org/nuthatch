@@ -11,9 +11,8 @@ use clap::{Args, Parser, Subcommand};
 pub struct Cli {
     /// Log output format. `text` (default) is the human-readable line format; `json` emits one
     /// structured object per line - `level`, `target`, `message`/`fields`, `timestamp` - so an
-    /// operator can point a log aggregator at stdout instead of scraping text. `global = true` so
-    /// it's accepted before or after the subcommand (`nuthatch --log-format json dev`, `nuthatch
-    /// dev --log-format json`).
+    /// operator can point a log aggregator at stdout instead of scraping text. Accepted before or
+    /// after the subcommand (`nuthatch --log-format json dev`, `nuthatch dev --log-format json`).
     #[arg(long, global = true, value_enum, default_value_t = LogFormat::Text)]
     pub log_format: LogFormat,
 
@@ -79,18 +78,20 @@ pub enum Command {
     /// Drain recorded authorisations and settle them (RFC-0046 S3).
     ///
     /// The nest already served. This is the back office: it reads `authorisations.jsonl`, hands each
-    /// row to `--exec`, and records settled/failed per payer. Rebuild with `--features counter` or
-    /// the command refuses. `--dry-run` lists the queue and writes nothing.
+    /// row to `--exec`, and records settled/failed per payer. Needs a source build with the `counter`
+    /// feature (no release carries it), or the command refuses. `--dry-run` lists the queue and writes
+    /// nothing.
     Settle(SettleArgs),
 
     // --- SCALED: the docker-compose writer-pool / control-plane topology (RFC-0022). ---
-    /// Run a **writer worker** for scaled mode (RFC-0022 §2): reconcile against the control plane,
-    /// take cursor leases, index what this worker is assigned.
+    /// Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): reconcile against the
+    /// control plane, take cursor leases, index what this worker is assigned.
     ///
     /// This is the scaled-mode counterpart of `dev`. `dev` indexes a nest directory it owns outright;
     /// a worker is told what to run and holds a lease proving it may.
     Worker(WorkerArgs),
-    /// Run the control-plane API for scaled mode (RFC-0022 §3): declare what the fleet should run.
+    /// Run the control-plane API for scaled mode (RFC-0022 §3; scaled build only): declare what the
+    /// fleet should run.
     ///
     /// Writes *desired state* only. Workers reconcile against it on their own tick - nothing here
     /// commands a worker or waits for one.
@@ -170,7 +171,7 @@ pub enum Command {
     GraphValidate(GraphValidateArgs),
 
     /// Build checkpoints for a nest's folds over sealed history, or read a fold at a block
-    /// (RFC-0059). Hidden, and present only in a build with `--features folds`.
+    /// (RFC-0059). Hidden, and present only in a source build with the `folds` feature.
     #[cfg(feature = "folds")]
     #[command(hide = true, subcommand)]
     Fold(FoldCommand),
@@ -647,8 +648,8 @@ pub enum NestWhat {
     Load(NestLoadArgs),
     /// Publish a `.bundle` to a registry (RFC-0019) under `name@version`, advancing `latest`. The
     /// registry is a decoupled, optional store: a filesystem path, or S3-compatible object storage
-    /// (`s3://bucket/prefix`, configured with the usual `AWS_*` env - needs a build with
-    /// on by default). A self-built bundle and `nest load <file|dir>` never need one.
+    /// (`s3://bucket/prefix`, configured with the usual `AWS_*` env; the `object-store`
+    /// feature, on by default). A self-built bundle and `nest load <file|dir>` never need one.
     /// Prints the content address.
     Publish(NestPublishArgs),
     /// Re-key a contract alias: `nuthatch.toml`, the ABI file, and `semantic.toml`.
@@ -974,7 +975,7 @@ pub struct QueryBenchArgs {
     pub label: Option<String>,
 
     /// Fail if the entity point-read p50 exceeds this many microseconds. Omitted, the bench only
-    /// reports; passed, it is a gate (CI uses it - CLAUDE.md: benchmark regressions fail the build).
+    /// reports; passed, it is a gate (CI uses it so a benchmark regression fails the build).
     #[arg(long)]
     pub max_point_read_p50_us: Option<f64>,
 
@@ -1366,17 +1367,26 @@ pub struct AddArgs {
 #[derive(Args)]
 pub struct WorkerArgs {
     /// The control-plane Postgres URL - desired state and the worker registry.
+    // The default build refuses the subcommand by name in `main`; clap must not ask for flags first.
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub control_db: String,
 
     /// The hot-store Postgres URL - where indexed state lives. Usually the same server as the control
     /// plane, but a distinct database: one holds *what should run*, the other holds *indexed data*.
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub hot_store: String,
 
     /// Chains this worker can host. The scheduler decides which it *should* run and the lease decides
     /// which it *does*; this is only what the machine is capable of.
-    #[arg(long, value_delimiter = ',', required = true)]
+    #[arg(long, value_delimiter = ',', required = cfg!(feature = "postgres-store"))]
     pub chains: Vec<String>,
 
     /// This worker's identity in the fleet. Defaults to the hostname, which is unique per container
@@ -1433,6 +1443,10 @@ pub struct ControlArgs {
     /// The control-plane Postgres URL, e.g. `postgres://user:pass@host/db`. This is desired state,
     /// **not** a nest's hot store - keep them separate so a fleet-wide outage and a single cursor's
     /// outage are different events.
+    #[cfg_attr(
+        not(feature = "postgres-store"),
+        arg(default_value = "", hide_default_value = true)
+    )]
     #[arg(long)]
     pub db: String,
 }
@@ -1447,8 +1461,9 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
-    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires a build with
-    /// `--features postgres-store`. Omit to serve the nest's local redb instead - but that store
+    /// Postgres hot store to serve from, e.g. `postgres://user:pass@host/db`. Requires the scaled
+    /// build (the `nuthatch-scaled-<target>.tar.gz` release asset or the `:<version>-scaled` image).
+    /// Omit to serve the nest's local redb instead - but that store
     /// must already exist (`serve` never creates or writes to it), and redb's exclusive flock means
     /// exactly one process may hold it: local redb does not read-scale a box or share with `dev`,
     /// only `--hot-store` does.
