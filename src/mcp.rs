@@ -197,7 +197,7 @@ fn redact_token(v: &mut Value, token: &str) {
 async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Value> {
     let id = req.get("id").cloned();
     match req.get("method").and_then(Value::as_str).unwrap_or("") {
-        "initialize" => Some(ok(id?, initialize_result(req))),
+        "initialize" => Some(ok(id?, initialize_result())),
         "notifications/initialized" => None,
         "ping" => Some(ok(id?, json!({}))),
         "tools/list" => Some(ok(
@@ -253,16 +253,10 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
     }
 }
 
-fn initialize_result(req: &Value) -> Value {
-    let pv = match req
-        .pointer("/params/protocolVersion")
-        .and_then(Value::as_str)
-    {
-        Some(version) if version == PROTOCOL_VERSION => version,
-        _ => PROTOCOL_VERSION,
-    };
+fn initialize_result() -> Value {
     json!({
-        "protocolVersion": pv,
+        // This server implements one protocol version, so unsupported requests fall back to it.
+        "protocolVersion": PROTOCOL_VERSION,
         // Advertise exactly what we implement - tools, resources, prompts; nothing else. When a future
         // standing-queries RFC lands, `notifications` slots in here without breaking a client (§6).
         "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
