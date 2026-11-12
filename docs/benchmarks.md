@@ -360,6 +360,12 @@ The `footprint (RAM budget)` job runs the 16-way case over a 100,000-block chain
 512 MB (`SEAL_DIRECT=16 bash .github/workflows/footprint.sh`). Without the bounds it measured 722 MB
 here, and 410 MB with them.
 
+**Owed: a real chain on one endpoint.** No full-history backfill has been measured since the cap went.
+The case that raised #2880 is BasePaint on Base (`0xba5e05cb26b78eda3a2f8e3b3814726305dcac83`, from
+block 2,385,188, scaffolded by `init` unedited) against one Base node, measured on 5.19.0 only over
+its first 45 s capped to one window: about 8,500 blocks/s at `--seal-direct --concurrency 16`. Its
+wall clock to the tip and peak RSS at 1, 4 and 16 belong here when a keyed Base RPC can be spent on it.
+
 ## Baseline matrix (pre-optimization)
 
 _Pending - the full W1-W3 × T1-T3 matrix is populated from archive-node runs (needed for the
