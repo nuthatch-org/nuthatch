@@ -5945,7 +5945,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> 
     let limit = answer::listing_limit(q.limit);
     let view = s.balances.clone();
     match sized(&s, s.balances.holders(), move || view.top(limit)).await {
-        Ok(top) => respond(answer::balances(&s.balances, top, first_indexed(&s))),
+        Ok(top) => respond(answer::balances(&s.balances, top)),
         Err(refused) => refused,
     }
 }
@@ -6306,7 +6306,7 @@ async fn derived_all(
     ))
 }
 
-/// The first block this nest indexed, where its balances start counting.
+/// The first block this nest indexed.
 fn first_indexed(s: &AppState) -> Option<u64> {
     s.store
         .get_meta(crate::indexer::START_BLOCK_KEY)
@@ -6317,7 +6317,7 @@ fn first_indexed(s: &AppState) -> Option<u64> {
 
 /// Point-read a single address's derived balance. Same COR-8 caveat as `/balances`.
 async fn balance(State(s): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
-    respond(answer::balance(&s.balances, &address, first_indexed(&s)))
+    respond(answer::balance(&s.balances, &address))
 }
 
 /// Direct counterparty-exposure for an address: how much it has transacted, directly, with the
@@ -9779,26 +9779,17 @@ mod tests {
         assert_eq!(ask(shared.clone()).await, 5, "the new generation");
         drop(old);
     }
-    /// A nest started past its contract's deployment holds net flows, so `/balance` and `/balances`
-    /// and `/schema` say where its window begins.
+
+    /// A nest started past its contract's deployment holds net flows, so `/schema` says where its
+    /// window begins.
     #[tokio::test]
-    async fn balances_and_schema_name_the_first_indexed_block() {
+    async fn schema_names_the_first_indexed_block() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(tmp.path(), 1);
         state
             .store
             .set_meta(crate::indexer::START_BLOCK_KEY, "26397446")
             .unwrap();
-        state
-            .balances
-            .apply(crate::views::transfer_deltas("0xa", "0xb", 5, 1));
-        state.balances.flush();
-        let (_, body) = get_json(state.clone(), "/balances?limit=1").await;
-        assert_eq!(body["indexed_from"], 26397446, "{body}");
-        let (_, body) = get_json(state.clone(), "/balance/0xb").await;
-        assert_eq!(body["indexed_from"], 26397446, "{body}");
-        let (_, body) = get_json(state.clone(), "/balance/0xnobody").await;
-        assert_eq!(body["indexed_from"], 26397446, "{body}");
         let resp = schema_doc(State(state)).await.into_response();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await

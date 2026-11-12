@@ -108,46 +108,32 @@ pub fn entities(rows: anyhow::Result<Vec<String>>) -> Answer {
 }
 
 /// `/balances`: `top` is the view's first `limit` holders. Balances are decimal strings, since a
-/// JSON number cannot carry an i128 and an f64 reader would corrupt a large one. `indexed_from` is
-/// the first block indexed: past the contract's deployment these are net flows, not balances.
-pub fn balances(view: &BalanceView, top: Vec<(String, i128)>, indexed_from: Option<u64>) -> Answer {
+/// JSON number cannot carry an i128 and an f64 reader would corrupt a large one.
+pub fn balances(view: &BalanceView, top: Vec<(String, i128)>) -> Answer {
     let items: Vec<Value> = top
         .into_iter()
         .map(|(address, balance)| json!({ "address": address, "balance": balance.to_string() }))
         .collect();
     // COR-8 (#814): a transfer over 38 digits is dropped, both legs, and the count says so; zero is
     // reported rather than omitted, so its absence means an old build rather than a clean nest.
-    let mut body = json!({
+    Answer::ok(&json!({
         "holders": view.holders(),
         "count": items.len(),
         "items": items,
         "dropped_over_i128": view.dropped_over_i128(),
-    });
-    with_indexed_from(&mut body, indexed_from);
-    Answer::ok(&body)
+    }))
 }
 
 /// `/balance/{address}`.
-pub fn balance(view: &BalanceView, address: &str, indexed_from: Option<u64>) -> Answer {
+pub fn balance(view: &BalanceView, address: &str) -> Answer {
     let address = address.to_ascii_lowercase();
-    let (status, mut body) = match view.balance(&address) {
-        Some(b) => (
-            200,
-            json!({
-                "address": address,
-                "balance": b.to_string(),
-                "dropped_over_i128": view.dropped_over_i128(),
-            }),
-        ),
-        None => (404, json!({ "error": "no balance", "address": address })),
-    };
-    with_indexed_from(&mut body, indexed_from);
-    Answer::json(status, &body)
-}
-
-fn with_indexed_from(body: &mut Value, indexed_from: Option<u64>) {
-    if let (Some(obj), Some(from)) = (body.as_object_mut(), indexed_from) {
-        obj.insert("indexed_from".into(), json!(from));
+    match view.balance(&address) {
+        Some(b) => Answer::ok(&json!({
+            "address": address,
+            "balance": b.to_string(),
+            "dropped_over_i128": view.dropped_over_i128(),
+        })),
+        None => Answer::json(404, &json!({ "error": "no balance", "address": address })),
     }
 }
 
@@ -716,23 +702,6 @@ pub fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn balance_answers_say_where_the_window_starts() {
-        let view = BalanceView::inert();
-        let b = super::balance(&view, "0xAbC", Some(26_397_446));
-        let v: Value = serde_json::from_slice(&b.body).unwrap();
-        assert_eq!(v["error"], "no balance");
-        assert_eq!(v["indexed_from"], 26_397_446);
-        let t = super::balances(&view, vec![("0xa".into(), -5)], Some(26_397_446));
-        let v: Value = serde_json::from_slice(&t.body).unwrap();
-        assert_eq!(v["indexed_from"], 26_397_446);
-        let t = super::balances(&view, vec![], None);
-        let v: Value = serde_json::from_slice(&t.body).unwrap();
-        assert!(v.get("indexed_from").is_none());
-    }
-
     #[test]
     fn timestamps_render_at_every_unit_and_before_the_epoch() {
         use super::rfc3339;

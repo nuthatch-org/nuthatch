@@ -496,11 +496,13 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let a = args["address"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`address` is required"))?;
-            get(client, &format!("{base}/balance/{}", segment(a)?)).await
+            let body = get(client, &format!("{base}/balance/{}", segment(a)?)).await?;
+            Ok(with_indexed_from(client, base, body).await)
         }
         "top_balances" => {
             let n = args["limit"].as_u64().unwrap_or(20);
-            get(client, &format!("{base}/balances?limit={n}")).await
+            let body = get(client, &format!("{base}/balances?limit={n}")).await?;
+            Ok(with_indexed_from(client, base, body).await)
         }
         "flags" => {
             let kind = args["kind"].as_str().unwrap_or("threshold");
@@ -518,6 +520,27 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
         }
         other => bail!("unknown tool `{other}`"),
     }
+}
+
+/// `body`, a balance answer, with the first block this nest indexed beside it: the view counts from
+/// there, so on a `--backfill` nest its figures are net flows, not balances. Left as sent if the
+/// status cannot be read.
+async fn with_indexed_from(client: &reqwest::Client, base: &str, body: String) -> String {
+    let start = get(client, &format!("{base}/"))
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|s| match &s["start_block"] {
+            Value::String(b) => b.parse::<u64>().ok(),
+            other => other.as_u64(),
+        });
+    let (Some(start), Ok(Value::Object(mut answer))) =
+        (start, serde_json::from_str::<Value>(&body))
+    else {
+        return body;
+    };
+    answer.insert("indexed_from".into(), json!(start));
+    Value::Object(answer).to_string()
 }
 
 /// Shape a `/sql` JSON response for an agent's context window (RFC-0016 §4): a compact aligned table
@@ -1488,5 +1511,37 @@ mod tests {
             text.contains("cannot reach nuthatch") && text.contains("nuthatch dev"),
             "tell the caller to start the local instance: {text}"
         );
+    }
+
+    /// On a `--backfill` nest the balance view is a net flow over the window; the answer carries the
+    /// block the window starts at so an agent cannot read it as a balance.
+    #[tokio::test]
+    async fn balance_answers_carry_the_block_the_window_starts_at() {
+        use axum::{routing::get, Router};
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async { r#"{"start_block":"26397446","last_block":"26397645"}"# }),
+            )
+            .route(
+                "/balance/{address}",
+                get(|| async { r#"{"address":"0xa","balance":"-5"}"# }),
+            )
+            .route("/balances", get(|| async { r#"{"holders":1,"items":[]}"# }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (name, args) in [
+            ("balance", json!({ "address": "0xa" })),
+            ("top_balances", json!({})),
+        ] {
+            let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": name, "arguments": args } });
+            let resp = handle(&req, &client, &base).await.unwrap();
+            let body: Value = serde_json::from_str(tool_text(&resp)).unwrap();
+            assert_eq!(body["indexed_from"], 26397446, "{name}: {body}");
+        }
+        server.abort();
     }
 }
