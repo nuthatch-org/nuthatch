@@ -566,5 +566,6 @@ fn ready(n: &Nest) -> Answer {
         seal_fault: None,
         maintained: None,
         webhooks: None,
+        integrity: None,
     })
 }

@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
                     ("--trace-rpc", !args.trace_rpc.is_empty()),
                     ("--public-host", !args.public_host.is_empty()),
                     ("--local-host", !args.local_host.is_empty()),
+                    ("--write-token-env", args.write_token_env.is_some()),
                 ] {
                     if set {
                         anyhow::bail!("{flag} serves an address-history nest, which runs alone, not in a runtime");
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             } else {
-                indexer::dev(args).await
+                indexer::dev(*args).await
             }
         }
         cli::Command::Serve(args) if args.runtime.is_some() || args.follow.is_some() => {
@@ -881,8 +882,8 @@ fn log_ansi(is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// A failed `nuthatch sql` query as the terminal shows it: the hint first, then one line of the
-/// engine's own words, with DataFusion's bug-report request dropped. The hints are written for MCP
-/// agents and the HTTP API, so the pointers at the `schema` tool become the REPL's dot-commands.
+/// engine's own words, with DataFusion's bug-report request dropped, and the hint's pointers at the
+/// REPL's dot-commands.
 fn sql_failure_message(raw: &str) -> String {
     const BUG_REPORT: &str = "This issue was likely caused by a bug in DataFusion";
     let (engine, hint) = match raw.split_once("\n\nhint: ") {
@@ -900,23 +901,7 @@ fn sql_failure_message(raw: &str) -> String {
     let Some(hint) = hint else {
         return engine.to_string();
     };
-    let hint = hint
-        .replace(
-            "Call the `schema` tool for the full list.",
-            "`.tables` in the `nuthatch sql` REPL lists them.",
-        )
-        .replace(
-            "Call the `schema` tool for the list of tables.",
-            "`.tables` in the `nuthatch sql` REPL lists them.",
-        )
-        .replace(
-            "Call `schema` for this table's columns.",
-            "`.schema <table>` in the REPL lists its columns.",
-        )
-        .replace(
-            "Call `schema` for the columns.",
-            "`.schema <table>` in the REPL lists the columns.",
-        );
+    let hint = nuthatch::sql_errors::for_surface(hint, nuthatch::sql_errors::Surface::Repl);
     let first = engine.lines().next().unwrap_or_default();
     format!("{hint}\n\n{first}")
 }
@@ -1457,14 +1442,14 @@ mod tests {
 
     #[test]
     fn a_sql_failure_leads_with_its_hint_and_points_at_the_repl() {
-        let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. Call the `schema` tool for the full list.";
+        let raw = "no segments: Catalog Error: Table with name transfer does not exist!\nError during planning: no table transfer\n\nhint: no table `transfer`; the closest is `weth__transfer`. `SELECT table_name FROM information_schema.tables` lists the tables.";
         let out = sql_failure_message(raw);
         assert!(
             out.starts_with("no table `transfer`; the closest is `weth__transfer`."),
             "{out}"
         );
         assert!(
-            out.contains("`.tables`") && !out.contains("`schema` tool"),
+            out.contains("`.tables`") && !out.contains("information_schema"),
             "{out}"
         );
         assert_eq!(out.lines().count(), 3, "{out}");

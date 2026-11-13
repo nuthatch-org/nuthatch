@@ -1699,6 +1699,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     }
     body.push_str(&entity_metrics(&s));
     body.push_str(&snapshot_metrics(&s));
+    body.push_str(&integrity_metrics(&s));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1797,6 +1798,30 @@ fn snapshot_metrics(s: &AppState) -> String {
         "# HELP nuthatch_snapshot_retained_bytes Bytes that versions still being read hold beside the latest.\n\
          # TYPE nuthatch_snapshot_retained_bytes gauge\n\
          nuthatch_snapshot_retained_bytes{{nest=\"{nest}\"}} {bytes}\n"
+    )
+}
+
+/// What the integrity passes took from this nest since its segments were last whole, as gauges an
+/// operator can alert on; zero on a healthy nest.
+fn integrity_metrics(s: &AppState) -> String {
+    let nest = match &s.runtime_health {
+        Some((name, _)) => name.as_str(),
+        None => s
+            .nest_info
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    };
+    let found = crate::seal::integrity(&s.dir).unwrap_or_default();
+    format!(
+        "# HELP nuthatch_quarantined_segments Sealed segments this nest names that an integrity pass quarantined and no seal has restored.\n\
+         # TYPE nuthatch_quarantined_segments gauge\n\
+         nuthatch_quarantined_segments{{nest=\"{nest}\"}} {}\n\
+         # HELP nuthatch_derived_state_stale 1 when derived state was rebuilt at start from a segment quarantined since.\n\
+         # TYPE nuthatch_derived_state_stale gauge\n\
+         nuthatch_derived_state_stale{{nest=\"{nest}\"}} {}\n",
+        found.quarantined_segments,
+        u8::from(found.derived_stale)
     )
 }
 
@@ -2173,6 +2198,10 @@ pub(crate) struct NestReadiness {
     pub ipfs_window_deadline: Option<u64>,
     pub fetch_window: u64,
     pub entities: Value,
+    /// What the integrity passes took from this nest since it started.
+    pub integrity: Option<crate::seal::Integrity>,
+    /// A quarantined provisional tail with rows still to seal behind it.
+    pub seals_stopped: bool,
     #[cfg(feature = "folds")]
     pub folds: Value,
     #[cfg(feature = "folds")]
@@ -2202,6 +2231,9 @@ impl NestReadiness {
         }
         if self.seal_faulted {
             out.push("seal_faulted");
+        }
+        if self.seals_stopped {
+            out.push("seals_stopped");
         }
         if self.entities_stalled {
             out.push("entities_stalled");
@@ -2376,8 +2408,20 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     let seal_faulted = seal_fault.as_ref().is_some_and(|(since, _)| {
         now.saturating_sub(*since) > s.freshness.stall_threshold_secs(READINESS_SEAL_STALL_SECS)
     });
-    let stalled =
-        seal_stalled || tip_seal_stalled || seal_faulted || entities_stalled || cursor_stalled;
+    // Every later seal reads a quarantined tail and fails, so this is the stall the seal clock above
+    // would report, hours later on a sparse nest.
+    let integrity = crate::seal::integrity(&s.dir);
+    let seals_stopped = !s.cursorless
+        && last > sealed
+        && integrity
+            .as_ref()
+            .is_some_and(|i| !i.seals_stopped.is_empty());
+    let stalled = seal_stalled
+        || tip_seal_stalled
+        || seal_faulted
+        || seals_stopped
+        || entities_stalled
+        || cursor_stalled;
     #[cfg(feature = "folds")]
     let stalled = stalled || folds_stalled;
     NestReadiness {
@@ -2407,6 +2451,8 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         ipfs_window_deadline,
         fetch_window,
         entities,
+        integrity,
+        seals_stopped,
         #[cfg(feature = "folds")]
         folds,
         #[cfg(feature = "folds")]
@@ -2473,6 +2519,8 @@ fn ready_answer(s: &AppState) -> Answer {
         ipfs_window_deadline,
         fetch_window,
         entities,
+        integrity,
+        seals_stopped: _,
         #[cfg(feature = "folds")]
         folds,
         #[cfg(feature = "folds")]
@@ -2527,6 +2575,8 @@ fn ready_answer(s: &AppState) -> Answer {
         // RFC-0062: absent unless the nest declares a maintained view.
         maintained: crate::maintained::is_declared(&s.dir).then(|| maintained_status(&s.dir)),
         webhooks: webhook_status(&s.dir),
+        // Absent while the integrity passes have taken nothing from this nest.
+        integrity: integrity.map(|i| i.to_json()),
     })
 }
 
@@ -6230,12 +6280,39 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     }
 }
 
+/// Whether this nest's derived state (balances, exposure, velocity, entities) was rebuilt at start
+/// from a segment quarantined since. It stays as built until a restart rebuilds it from what remains.
+fn derived_stale(s: &AppState) -> bool {
+    crate::seal::integrity(&s.dir).is_some_and(|i| i.derived_stale)
+}
+
+/// Say so in an answer read from derived state, while [`derived_stale`] holds.
+fn mark_stale(s: &AppState, body: &mut Value) {
+    if let Some(obj) = body.as_object_mut().filter(|_| derived_stale(s)) {
+        obj.insert("derived_state_stale".into(), Value::Bool(true));
+    }
+}
+
+fn derived_answer(s: &AppState, a: Answer) -> Answer {
+    // A 404 from a stale view is as much its answer as a 200.
+    if !matches!(a.status, 200 | 404) || !derived_stale(s) {
+        return a;
+    }
+    match serde_json::from_slice::<Value>(&a.body) {
+        Ok(mut body) => {
+            mark_stale(s, &mut body);
+            Answer::json(a.status, &body)
+        }
+        Err(_) => a,
+    }
+}
+
 /// Top balances from the IVM view, descending, in i128 base units as decimal strings.
 async fn balances(State(s): State<AppState>, Query(q): Query<EntitiesQuery>) -> impl IntoResponse {
     let limit = answer::listing_limit(q.limit);
     let view = s.balances.clone();
     match sized(&s, s.balances.holders(), move || view.top(limit)).await {
-        Ok(top) => respond(answer::balances(&s.balances, top)),
+        Ok(top) => respond(derived_answer(&s, answer::balances(&s.balances, top))),
         Err(refused) => refused,
     }
 }
@@ -6255,7 +6332,7 @@ async fn derived_index(State(s): State<AppState>) -> impl IntoResponse {
             answer::derived_index_item(&entity_facts(e), row_count, &applied, head)
         })
         .collect();
-    respond(answer::derived_index(head, items))
+    respond(derived_answer(&s, answer::derived_index(head, items)))
 }
 
 fn find_entity<'a>(
@@ -6311,11 +6388,20 @@ fn sql_facts_envelope(
             names.contains(&e.name().to_ascii_lowercase()) && !e.offchain_tables().is_empty()
         })
     });
+    let mut degraded_tables = out.degraded_tables.clone();
+    if let Some(names) = out.referenced_tables.as_ref().filter(|_| derived_stale(s)) {
+        degraded_tables.extend(
+            s.entities
+                .iter()
+                .map(|e| e.name().to_string())
+                .filter(|n| names.contains(&n.to_ascii_lowercase())),
+        );
+    }
     answer::sql_envelope(
         &answer::SqlFacts {
             count,
             truncated: out.truncated,
-            degraded_tables: &out.degraded_tables,
+            degraded_tables: &degraded_tables,
             tip_unavailable: out.tip_unavailable,
             columns: &out.columns,
             cached,
@@ -6561,11 +6647,14 @@ async fn derived_key(
     }
     let head = dataset_head(&s);
     let (found, applied) = entity.get_with_watermark(&answer::key_readings(&key));
-    respond(answer::derived_key(
-        &name,
-        &key,
-        found,
-        derived_provenance(&s, entity, head, &applied),
+    respond(derived_answer(
+        &s,
+        answer::derived_key(
+            &name,
+            &key,
+            found,
+            derived_provenance(&s, entity, head, &applied),
+        ),
     ))
 }
 
@@ -6588,11 +6677,14 @@ async fn derived_all(
     }
     let head = dataset_head(&s);
     let (rows, first, applied) = entity.head_rows_with_watermark(answer::listing_limit(q.limit));
-    respond(answer::derived_all(
-        &name,
-        rows,
-        &first,
-        derived_provenance(&s, entity, head, &applied),
+    respond(derived_answer(
+        &s,
+        answer::derived_all(
+            &name,
+            rows,
+            &first,
+            derived_provenance(&s, entity, head, &applied),
+        ),
     ))
 }
 
@@ -6623,7 +6715,7 @@ fn first_indexed(s: &AppState) -> Option<u64> {
 
 /// Point-read a single address's derived balance. Same COR-8 caveat as `/balances`.
 async fn balance(State(s): State<AppState>, Path(address): Path<String>) -> impl IntoResponse {
-    respond(answer::balance(&s.balances, &address))
+    respond(derived_answer(&s, answer::balance(&s.balances, &address)))
 }
 
 /// Direct counterparty-exposure for an address: how much it has transacted, directly, with the
@@ -6644,7 +6736,9 @@ async fn exposure(State(s): State<AppState>, Path(address): Path<String>) -> imp
             })
         })
         .collect();
-    Json(json!({ "address": address, "count": items.len(), "exposure": items }))
+    let mut body = json!({ "address": address, "count": items.len(), "exposure": items });
+    mark_stale(&s, &mut body);
+    Json(body)
 }
 
 #[derive(Deserialize)]
@@ -6702,12 +6796,15 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
 
     let answer = async {
         Ok::<_, Refused>(match kind {
-            Some("velocity") => Json(json!({
-                "kind": "velocity",
-                "threshold": s.velocity_threshold.map(|t| t.to_string()),
-                "flags": velocity(&s, limit).await?,
-            }))
-            .into_response(),
+            Some("velocity") => {
+                let mut body = json!({
+                    "kind": "velocity",
+                    "threshold": s.velocity_threshold.map(|t| t.to_string()),
+                    "flags": velocity(&s, limit).await?,
+                });
+                mark_stale(&s, &mut body);
+                Json(body).into_response()
+            }
             Some("threshold") => Json(json!({
                 "kind": "threshold",
                 "threshold": s.threshold.map(|t| t.to_string()),
@@ -6720,11 +6817,14 @@ async fn flags(State(s): State<AppState>, Query(q): Query<FlagsQuery>) -> impl I
                 Json(json!({ "error": format!("unknown flag kind '{other}' (want: threshold, velocity)") })),
             )
                 .into_response(),
-            None => Json(json!({
-                "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold(&s, limit).await? },
-                "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s, limit).await? },
-            }))
-            .into_response(),
+            None => {
+                let mut body = json!({
+                    "threshold": { "configured": s.threshold.map(|t| t.to_string()), "flags": threshold(&s, limit).await? },
+                    "velocity": { "configured": s.velocity_threshold.map(|t| t.to_string()), "flags": velocity(&s, limit).await? },
+                });
+                mark_stale(&s, &mut body);
+                Json(body).into_response()
+            }
         })
     };
     answer.await.unwrap_or_else(|refused| refused)
@@ -11958,6 +12058,192 @@ mod tests {
             Some(66),
             "lag computed across two chains is meaningless - it was ~463 million before this fix"
         );
+    }
+
+    /// Flip a byte of `dir`'s first `usdc__transfer` segment and let a background pass find it.
+    fn rot_and_verify_in_background(dir: &std::path::Path) {
+        let seg = crate::seal::load_manifest(dir).unwrap().tables["usdc__transfer"][0].clone();
+        let path = crate::seal::segment_path(dir, &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        crate::seal::verify_in_background(
+            dir.to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::ZERO,
+        );
+        let start = std::time::Instant::now();
+        // The record, not the rename: it is written just after.
+        while crate::seal::integrity(dir).is_none() && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!path.exists(), "the background pass did not quarantine it");
+    }
+
+    fn sealed_transfer_nest(name: &str, provisional: bool) -> (tempfile::TempDir, AppState) {
+        use crate::metrics::METRICS;
+        let tmp = tempfile::tempdir().unwrap();
+        if !provisional {
+            crate::seal::test_set_table_floor(tmp.path(), 0);
+        }
+        let row = r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":100,"tx_hash":"0xt","log_index":0}"#;
+        crate::seal::seal_range(tmp.path(), &[row.to_string()], 100, 100).unwrap();
+        assert_eq!(
+            crate::seal::load_manifest(tmp.path()).unwrap().tables["usdc__transfer"][0].provisional,
+            provisional
+        );
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        health.register(name, "mainnet");
+        let m = METRICS.nest(name);
+        m.set_last_block(120);
+        m.set_tip(120);
+        m.mark_poll_ok();
+        let mut state = test_state(tmp.path(), 1);
+        state.runtime_health = Some((name.to_string(), health));
+        (tmp, state)
+    }
+
+    async fn ready_and_code(state: &AppState) -> (StatusCode, Value) {
+        let r = ready(State(state.clone())).await.into_response();
+        let code = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Every later seal reads the provisional tail and fails, so `/ready` says so the moment it is
+    /// quarantined rather than when the seal clock runs out.
+    #[tokio::test]
+    async fn a_quarantined_provisional_tail_takes_ready_down_at_once() {
+        let (tmp, state) = sealed_transfer_nest("tail-quarantined", true);
+        let (code, before) = ready_and_code(&state).await;
+        assert_eq!(code, StatusCode::OK, "{before}");
+        assert!(before.get("integrity").is_none(), "{before}");
+
+        rot_and_verify_in_background(tmp.path());
+        let (code, after) = ready_and_code(&state).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{after}");
+        assert_eq!(after["tip_seal_stalled"], json!(false), "{after}");
+        assert_eq!(
+            after["integrity"],
+            json!({
+                "quarantined_segments": 1,
+                "reduced_tables": ["usdc__transfer"],
+                "seals_stopped": true,
+                "seals_stopped_tables": ["usdc__transfer"],
+                "derived_state_stale": false,
+            }),
+            "{after}"
+        );
+    }
+
+    /// A restart forgets nothing it can read off disk: the reduction is on `/ready` and `/metrics`
+    /// until a seal puts the segment back.
+    #[tokio::test]
+    async fn a_quarantine_is_still_reported_after_a_restart_until_the_segment_is_resealed() {
+        let (tmp, state) = sealed_transfer_nest("quarantine-survives", false);
+        let router = router(SharedNest::new(state.clone()));
+        let quarantined = |metrics: &str| {
+            metrics
+                .lines()
+                .find(|l| {
+                    l.starts_with("nuthatch_quarantined_segments{nest=\"quarantine-survives\"}")
+                })
+                .map(|l| l.rsplit(' ').next().unwrap().to_string())
+        };
+        let (_, m) = get(router.clone(), "/metrics").await;
+        assert_eq!(
+            quarantined(&String::from_utf8(m).unwrap()).as_deref(),
+            Some("0")
+        );
+
+        rot_and_verify_in_background(tmp.path());
+        crate::seal::forget_findings(tmp.path());
+        let (_, r) = ready_and_code(&state).await;
+        assert!(
+            r.get("integrity").is_none(),
+            "the fixture did not forget: {r}"
+        );
+        // The next start.
+        assert_eq!(crate::seal::verify_and_quarantine(tmp.path()).unwrap(), 0);
+        crate::seal::record_rebuild(tmp.path());
+        let (code, r) = ready_and_code(&state).await;
+        assert_eq!(code, StatusCode::OK, "{r}");
+        assert_eq!(r["integrity"]["quarantined_segments"], json!(1), "{r}");
+        assert_eq!(r["integrity"]["derived_state_stale"], json!(false), "{r}");
+        let (_, m) = get(router.clone(), "/metrics").await;
+        let m = String::from_utf8(m).unwrap();
+        assert_eq!(quarantined(&m).as_deref(), Some("1"), "{m}");
+        assert!(m.contains("nuthatch_derived_state_stale{nest=\"quarantine-survives\"} 0"));
+
+        let row = r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":100,"tx_hash":"0xt","log_index":0}"#;
+        crate::seal::seal_range(tmp.path(), &[row.to_string()], 100, 100).unwrap();
+        let (_, r) = ready_and_code(&state).await;
+        assert!(
+            r.get("integrity").is_none(),
+            "a resealed segment is still reported: {r}"
+        );
+    }
+
+    /// The start rebuilt balances from a segment the background pass then quarantined: the answers
+    /// built from it say so until a restart rebuilds them, and `/ready` says so without going down.
+    #[tokio::test]
+    async fn derived_state_rebuilt_from_a_segment_since_quarantined_is_marked_stale() {
+        let (tmp, mut state) = sealed_transfer_nest("derived-stale", false);
+        crate::seal::record_rebuild(tmp.path());
+        state.entities = Arc::new(vec![two_row_entity("e")]);
+        let router = router(SharedNest::new(state.clone()));
+        let body = |b: Vec<u8>| serde_json::from_slice::<Value>(&b).unwrap();
+        const SQL: &str = "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20e";
+        let degraded = |b: Value| b["degraded_tables"].clone();
+        for route in [
+            "/balances",
+            "/balance/0xb",
+            "/exposure/0xb",
+            "/flags",
+            "/derived",
+        ] {
+            let (code, b) = get(router.clone(), route).await;
+            assert!(
+                code == StatusCode::OK || route.starts_with("/balance/"),
+                "{route}"
+            );
+            assert!(body(b).get("derived_state_stale").is_none(), "{route}");
+        }
+        let (code, b) = get(router.clone(), SQL).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(degraded(body(b)), json!([]));
+
+        rot_and_verify_in_background(tmp.path());
+        let (_, b) = get(router.clone(), SQL).await;
+        assert_eq!(
+            degraded(body(b)),
+            json!(["e"]),
+            "an entity answer read stale state"
+        );
+        for route in [
+            "/balances",
+            "/balance/0xb",
+            "/exposure/0xb",
+            "/flags",
+            "/derived",
+        ] {
+            let (code, b) = get(router.clone(), route).await;
+            assert!(
+                code == StatusCode::OK || route.starts_with("/balance/"),
+                "{route}"
+            );
+            assert_eq!(body(b)["derived_state_stale"], json!(true), "{route}");
+        }
+        let (code, r) = ready_and_code(&state).await;
+        assert_eq!(code, StatusCode::OK, "{r}");
+        assert_eq!(r["integrity"]["derived_state_stale"], json!(true), "{r}");
+        assert_eq!(r["integrity"]["seals_stopped"], json!(false), "{r}");
     }
 
     fn named_surface(sql: &str) -> Arc<crate::allowlist::Surface> {

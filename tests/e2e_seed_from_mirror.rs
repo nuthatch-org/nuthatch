@@ -133,6 +133,66 @@ fn recipient_balance(balances: &[(String, i128)]) -> i128 {
         .expect("the recipient holds a balance")
 }
 
+/// A segment quarantined before the mirror held it stays in the published catalogue with no file
+/// behind it. Verify names it, and a seed refuses naming it and its blocks rather than producing a
+/// nest that is short and says nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_quarantined_before_it_was_published_stops_a_seed_by_name() {
+    let publisher = tempfile::tempdir().unwrap();
+    let mirror = tempfile::tempdir().unwrap();
+    let target = mirror.path().to_str().unwrap();
+    stopped_publisher(publisher.path()).await;
+    let manifest = nuthatch::seal::load_manifest(publisher.path()).unwrap();
+    let seg = manifest
+        .tables
+        .values()
+        .flatten()
+        .find(|s| !s.provisional)
+        .expect("a full segment")
+        .clone();
+    let path = nuthatch::seal::segment_path(publisher.path(), &seg.file, &seg.hash);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let refused = nuthatch::publish::sync(publisher.path(), target, false)
+        .await
+        .expect_err("a corrupt segment was published");
+    assert!(format!("{refused:#}").contains(&seg.file), "{refused:#}");
+    assert!(!path.exists(), "a stopped solo publisher quarantines it");
+    let report = nuthatch::publish::sync(publisher.path(), target, false)
+        .await
+        .expect("the next publish goes ahead");
+    let catalogue =
+        std::fs::read_to_string(mirror.path().join(&report.dataset).join("manifest.json")).unwrap();
+    assert!(
+        catalogue.contains(&seg.hash),
+        "the entry left the catalogue"
+    );
+
+    let verify = nuthatch::publish::verify(publisher.path(), target, false, false)
+        .await
+        .expect_err("a mirror missing a segment verified");
+    let verify = format!("{verify:#}");
+    assert!(
+        verify.contains(&seg.file) && verify.contains("quarantined"),
+        "{verify}"
+    );
+
+    let seeded = tempfile::tempdir().unwrap();
+    scaffold_nest(seeded.path(), PUBLISHER, USDC);
+    let err = nuthatch::seed::seed(seeded.path(), target)
+        .await
+        .expect_err("a seed from a mirror missing a segment went quietly short");
+    let err = format!("{err:#}");
+    let blocks = format!("blocks {}..={}", seg.from_block, seg.to_block);
+    assert!(
+        err.contains(&seg.hash) && err.contains(&blocks) && err.contains("short"),
+        "{err}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_seeded_nest_equals_a_clean_replay_and_rereads_nothing_sealed() {
     let publisher = tempfile::tempdir().unwrap();

@@ -6,6 +6,7 @@
 //! Bridging (rather than reopening the redb/segments) means the MCP server never contends with the
 //! indexer for the single-writer store, and it automatically reflects the live IVM views.
 
+use crate::sql_errors;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -150,6 +151,7 @@ pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
     }
     let token = bearer_token(token_env.as_deref(), |v| std::env::var(v).ok())?;
     let client = http_client(token.as_deref())?;
+    let session = Session::new(&client, &base);
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     while let Some(message) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
@@ -161,7 +163,7 @@ pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
                     continue;
                 }
                 match serde_json::from_str::<Value>(line) {
-                    Ok(req) => respond(&req, &client, &base, token.as_deref()).await,
+                    Ok(req) => respond(&req, &session, token.as_deref()).await,
                     Err(parse_error) => {
                         eprintln!("nuthatch mcp: malformed JSON-RPC message: {parse_error}");
                         Some(err(Value::Null, -32700, "Parse error"))
@@ -201,13 +203,8 @@ fn bearer_token(
 
 /// `handle`, with the token scrubbed from everything the model will read: a 401 body or a proxy's
 /// error page can echo the header back.
-async fn respond(
-    req: &Value,
-    client: &reqwest::Client,
-    base: &str,
-    token: Option<&str>,
-) -> Option<Value> {
-    let mut resp = handle(req, client, base).await?;
+async fn respond(req: &Value, session: &Session<'_>, token: Option<&str>) -> Option<Value> {
+    let mut resp = handle(req, session).await?;
     if let Some(t) = token {
         redact_token(&mut resp, t);
     }
@@ -224,9 +221,8 @@ fn redact_token(v: &mut Value, token: &str) {
 }
 
 /// Dispatch one JSON-RPC message. Returns None for notifications (no response expected).
-async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Value> {
-    // `http://host:port/` would otherwise request `//schema`.
-    let base = base.trim_end_matches('/');
+async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
+    let (client, base) = (session.client, session.base);
     // JSON-RPC 2.0 §5.1: valid JSON that is not a Request object (a number, a string, an array - the
     // batches MCP no longer carries) or an object with no method is an Invalid Request. A response
     // from the client (it has `result` or `error`) answers nothing this bridge asked, so it is dropped.
@@ -253,7 +249,7 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
         "ping" => Some(ok(id?, json!({}))),
         "tools/list" => Some(ok(
             id?,
-            json!({ "tools": tool_specs(&fetch_shape(client, base).await) }),
+            json!({ "tools": tool_specs(&fetch_shape(session).await) }),
         )),
         "tools/call" => {
             let id = id?;
@@ -261,7 +257,8 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
             match call_tool(&params, client, base).await {
                 Ok(text) => Some(ok(id, content(&text, false))),
                 Err(e) => {
-                    let text = explain_bare_404(format!("{e:#}"), client, base).await;
+                    let text = explain_bare_404(format!("{e:#}"), session).await;
+                    let text = sql_errors::for_surface(&text, sql_errors::Surface::Mcp);
                     Some(ok(id, content(&text, true)))
                 }
             }
@@ -281,7 +278,7 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
                     json!({ "contents": [{ "uri": uri, "mimeType": "text/plain", "text": text }] }),
                 )),
                 Err(e) => {
-                    let text = explain_bare_404(format!("{e:#}"), client, base).await;
+                    let text = explain_bare_404(format!("{e:#}"), session).await;
                     Some(err(id, -32602, &text))
                 }
             }
@@ -289,7 +286,7 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
         // Prompts (RFC-0016 §6): canned, argument-taking analysis flows that name real tools.
         "prompts/list" => Some(ok(
             id?,
-            json!({ "prompts": prompt_specs(&fetch_shape(client, base).await) }),
+            json!({ "prompts": prompt_specs(&fetch_shape(session).await) }),
         )),
         "prompts/get" => {
             let id = id?;
@@ -301,7 +298,7 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
                 .pointer("/params/arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let shape = fetch_shape(client, base).await;
+            let shape = fetch_shape(session).await;
             match render_prompt(name, &args, &shape) {
                 Some(result) => Some(ok(id, result)),
                 None => Some(err(id, -32602, &format!("unknown prompt `{name}`"))),
@@ -314,27 +311,77 @@ async fn handle(req: &Value, client: &reqwest::Client, base: &str) -> Option<Val
 /// A runtime serves each mount under `/<alias>` or `/<tenant>/<alias>` and nothing else at its root, so
 /// a bridge pointed at the root meets a bare 404 from every tool. After any 404, ask `/nests`, which
 /// only a runtime root answers, and name the URLs that would work.
-async fn explain_bare_404(error: String, client: &reqwest::Client, base: &str) -> String {
+async fn explain_bare_404(error: String, session: &Session<'_>) -> String {
     if !error.starts_with("HTTP 404:") {
         return error;
     }
-    let mounts = mount_urls(client, base).await;
-    if mounts.is_empty() {
-        return error;
+    match session.root_mounts().await {
+        Some(mounts) if mounts.is_empty() => {
+            format!("{error} - this URL is a runtime's root, which has nothing mounted yet")
+        }
+        Some(mounts) => format!("{error} - {}", root_explanation(&mounts)),
+        None => error,
     }
-    format!("{error} - {}", root_explanation(&mounts))
 }
 
-/// The mounts `/nests` lists, as URLs under `base`; empty unless `base` is a runtime's root.
-async fn mount_urls(client: &reqwest::Client, base: &str) -> Vec<String> {
-    let Ok(body) = get(client, &format!("{base}/nests")).await else {
-        return Vec::new();
+/// One bridge session: the URL it bridges to and, once `/nests` has answered, whether that is a
+/// runtime's root.
+struct Session<'a> {
+    client: &'a reqwest::Client,
+    base: &'a str,
+    root: std::sync::OnceLock<bool>,
+}
+
+impl<'a> Session<'a> {
+    fn new(client: &'a reqwest::Client, base: &'a str) -> Self {
+        Session {
+            client,
+            // `http://host:port/` would otherwise request `//schema`.
+            base: base.trim_end_matches('/'),
+            root: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The mounts to name if this URL is a runtime's root, `None` if it is not known to be one. Only a 404 from `/nests` settles that it is
+    /// not one; a root, even one with nothing mounted yet, is asked again each time.
+    async fn root_mounts(&self) -> Option<Vec<String>> {
+        if self.root.get() == Some(&false) {
+            return None;
+        }
+        match listed_mounts(self.client, self.base).await {
+            Nests::NotRoot => {
+                let _ = self.root.set(false);
+                None
+            }
+            Nests::Root(mounts) => Some(mounts),
+            Nests::Unknown => None,
+        }
+    }
+}
+
+/// What `/nests` says about `base`.
+enum Nests {
+    /// A 404: `base` is a nest or a mount.
+    NotRoot,
+    /// A runtime's root, and its mounts as URLs under `base`, which may be none yet.
+    Root(Vec<String>),
+    /// No answer, or one that says nothing about `base`, such as a proxy's 5xx.
+    Unknown,
+}
+
+async fn listed_mounts(client: &reqwest::Client, base: &str) -> Nests {
+    let body = match get(client, &format!("{base}/nests")).await {
+        Ok(body) => body,
+        Err(e) if e.to_string().starts_with("HTTP 404:") => return Nests::NotRoot,
+        Err(_) => return Nests::Unknown,
     };
-    let nests = serde_json::from_str::<Value>(&body)
+    let Some(nests) = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|v| v.get("nests").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
-    nests
+    else {
+        return Nests::Unknown;
+    };
+    let mounts = nests
         .iter()
         .filter_map(|e| {
             let name = e.get("name").and_then(Value::as_str)?;
@@ -342,7 +389,8 @@ async fn mount_urls(client: &reqwest::Client, base: &str) -> Vec<String> {
             let path = path.map_or_else(|| format!("/{name}"), str::to_string);
             Some(format!("{}{path}", base.trim_end_matches('/')))
         })
-        .collect()
+        .collect();
+    Nests::Root(mounts)
 }
 
 fn root_explanation(mounts: &[String]) -> String {
@@ -406,7 +454,8 @@ struct Shape {
 /// Fetch the nest's shape from `GET /shape`. If the endpoint is missing (an older nest) or unreachable,
 /// default to advertising **everything** - never hide a tool because a probe failed. The safe default
 /// is the current, unconditional behaviour, so a stale nest degrades to exactly today's surface.
-async fn fetch_shape(client: &reqwest::Client, base: &str) -> Shape {
+async fn fetch_shape(session: &Session<'_>) -> Shape {
+    let (client, base) = (session.client, session.base);
     let all = Shape {
         transfers: true,
         compliance: true,
@@ -416,7 +465,7 @@ async fn fetch_shape(client: &reqwest::Client, base: &str) -> Shape {
     };
     let Ok(body) = get(client, &format!("{base}/shape")).await else {
         // A runtime's root has no `/shape` either, and nothing it could offer would answer.
-        let runtime_root = !mount_urls(client, base).await.is_empty();
+        let runtime_root = session.root_mounts().await.is_some();
         return Shape {
             runtime_root,
             ..all
@@ -606,13 +655,15 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             .await?;
             Ok(format_sql_result(&raw, limit))
         }
-        "mounts" => {
-            let mounts = mount_urls(client, base).await;
-            if mounts.is_empty() {
-                bail!("this URL is not a runtime's root: it lists no mounts");
+        "mounts" => match listed_mounts(client, base).await {
+            Nests::Root(mounts) if mounts.is_empty() => {
+                bail!("this runtime's root has nothing mounted yet")
             }
-            Ok(root_explanation(&mounts))
-        }
+            Nests::Root(mounts) => Ok(root_explanation(&mounts)),
+            Nests::NotRoot | Nests::Unknown => {
+                bail!("this URL is not a runtime's root: it lists no mounts")
+            }
+        },
         "queries" => get(client, &format!("{base}/queries")).await,
         "query" => {
             let name = args["name"]
@@ -642,7 +693,9 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             let q = args["query"]
                 .as_str()
                 .ok_or_else(|| anyhow!("`query` is required"))?;
-            get_query(client, &format!("{base}/explain"), &[("q", q)]).await
+            get_query(client, &format!("{base}/explain"), &[("q", q)])
+                .await
+                .map(|body| sql_errors::for_surface(&body, sql_errors::Surface::Mcp))
         }
         // The route's JSON document, returned as it was sent: the same bytes `nuthatch diff
         // --format json` prints for the same request.
@@ -789,7 +842,7 @@ fn format_sql_result(raw: &str, limit: u64) -> String {
         Err(_) => return bound(raw.to_string()),
     };
     if let Some(err) = v.get("error").and_then(Value::as_str) {
-        return bound(err.to_string());
+        return bound(sql_errors::for_surface(err, sql_errors::Surface::Mcp));
     }
     let rows = v
         .get("rows")
@@ -1292,7 +1345,7 @@ mod tests {
 
         // No `/shape` route at all - the older-nest case this default encodes.
         let (base, h) = fake_nest(None).await;
-        let shape = fetch_shape(&client, &base).await;
+        let shape = fetch_shape(&Session::new(&client, &base)).await;
         assert!(
             shape.transfers,
             "a nest with no /shape must still advertise transfers"
@@ -1301,13 +1354,13 @@ mod tests {
         h.abort();
 
         // Unreachable host: nothing listening on this port.
-        let shape = fetch_shape(&client, "http://127.0.0.1:1").await;
+        let shape = fetch_shape(&Session::new(&client, "http://127.0.0.1:1")).await;
         assert!(shape.transfers, "an unreachable nest must fail open");
         assert!(shape.compliance);
 
         // Present but not JSON-shaped as expected: missing keys fall back to true per-field.
         let (base, h) = fake_nest(Some(serde_json::json!({"unrelated": 1}))).await;
-        let shape = fetch_shape(&client, &base).await;
+        let shape = fetch_shape(&Session::new(&client, &base)).await;
         assert!(shape.transfers);
         assert!(shape.compliance);
         h.abort();
@@ -1318,7 +1371,7 @@ mod tests {
             "compliance": false
         })))
         .await;
-        let shape = fetch_shape(&client, &base).await;
+        let shape = fetch_shape(&Session::new(&client, &base)).await;
         assert!(!shape.transfers, "an explicit false must be respected");
         assert!(!shape.compliance);
         h.abort();
@@ -1405,7 +1458,9 @@ mod tests {
         ];
         let mut out = String::new();
         for r in &reqs {
-            let resp = respond(r, &client, &base, Some(TOKEN)).await.unwrap();
+            let resp = respond(r, &Session::new(&client, &base), Some(TOKEN))
+                .await
+                .unwrap();
             out.push_str(&resp.to_string());
         }
         let seen = seen.lock().unwrap().clone();
@@ -1421,9 +1476,13 @@ mod tests {
         // An unreachable nest's error names no token either.
         let gone = json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "tables", "arguments": {} } });
-        let resp = respond(&gone, &client, "http://127.0.0.1:1", Some(TOKEN))
-            .await
-            .unwrap();
+        let resp = respond(
+            &gone,
+            &Session::new(&client, "http://127.0.0.1:1"),
+            Some(TOKEN),
+        )
+        .await
+        .unwrap();
         assert!(!resp.to_string().contains(TOKEN), "{resp}");
         server.abort();
     }
@@ -1433,7 +1492,9 @@ mod tests {
         let client = reqwest::Client::new();
         let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "protocolVersion": "2025-03-26" } });
-        let resp = handle(&init, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&init, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "nuthatch");
         assert_eq!(
             resp["result"]["protocolVersion"], PROTOCOL_VERSION,
@@ -1442,13 +1503,18 @@ mod tests {
 
         let supported_init = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize",
             "params": { "protocolVersion": PROTOCOL_VERSION } });
-        let supported = handle(&supported_init, &client, "http://127.0.0.1:1")
-            .await
-            .unwrap();
+        let supported = handle(
+            &supported_init,
+            &Session::new(&client, "http://127.0.0.1:1"),
+        )
+        .await
+        .unwrap();
         assert_eq!(supported["result"]["protocolVersion"], PROTOCOL_VERSION);
 
         let list = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" });
-        let resp = handle(&list, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&list, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
         // everything (RFC-0025) - the safe default, identical to the pre-RFC-0025 unconditional surface.
@@ -1546,7 +1612,9 @@ mod tests {
     async fn advertises_resources_and_prompts_and_lists_them() {
         let client = reqwest::Client::new();
         let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
-        let resp = handle(&init, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&init, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         let caps = &resp["result"]["capabilities"];
         assert!(
             caps.get("tools").is_some()
@@ -1555,7 +1623,9 @@ mod tests {
         );
 
         let rl = json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list" });
-        let resp = handle(&rl, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&rl, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         let uris: Vec<&str> = resp["result"]["resources"]
             .as_array()
             .unwrap()
@@ -1565,7 +1635,9 @@ mod tests {
         assert!(uris.contains(&"nuthatch://schema"));
 
         let pl = json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/list" });
-        let resp = handle(&pl, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&pl, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         assert_eq!(resp["result"]["prompts"].as_array().unwrap().len(), 3);
     }
 
@@ -1574,7 +1646,9 @@ mod tests {
         let client = reqwest::Client::new();
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/get",
             "params": { "name": "investigate-address", "arguments": { "address": "0xBEEF" } } });
-        let resp = handle(&req, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&req, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         let text = resp["result"]["messages"][0]["content"]["text"]
             .as_str()
             .unwrap();
@@ -1586,7 +1660,9 @@ mod tests {
 
         // Unknown prompt → a clean error, not a panic.
         let bad = json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/get", "params": { "name": "nope" } });
-        let resp = handle(&bad, &client, "http://127.0.0.1:1").await.unwrap();
+        let resp = handle(&bad, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .unwrap();
         assert!(resp.get("error").is_some());
     }
 
@@ -1678,11 +1754,83 @@ mod tests {
         assert!(out.contains("hint: use value_dec"));
     }
 
+    /// The node writes its hints for HTTP callers; an agent is pointed at its own `schema` tool.
+    #[tokio::test]
+    async fn a_refused_query_points_an_agent_at_the_schema_tool() {
+        use axum::{response::IntoResponse, routing::get, Router};
+        let hinted = |raw: &str| {
+            let hint = sql_errors::enrich(raw, "", &[]).expect("a hint");
+            format!("{raw}\n\nhint: {hint}")
+        };
+        let table = hinted("no segments: Catalog Error: Table with name nope does not exist!");
+        let column = hinted(
+            "plan error: Binder Error: Referenced column \"nope\" not found in FROM clause!",
+        );
+        let reply = |a: nuthatch_core::answer::Answer| {
+            (
+                axum::http::StatusCode::from_u16(a.status).unwrap(),
+                [("content-type", "application/json")],
+                a.body,
+            )
+                .into_response()
+        };
+        let sql = nuthatch_core::answer::Answer::json(400, &json!({ "error": column }));
+        let explain = nuthatch_core::answer::explain_invalid(&table);
+        let app = Router::new()
+            .route("/sql", get(move || async move { reply(sql) }))
+            .route("/explain", get(move || async move { reply(explain) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        for (tool, said) in [
+            ("sql", "Call the `schema` tool for each table's columns."),
+            ("explain", "Call the `schema` tool for the list of tables."),
+        ] {
+            let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": tool, "arguments": { "query": "SELECT nope FROM nope" } } });
+            let out = handle(&req, &Session::new(&client, &base))
+                .await
+                .unwrap()
+                .to_string();
+            assert!(
+                out.contains(said) && !out.contains("information_schema"),
+                "{tool}: {out}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_query_that_binds_is_sent_to_the_sql_tool() {
+        use axum::{response::IntoResponse, routing::get, Router};
+        let valid = nuthatch_core::answer::explain_valid(false);
+        assert!(!String::from_utf8_lossy(&valid.body).contains("sql tool"));
+        let app = Router::new().route(
+            "/explain",
+            get(move || async move {
+                ([("content-type", "application/json")], valid.body).into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "explain", "arguments": { "query": "SELECT 1" } } });
+        let out = handle(&req, &Session::new(&client, &base))
+            .await
+            .unwrap()
+            .to_string();
+        assert!(out.contains("run it with the sql tool"), "{out}");
+    }
+
     #[tokio::test]
     async fn notifications_get_no_response() {
         let client = reqwest::Client::new();
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
-        assert!(handle(&note, &client, "http://127.0.0.1:1").await.is_none());
+        assert!(handle(&note, &Session::new(&client, "http://127.0.0.1:1"))
+            .await
+            .is_none());
     }
 
     /// A nest that answers the HTTP surface MCP bridges to. Enough routes for every generic tool
@@ -1779,8 +1927,7 @@ mod tests {
 
         let list = handle(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-            &client,
-            &base,
+            &Session::new(&client, &base),
         )
         .await
         .unwrap();
@@ -1811,8 +1958,7 @@ mod tests {
                     "method": "tools/call",
                     "params": { "name": name, "arguments": arguments }
                 }),
-                client,
-                base,
+                &Session::new(client, base),
             )
             .await
             .unwrap()
@@ -1885,8 +2031,7 @@ mod tests {
                 "method": "resources/read",
                 "params": { "uri": "nuthatch://schema" }
             }),
-            &client,
-            &base,
+            &Session::new(&client, &base),
         )
         .await
         .unwrap();
@@ -1917,8 +2062,7 @@ mod tests {
                 "method": "tools/call",
                 "params": { "name": "status", "arguments": {} }
             }),
-            &client,
-            "http://127.0.0.1:1",
+            &Session::new(&client, "http://127.0.0.1:1"),
         )
         .await
         .unwrap();
@@ -2043,8 +2187,7 @@ mod tests {
         handle(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": name, "arguments": arguments } }),
-            client,
-            base,
+            &Session::new(client, base),
         )
         .await
         .unwrap()
@@ -2138,7 +2281,7 @@ mod tests {
             "transfers": true, "compliance": false, "free_form": false, "queries": 2
         })))
         .await;
-        let shape = fetch_shape(&client, &base).await;
+        let shape = fetch_shape(&Session::new(&client, &base)).await;
         assert!(!shape.free_form && shape.queries);
         h.abort();
     }
@@ -2219,6 +2362,99 @@ mod tests {
         server.abort();
     }
 
+    /// One session asks a mount's `/nests` once, however many 404s it meets; a root's, or one behind a
+    /// failing proxy, every time.
+    #[tokio::test]
+    async fn a_session_asks_whether_it_is_at_a_root_once() {
+        use axum::{extract::State, http::Uri, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        for (root, status) in [(false, 404), (true, 404), (false, 503), (false, 403)] {
+            let asked = Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .fallback(
+                    |State((asked, root, status)): State<(Arc<AtomicUsize>, bool, u16)>,
+                     uri: Uri| async move {
+                        use axum::response::IntoResponse;
+                        if uri.path() == "/nests" {
+                            asked.fetch_add(1, Ordering::SeqCst);
+                            if root {
+                                return r#"{"runtime":"r","nests":[{"name":"usdc"}]}"#
+                                    .into_response();
+                            }
+                            let status = axum::http::StatusCode::from_u16(status).unwrap();
+                            return (status, "unavailable").into_response();
+                        }
+                        (
+                            axum::http::StatusCode::NOT_FOUND,
+                            r#"{"error":"not found"}"#,
+                        )
+                            .into_response()
+                    },
+                )
+                .with_state((asked.clone(), root, status));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::new();
+            let session = Session::new(&client, &base);
+            for _ in 0..3 {
+                let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "entity", "arguments": { "id": "x" } } });
+                let out = respond(&req, &session, None).await.unwrap();
+                let text = tool_text(&out);
+                assert_eq!(text.contains(&format!("{base}/usdc")), root, "{text}");
+            }
+            let once = !root && status == 404;
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                if once { 1 } else { 3 },
+                "{root} {status}"
+            );
+            server.abort();
+        }
+    }
+
+    /// A root with nothing mounted yet is still a root: the mount added later is named.
+    #[tokio::test]
+    async fn an_empty_root_names_a_mount_added_mid_session() {
+        use axum::{extract::State, http::Uri, response::IntoResponse, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mounted = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .fallback(
+                |State(mounted): State<Arc<AtomicBool>>, uri: Uri| async move {
+                    if uri.path() == "/nests" {
+                        return if mounted.load(Ordering::SeqCst) {
+                            r#"{"runtime":"r","nests":[{"name":"usdc"}]}"#
+                        } else {
+                            r#"{"runtime":"r","nests":[]}"#
+                        }
+                        .into_response();
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, "no such route").into_response()
+                },
+            )
+            .with_state(mounted.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let session = Session::new(&client, &base);
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "schema", "arguments": {} } });
+        let before = respond(&req, &session, None).await.unwrap();
+        let before = tool_text(&before);
+        assert!(!before.contains(&format!("{base}/usdc")), "{before}");
+        assert!(before.contains("nothing mounted yet"), "{before}");
+        mounted.store(true, Ordering::SeqCst);
+        let after = respond(&req, &session, None).await.unwrap();
+        let after = tool_text(&after);
+        assert!(after.contains(&format!("{base}/usdc")), "{after}");
+        server.abort();
+    }
+
     #[test]
     fn a_row_of_many_wide_cells_is_cut_to_the_budget() {
         let row: serde_json::Map<String, Value> = (0..200)
@@ -2285,7 +2521,7 @@ mod tests {
             async move {
                 let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                     "params": { "name": name, "arguments": args } });
-                let resp = handle(&req, &client, &base).await.unwrap();
+                let resp = handle(&req, &Session::new(&client, &base)).await.unwrap();
                 serde_json::from_str::<Value>(tool_text(&resp)).unwrap()
             }
         };
@@ -2363,8 +2599,7 @@ mod tests {
     async fn rpc(client: &reqwest::Client, base: &str, method: &str, params: Value) -> Value {
         handle(
             &json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }),
-            client,
-            base,
+            &Session::new(client, base),
         )
         .await
         .unwrap()

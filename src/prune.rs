@@ -168,7 +168,7 @@ fn referenced_segments(surviving: &[PathBuf]) -> Result<std::collections::HashSe
 
 /// Whether a running process holds this dataset's store, which redb locks exclusively. A placeholder
 /// or corrupt store is not held and answers false.
-fn store_is_held(dataset: &Path) -> bool {
+pub(crate) fn store_is_held(dataset: &Path) -> bool {
     let db = dataset.join(crate::config::DB_FILE);
     db.exists()
         && crate::store::Store::open_existing(&db).is_err_and(|e| {

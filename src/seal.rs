@@ -41,18 +41,31 @@ pub const SEGMENTS_DIR: &str = "segments";
 /// The **shared segment store** for the runtime `dir` belongs to, if it has one (RFC-0033 §11a).
 ///
 /// Derived by convention rather than plumbed: a mounted dataset lives at `<root>/data/<nid>`, so its
-/// runtime root is two levels up and the store is `<root>/segments`. A solo `nuthatch dev` nest is
-/// not under a `data/` parent, gets `None`, and keeps its segments where they have always been -
-/// sharing is a property of a runtime hosting several nests, not of a nest.
+/// runtime root is two levels up and the store is `<root>/segments`. It is a runtime's only where
+/// something says so, a NID for a directory name or a `mounts.toml` at the root: a solo nest that
+/// merely sits in a directory called `data` keeps its segments beside it, not beside its siblings.
 ///
 /// The alternative was threading a root through every seal and query call site, which would have made
 /// the layout a parameter of functions that have no business knowing about it.
 pub fn shared_store(dir: &Path) -> Option<PathBuf> {
+    let root = data_root(dir)?;
+    (crate::runtime::MountTable::is_identity_keyed(dir)
+        || root.join(crate::runtime::MOUNTS_FILE).is_file())
+    .then(|| root.join(SEGMENTS_DIR))
+}
+
+/// The store outside `dir` its segment files may be read from: a runtime's shared store, or where a
+/// solo nest under a `data/` directory sealed before 5.21, which its siblings may name too.
+fn outer_store(dir: &Path) -> Option<PathBuf> {
+    shared_store(dir).or_else(|| data_root(dir).map(|r| r.join(SEGMENTS_DIR)))
+}
+
+/// `<root>` for a `dir` at `<root>/data/<name>`.
+fn data_root(dir: &Path) -> Option<&Path> {
     let parent = dir.parent()?;
-    if parent.file_name()? != crate::runtime::DATA_DIR {
-        return None;
-    }
-    Some(parent.parent()?.join(SEGMENTS_DIR))
+    (parent.file_name()? == crate::runtime::DATA_DIR)
+        .then(|| parent.parent())
+        .flatten()
 }
 
 /// The directory a nest's new segments are written to: the shared store when there is one, else
@@ -66,14 +79,23 @@ pub fn segments_dir(dir: &Path) -> PathBuf {
 /// **Falls back to the per-dataset path when the shared copy is absent**, so a dataset migrated
 /// before slice C still reads. A missing shared segment is not evidence of corruption; it is evidence
 /// of a layout that has not been relocated yet.
+///
+/// A solo nest under a `data/` directory sealed into `<root>/segments` before 5.21, so a file it
+/// does not hold itself is still read from there; it seals into its own `segments/` from now on.
 pub fn segment_path(dir: &Path, file: &str, hash: &str) -> PathBuf {
-    if let Some(store) = shared_store(dir) {
-        let shared = store.join(format!("{hash}.parquet"));
-        if shared.exists() {
-            return shared;
-        }
+    let own = dir.join(SEGMENTS_DIR).join(file);
+    let other = match shared_store(dir) {
+        Some(store) => store.join(format!("{hash}.parquet")),
+        None => match data_root(dir) {
+            Some(root) if !own.exists() => root.join(SEGMENTS_DIR).join(format!("{hash}.parquet")),
+            _ => return own,
+        },
+    };
+    if other.exists() {
+        other
+    } else {
+        own
     }
-    dir.join(SEGMENTS_DIR).join(file)
 }
 pub const MANIFEST_FILE: &str = "manifest.json";
 
@@ -187,11 +209,20 @@ impl SegmentSink for FsSink<'_> {
             }
             None => self.dir.join(SEGMENTS_DIR).join(&s.file),
         };
-        replace_durable(&target, bytes)
+        replace_durable(&target, bytes)?;
+        unrefuse(&target);
+        record_restored(self.dir, &s.hash);
+        Ok(())
     }
 
     fn rows(&self, s: &Segment) -> Result<Vec<Value>> {
-        read_segment_rows(&segment_path(self.dir, &s.file, &s.hash))
+        let path = segment_path(self.dir, &s.file, &s.hash);
+        anyhow::ensure!(
+            !refused(&path),
+            "{} does not hash to its address and is refused",
+            path.display()
+        );
+        read_segment_rows(&path)
     }
 
     fn table_floor(&self) -> usize {
@@ -560,7 +591,10 @@ fn write_ledgers(r: &Retention) {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    // Unique per write: two writers of one ledger sharing a temp name would rename each other's half.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
 }
@@ -1274,10 +1308,9 @@ pub fn load_manifest(dir: &Path) -> Result<Manifest> {
 /// the check `verify_and_quarantine` makes at startup. Using the same one here is what stops the
 /// serving path and the startup path disagreeing about the same file, which was half of #419.
 ///
-/// **Reduce here, never quarantine.** Quarantine moves bytes, and the shared store's bytes belong to
-/// every dataset referencing them (RFC-0033 §11a). Dropping a segment from one query's view changes
-/// nothing on disk and so is safe for a shared segment, which is why this returns hashes rather than
-/// calling the startup pass.
+/// **Reduce here, never quarantine.** A query is a reader, possibly on a mount that does not own the
+/// dataset, and moving files is the integrity passes' job on the writer. Dropping a segment from one
+/// query's view changes nothing on disk, which is why this returns hashes rather than calling them.
 ///
 /// ## Cost, and the cache that is deliberately not here
 ///
@@ -1818,6 +1851,11 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     // again: both read its file, and the failed read stopped every later seal (#2172).
     let mut lost_tails = 0usize;
     let before = verified_record(dir);
+    let earlier = shared_store(dir)
+        .is_none()
+        .then(|| data_root(dir).map(|r| r.join(SEGMENTS_DIR)))
+        .flatten();
+    let mut read_from_earlier = 0usize;
     let mut verified = Verified {
         last_full: before.last_full,
         stamps: BTreeMap::new(),
@@ -1826,6 +1864,7 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     for (table, segs) in &mut manifest.tables {
         for s in segs.iter_mut() {
             let path = segment_path(dir, &s.file, &s.hash);
+            read_from_earlier += usize::from(earlier.as_ref().is_some_and(|e| path.starts_with(e)));
             let key = verified_key(&path, &s.hash);
             // Taken before the read, so a write landing during it moves the stamp past this one.
             let stamp = file_stamp(&path);
@@ -1844,17 +1883,22 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             }
             let reason = match read {
                 Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == s.hash => {
+                    unrefuse(&path);
                     if let Some(stamp) = stamp {
                         verified.stamps.insert(key, stamp);
                     }
                     continue;
                 }
-                Ok(_) => "hash mismatch (corrupt or tampered)",
+                Ok(_) => HASH_MISMATCH,
                 // Already gone from disk - nothing to move; `define_views` skips it. Not counted.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     if s.provisional {
                         s.provisional = false;
                         lost_tails += 1;
+                    }
+                    // A quarantine before this start is still a reduction, and `/ready` keeps saying so.
+                    if let Some(store) = quarantined_copy(dir, s) {
+                        record_quarantine(dir, store.as_deref(), table, s);
                     }
                     continue;
                 }
@@ -1875,6 +1919,15 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
             tracing::warn!("could not record the segments verified intact: {e:#}");
         }
     }
+    if let (Some(earlier), 1..) = (&earlier, read_from_earlier) {
+        tracing::warn!(
+            "{read_from_earlier} sealed segment(s) of {} are read from {}, where a nest under a `data` \
+             directory sealed before 5.21; new seals go to its own segments/. Leave them there: a \
+             sibling nest may read the same files",
+            dir.display(),
+            earlier.display()
+        );
+    }
     if quarantined > 0 {
         tracing::error!(
             "startup integrity: quarantined {quarantined} corrupt segment(s) - data is reduced, node \
@@ -1884,47 +1937,355 @@ pub fn verify_and_quarantine(dir: &Path) -> Result<usize> {
     Ok(quarantined)
 }
 
+const HASH_MISMATCH: &str = "hash mismatch (corrupt or tampered)";
+
 /// Move a segment that does not hash to its address into `quarantine/`, so `define_views` skips it.
 /// True when it was moved.
 fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason: &str) -> bool {
-    // **Never quarantine a shared segment** (RFC-0033 §11a). Quarantine *moves* the file, and in the
-    // shared store those bytes belong to every dataset referencing them - one nest's integrity pass
-    // must not yank data out from under its neighbours. A corrupt shared segment is reported loudly
-    // and left in place; the operator decides, with the knowledge that more than one dataset is
-    // affected.
-    if shared_store(dir).is_some_and(|st| path.starts_with(&st)) {
+    // A shared file is addressed by its hash, so bytes that do not hash to it are wrong for every
+    // dataset naming it, and moving it out of the store reduces them all at once. It goes beside the
+    // store, not into this dataset, which may be unmounted while another still names the hash.
+    let shared = outer_store(dir).filter(|st| path.starts_with(st));
+    // Only a read that completed proves the bytes wrong. An error may pass, and a shared file taken
+    // away on one reduces every dataset in the runtime.
+    if shared.is_some() && reason != HASH_MISMATCH {
         tracing::error!(
-            "shared segment {} for table {table} is {reason} - left in place because other \
-             datasets reference it. Remove it deliberately once you know what else breaks.",
+            "shared segment {} for table {table} is {reason}; left in place for the next pass",
             s.hash
         );
         return false;
     }
     // Sibling of `segments/`, deliberately *outside* it - nothing globs or SQL-reads the quarantine.
-    let quarantine = dir.join(QUARANTINE_DIR);
+    let (quarantine, dest_name, scope) = match &shared {
+        Some(store) => (
+            store.with_file_name(QUARANTINE_DIR),
+            format!("{}.parquet", s.hash),
+            "every dataset that names it",
+        ),
+        None => (dir.join(QUARANTINE_DIR), s.file.clone(), "this table"),
+    };
     std::fs::create_dir_all(&quarantine).ok();
-    let dest = quarantine.join(&s.file);
-    match std::fs::rename(path, &dest) {
+    let dest = keep_earlier(quarantine.join(dest_name));
+    // A rename cannot cross filesystems, as it must where `segments/` is a link onto another disk.
+    let rename = || {
+        #[cfg(test)]
+        if test_rename_fails().lock().unwrap().contains(path) {
+            return Err(std::io::ErrorKind::CrossesDevices.into());
+        }
+        std::fs::rename(path, &dest)
+    };
+    let moved = rename().or_else(|renaming| {
+        move_by_copy(path, &dest).map_err(|copying| format!("{renaming}; copying it: {copying}"))
+    });
+    match moved {
         Ok(()) => {
             tracing::error!(
-                "quarantined segment {} for table {table} ({reason}) → {} - cold data for this \
-                 table is reduced. Its rows left the hot store when it was sealed, so nuthatch \
+                "quarantined segment {} for table {table} ({reason}) → {} - cold data for {scope} \
+                 is reduced. Its rows left the hot store when it was sealed, so nuthatch \
                  cannot re-seal them: restore a copy hashing to {} at {}, or re-index the nest",
                 s.file,
                 dest.display(),
                 s.hash,
                 path.display()
             );
+            record_quarantine(dir, shared.as_deref(), table, s);
             true
         }
         Err(e) => {
+            refuse(path);
             tracing::error!(
-                "segment {} for {table} is {reason} but could not be quarantined: {e}",
-                s.file
+                "segment {} for {table} is {reason} but could not be quarantined ({e}): it is \
+                 refused in place, so cold data for {scope} is reduced until a copy hashing to {} \
+                 replaces it at {}",
+                s.file,
+                s.hash,
+                path.display()
             );
+            record_quarantine(dir, shared.as_deref(), table, s);
             false
         }
     }
+}
+
+/// [`std::fs::rename`] for two filesystems: a durable copy at `dest`, then the source removed.
+fn move_by_copy(from: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_copy_fails().lock().unwrap().contains(from) {
+        return Err(std::io::Error::other("copy refused by a test"));
+    }
+    let partial = dest.with_extension("parquet.partial");
+    let copied = std::fs::copy(from, &partial)
+        .and_then(|_| std::fs::File::open(&partial)?.sync_all())
+        .and_then(|()| std::fs::rename(&partial, dest))
+        .and_then(|()| fsync_dir(dest.parent().unwrap_or(Path::new("."))));
+    if copied.is_err() {
+        // `dest` is a fresh name, so whatever is there is this attempt's.
+        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(dest);
+    }
+    copied?;
+    std::fs::remove_file(from)?;
+    // Gone from where it is read either way; a crash before this sync can only bring it back,
+    // for the next pass to quarantine again.
+    if let Err(e) = fsync_dir(from.parent().unwrap_or(Path::new("."))) {
+        tracing::warn!("{}: the removal is not yet durable: {e}", from.display());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_rename_fails() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+#[cfg(test)]
+fn test_copy_fails() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+/// Segment files that failed their hash and could not be moved aside. Every reader skips them, and
+/// a pass that finds one intact again, or a seal that rewrites it, lets it back.
+fn refused_paths() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static S: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+    &S
+}
+
+fn refuse(path: &Path) {
+    refused_paths()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+fn unrefuse(path: &Path) {
+    let mut r = refused_paths().lock().unwrap_or_else(|e| e.into_inner());
+    if !r.is_empty() {
+        r.remove(path);
+    }
+}
+
+/// Whether `path` holds bytes an integrity pass found wrong and could not move out of the way.
+pub fn refused(path: &Path) -> bool {
+    let r = refused_paths().lock().unwrap_or_else(|e| e.into_inner());
+    !r.is_empty() && r.contains(path)
+}
+
+/// One segment this process quarantined.
+struct Quarantined {
+    dataset: PathBuf,
+    /// The shared store it was taken from, where every dataset naming its hash lost it too.
+    store: Option<PathBuf>,
+    table: String,
+    hash: String,
+    provisional: bool,
+    from_block: u64,
+    at: Instant,
+    /// A seal has since written the bytes its address names.
+    restored: bool,
+}
+
+/// What the start rebuilt derived state from: when, and through the last block each table then had
+/// catalogued.
+#[derive(Clone)]
+struct Rebuilt {
+    at: Instant,
+    through: HashMap<String, u64>,
+}
+
+#[derive(Default)]
+struct Findings {
+    quarantined: Vec<Quarantined>,
+    rebuilt: HashMap<PathBuf, Rebuilt>,
+}
+
+fn findings() -> &'static Mutex<Findings> {
+    static F: OnceLock<Mutex<Findings>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+fn record_quarantine(dir: &Path, store: Option<&Path>, table: &str, s: &Segment) {
+    findings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .quarantined
+        .push(Quarantined {
+            dataset: lease_key(dir),
+            store: store.map(lease_key),
+            table: table.to_string(),
+            hash: s.hash.clone(),
+            provisional: s.provisional,
+            from_block: s.from_block,
+            at: Instant::now(),
+            restored: false,
+        });
+}
+
+/// What a new process knows of `dir`: nothing but what is on disk.
+#[cfg(test)]
+pub(crate) fn forget_findings(dir: &Path) {
+    let key = lease_key(dir);
+    let mut f = findings().lock().unwrap();
+    f.quarantined.retain(|q| q.dataset != key);
+    f.rebuilt.remove(&key);
+}
+
+/// A seal wrote `hash`'s own bytes back: it no longer reduces anything, though state derived from the
+/// bad copy stays stale.
+fn record_restored(dir: &Path, hash: &str) {
+    // Only what this dataset or its store lost: another runtime may hold the same hash, still bad.
+    let me = lease_key(dir);
+    let store = outer_store(dir).map(|s| lease_key(&s));
+    let mut f = findings().lock().unwrap_or_else(|e| e.into_inner());
+    for q in f
+        .quarantined
+        .iter_mut()
+        .filter(|q| q.hash == hash && (q.dataset == me || (q.store.is_some() && q.store == store)))
+    {
+        q.restored = true;
+    }
+}
+
+/// The start is about to rebuild `dir`'s derived state (balances, exposure, velocity, entities) from
+/// its segments, after its integrity pass. A segment quarantined later leaves that state wrong.
+pub fn record_rebuild(dir: &Path) {
+    let through = shared_manifest(dir)
+        .map(|m| {
+            m.tables
+                .iter()
+                .filter_map(|(t, segs)| Some((t.clone(), segs.iter().map(|s| s.to_block).max()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    findings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .rebuilt
+        .insert(
+            lease_key(dir),
+            Rebuilt {
+                at: Instant::now(),
+                through,
+            },
+        );
+}
+
+/// What the integrity passes took from a dataset, for `/ready`, `/metrics` and the answers derived
+/// from it. A start derives it again from what `quarantine/` holds; a seal that restores a segment
+/// clears that segment, and only a restart clears stale derived state.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Integrity {
+    /// Tables whose cold data is reduced by a segment quarantined and not since restored.
+    pub reduced_tables: BTreeSet<String>,
+    pub quarantined_segments: usize,
+    /// Tables whose provisional tail was quarantined: every later seal fails reading it.
+    pub seals_stopped: BTreeSet<String>,
+    /// Derived state was rebuilt at start from a segment since quarantined.
+    pub derived_stale: bool,
+}
+
+impl Integrity {
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({
+            "quarantined_segments": self.quarantined_segments,
+            "reduced_tables": self.reduced_tables,
+            "seals_stopped": !self.seals_stopped.is_empty(),
+            "seals_stopped_tables": self.seals_stopped,
+            "derived_state_stale": self.derived_stale,
+        })
+    }
+}
+
+/// [`Integrity`] for `dir`, `None` while nothing it names has been quarantined.
+pub fn integrity(dir: &Path) -> Option<Integrity> {
+    let f = findings().lock().unwrap_or_else(|e| e.into_inner());
+    if f.quarantined.is_empty() {
+        return None;
+    }
+    let me = lease_key(dir);
+    let store = outer_store(dir).map(|s| lease_key(&s));
+    let rebuilt = f.rebuilt.get(&me);
+    let stale = |at: Instant, table: &str, from_block: u64| {
+        rebuilt.is_some_and(|r| at > r.at && r.through.get(table).is_some_and(|t| from_block <= *t))
+    };
+    let manifest = shared_manifest(dir).ok();
+    let mut out = Integrity::default();
+    let mut counted = BTreeSet::new();
+    for q in &f.quarantined {
+        let mine = q.dataset == me;
+        if !mine && (q.store.is_none() || q.store != store) {
+            continue;
+        }
+        // Another dataset's find reaches this one only through a hash its own catalogue names.
+        let named = manifest.as_ref().and_then(|m| {
+            m.tables.iter().find_map(|(t, segs)| {
+                segs.iter()
+                    .find(|s| s.hash == q.hash)
+                    .map(|s| (t.clone(), s.clone()))
+            })
+        });
+        let (table, provisional, from_block) = match (&named, mine) {
+            (Some((t, s)), _) => (t.clone(), s.provisional, s.from_block),
+            (None, true) => (q.table.clone(), q.provisional, q.from_block),
+            (None, false) => continue,
+        };
+        out.derived_stale |= stale(q.at, &table, from_block);
+        if q.restored || !counted.insert(q.hash.as_str()) {
+            continue;
+        }
+        out.quarantined_segments += 1;
+        if provisional {
+            out.seals_stopped.insert(table.clone());
+        }
+        out.reduced_tables.insert(table);
+    }
+    (out != Integrity::default()).then_some(out)
+}
+
+/// Where an earlier pass quarantined `s`: `Some(None)` in this dataset's own `quarantine/`,
+/// `Some(Some(store))` beside the store outside it, `None` when there is no copy.
+fn quarantined_copy(dir: &Path, s: &Segment) -> Option<Option<PathBuf>> {
+    let held = |in_dir: &Path, name: &str| {
+        let stem = name.strip_suffix(".parquet").unwrap_or(name);
+        std::fs::read_dir(in_dir).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n == name || (n.starts_with(&format!("{stem}.")) && n.ends_with(".parquet"))
+            })
+        })
+    };
+    if held(&dir.join(QUARANTINE_DIR), &s.file) {
+        return Some(None);
+    }
+    let store = outer_store(dir)?;
+    held(
+        &store.with_file_name(QUARANTINE_DIR),
+        &format!("{}.parquet", s.hash),
+    )
+    .then_some(Some(store))
+}
+
+/// Whether `s` is gone from where it is read because an integrity pass took it aside.
+pub fn is_quarantined(dir: &Path, s: &Segment) -> bool {
+    !segment_path(dir, &s.file, &s.hash).exists() && quarantined_copy(dir, s).is_some()
+}
+
+/// `dest`, or where it already holds an earlier quarantined copy, the same name stamped with now.
+fn keep_earlier(dest: PathBuf) -> PathBuf {
+    if !dest.exists() {
+        return dest;
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let stem = dest.file_stem().unwrap_or_default().to_string_lossy();
+    dest.with_file_name(format!(
+        "{stem}.{}.{:09}.parquet",
+        at.as_secs(),
+        at.subsec_nanos()
+    ))
 }
 
 /// Bytes a background pass reads per second, across every dataset in the process: one pass runs at a
@@ -1951,12 +2312,15 @@ pub fn verify_in_background(
     delay: Duration,
 ) -> std::thread::JoinHandle<()> {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    // Before the thread starts, so a publisher that asks straight after the start is heard.
+    let verifying = Verifying::register(&dir);
     std::thread::Builder::new()
         .name("segment-verify".into())
         .spawn(move || {
+            let _verifying = verifying;
             let mut wait = delay;
             loop {
-                if !sleep_while(wait, &alive) {
+                if !sleep_serving(wait, &alive, &dir) {
                     return;
                 }
                 let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -1979,17 +2343,112 @@ pub fn verify_in_background(
         .expect("spawning the segment verifier")
 }
 
-/// Sleep `d` in short steps, false as soon as `alive` stops holding.
-fn sleep_while(d: Duration, alive: &impl Fn() -> bool) -> bool {
+/// Segments a publisher in this process found wrong, waiting for the dataset's own verifier.
+type Requests = Mutex<HashMap<PathBuf, Vec<(String, Segment)>>>;
+
+fn requests() -> &'static Requests {
+    static R: OnceLock<Requests> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// A verifier running for a dataset, for as long as it is held.
+struct Verifying(PathBuf);
+
+impl Verifying {
+    fn register(dir: &Path) -> Verifying {
+        let key = lease_key(dir);
+        requests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone(), Vec::new());
+        Verifying(key)
+    }
+}
+
+impl Drop for Verifying {
+    fn drop(&mut self) {
+        requests()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Ask the writer in this process that verifies `dir` to hash `s` now and quarantine it if it does
+/// not match, rather than at its next full pass. False when no verifier for `dir` runs here.
+pub fn request_verify(dir: &Path, table: &str, s: &Segment) -> bool {
+    let mut r = requests().lock().unwrap_or_else(|e| e.into_inner());
+    match r.get_mut(&lease_key(dir)) {
+        Some(pending) => {
+            pending.push((table.to_string(), s.clone()));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Sleep `d` in short steps, answering [`request_verify`] for `dir` between them; false as soon as
+/// `alive` stops holding.
+fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
     let until = Instant::now() + d;
+    let key = lease_key(dir);
     while alive() {
+        serve_requests(dir, &key, alive);
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
         }
-        std::thread::sleep(left.min(Duration::from_secs(1)));
+        std::thread::sleep(left.min(Duration::from_millis(200)));
     }
     false
+}
+
+/// Answer what publishers have asked of `dir`'s verifier. Only a final segment the catalogue still
+/// names is checked: a provisional tail is the writer's own to rewrite, and an entry a fold replaced
+/// is not served any more.
+fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
+    let asked = requests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(key)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if asked.is_empty() {
+        return;
+    }
+    let Ok(manifest) = load_manifest(dir) else {
+        return;
+    };
+    for (table, s) in asked {
+        let current = manifest
+            .tables
+            .get(&table)
+            .and_then(|segs| segs.iter().find(|c| c.hash == s.hash && c.file == s.file));
+        if current.is_none_or(|c| c.provisional) {
+            continue;
+        }
+        let path = segment_path(dir, &s.file, &s.hash);
+        let mut throttle = Throttle::process();
+        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
+            if got != s.hash {
+                quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
+            }
+        }
+    }
+}
+
+/// [`serve_requests`] for every dataset with one waiting, keyed by its canonical path.
+fn serve_all_requests(alive: &impl Fn() -> bool) {
+    let waiting: Vec<PathBuf> = requests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, pending)| !pending.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in waiting {
+        serve_requests(&key, &key, alive);
+    }
 }
 
 /// One full pass. `None` when the nest went away part way; the next start runs a whole pass again.
@@ -1997,20 +2456,24 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
     let manifest = load_manifest(dir)?;
     let mut verified = Verified::default();
     let mut quarantined = 0;
-    let mut throttle = Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC);
+    let mut throttle = Throttle::process();
     for (table, segs) in &manifest.tables {
         for s in segs {
+            // A publisher waiting on this pass, or on another dataset's verifier queued behind it, is
+            // answered between segments rather than at its end.
+            serve_all_requests(alive);
             let path = segment_path(dir, &s.file, &s.hash);
             let stamp = file_stamp(&path);
             let reason = match hash_throttled(&path, &mut throttle, alive) {
                 Ok(None) => return Ok(None),
                 Ok(Some(hash)) if hash == s.hash => {
+                    unrefuse(&path);
                     if let Some(stamp) = stamp {
                         verified.stamps.insert(verified_key(&path, &s.hash), stamp);
                     }
                     continue;
                 }
-                Ok(Some(_)) => "hash mismatch (corrupt or tampered)",
+                Ok(Some(_)) => HASH_MISMATCH,
                 // Folded away or pruned since the catalogue was read, or already quarantined.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => "unreadable",
@@ -2033,11 +2496,26 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
     Ok(Some(quarantined))
 }
 
-/// Paces reads to a byte rate measured from its creation.
+/// Paces reads to a byte rate measured from its creation, or, for [`Throttle::process`], to
+/// [`BACKGROUND_VERIFY_BYTES_PER_SEC`] across every reader in the process.
 struct Throttle {
     started: Instant,
     bytes: u64,
     per_sec: u64,
+    shared: bool,
+}
+
+/// When the process-wide verify budget is next free.
+static VERIFY_BUDGET: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Reserve `n` bytes at `per_sec` on `budget`, after whatever is already reserved: when they are paid for.
+fn reserve(budget: &Mutex<Option<Instant>>, n: usize, per_sec: u64) -> Instant {
+    let cost = Duration::from_secs_f64(n as f64 / per_sec as f64);
+    let now = Instant::now();
+    let mut next = budget.lock().unwrap_or_else(|e| e.into_inner());
+    let end = next.filter(|t| *t > now).unwrap_or(now) + cost;
+    *next = Some(end);
+    end
 }
 
 impl Throttle {
@@ -2046,10 +2524,25 @@ impl Throttle {
             started: Instant::now(),
             bytes: 0,
             per_sec,
+            shared: false,
+        }
+    }
+
+    /// The budget every verify read in the process shares, so neither a pass nor a burst of
+    /// publisher requests can take more of the disk than it.
+    fn process() -> Self {
+        Throttle {
+            shared: true,
+            ..Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC)
         }
     }
 
     fn read(&mut self, n: usize) {
+        if self.shared {
+            let until = reserve(&VERIFY_BUDGET, n, self.per_sec);
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            return;
+        }
         self.bytes += n as u64;
         let due = Duration::from_secs_f64(self.bytes as f64 / self.per_sec as f64);
         let ahead = due.saturating_sub(self.started.elapsed());
@@ -2083,29 +2576,20 @@ fn hash_throttled(
     }
 }
 
-/// `Ok` when the file at `path` hashes to `expected`, for a caller about to hand the bytes on.
-pub fn check_segment_bytes(path: &Path, expected: &str) -> Result<()> {
-    let mut throttle = Throttle::new(u64::MAX);
-    let got = hash_throttled(path, &mut throttle, &|| true)
-        .with_context(|| format!("reading {}", path.display()))?
-        .expect("never interrupted");
-    anyhow::ensure!(
-        got == expected,
-        "{} does not hash to its address {expected} (it hashes to {got})",
-        path.display()
-    );
-    Ok(())
-}
-
-/// [`check_segment_bytes`] for a catalogued segment, quarantining it on a mismatch as the integrity
-/// passes do.
-pub fn check_or_quarantine(dir: &Path, table: &str, s: &Segment) -> Result<()> {
-    let path = segment_path(dir, &s.file, &s.hash);
-    let checked = check_segment_bytes(&path, &s.hash);
-    if checked.is_err() && path.exists() && !s.provisional {
-        quarantine_segment(dir, table, s, &path, "hash mismatch (corrupt or tampered)");
+/// Quarantine a catalogued segment a caller read whole, to hand on, and found not to hash to its
+/// address. A provisional tail is left for the next start to record as lost.
+pub fn quarantine_mismatched(dir: &Path, table: &str, s: &Segment) {
+    if s.provisional {
+        return;
     }
-    checked
+    let path = segment_path(dir, &s.file, &s.hash);
+    // Read again: a seal may have restored the right bytes since the caller's read.
+    let mut throttle = Throttle::new(u64::MAX);
+    if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, &|| true) {
+        if got != s.hash {
+            quarantine_segment(dir, table, s, &path, HASH_MISMATCH);
+        }
+    }
 }
 
 /// Beside the catalogue: when every segment was last hashed, and the stamp of each segment file a
@@ -2950,7 +3434,7 @@ mod retention_ledger {
 
     /// A mounted dataset `<root>/data/<nid>` with its shared store, followed by connection `conn`.
     fn followed_dataset(root: &Path, conn: u64) -> (PathBuf, PathBuf) {
-        let dir = root.join(crate::runtime::DATA_DIR).join("nid");
+        let dir = root.join(crate::runtime::DATA_DIR).join("3".repeat(64));
         let store = root.join(SEGMENTS_DIR);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(&store).unwrap();
@@ -3680,6 +4164,128 @@ mod tests {
         assert_eq!(hash, fresh_hash);
     }
 
+    /// Readers on one budget queue behind each other: eight threads reserving a second's worth each
+    /// are paid for over eight seconds, not one.
+    #[test]
+    fn verify_readers_share_one_budget() {
+        let budget = Mutex::new(None);
+        let start = Instant::now();
+        let ends: Vec<Instant> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| reserve(&budget, 1 << 20, 1 << 20)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let last = ends.iter().max().unwrap().duration_since(start);
+        assert!(last >= Duration::from_secs(8), "{last:?}");
+        assert!(last < Duration::from_secs(9), "{last:?}");
+    }
+
+    /// A publisher's request moves only a final segment the catalogue still names: a provisional tail
+    /// is the writer's to rewrite, and a request from an older snapshot is answered by the current one.
+    #[test]
+    fn a_verify_request_moves_only_a_final_segment_still_catalogued() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let tail = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        assert!(tail.provisional);
+        let tail_path = segment_path(dir.path(), &tail.file, &tail.hash);
+        let rot = |path: &Path| {
+            let mut bytes = std::fs::read(path).unwrap();
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0x01;
+            std::fs::write(path, &bytes).unwrap();
+        };
+        rot(&tail_path);
+        let mut stale = tail.clone();
+        stale.provisional = false;
+        stale.file = "usdc__transfer-gone.parquet".into();
+
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        verify_in_background(
+            dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        assert!(request_verify(dir.path(), "usdc__transfer", &tail));
+        assert!(request_verify(dir.path(), "usdc__transfer", &stale));
+        // Served in order, so by the time this one is taken the two before it were answered.
+        let final_dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(final_dir.path(), 0);
+        seal_range(final_dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(final_dir.path(), &seg.file, &seg.hash);
+        rot(&path);
+        let held = alive.clone();
+        verify_in_background(
+            final_dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        assert!(request_verify(final_dir.path(), "usdc__transfer", &seg));
+        let start = Instant::now();
+        while path.exists() && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The first verifier has had as long as the second, which answered.
+        std::thread::sleep(Duration::from_millis(500));
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !path.exists(),
+            "a final rotten segment was not quarantined on request"
+        );
+        assert!(
+            tail_path.exists(),
+            "a provisional tail was moved on a request"
+        );
+        assert!(!dir.path().join(QUARANTINE_DIR).exists());
+    }
+
+    #[test]
+    fn a_segment_quarantined_twice_keeps_both_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let good = std::fs::read(&path).unwrap();
+        for flip in [1u8, 2] {
+            let mut bad = good.clone();
+            let mid = bad.len() / 2;
+            bad[mid] ^= flip;
+            std::fs::write(&path, &bad).unwrap();
+            assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+            std::fs::write(&path, &good).unwrap();
+        }
+        let kept: BTreeSet<Vec<u8>> = std::fs::read_dir(dir.path().join(QUARANTINE_DIR))
+            .unwrap()
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(kept.len(), 2, "the second quarantine overwrote the first");
+    }
+
+    /// Writers of one ledger at once each install a whole file: none renames another's temp.
+    #[test]
+    fn concurrent_ledger_writes_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RETAINED_FILE);
+        let writers: Vec<_> = (0..8u8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        write_atomic(&path, &[i; 64]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().expect("a write failed");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() == 64 && bytes.iter().all(|b| *b == bytes[0]));
+    }
+
     #[test]
     fn verify_quarantines_a_corrupt_segment_and_leaves_intact_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -3943,7 +4549,10 @@ mod tests {
         // `shared_store` is derived by convention: a dataset at `<root>/data/<nid>` shares
         // `<root>/segments`. A solo nest is not under a `data/` parent and takes the other arm.
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let store = shared_store(&dir).expect("a dataset under data/ has a shared store");
         assert_eq!(store, root.path().join(SEGMENTS_DIR));
@@ -3981,13 +4590,329 @@ mod tests {
         assert_eq!(segment_path(&dir, &seg.file, &seg.hash), shared);
     }
 
+    /// Two datasets in one runtime name the same shared segment. Bytes that no longer hash to it are
+    /// wrong for both, so one dataset's pass takes them out of the store and the other's queries
+    /// answer reduced, never from the bad bytes.
+    #[test]
+    fn a_corrupt_shared_segment_is_quarantined_for_every_dataset_that_names_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (a, b) = (data.join("a".repeat(64)), data.join("b".repeat(64)));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("schema.json"),
+                r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+            )
+            .unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        }
+        let seg = load_manifest(&a).unwrap().tables["usdc__transfer"][0].clone();
+        assert_eq!(
+            load_manifest(&b).unwrap().tables["usdc__transfer"][0].hash,
+            seg.hash
+        );
+        let shared = segment_path(&a, &seg.file, &seg.hash);
+        assert!(shared.starts_with(root.path().join(SEGMENTS_DIR)));
+        // Rot that still decodes: another segment's valid bytes under this address.
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &shared).unwrap();
+        let values = |dir: &Path| {
+            let out = crate::analytics::query_guarded(
+                dir,
+                r#"SELECT value FROM "usdc__transfer""#,
+                Default::default(),
+            )
+            .unwrap();
+            let rows: Vec<String> = out
+                .rows
+                .iter()
+                .map(|r| r["value"].as_str().unwrap_or_default().to_string())
+                .collect();
+            (rows, out.degraded_tables)
+        };
+        assert_eq!(
+            values(&b).0,
+            ["999"],
+            "the fixture's bad bytes do not decode"
+        );
+
+        assert_eq!(verify_and_quarantine(&a).unwrap(), 1);
+        assert!(!shared.exists(), "the bad bytes are still in the store");
+        assert!(root
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(format!("{}.parquet", seg.hash))
+            .is_file());
+        let (rows, degraded) = values(&b);
+        assert!(
+            rows.is_empty(),
+            "the other dataset still reads them: {rows:?}"
+        );
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+
+        // The right bytes sealed again put the segment back, for both.
+        seal_range(&b, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert_eq!(values(&a).0, ["5"]);
+    }
+
+    /// A segment `dir` names, replaced by another segment's valid bytes: rot that still decodes.
+    fn decodable_rot(dir: &Path) -> (Segment, PathBuf) {
+        std::fs::write(
+            dir.join("schema.json"),
+            r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+        )
+        .unwrap();
+        seal_range(dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir, &seg.file, &seg.hash);
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &path).unwrap();
+        (seg, path)
+    }
+
+    fn values_and_degraded(dir: &Path) -> (Vec<String>, BTreeSet<String>) {
+        let out = crate::analytics::query_guarded(
+            dir,
+            r#"SELECT value FROM "usdc__transfer""#,
+            Default::default(),
+        )
+        .unwrap();
+        let rows = out
+            .rows
+            .iter()
+            .map(|r| r["value"].as_str().unwrap_or_default().to_string())
+            .collect();
+        (rows, out.degraded_tables)
+    }
+
+    /// A solo nest is not a runtime's for sitting in a directory called `data`: its segments stay in
+    /// it, and a sibling sealing the same rows holds its own copy.
+    #[test]
+    fn a_solo_nest_under_a_data_directory_keeps_its_segments_in_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (solo, sibling) = (data.join("solo"), data.join("sibling"));
+        for d in [&solo, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        }
+        assert!(shared_store(&solo).is_none());
+        assert!(
+            !root.path().join(SEGMENTS_DIR).exists(),
+            "sealed outside the nest"
+        );
+        let seg = load_manifest(&solo).unwrap().tables["usdc__transfer"][0].clone();
+        assert_eq!(
+            segment_path(&solo, &seg.file, &seg.hash),
+            solo.join(SEGMENTS_DIR).join(&seg.file)
+        );
+        std::fs::remove_dir_all(&sibling).unwrap();
+        assert_eq!(values_and_degraded(&solo).0, ["5"]);
+
+        // A runtime says so with its mounts file, whatever its datasets are called.
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join(crate::runtime::MOUNTS_FILE), "").unwrap();
+        let mounted = runtime.path().join(crate::runtime::DATA_DIR).join("usdc");
+        assert_eq!(
+            shared_store(&mounted),
+            Some(runtime.path().join(SEGMENTS_DIR))
+        );
+    }
+
+    /// A solo nest under `data/` that sealed before 5.21 wrote its files to `<root>/segments`. They are
+    /// still read from there, untouched, and what it seals next goes into the nest.
+    #[test]
+    fn a_solo_nest_sealed_in_the_earlier_layout_still_finds_its_segments() {
+        let root = tempfile::tempdir().unwrap();
+        let solo = root.path().join(crate::runtime::DATA_DIR).join("solo");
+        std::fs::create_dir_all(&solo).unwrap();
+        std::fs::write(
+            solo.join("schema.json"),
+            r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+        )
+        .unwrap();
+        test_set_table_floor(&solo, 0);
+        seal_range(&solo, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        // What 5.20 left: the file in the root's store, the catalogue in the nest.
+        let old = load_manifest(&solo).unwrap().tables["usdc__transfer"][0].clone();
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        let earlier = store.join(format!("{}.parquet", old.hash));
+        std::fs::rename(solo.join(SEGMENTS_DIR).join(&old.file), &earlier).unwrap();
+        let bytes = std::fs::read(&earlier).unwrap();
+
+        assert_eq!(verify_and_quarantine(&solo).unwrap(), 0);
+        assert_eq!(
+            values_and_degraded(&solo),
+            (vec!["5".to_string()], BTreeSet::new())
+        );
+
+        seal_range(&solo, &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let new = load_manifest(&solo).unwrap().tables["usdc__transfer"][1].clone();
+        assert!(solo.join(SEGMENTS_DIR).join(&new.file).is_file());
+        let mut values = values_and_degraded(&solo).0;
+        values.sort();
+        assert_eq!(values, ["5", "7"]);
+        assert_eq!(
+            std::fs::read(&earlier).unwrap(),
+            bytes,
+            "the earlier copy was touched"
+        );
+    }
+
+    /// Two solo nests that sealed the same rows before 5.21 name one file in `<root>/segments`. Bad
+    /// bytes there are taken out of the store for both, and the one that did not find them says so.
+    #[test]
+    fn a_corrupt_earlier_layout_file_is_quarantined_for_every_solo_nest_naming_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join(crate::runtime::DATA_DIR);
+        let (a, b) = (data.join("a"), data.join("b"));
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(
+                d.join("schema.json"),
+                r#"{"tables":[{"table":"usdc__transfer","columns":[{"name":"block_number","storage":"u64"},{"name":"value","storage":"varchar"}]}]}"#,
+            )
+            .unwrap();
+            seal_range(d, &[transfer(100, 0, "5")], 100, 100).unwrap();
+            let seg = load_manifest(d).unwrap().tables["usdc__transfer"][0].clone();
+            std::fs::rename(
+                d.join(SEGMENTS_DIR).join(&seg.file),
+                store.join(format!("{}.parquet", seg.hash)),
+            )
+            .unwrap();
+        }
+        let seg = load_manifest(&a).unwrap().tables["usdc__transfer"][0].clone();
+        let earlier = store.join(format!("{}.parquet", seg.hash));
+        assert_eq!(segment_path(&b, &seg.file, &seg.hash), earlier);
+        let other = tempfile::tempdir().unwrap();
+        seal_range(other.path(), &[transfer(100, 0, "999")], 100, 100).unwrap();
+        let o = load_manifest(other.path()).unwrap().tables["usdc__transfer"][0].clone();
+        std::fs::copy(segment_path(other.path(), &o.file, &o.hash), &earlier).unwrap();
+
+        assert_eq!(verify_and_quarantine(&a).unwrap(), 1);
+        assert!(root
+            .path()
+            .join(QUARANTINE_DIR)
+            .join(format!("{}.parquet", seg.hash))
+            .is_file());
+        let (rows, degraded) = values_and_degraded(&b);
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+        assert_eq!(
+            integrity(&b).map(|i| i.quarantined_segments),
+            Some(1),
+            "the sibling is not told"
+        );
+    }
+
+    #[test]
+    fn a_quarantine_that_cannot_rename_across_filesystems_copies_the_segment_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seg, path) = decodable_rot(dir.path());
+        let bad = std::fs::read(&path).unwrap();
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 1);
+        assert!(!path.exists(), "the corrupt segment is still served");
+        assert_eq!(
+            std::fs::read(dir.path().join(QUARANTINE_DIR).join(&seg.file)).unwrap(),
+            bad
+        );
+        let (rows, degraded) = values_and_degraded(dir.path());
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+    }
+
+    /// The copy aside is durable before the original goes: a quarantine directory that will not
+    /// sync keeps the original, refused, and leaves no copy that might not survive a crash.
+    #[test]
+    fn a_cross_device_quarantine_syncs_the_quarantine_directory_before_removing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (seg, path) = decodable_rot(dir.path());
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                FAIL_DIR_SYNC.with(|fail| fail.set(false));
+            }
+        }
+        let _clear = Clear;
+        FAIL_DIR_SYNC.with(|fail| fail.set(true));
+        assert!(!quarantine_segment(
+            dir.path(),
+            "usdc__transfer",
+            &seg,
+            &path,
+            HASH_MISMATCH
+        ));
+        FAIL_DIR_SYNC.with(|fail| fail.set(false));
+        assert!(path.exists(), "removed before its copy was durable");
+        assert!(refused(&path));
+        assert!(!dir.path().join(QUARANTINE_DIR).join(&seg.file).exists());
+    }
+
+    #[test]
+    fn a_segment_that_cannot_be_moved_at_all_is_refused_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, path) = decodable_rot(dir.path());
+        assert_eq!(values_and_degraded(dir.path()).0, ["999"]);
+        test_rename_fails().lock().unwrap().insert(path.clone());
+        test_copy_fails().lock().unwrap().insert(path.clone());
+        assert_eq!(verify_and_quarantine(dir.path()).unwrap(), 0);
+        assert!(path.exists());
+
+        let (rows, degraded) = values_and_degraded(dir.path());
+        assert!(rows.is_empty(), "the refused bytes were served: {rows:?}");
+        assert_eq!(degraded, BTreeSet::from(["usdc__transfer".to_string()]));
+        let found = integrity(dir.path()).expect("the refusal is reported");
+        assert_eq!(found.quarantined_segments, 1);
+
+        // The right rows sealed again overwrite the bad file, and it is served again.
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        assert!(!refused(&path));
+        assert_eq!(values_and_degraded(dir.path()).0, ["5"]);
+    }
+
+    /// A read that fails proves nothing about the bytes, so a shared file stays for the next pass.
+    #[test]
+    fn a_shared_segment_that_will_not_read_is_left_for_the_next_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("c".repeat(64));
+        std::fs::create_dir_all(&dir).unwrap();
+        seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(&dir).unwrap().tables["usdc__transfer"][0].clone();
+        let shared = segment_path(&dir, &seg.file, &seg.hash);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&shared).is_ok() {
+            return; // Running as root: nothing is unreadable.
+        }
+        assert_eq!(verify_and_quarantine(&dir).unwrap(), 0);
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(shared.is_file(), "a readable-again segment was taken away");
+        assert!(!root.path().join(QUARANTINE_DIR).exists());
+    }
+
     /// The other half of the same guard: re-sealing identical rows must not disturb the stored copy.
     /// This is what the `!` buys, and it is worth pinning separately so a fix for the test above
     /// cannot simply drop the condition.
     #[test]
     fn re_sealing_identical_rows_leaves_the_shared_segment_alone() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         seal_range(&dir, &[transfer(100, 0, "5")], 100, 100).unwrap();
 
@@ -4058,7 +4983,10 @@ mod tests {
         assert_seal_durable(solo.path(), &trace, solo.path().join(SEGMENTS_DIR));
 
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let trace = capture_durable(|| {
             seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4066,7 +4994,10 @@ mod tests {
         let store = shared_store(&dir).unwrap();
         assert_seal_durable(&dir, &trace, store.clone());
 
-        let other = root.path().join(crate::runtime::DATA_DIR).join("nid1");
+        let other = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("1".repeat(64));
         std::fs::create_dir_all(&other).unwrap();
         let again = capture_durable(|| {
             seal_range(&other, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4511,7 +5442,10 @@ mod tests {
     #[test]
     fn a_re_seal_replaces_a_corrupt_shared_segment_before_it_returns() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         test_set_table_floor(&dir, 0);
         seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();
@@ -4543,7 +5477,7 @@ mod tests {
     fn a_second_dataset_replaces_a_corrupt_shared_segment_it_seals_again() {
         let root = tempfile::tempdir().unwrap();
         let data = root.path().join(crate::runtime::DATA_DIR);
-        let (a, b) = (data.join("nid0"), data.join("nid1"));
+        let (a, b) = (data.join("0".repeat(64)), data.join("1".repeat(64)));
         for dir in [&a, &b] {
             std::fs::create_dir_all(dir).unwrap();
             test_set_table_floor(dir, 0);
@@ -4946,7 +5880,10 @@ mod tests {
         // the new file and deletes nothing; the manifest stops referencing the old hash and
         // `nuthatch prune` reclaims it from that.
         let root = tempfile::tempdir().unwrap();
-        let nest = root.path().join(crate::runtime::DATA_DIR).join("nid-1");
+        let nest = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("2".repeat(64));
         std::fs::create_dir_all(&nest).unwrap();
         seal_range(&nest, &[transfer(10, 0, "1")], 10, 10).unwrap();
         let first = only(&load_manifest(&nest).unwrap(), "usdc__transfer");
@@ -5286,7 +6223,10 @@ mod tests {
     #[test]
     fn creating_the_shared_store_syncs_its_parent_before_the_manifest() {
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join(crate::runtime::DATA_DIR).join("nid0");
+        let dir = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("0".repeat(64));
         std::fs::create_dir_all(&dir).unwrap();
         let trace = capture_durable(|| {
             seal_range(&dir, &[transfer(10, 0, "1")], 10, 10).unwrap();

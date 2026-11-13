@@ -292,7 +292,7 @@ type Pool @entity {
 "#;
     let mapping = r#"
 export function handlePoolCreated(event: PoolCreated): void {
-  let pool = new Pool(event.transaction.hash.concatI32(event.logIndex.toI32()))
+  let pool = new Pool(event.transaction.hash.concatI32(event.block.number.toI32()))
   pool.plain = event.params.fee
   pool.save()
 }
@@ -317,6 +317,53 @@ export function handlePoolCreated(event: PoolCreated): void {
     );
     let readme = std::fs::read_to_string(nest.path().join("README.md")).unwrap();
     assert!(readme.contains("no `id` column"), "{readme}");
+}
+
+/// Both spellings of `graph init`'s id render it; anything that is not those bytes leaves the view id-less.
+#[cfg(feature = "graph")]
+#[test]
+fn the_concat_i32_log_index_id_is_rendered_and_near_misses_are_not() {
+    let schema = "type Pool @entity {\n  id: Bytes!\n  plain: BigInt!\n}\n";
+    let rendered = [
+        "event.transaction.hash.concatI32(event.logIndex.toI32())",
+        "event.transaction.hash.concatI32( event.logIndex.toI32() )",
+        "event.transaction.hash.concat(Bytes.fromI32(event.logIndex.toI32()))",
+    ];
+    let refused = [
+        "event.transaction.hash.concatI32(event.block.number.toI32())",
+        "event.transaction.hash.concatI32(event.logIndex.toI32()).toHexString()",
+        "event.transaction.hash.toHexString().concat(event.logIndex.toString())",
+        "event.transaction.hash.concat(event.params.pool)",
+        "event.params.pool.concatI32(event.logIndex.toI32())",
+    ];
+    for (id, want) in rendered
+        .iter()
+        .map(|e| (e, true))
+        .chain(refused.iter().map(|e| (e, false)))
+    {
+        let mapping = format!(
+            "export function handlePoolCreated(event: PoolCreated): void {{\n  let pool = new Pool({id})\n  pool.plain = event.params.fee\n  pool.save()\n}}\n"
+        );
+        let (_nest, result) = emitted_nest(schema, &mapping);
+        let view = result
+            .views
+            .iter()
+            .find(|v| v.entity == "Pool")
+            .expect("view");
+        assert_eq!(
+            view.exact_fields.contains(&"id".to_string()),
+            want,
+            "{id}:\n{}",
+            view.sql
+        );
+        if want {
+            assert!(
+                select_sql(&view.sql).contains("\"tx_hash\" || lpad(to_hex("),
+                "{id}:\n{}",
+                view.sql
+            );
+        }
+    }
 }
 
 /// #1947: from a deployment CID the subgraph directory holds a manifest, a schema and compiled WASM.

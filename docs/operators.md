@@ -362,7 +362,10 @@ the same `as_of`, `sealed_through` and `nid`.
   follower takes fresh snapshots as a full queue does. Meanwhile it answers the generation before
   the seal, whole, and `/<tenant>/<alias>/ready`'s `follower.mirror` says what it waits for and why
   the last attempt failed: the publisher has not uploaded it yet, or the bytes did not hash to the
-  name and were refused. It never names a segment it cannot read, and never answers short. The
+  name and were refused; before the first attempt answers, which file it is fetching. It stays ready,
+  since what it serves is whole, and `follower.holding_earlier_generation` gives the generation it
+  holds and `since_unixtime`; `nuthatch_follower_held_generation_seconds{dataset}` counts the same
+  for alerts. It never names a segment it cannot read, and never answers short. The
   publisher uploads after the writer's catalogue moves and the writer never waits for a follower,
   so a slow mirror shows as seal visibility lag on remote followers, which is reported apart from
   tip visibility, and never anywhere else.
@@ -1180,7 +1183,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 |---|---|
 | `GET /` | summary: nest identity, heights, table count |
 | `GET /health` | liveness. `200 "ok"` while the process serves |
-| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) or fails on every attempt for 15 minutes (`seal_faulted`) |
+| `GET /ready` | readiness. Per-nest: `503` if quarantined, the source stops answering, the cursor stops advancing (`wedged`), or the seal stops advancing (`tip_seal_stalled`, 3.6.1) or fails on every attempt for 15 minutes (`seal_faulted`), or a quarantined provisional tail has stopped it (`integrity.seals_stopped`) |
 | `GET /metrics` | Prometheus text exposition |
 | `GET /tables`, `GET /table/{name}` | schema and recent rows, merged hot and cold; `"degraded": true` and the table in `degraded_tables`, as on `/sql`, when the sealed rows could not be read |
 | `GET /schema` | the full data model |
@@ -1329,7 +1332,15 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   One proxy no header can reveal: one that rewrites `Host` to a loopback address and adds no proxy
   header, as nginx's plain `proxy_pass http://127.0.0.1:PORT` does, is indistinguishable from a
   local process, so its callers can watch, unwatch and borrow the RPC. Configure such a proxy to
-  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`.
+  pass the client's `Host` (and give that name to `--public-host`) or to add `X-Forwarded-For`, or,
+  when you cannot be sure of the proxy, start the nest with `--write-token-env <VAR>`: the token in
+  that environment variable (at least 16 characters, such as `openssl rand -hex 32`) is then needed
+  as `Authorization: Bearer <token>` for watch, unwatch, the `proxy` module, tracing by hash and the
+  timestamp search, from this machine too, and reads need none. The token only adds a requirement: a
+  caller the rules above treat as remote stays remote with it. Without the flag nothing changes, so
+  rotki on the same machine needs no configuration; with it, rotki must send the token. The flag is
+  refused off a loopback bind, where those actions are refused to everyone, and on an event nest or
+  a runtime.
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
@@ -1735,6 +1746,7 @@ not reach the mirror; a rising count is a writer about to fence itself off).
 | **Queries out of memory** | `increase(nuthatch_sql_rejections_total{reason="out_of_memory"}[2m]) > 0` | a query did not fit the engine's memory budget; a release that regressed memory shows here first, as 4.1.1 would have |
 | **Logs not decoding** | `increase(nuthatch_nest_logs_undecoded_total[1h]) > 0` | a contract's ABI no longer fits what it emits, usually a proxy upgrade; the nest indexes less and stays ready. `/ready`'s `undecoded` names the pair, the warn line the error |
 | **Quarantine flapping** | `increase(nuthatch_nest_quarantine_total[1h]) > 3` | a retryable fault that never settles |
+| **Sealed data quarantined** | `nuthatch_quarantined_segments > 0` or `nuthatch_derived_state_stale == 1` | a segment failed its hash and the nest answers reduced; restore it, re-index, or restart to rebuild derived state |
 | **Mirror behind** | `nuthatch_publish_lag_blocks` growing across several intervals, or `nuthatch_publish_dead_letter == 1` | the bucket is unreachable or refusing an object, and consumers of the mirror see stale history |
 | **Sealed history disagrees** | `increase(nuthatch_audit_mismatches_total[1d]) > 0` | a second endpoint served different logs for a sealed range; one of the two providers is wrong (below) |
 | **Audit not running** | `increase(nuthatch_audit_ranges_total[6h]) == 0` for 2h (the series exists only where `--audit-rpc` is set; six hours assumes the default 24 samples a day) | the audit endpoint is unreachable or on the wrong chain; `nuthatch_audit_errors_total` and the log say which |
@@ -1834,6 +1846,20 @@ while sealing succeeds. Once it has lasted 15 minutes (or three poll intervals, 
 `seal_faulted` turns true and the nest answers `503`, whatever `seal_lag_blocks` says (#2262). Hot
 keeps every unsealed row meanwhile, so reads stay complete; the log line at each attempt is the same
 error.
+
+**What the integrity passes took is on `/ready`.** Once this process has quarantined a segment the
+nest names, `integrity` is `{"quarantined_segments", "reduced_tables", "seals_stopped",
+"seals_stopped_tables", "derived_state_stale"}`; it is absent until then. A start derives it again
+from what `quarantine/` holds, so a reduction stays reported across restarts until a seal writes the
+segment's bytes back, which clears it at once; `/metrics` carries the same as
+`nuthatch_quarantined_segments` and `nuthatch_derived_state_stale`. A
+quarantined provisional tail stops every later seal, so `seals_stopped` turns true, and once the cursor
+holds a block past the sealed watermark the nest answers `503`, without waiting for
+`tip_seal_stalled`; the next start records the tail as lost and sealing resumes. `derived_state_stale` means the start rebuilt balances, exposure, velocity and
+entities from a segment since quarantined: they stay as built, the nest stays ready, and until a
+restart rebuilds them from what remains, `/balances`, `/balance`, `/exposure`, `/flags` and
+`/derived` answers carry `"derived_state_stale": true`, and a `/sql` answer naming an entity lists it
+in `degraded_tables` (#2898, #2900).
 
 **A log that matches a declared event and does not decode is counted, not dropped unseen.** `undecoded`
 is `{"total", "top"}`, `top` the five largest `{"contract", "topic0", "logs"}` pairs since start, and
@@ -1983,11 +2009,27 @@ unchanged metadata is caught within one background pass of a start, and within 2
 pass after that. Until then a corrupted segment that still decodes can answer a query wrongly. The views
 and balances rebuilt at start read segments before that pass has verified them, where before 5.21
 rot that happened before a restart was caught before the rebuild; and nothing retracts derived state
-built from a segment that is later quarantined, so it stays wrong until the next restart. A shared segment is reported and
-left in place. A provisional tail found corrupt in the background stops later seals until the next
-start records it as lost. `nuthatch publish` hashes every segment before it uploads it, and refuses
-(and quarantines) one that does not match, so a corrupted segment is never mirrored. `nuthatch doctor
---catalogue` checks the same thing and only reports.
+built from a segment that is later quarantined, so it stays wrong until the next restart, and
+`/ready` and the answers drawn from it say so (`derived_state_stale`). A segment
+in a runtime's shared store (`<root>/segments/`) is moved to `<root>/quarantine/<hash>.parquet`: its
+bytes are wrong for every dataset that names that hash, so every mount of every such nest answers
+reduced from then on, and sealing the same rows again in any of them puts it back. A provisional
+tail found corrupt in the background stops later seals until the next start records it as lost, and
+`/ready` answers `503` with `integrity.seals_stopped` from that moment. Where the quarantine cannot be renamed
+into place, as across filesystems when `segments/` is a link onto another disk, the segment is copied
+there and removed; where it cannot be moved at all, it stays on disk refused, so no read uses it,
+until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it
+reads it for upload, once, and refuses one that does not match by name, exiting non-zero, so a
+corrupted segment is never mirrored. It quarantines the file itself only for a solo nest no running
+`dev` holds, and never a provisional tail; a shared segment, or one a running writer holds, is left
+for that writer's own pass. A publisher inside the writer's own process (`dev --publish-target`,
+or a runtime's `[mounts.publish]`) asks that writer to verify a final segment it refused. It is
+hashed within the same 64 MiB/s budget once the verifier is free: during a full pass, after the
+segment the pass is reading. Once a segment the mirror never held is quarantined, the next publish goes ahead with its
+entry still catalogued and no file behind it, and logs that it did: a follower then refuses a query
+that would read it rather than answer short, `nuthatch publish verify` names it, and
+`nuthatch seed` refuses, naming the segment and its blocks. `nuthatch doctor --catalogue` checks
+the same thing and only reports.
 
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is
 checkpointed and rows are keyed by `(block, log_index)`, so a restart resumes without gaps or
