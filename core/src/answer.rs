@@ -515,6 +515,8 @@ pub struct Ready {
     pub maintained: Option<Value>,
     /// Each webhook's delivered block, backlog and last error; absent where none is declared.
     pub webhooks: Option<Value>,
+    /// What the integrity passes took from the nest since it started; absent while nothing.
+    pub integrity: Option<Value>,
 }
 
 /// `/ready`: 503 while stalled.
@@ -592,6 +594,9 @@ pub fn ready(r: &Ready) -> Answer {
     }
     if let Some(webhooks) = &r.webhooks {
         body["webhooks"] = webhooks.clone();
+    }
+    if let Some(integrity) = &r.integrity {
+        body["integrity"] = integrity.clone();
     }
     Answer::json(if r.stalled { 503 } else { 200 }, &body)
 }

@@ -3431,6 +3431,7 @@ async fn build_nest(
         if let Err(e) = seal::verify_and_quarantine(&dir) {
             tracing::warn!("segment integrity check failed (continuing): {e:#}");
         }
+        seal::record_rebuild(&dir);
         let alive = Arc::downgrade(&store);
         seal::verify_in_background(
             dir.clone(),
@@ -9175,6 +9176,11 @@ fn visit_sealed_columns(
     use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ProjectionMask};
     for segment in segments {
         let path = crate::seal::segment_path(dir, &segment.file, &segment.hash);
+        anyhow::ensure!(
+            !crate::seal::refused(&path),
+            "sealed segment {} does not hash to its address and is refused",
+            path.display()
+        );
         let file = std::fs::File::open(&path)
             .with_context(|| format!("opening sealed segment {}", path.display()))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -12629,21 +12635,18 @@ template = "pool"
         assert!(advice.contains("`--backfill 300`"), "{advice}");
         assert!(!long_history_advice(5_000_000, 300, shared).contains("remove"));
 
-        // A solo nest kept under a directory named `data` has its segments outside its own
-        // directory, shared with its siblings: no deletion advice, and the shared directory is named.
+        // A solo nest kept under a directory named `data` holds its own segments, so the advice is
+        // the solo one; only a runtime's dataset shares a store.
         let root = tempfile::tempdir().unwrap();
         let solo_in_data = root.path().join("data").join("solo");
         std::fs::create_dir_all(&solo_in_data).unwrap();
         let note = ignored_backfill(Some(300), Some(10), 50, &solo_in_data).unwrap();
-        assert!(!note.contains("remove"), "{note}");
         assert!(
-            note.contains(&root.path().join("segments").display().to_string())
-                && note.contains("possibly shared"),
+            note.contains(&solo_in_data.join("segments").display().to_string()),
             "{note}"
         );
         let advice = long_history_advice(5_000_000, 300, &solo_in_data);
-        assert!(!advice.contains("remove"), "{advice}");
-        assert!(advice.contains("possibly shared"), "{advice}");
+        assert!(advice.contains("remove"), "{advice}");
     }
 
     #[test]

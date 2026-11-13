@@ -161,7 +161,9 @@ pub fn segment_stamps(dir: &Path, tables: Option<&std::collections::BTreeSet<Str
             let (len, mtime) = match std::fs::metadata(&path) {
                 // A file that is gone stamps as absent rather than being skipped: a quarantined
                 // segment is a change to the cold side, and the answer over it is different.
+                // One refused in place is as good as gone.
                 Err(_) => (u64::MAX, i64::MIN),
+                Ok(_) if crate::seal::refused(&path) => (u64::MAX, i64::MIN),
                 Ok(m) => (
                     m.len(),
                     m.modified()
