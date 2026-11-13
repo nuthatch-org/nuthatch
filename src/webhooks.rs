@@ -1513,6 +1513,57 @@ mod tests {
         }
     }
 
+    /// The stop-between-chunks property on the Postgres store, where the chunk and its cursor are
+    /// one transaction too. Needs `NUTHATCH_TEST_PG`; CI's scaled-mode job sets it.
+    #[cfg(feature = "postgres-store")]
+    #[test]
+    fn a_stop_between_chunks_queues_no_row_twice_on_postgres() {
+        let Ok(url) = std::env::var("NUTHATCH_TEST_PG") else {
+            assert!(
+                std::env::var("NUTHATCH_REQUIRE_PG").is_err(),
+                "NUTHATCH_REQUIRE_PG is set but NUTHATCH_TEST_PG is not"
+            );
+            return;
+        };
+        let mut want: Vec<(u64, u64)> = vec![(1, 0), (2, 0)];
+        want.extend((0..25).map(|i| (3, i)));
+        want.extend([(4, 0), (5, 0), (6, 0)]);
+        let rows: Vec<String> = want.iter().map(|(b, l)| transfer(*b, *l)).collect();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.batch_max = Some(4);
+        let webhooks = vec![w];
+        use crate::store::CoreHotStore as _;
+        let drain_pg = |store: &crate::pgstore::PgStore| {
+            let mut out = vec![];
+            for (seq, p) in store.outbox_pending(usize::MAX).unwrap() {
+                let v: serde_json::Value = serde_json::from_str(&p).unwrap();
+                for r in v["rows"].as_array().into_iter().flatten() {
+                    out.push((row_block(r).unwrap(), r["log_index"].as_u64().unwrap()));
+                }
+                store.outbox_remove(seq).unwrap();
+            }
+            out
+        };
+        for stop in 1..want.len().div_ceil(4) {
+            let dir = tempfile::tempdir().unwrap();
+            crate::seal::seal_range(dir.path(), &rows, 1, 6).unwrap();
+            let schema = format!("wh_stop_{}_{stop}", std::process::id());
+            let mut got = vec![];
+            {
+                let store = crate::pgstore::PgStore::connect(&url, &schema).unwrap();
+                init_cursors(&store, &webhooks, 0).unwrap();
+                STOP_AFTER_CHUNKS.with(|c| c.set(Some(stop)));
+                assert!(deliver_sealed(&store, dir.path(), &webhooks, 6).is_err());
+                STOP_AFTER_CHUNKS.with(|c| c.set(None));
+                got.extend(drain_pg(&store));
+            }
+            let store = crate::pgstore::PgStore::connect(&url, &schema).unwrap();
+            deliver_sealed(&store, dir.path(), &webhooks, 6).unwrap();
+            got.extend(drain_pg(&store));
+            assert_eq!(got, want, "stopped after chunk {stop}");
+        }
+    }
+
     /// Two nests may name a webhook alike: each keeps its own series under its mount, and an unmounted
     /// nest keeps none.
     #[test]
