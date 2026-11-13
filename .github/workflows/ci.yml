@@ -49,6 +49,8 @@ env:
   CARGO_TERM_COLOR: always
   # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
   CFLAGS: -std=gnu17
+  # The commands the jobs run live in yatr.toml. Bump deliberately.
+  YATR_VERSION: "1.2.0"
 
 jobs:
   # Two tiers, to fit a 20-job org on a single PR. `full` is false for a change only to docs/ (bar
@@ -211,10 +213,6 @@ jobs:
             exit 1
           fi
           echo "$notes present, $(wc -c < "$notes") bytes"
-      # A stale image tag in what an operator copies starts up perfectly well, so nothing else fails.
-      # A step here for the reason above: this job is a required check and a new one would not be.
-      - name: no stale version in what a reader copies and pastes
-        run: scripts/version-check.sh
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
@@ -234,6 +232,13 @@ jobs:
           # its prefix) and took ~45m instead of ~8m. PR-scoped saves only ever help a later push to
           # the same PR; their cost is evicting main's, which every PR restores from.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
+      # A stale image tag in what an operator copies starts up perfectly well, so nothing else fails.
+      # A step here for the reason above: this job is a required check and a new one would not be.
+      - name: no stale version in what a reader copies and pastes
+        run: yatr version-check
       # #733 moved the other feature sets onto their own runners. This job holds clippy + test for
       # the default feature set, plus the decode crate's own checks. Two compiles, one `target/`.
       #
@@ -253,22 +258,18 @@ jobs:
           sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
             /opt/hostedtoolcache >/dev/null 2>&1 &
       - name: fmt
-        run: cargo fmt --check
+        run: yatr fmt-check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
-      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
-      - name: build the parity comparison into the test archive
-        run: |
-          t=${CARGO_TARGET_DIR:-target}
-          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
-          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
+        run: yatr lint
       - uses: ./.github/actions/install-nextest
       # Built here, run by the `test-default` shards. Outside `target/`, so rust-cache never saves it.
-      - name: build the test archive
-        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/nextest-default.tar.zst"
+      # tests/parity_*.rs run scripts/lodestar-parity.sh, which needs the parity comparison the shards
+      # cannot build, so the task builds it into the archive first.
+      - name: build the parity comparison and the test archive
+        run: yatr archive-default
       # nextest does not run doctests. There are none today; this keeps the first one from going unrun.
       - name: doctests
-        run: cargo test --doc --locked
+        run: yatr doctest
       - name: upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -303,84 +304,55 @@ jobs:
       # So the job was already finishing at 94% before the decode steps existed, and a docs-only PR
       # is what tipped it. The variable is cache-restore size between runs, exactly as the paragraph
       # above says. Reclaiming 0.4 GB is worth doing and does not fix it.
-      - name: fmt (decode)
-        run: cargo fmt --check --manifest-path decode/Cargo.toml
-      - name: clippy (decode)
+      - name: fmt · clippy · test (decode)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo clippy --all-targets --manifest-path decode/Cargo.toml -- -D warnings
-      - name: test (decode)
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: cargo test --locked --manifest-path decode/Cargo.toml
+        run: yatr decode
       # RFC-0054 S2. The head-count receiver is its own crate, outside the workspace and the binary.
       - name: fmt · clippy · test (count receiver)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path count/receiver/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path count/receiver/Cargo.toml
+        run: yatr crate-count-receiver
       # The fixture chains the tests and measurement jobs run against, in their own crate.
       - name: fmt · clippy · test (fixture-rpc)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path tools/fixture-rpc/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path tools/fixture-rpc/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path tools/fixture-rpc/Cargo.toml
+        run: yatr crate-fixture-rpc
       # The comparison scripts/lodestar-parity.sh runs; tests/parity_*.rs drive it through the script.
       - name: fmt · clippy (lodestar-parity)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path tools/lodestar-parity/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings
+        run: yatr crate-lodestar-parity
       # RFC-0065 S2. The bytes sealing writes, in their own crate so a browser tab can seal to the
       # same address; `seal::tests::sealed_bytes_are_pinned` in the root crate holds the hashes.
       - name: fmt · clippy · test (seal)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path seal/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path seal/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path seal/Cargo.toml
+        run: yatr crate-seal
       # RFC-0066 S0. The nest identity from its files' bytes, so a tab gets the NID a node gives the
       # same nest; `blob::tests::the_identity_of_fixed_nests_is_pinned` in the root crate holds the hashes.
       - name: fmt · clippy · test (identity)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path identity/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path identity/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path identity/Cargo.toml
+        run: yatr crate-identity
       # RFC-0066 S0. The files `init` writes, as contents, so a tab scaffolds the nest a node would;
       # `project::tests::the_scaffold_writes_what_init_wrote` holds them to real `init` output.
       - name: fmt · clippy · test (scaffold)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path scaffold/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path scaffold/Cargo.toml
+        run: yatr crate-scaffold
       # RFC-0070 S1. The time-lapse spec, validator, plan and fold, with no engine, so a tab and a node
       # fold the same batches into the same frames. Not a dependency of the binary.
       - name: fmt · clippy · test (timelapse)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path timelapse/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path timelapse/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path timelapse/Cargo.toml
+        run: yatr crate-timelapse
       # The RFC-0016/RFC-0017 eval runners, outside the binary. Their tests run both self-tests,
       # which need no key, model or network (#1050, #1051).
       - name: fmt · clippy · test (eval runner)
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
-        run: |
-          cargo fmt --check --manifest-path eval/runner/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path eval/runner/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path eval/runner/Cargo.toml
+        run: yatr crate-eval-runner
       # RFC-0065: decode and seal must keep building for a tab. zstd-sys compiles C for the target,
       # which needs a clang with the WebAssembly backend; the runner's LLVM clang has one. Ubuntu's
       # clang also searches the host's /usr/include, which cannot build for wasm: unknown-unknown gets
@@ -398,11 +370,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_unknown_unknown="--sysroot=$RUNNER_TEMP/no-sysroot"
           export CFLAGS_wasm32_wasip2="--sysroot=/usr/share/wasi-sysroot"
-          for crate in decode seal identity scaffold timelapse; do
-            for target in wasm32-unknown-unknown wasm32-wasip2; do
-              cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"
-            done
-          done
+          yatr wasm-check
       # What was left when the longest step finished, or when it died. A job that can fail of
       # exhaustion has to report what it had, or the next failure is guessed at like the last two.
       - name: disk after the builds
@@ -460,6 +428,9 @@ jobs:
           cache-on-failure: true
           key: check-no-count
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: reclaim runner disk
         run: |
           df -h /
@@ -468,18 +439,13 @@ jobs:
       - name: delete the head count
         run: scripts/delete-count.sh
       - name: clippy (head count deleted)
-        run: cargo clippy --all-targets -- -D warnings
+        run: yatr lint
       - name: regenerate the skill reference without it
-        run: cargo run --locked -- skill-refs
-      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
-      - name: build the parity comparison into the test archive
-        run: |
-          t=${CARGO_TARGET_DIR:-target}
-          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
-          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
+        run: yatr skill-refs
       - uses: ./.github/actions/install-nextest
-      - name: build the test archive
-        run: cargo nextest archive --locked --archive-file "$RUNNER_TEMP/nextest-no-count.tar.zst"
+      # The parity comparison first, as in check-default.
+      - name: build the parity comparison and the test archive
+        run: yatr archive-no-count
       - name: upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -551,34 +517,32 @@ jobs:
           # The graph leg's entry, the closest existing build to this one.
           shared-key: graph-facade
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: reclaim runner disk
         run: |
           df -h /
           sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
             /opt/hostedtoolcache >/dev/null 2>&1 &
       - name: clippy (graph)
-        run: cargo clippy --locked --features graph --all-targets -- -D warnings
+        run: yatr clippy-graph
       - name: clippy (folds alone)
-        run: cargo clippy --locked --features folds --all-targets -- -D warnings
+        run: yatr clippy-folds
       - name: clippy (counter)
-        run: cargo clippy --locked --features counter --all-targets -- -D warnings
+        run: yatr clippy-counter
       - name: clippy (crash-points)
-        run: cargo clippy --locked --features crash-points --all-targets -- -D warnings
+        run: yatr clippy-crash-points
       - name: clippy (flight)
-        run: cargo clippy --locked --features flight --all-targets -- -D warnings
+        run: yatr clippy-flight
       - name: clippy (sync-server)
-        run: cargo clippy --locked --features sync-server --all-targets -- -D warnings
-      # tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; the shards have no cargo.
-      - name: build the parity comparison into the test archive
-        run: |
-          t=${CARGO_TARGET_DIR:-target}
-          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
-          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
+        run: yatr clippy-sync-server
       - uses: ./.github/actions/install-nextest
-      - name: build the test archive
-        run: cargo nextest archive --locked --features graph,counter,crash-points,flight,sync-server --archive-file "$RUNNER_TEMP/nextest-features.tar.zst"
+      # The parity comparison first, as in check-default.
+      - name: build the parity comparison and the test archive
+        run: yatr archive-features
       - name: doctests
-        run: cargo test --doc --locked --features graph,counter,crash-points,flight,sync-server
+        run: yatr doctest-features
       - name: upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -642,9 +606,11 @@ jobs:
           cache-on-failure: true
           workspaces: embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: native step test (embed)
-        working-directory: embed
-        run: cargo test --locked --release --lib --test native
+        run: yatr embed-native
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
   wasm-tab:
@@ -666,22 +632,18 @@ jobs:
             core
             embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: fmt · clippy · test (core)
-        run: |
-          cargo fmt --check --manifest-path core/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path core/Cargo.toml -- -D warnings
-          cargo test --locked --manifest-path core/Cargo.toml
-          cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index
+        run: yatr core
       # #2633: `plain/` is linted in wasm-plain; the root crate was linted nowhere and had drifted.
       - name: fmt · clippy (embed)
-        run: |
-          cargo fmt --check --manifest-path embed/Cargo.toml
-          cargo clippy --locked --all-targets --manifest-path embed/Cargo.toml -- -D warnings
+        run: yatr embed-lint
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm check (core)
-        working-directory: embed
-        run: cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core
+        run: yatr wasm-check-core
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: the tab module (embed)
@@ -696,10 +658,9 @@ jobs:
           # RFC-0077 S5: the event build `/play` serves, held to 5.5 MB brotli.
           node size.mjs pkg/nuthatch_embed_bg.wasm --max-brotli 5500000
       - name: Node step test (embed)
-        working-directory: embed
-        run: node --stack-trace-limit=60 run-node.mjs pkg
+        run: yatr embed-node
       - name: fixture-rpc
-        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+        run: yatr fixture-rpc
       # RFC-0075 S3: the tab's live cursor over `fetch`, held to the node's pinned segments and
       # balances for the recorded young contract (`e2e_tab_parity` holds the node to the same file).
       - name: live cursor in Node against the recording (embed)
@@ -763,19 +724,15 @@ jobs:
             embed/plain
             embed/tests/wasmtime-host
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: fmt · clippy · test (plain module, wasmtime host)
-        working-directory: embed
-        run: |
-          cargo fmt --check --manifest-path plain/Cargo.toml
-          cargo fmt --check --manifest-path tests/wasmtime-host/Cargo.toml
-          RUSTFLAGS='--cfg getrandom_backend="custom"' cargo clippy --locked --manifest-path plain/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
-          cargo clippy --locked --all-targets --manifest-path tests/wasmtime-host/Cargo.toml -- -D warnings
-          cargo test --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
-          cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
+        run: yatr plain
       - name: the plain module, its imports, and its pinned interface
         working-directory: embed
         # `shell: bash` for pipefail: the compile and the interface check are piped.
@@ -791,7 +748,7 @@ jobs:
           tests/wasmtime-host/target/release/wasmtime-host compile "$RUNNER_TEMP/plain.wasm" "$RUNNER_TEMP/plain.cwasm" | tee "$RUNNER_TEMP/compile.log"
           tests/wasmtime-host/target/release/wasmtime-host abi "$RUNNER_TEMP/plain.wasm" --cache "$RUNNER_TEMP/cwasm" | tail -1
       - name: fixture-rpc
-        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+        run: yatr fixture-rpc
       - name: browsers, pinned
         uses: ./.github/actions/test-browsers
       - name: the same module in Node, wasmtime and Chrome
@@ -914,12 +871,15 @@ jobs:
           cache-on-failure: true
           workspaces: embed
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: C toolchain for wasm32
         uses: ./.github/actions/wasm32-c-toolchain
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: fixture-rpc
-        run: cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml
+        run: yatr fixture-rpc
       - name: browsers, pinned
         uses: ./.github/actions/test-browsers
       - name: OPFS and the live cursor in headless Chrome (embed)
@@ -935,7 +895,7 @@ jobs:
             --file ../tests/fixtures/tab-parity/chain.json.gz &
           CHROMEDRIVER="$driver" WASM_BINDGEN_TEST_WEBDRIVER_JSON="$b/webdriver.json" \
           TAB_PARITY_RPC=http://127.0.0.1:8948/ \
-            cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture
+            yatr opfs-live
 
   # The parked RFC-0060 replays (network_contract and serve's network_* tests) run nightly in
   # network-contract.yml instead; this filter must stay the complement of that one.
@@ -975,9 +935,11 @@ jobs:
         with:
           go-version-file: tools/flight-client/go.mod
           cache-dependency-path: tools/flight-client/go.sum
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: build the ADBC client
-        working-directory: tools/flight-client
-        run: go build -o "$NUTHATCH_FLIGHT_GO_CLIENT" .
+        run: yatr flight-client
       - uses: ./.github/actions/nextest-shard
         with:
           archive: nextest-features
@@ -1023,6 +985,9 @@ jobs:
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       # Clippy runs **first**, deliberately. It compiles `--all-targets` under this feature, which is a
       # superset of what the test step needs, so running it first warms the shared cache and the test
       # step reuses it. In the other order both steps did a near-full build of datafusion and
@@ -1034,7 +999,7 @@ jobs:
       # The scaled backend must not rot behind its feature flag either - the default build never
       # compiles it, so no other job would notice it breaking.
       - name: clippy (postgres-store)
-        run: cargo clippy --features postgres-store --all-targets -- -D warnings
+        run: yatr clippy-postgres
       # `NUTHATCH_REQUIRE_PG` turns a missing URL into a failure. Without it a misconfigured service
       # container would make the suite skip and still report green, which is the failure mode this
       # job exists to prevent - a parity gate that quietly stops comparing is worse than none.
@@ -1042,20 +1007,11 @@ jobs:
         env:
           NUTHATCH_TEST_PG: postgres://nuthatch:nuthatch@127.0.0.1:5432/nuthatch
           NUTHATCH_REQUIRE_PG: "1"
-        run: |
-          # Every Postgres-backed suite, not just parity: the control plane and the reconcile loop
-          # have no coverage anywhere else, and a job named for one of three would let the other two
-          # rot behind the feature flag.
-          # The ordinary integration sources share `tests/it.rs` (#1429), so retain these six
-          # service-backed modules as explicit filters rather than recreating six linked binaries.
-          # Each invocation remains serial: they share one Postgres service and the coverage is
-          # deliberately about its real control-plane state, not a parallel imitation of it.
-          cargo test --locked --features postgres-store --test it pg_parity -- --test-threads=1
-          cargo test --locked --features postgres-store --test it control_plane -- --test-threads=1
-          cargo test --locked --features postgres-store --test it e2e_reconcile -- --test-threads=1
-          cargo test --locked --features postgres-store --test it control_api -- --test-threads=1
-          cargo test --locked --features postgres-store --test it secret_isolation -- --test-threads=1
-          cargo test --locked --features postgres-store --test it e2e_resolution -- --test-threads=1
+        # Every Postgres-backed suite, not just parity: the control plane and the reconcile loop
+        # have no coverage anywhere else, and a job named for one of three would let the other two
+        # rot behind the feature flag. The six service-backed modules of `tests/it.rs` (#1429), each
+        # serial against the one Postgres service: see the `pg-parity` task.
+        run: yatr pg-parity
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel
@@ -1098,6 +1054,9 @@ jobs:
           # deliberate: shared-key replaces key + job id, and check-default's key is both.
           shared-key: check-default-check-default
           save-if: false
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       # Open-source MinIO was archived and its images withdrawn in 2026 (#1492). versitygw (Apache-2.0)
       # enforces If-None-Match and If-Match, which the catalogue compare-and-swap depends on; Garage
       # and Zenko CloudServer were measured accepting violations with a 200. Pinned by digest. The
@@ -1126,7 +1085,7 @@ jobs:
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_MINIO_BUCKET"
           aws --endpoint-url "$AWS_ENDPOINT" s3 mb "s3://$NUTHATCH_REGISTRY_BUCKET"
       - name: publish, registry, seed and remote follower suites against a real S3 server
-        run: cargo test --locked --test it -- e2e_minio_publish e2e_minio_lease e2e_s3_registry e2e_s3_seed_mount e2e_remote_follower
+        run: yatr s3-suites
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel
@@ -1169,6 +1128,9 @@ jobs:
           # deliberate: shared-key replaces key + job id, and check-default's key is both.
           shared-key: check-default-check-default
           save-if: false
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       # Open-source MinIO was archived and its images withdrawn in 2026 (#1492). versitygw (Apache-2.0)
       # enforces If-None-Match and If-Match, which the catalogue compare-and-swap depends on; Garage
       # and Zenko CloudServer were measured accepting violations with a 200. Pinned by digest. The
@@ -1193,7 +1155,7 @@ jobs:
       - name: publish the drifted nest and record the local numbers
         env:
           NUTHATCH_TRINO_FIXTURE_OUT: ${{ runner.temp }}/trino-fixture.json
-        run: cargo test --locked --test it e2e_trino_contract -- --nocapture
+        run: yatr trino-fixture
       # File metastore, kept in the same bucket, so no Hive Metastore service is needed. Trino 483
       # spells the S3 switch `fs.s3.enabled`; `fs.native-s3.enabled` is its legacy name.
       - name: start Trino
@@ -1221,7 +1183,9 @@ jobs:
           docker logs trino || true
           exit 1
       - name: Trino over the prefix matches the local numbers
-        run: scripts/trino-contract.sh "$RUNNER_TEMP/trino-fixture.json"
+        env:
+          NUTHATCH_TRINO_FIXTURE_OUT: ${{ runner.temp }}/trino-fixture.json
+        run: yatr trino-contract
       - name: distinguish an expired timeout from a cancel or supersede
         if: always() && cancelled()
         uses: ./.github/actions/timeout-or-cancel
@@ -1274,6 +1238,9 @@ jobs:
           cache-on-failure: true
           key: fleet-postgres-store
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       # This job exists because of four bugs that 41 passing tests never touched, found the first time
       # the stack was actually brought up: a migration race (`CREATE … IF NOT EXISTS` is not atomic in
       # Postgres, and the control plane plus every worker migrate at startup), a control plane that
@@ -1288,7 +1255,7 @@ jobs:
         env:
           CARGO_PROFILE_RELEASE_LTO: "off"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
-        run: cargo build --release --locked --features postgres-store
+        run: yatr build-scaled
       - name: build the scaled image
         run: |
           mkdir -p .fleet && cp target/release/nuthatch .fleet/ && cp Dockerfile .fleet/
@@ -1446,14 +1413,15 @@ jobs:
           # checkout's succeeded in the same grace window.
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: build
-        run: cargo build --release --locked
+        run: yatr build
       # The chains the measurement jobs serve themselves (tools/fixture-rpc), shipped beside the
       # binary so no job needs a toolchain. Its own crate: `nuthatch` is not rebuilt.
       - name: build the fixture chains
-        run: |
-          cargo build --release --locked --target-dir target \
-            --manifest-path tools/fixture-rpc/Cargo.toml
+        run: yatr fixture-rpc-bin
       - name: upload binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -1475,6 +1443,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1501,7 +1472,7 @@ jobs:
           MAX_RSS_MB: "256"
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/footprint.sh
+          yatr footprint
       - name: measure peak RSS, a 16-way seal-direct backfill on one endpoint
         # A seal-direct backfill holds every window it has in flight, and `--concurrency` once
         # multiplied that: 16-way over one endpoint peaked at 1,026 MB against 244 MB sequential in a
@@ -1512,7 +1483,7 @@ jobs:
           FIXTURE_RPC: bin/fixture-rpc
           SEAL_DIRECT: "16"
           MAX_RSS_MB: "512"
-        run: bash .github/workflows/footprint.sh
+        run: yatr footprint
 
   rolling-upgrade:
     name: rolling upgrade (followers answer throughout)
@@ -1522,6 +1493,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1533,9 +1507,10 @@ jobs:
         env:
           FIXTURE_RPC: bin/fixture-rpc
           GH_TOKEN: ${{ github.token }}
+          NUTHATCH_BIN: bin/nuthatch
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash scripts/rolling-upgrade.sh bin/nuthatch
+          yatr rolling-upgrade
 
   failover:
     name: writer failover (two writers, one lease)
@@ -1545,6 +1520,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1555,9 +1533,10 @@ jobs:
         env:
           FIXTURE_RPC: bin/fixture-rpc
           FAILOVER_OUT: ${{ runner.temp }}/failover
+          NUTHATCH_BIN: bin/nuthatch
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash scripts/failover-gate.sh bin/nuthatch
+          yatr failover
       - name: upload the writers' logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1573,6 +1552,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1639,7 +1621,7 @@ jobs:
           OUT: point-read-report.json
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/point-read.sh
+          yatr point-read
       - name: upload report
         # Always: a run that failed the gate is the report you most want to read.
         if: always()
@@ -1658,6 +1640,9 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1675,7 +1660,7 @@ jobs:
           COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/backfill-throughput.sh
+          yatr backfill-throughput
       - name: upload report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1697,9 +1682,9 @@ jobs:
         # thirty runs, so a failure is measured once more on a fresh server; the 20 ms sleep fails both.
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/tip-lag.sh || {
+          yatr tip-lag || {
             echo "::warning::tip lag over its ceiling; measuring once more on a fresh server"
-            PORT=8291 RPC_PORT=8549 bash .github/workflows/tip-lag.sh
+            PORT=8291 RPC_PORT=8549 yatr tip-lag
           }
       - name: upload tip lag report
         if: always()
@@ -1754,6 +1739,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1811,7 +1799,7 @@ jobs:
           REPORT: multinest-footprint.json
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/multinest-footprint.sh
+          yatr multinest-footprint
       - name: upload the report
         # The measurement is a CI artifact, per CLAUDE.md. It is also what re-baselining reads: the
         # ceilings above are one machine's numbers and want revisiting from the runner's own reports.
@@ -1831,6 +1819,9 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: download binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -1847,7 +1838,7 @@ jobs:
           REPORT: wideabi-footprint.json
         run: |
           chmod +x bin/nuthatch bin/fixture-rpc
-          bash .github/workflows/wideabi-footprint.sh
+          yatr wideabi-footprint
       - name: upload the report
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1892,6 +1883,9 @@ jobs:
           workspaces: fuzz -> target
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: install cargo-fuzz
         env:
           RUSTUP_TOOLCHAIN: nightly
@@ -1932,15 +1926,7 @@ jobs:
         # installed by dtolnay/rust-toolchain above.
         env:
           RUSTUP_TOOLCHAIN: nightly
-        run: |
-          for target in abi_json decode_log; do
-            echo "::group::$target"
-            cargo fuzz run "$target" -- -runs=300000 -max_total_time=180 -print_final_stats=1
-            echo "::endgroup::"
-          done
-          echo "::group::abi_arbitrary"
-          cargo fuzz run abi_arbitrary -- -runs=300000 -max_total_time=60 -print_final_stats=1
-          echo "::endgroup::"
+        run: yatr fuzz-decode
 
   fuzz-sql:
     name: fuzz smoke (SQL confinement)
@@ -1963,21 +1949,16 @@ jobs:
           workspaces: fuzz/sql -> target
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: fuzz /sql confinement
-        run: |
-          cargo fuzz run --fuzz-dir fuzz/sql -s none -O sql_confinement -- \
-            -runs=200000 -max_total_time=300 -print_final_stats=1
+        run: yatr fuzz-sql
       # #2743: the engine crate's parsers that take a gateway's bytes, on the build above.
       - name: fuzz IPFS CAR and subgraph manifest parsing
-        run: |
-          for target in cid_car subgraph_manifest; do
-            echo "::group::$target"
-            cargo fuzz run --fuzz-dir fuzz/sql -s none -O "$target" -- \
-              -runs=300000 -max_total_time=120 -print_final_stats=1
-            echo "::endgroup::"
-          done
+        run: yatr fuzz-sql-parsers
 
   fuzz-embed:
     name: fuzz smoke (engine input)
@@ -1995,12 +1976,10 @@ jobs:
           workspaces: fuzz/embed -> target
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }} # #1396, see check-default
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: fuzz header chains and attach
-        run: |
-          cargo fuzz build --fuzz-dir fuzz/embed -s none -O
-          for target in header_chain attach_ipc; do
-            cargo fuzz run --fuzz-dir fuzz/embed -s none -O "$target" -- \
-              -runs=300000 -max_total_time=120 -print_final_stats=1
-          done
+        run: yatr fuzz-embed

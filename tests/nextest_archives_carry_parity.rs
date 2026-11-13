@@ -1,8 +1,43 @@
 //! `.config/nextest.toml` makes `target/parity-bin` a required extra path of every nextest archive,
 //! so a workflow that archives without building it first fails at the archive step. The nightly
-//! network replays did exactly that for a day after 4d16a9db (#2635); this holds every workflow to it.
+//! network replays did exactly that for a day after 4d16a9db (#2635); this holds every workflow, and
+//! every yatr task ci.yml archives through, to it.
 
 use std::path::Path;
+
+/// The yatr tasks that run `cargo nextest archive`, and those of them that do not depend on
+/// `parity-bin`.
+fn unbuilt_task_archives(config: &str) -> (usize, Vec<String>) {
+    let config: toml::Table = config.parse().expect("yatr.toml parses");
+    let tasks = config
+        .get("tasks")
+        .and_then(|t| t.as_table())
+        .expect("yatr.toml has [tasks]");
+    let strings = |task: &toml::Value, key: &str| -> Vec<String> {
+        task.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (mut archives, mut unbuilt) = (0, Vec::new());
+    for (name, task) in tasks {
+        if !strings(task, "run")
+            .iter()
+            .any(|c| c.contains("cargo nextest archive"))
+        {
+            continue;
+        }
+        archives += 1;
+        if !strings(task, "depends").iter().any(|d| d == "parity-bin") {
+            unbuilt.push(name.clone());
+        }
+    }
+    (archives, unbuilt)
+}
 
 /// The archives in `workflow` whose own job did not build `target/parity-bin` before them, by line.
 fn unbuilt_archives(workflow: &str) -> (usize, Vec<usize>) {
@@ -57,10 +92,37 @@ fn every_workflow_that_archives_tests_builds_the_parity_comparison_first() {
             path.display()
         );
     }
+    let yatr = std::fs::read_to_string(root.join("yatr.toml")).unwrap();
+    let parity_bin = yatr.split("[tasks.parity-bin]").nth(1).unwrap_or("");
+    assert!(
+        parity_bin.contains("parity-bin/") && parity_bin.contains("cp "),
+        "yatr.toml's parity-bin task no longer copies the comparison into target/parity-bin"
+    );
+    let (archives, unbuilt) = unbuilt_task_archives(&yatr);
+    checked += archives;
+    assert!(
+        unbuilt.is_empty(),
+        "yatr.toml tasks {unbuilt:?} run `cargo nextest archive` without depending on parity-bin, \
+         which .config/nextest.toml requires: the archive step will fail"
+    );
     assert!(
         checked >= 2,
-        "expected the ci.yml and network-contract.yml archives, saw {checked}"
+        "expected the ci.yml (through yatr.toml) and network-contract.yml archives, saw {checked}"
     );
+}
+
+#[test]
+fn an_archive_task_must_depend_on_the_parity_build() {
+    let config = r#"
+[tasks.parity-bin]
+run = ["cp x target/parity-bin/"]
+[tasks.good]
+depends = ["parity-bin"]
+run = ["cargo nextest archive --archive-file a.tar.zst"]
+[tasks.bad]
+run = ["cargo nextest archive --archive-file b.tar.zst"]
+"#;
+    assert_eq!(unbuilt_task_archives(config), (2, vec!["bad".to_string()]));
 }
 
 #[test]

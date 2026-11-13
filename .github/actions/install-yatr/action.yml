@@ -1,0 +1,34 @@
+name: Install yatr
+description: >
+  Put yatr on PATH, from the cache when there is one. The CI commands live in yatr.toml, so a job
+  that runs `yatr <task>` uses this first.
+
+inputs:
+  version:
+    description: The yatr release to install; the workflow's YATR_VERSION.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # ImageOS in the key: a binary built on ubuntu-24.04 needs a newer glibc than the fleet job's 22.04.
+    - id: image
+      shell: bash
+      run: echo "os=${ImageOS:-unknown}" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cargo/bin/yatr
+        key: yatr-${{ runner.os }}-${{ steps.image.outputs.os }}-${{ inputs.version }}
+    - name: build yatr on a cache miss
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      # Outside the checkout so rust-toolchain.toml does not pick the toolchain, and not this
+      # workspace's RUSTFLAGS: yatr is another crate.
+      working-directory: ${{ runner.temp }}
+      env:
+        RUSTFLAGS: ""
+        VERSION: ${{ inputs.version }}
+      run: cargo install yatr --version "$VERSION" --locked
+    - shell: bash
+      run: yatr --version

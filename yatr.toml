@@ -5,15 +5,18 @@
 # `check`: `yatr check` is a builtin that validates this file, and it shadows
 # any task of that name without warning.
 
-# `yatr ci` runs what the required `fmt · clippy · test` check runs on its default leg (fmt, clippy
-# and test for the root crate, decode/ and the other path crates), the optional-features leg, and
-# cargo-deny.
+# .github/workflows/ci.yml runs its commands through these tasks, so a command changed here changes
+# the gate. `yatr ci` runs what the required `fmt · clippy · test` check runs on its default leg
+# (fmt, clippy and test for the root crate, decode/ and the other path crates), the optional-features
+# leg, and cargo-deny.
 #
 # It leaves these to CI, because they need Docker, a Postgres or S3 server, a Linux runner, a long
 # soak or the nightly toolchain, and a local `yatr ci` would either skip them or lie about them:
 #   the head-count-deleted leg (it deletes files), the wasm checks, pg-parity, minio-publish,
 #   trino-contract, fleet (compose), footprint and RAM budget, point-read latency, build release,
 #   fuzz smoke (`yatr fuzz-smoke` runs it by hand).
+# Their tasks are below, for CI to call; the measurement and service-backed ones read what CI's
+# step sets in the environment, so they are `no_cache`.
 # `scripts/verify.sh` is a runbook for a running nest or fleet, not part of this gate.
 
 [env]
@@ -29,8 +32,8 @@ run = ["cargo fmt --all"]
 no_cache = true
 
 [tasks.fmt-check]
-desc = "Fail if the tree is unformatted"
-run = ["cargo fmt --all -- --check"]
+desc = "Fail if the root crate is unformatted (the path crates are checked by their own tasks)"
+run = ["cargo fmt --check"]
 sources = ["**/*.rs"]
 
 [tasks.lint]
@@ -40,10 +43,60 @@ sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src
 
 [tasks.test]
 desc = "Run the test suite (needs cargo-nextest, as CI does)"
-run = ["cargo nextest run --locked", "cargo test --doc --locked"]
+depends = ["doctest"]
+run = ["cargo nextest run --locked"]
 # Tests read fixtures, docs, scripts and .github/ from across the tree.
 sources = ["**/*"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
+
+[tasks.doctest]
+desc = "Doctests, which nextest does not run"
+run = ["cargo test --doc --locked"]
+sources = ["**/*"]
+
+[tasks.version-check]
+desc = "No stale version in what a reader copies and pastes"
+run = ["scripts/version-check.sh"]
+sources = ["**/*"]
+
+# tests/parity_*.rs run scripts/lodestar-parity.sh, which runs this; .config/nextest.toml refuses
+# an archive without it, so every archive task depends on it.
+[tasks.parity-bin]
+desc = "Build the parity comparison into target/parity-bin"
+shell = true
+run = [
+  '''t=${CARGO_TARGET_DIR:-target} \
+  && cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity" \
+  && mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"''',
+]
+no_cache = true
+
+# The archives CI's shards run. CI writes them to $RUNNER_TEMP, outside target/.
+[tasks.archive-default]
+desc = "nextest archive of the default build"
+depends = ["parity-bin"]
+shell = true
+run = ['cargo nextest archive --locked --archive-file "${RUNNER_TEMP:-target}/nextest-default.tar.zst"']
+no_cache = true
+
+[tasks.archive-no-count]
+desc = "nextest archive with the head count deleted (run scripts/delete-count.sh first)"
+depends = ["parity-bin"]
+shell = true
+run = ['cargo nextest archive --locked --archive-file "${RUNNER_TEMP:-target}/nextest-no-count.tar.zst"']
+no_cache = true
+
+[tasks.archive-features]
+desc = "nextest archive with the optional features on"
+depends = ["parity-bin"]
+shell = true
+run = ['cargo nextest archive --locked --features graph,counter,crash-points,flight,sync-server --archive-file "${RUNNER_TEMP:-target}/nextest-features.tar.zst"']
+no_cache = true
+
+[tasks.skill-refs]
+desc = "Regenerate the skill's CLI reference from the binary"
+run = ["cargo run --locked -- skill-refs"]
+no_cache = true
 
 [tasks.decode]
 desc = "fmt, clippy and test for the decode crate (its own workspace, so the root cargo never runs its tests)"
@@ -52,67 +105,334 @@ run = [
   "cargo clippy --all-targets --manifest-path decode/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path decode/Cargo.toml",
 ]
-sources = ["decode/**/*.rs", "decode/Cargo.toml", "decode/Cargo.lock"]
+sources = ["decode/**/*.rs", "decode/Cargo.toml", "decode/Cargo.lock", "rust-toolchain.toml"]
 
+# The optional-features leg: each feature linted alone, the suite once with all of them.
 [tasks.features]
 desc = "The optional-features leg: clippy per feature, then the tests with all of them"
-run = [
-  "cargo clippy --locked --features graph --all-targets -- -D warnings",
-  "cargo clippy --locked --features folds --all-targets -- -D warnings",
-  "cargo clippy --locked --features counter --all-targets -- -D warnings",
-  "cargo clippy --locked --features crash-points --all-targets -- -D warnings",
-  "cargo clippy --locked --features flight --all-targets -- -D warnings",
-  "cargo clippy --locked --features sync-server --all-targets -- -D warnings",
-  "cargo nextest run --locked --features graph,counter,crash-points,flight,sync-server",
-  "cargo test --doc --locked --features graph,counter,crash-points,flight,sync-server",
+depends = [
+  "clippy-graph",
+  "clippy-folds",
+  "clippy-counter",
+  "clippy-crash-points",
+  "clippy-flight",
+  "clippy-sync-server",
+  "test-features",
 ]
+
+[tasks.clippy-graph]
+run = ["cargo clippy --locked --features graph --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.clippy-folds]
+run = ["cargo clippy --locked --features folds --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.clippy-counter]
+run = ["cargo clippy --locked --features counter --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.clippy-crash-points]
+run = ["cargo clippy --locked --features crash-points --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.clippy-flight]
+run = ["cargo clippy --locked --features flight --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.clippy-sync-server]
+run = ["cargo clippy --locked --features sync-server --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.test-features]
+desc = "The suite with every optional feature on"
+depends = ["doctest-features"]
+run = ["cargo nextest run --locked --features graph,counter,crash-points,flight,sync-server"]
+sources = ["**/*"]
+
+[tasks.doctest-features]
+run = ["cargo test --doc --locked --features graph,counter,crash-points,flight,sync-server"]
 sources = ["**/*"]
 
 [tasks.crates]
 desc = "fmt, clippy and test for the path crates CI checks beside decode"
+depends = [
+  "crate-count-receiver",
+  "crate-fixture-rpc",
+  "crate-lodestar-parity",
+  "crate-seal",
+  "crate-identity",
+  "crate-scaffold",
+  "crate-timelapse",
+  "crate-eval-runner",
+]
+
+[tasks.crate-count-receiver]
 run = [
   "cargo fmt --check --manifest-path count/receiver/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path count/receiver/Cargo.toml",
+]
+sources = ["count/receiver/**", "rust-toolchain.toml"]
+
+[tasks.crate-fixture-rpc]
+run = [
   "cargo fmt --check --manifest-path tools/fixture-rpc/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path tools/fixture-rpc/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path tools/fixture-rpc/Cargo.toml",
+]
+sources = ["tools/fixture-rpc/**", "rust-toolchain.toml"]
+
+[tasks.crate-lodestar-parity]
+run = [
   "cargo fmt --check --manifest-path tools/lodestar-parity/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings",
+]
+sources = ["tools/lodestar-parity/**", "rust-toolchain.toml"]
+
+[tasks.crate-seal]
+run = [
   "cargo fmt --check --manifest-path seal/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path seal/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path seal/Cargo.toml",
+]
+sources = ["seal/**", "rust-toolchain.toml"]
+
+[tasks.crate-identity]
+run = [
   "cargo fmt --check --manifest-path identity/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path identity/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path identity/Cargo.toml",
+]
+sources = ["identity/**", "rust-toolchain.toml"]
+
+[tasks.crate-scaffold]
+run = [
   "cargo fmt --check --manifest-path scaffold/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path scaffold/Cargo.toml",
+]
+sources = ["scaffold/**", "decode/**", "rust-toolchain.toml"]
+
+[tasks.crate-timelapse]
+run = [
   "cargo fmt --check --manifest-path timelapse/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path timelapse/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path timelapse/Cargo.toml",
+]
+sources = ["timelapse/**", "decode/**", "identity/**", "rust-toolchain.toml"]
+
+[tasks.crate-eval-runner]
+run = [
   "cargo fmt --check --manifest-path eval/runner/Cargo.toml",
   "cargo clippy --locked --all-targets --manifest-path eval/runner/Cargo.toml -- -D warnings",
   "cargo test --locked --manifest-path eval/runner/Cargo.toml",
 ]
-sources = ["count/receiver/**", "tools/fixture-rpc/**", "tools/lodestar-parity/**", "seal/**", "identity/**", "scaffold/**", "timelapse/**", "eval/runner/**", "decode/**", "core/**"]
+sources = ["eval/runner/**", "rust-toolchain.toml"]
+
+# CI sets CC_*, AR_* and CFLAGS_* for both targets before calling this.
+[tasks.wasm-check]
+desc = "decode, seal, identity, scaffold and timelapse still build for wasm32-unknown-unknown and wasm32-wasip2"
+shell = true
+run = [
+  '''set -e; for crate in decode seal identity scaffold timelapse; do \
+  for target in wasm32-unknown-unknown wasm32-wasip2; do \
+  cargo check --locked --manifest-path "$crate/Cargo.toml" --target "$target"; \
+  done; done''',
+]
+sources = ["decode/**", "seal/**", "identity/**", "scaffold/**", "timelapse/**", "rust-toolchain.toml"]
+env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown", "CC_wasm32_wasip2", "AR_wasm32_wasip2", "CFLAGS_wasm32_wasip2"]
+
+# nuthatch-core and embed/ (RFC-0075, RFC-0077). embed/ carries its own .cargo/config.toml, so the
+# tasks that CI runs from inside embed/ keep that cwd.
+[tasks.core]
+desc = "fmt, clippy and test for nuthatch-core"
+run = [
+  "cargo fmt --check --manifest-path core/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path core/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path core/Cargo.toml",
+  "cargo test --locked --manifest-path core/Cargo.toml --features checkpoint-hash-index",
+]
+sources = ["core/**", "decode/**", "seal/**", "scaffold/**", "rust-toolchain.toml"]
+
+[tasks.embed-lint]
+desc = "fmt and clippy for embed/"
+run = [
+  "cargo fmt --check --manifest-path embed/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path embed/Cargo.toml -- -D warnings",
+]
+sources = ["embed/**", "core/**", "decode/**", "seal/**", "identity/**", "scaffold/**", "rust-toolchain.toml"]
+
+[tasks.embed-native]
+desc = "The native step test of embed/, release"
+cwd = "embed"
+run = ["cargo test --locked --release --lib --test native"]
+sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "../scaffold/**", "../rust-toolchain.toml"]
+
+[tasks.wasm-check-core]
+desc = "nuthatch-core builds for wasm32 on embed/'s patched dbsp (needs the wasm32 C toolchain)"
+cwd = "embed"
+run = ["cargo check --locked --target wasm32-unknown-unknown -p nuthatch-core"]
+sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "../scaffold/**", "../rust-toolchain.toml"]
+env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown"]
+
+[tasks.plain]
+desc = "fmt, clippy and test for the plain module and the wasmtime host, and the host's release build"
+cwd = "embed"
+shell = true
+run = [
+  "cargo fmt --check --manifest-path plain/Cargo.toml",
+  "cargo fmt --check --manifest-path tests/wasmtime-host/Cargo.toml",
+  "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo clippy --locked --manifest-path plain/Cargo.toml --target wasm32-unknown-unknown -- -D warnings",
+  "cargo clippy --locked --all-targets --manifest-path tests/wasmtime-host/Cargo.toml -- -D warnings",
+  "cargo test --locked --release --manifest-path tests/wasmtime-host/Cargo.toml",
+  "cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml",
+]
+sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "../scaffold/**", "../rust-toolchain.toml"]
+outputs = ["tests/wasmtime-host/target/release/wasmtime-host"]
+env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown"]
+
+# The step test on the tab module CI builds into embed/pkg with build-tab.sh.
+[tasks.embed-node]
+desc = "The Node step test of the tab module in embed/pkg"
+cwd = "embed"
+run = ["node --stack-trace-limit=60 run-node.mjs pkg"]
+no_cache = true
+
+# CI starts the recorded chain and passes the browser through CHROMEDRIVER, WASM_BINDGEN_TEST_* and
+# TAB_PARITY_RPC.
+[tasks.opfs-live]
+desc = "OPFS and the live cursor in headless Chrome"
+cwd = "embed"
+run = ["cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture"]
+no_cache = true
+
+# Two builds of the same crate: the wasm jobs run it from its own target/, the measurement jobs from
+# the root one, beside the release binary.
+[tasks.fixture-rpc]
+desc = "The fixture chains, release, in tools/fixture-rpc/target"
+run = ["cargo build --locked --release --manifest-path tools/fixture-rpc/Cargo.toml"]
+sources = ["tools/fixture-rpc/**", "rust-toolchain.toml"]
+outputs = ["tools/fixture-rpc/target/release/fixture-rpc"]
+
+[tasks.fixture-rpc-bin]
+desc = "The fixture chains, release, in target/release beside nuthatch"
+run = ["cargo build --release --locked --target-dir target --manifest-path tools/fixture-rpc/Cargo.toml"]
+sources = ["tools/fixture-rpc/**", "rust-toolchain.toml"]
+outputs = ["target/release/fixture-rpc"]
+
+[tasks.flight-client]
+desc = "The ADBC Flight SQL client, to $NUTHATCH_FLIGHT_GO_CLIENT"
+cwd = "tools/flight-client"
+shell = true
+run = ['go build -o "$NUTHATCH_FLIGHT_GO_CLIENT" .']
+no_cache = true
+
+# Service-backed suites: CI provides the Postgres or S3 server and the variables that point at it.
+[tasks.clippy-postgres]
+desc = "Clippy for the scaled backend"
+run = ["cargo clippy --features postgres-store --all-targets -- -D warnings"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+[tasks.pg-parity]
+desc = "Every Postgres-backed suite, serially (needs NUTHATCH_TEST_PG)"
+run = [
+  "cargo test --locked --features postgres-store --test it pg_parity -- --test-threads=1",
+  "cargo test --locked --features postgres-store --test it control_plane -- --test-threads=1",
+  "cargo test --locked --features postgres-store --test it e2e_reconcile -- --test-threads=1",
+  "cargo test --locked --features postgres-store --test it control_api -- --test-threads=1",
+  "cargo test --locked --features postgres-store --test it secret_isolation -- --test-threads=1",
+  "cargo test --locked --features postgres-store --test it e2e_resolution -- --test-threads=1",
+]
+no_cache = true
+
+[tasks.s3-suites]
+desc = "Publish, registry, seed and remote follower suites against a real S3 server (needs NUTHATCH_MINIO_*)"
+run = ["cargo test --locked --test it -- e2e_minio_publish e2e_minio_lease e2e_s3_registry e2e_s3_seed_mount e2e_remote_follower"]
+no_cache = true
+
+[tasks.trino-fixture]
+desc = "Publish the drifted nest and record the local numbers to $NUTHATCH_TRINO_FIXTURE_OUT"
+run = ["cargo test --locked --test it e2e_trino_contract -- --nocapture"]
+no_cache = true
+
+[tasks.trino-contract]
+desc = "Trino over the published prefix matches $NUTHATCH_TRINO_FIXTURE_OUT"
+shell = true
+run = ['scripts/trino-contract.sh "$NUTHATCH_TRINO_FIXTURE_OUT"']
+no_cache = true
 
 [tasks.deny]
-desc = "cargo-deny: licences, bans, advisories, sources"
-run = ["cargo deny check"]
+desc = "cargo-deny: advisories, licences, bans, sources, for each manifest CI checks"
+run = [
+  "cargo deny check advisories licenses bans sources",
+  "cargo deny --manifest-path timelapse/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --manifest-path embed/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --manifest-path embed/plain/Cargo.toml check advisories licenses bans sources",
+]
 # Advisories arrive without Cargo.lock changing, so a cached pass would hide them.
 no_cache = true
 
 [tasks.build]
 desc = "Build the release binary"
-run = ["cargo build --release"]
+run = ["cargo build --release --locked"]
 sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
 outputs = ["target/release/nuthatch"]
+
+# CI turns LTO off for this one through CARGO_PROFILE_RELEASE_*, so it is not cached.
+[tasks.build-scaled]
+desc = "Build the release binary with the scaled backend"
+run = ["cargo build --release --locked --features postgres-store"]
+no_cache = true
 
 [tasks.doc]
 desc = "Build the API docs"
 run = ["cargo doc --no-deps"]
 sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
+
+# Measurements of a built binary. Each reads BIN, FIXTURE_RPC and its ceilings from the environment,
+# and CI runs some of them twice with different ones, so none is cached.
+[tasks.footprint]
+desc = "Peak RSS against MAX_RSS_MB"
+run = ["bash .github/workflows/footprint.sh"]
+no_cache = true
+
+[tasks.point-read]
+desc = "Entity point-read p50/p99 against MAX_P50_US"
+run = ["bash .github/workflows/point-read.sh"]
+no_cache = true
+
+[tasks.backfill-throughput]
+desc = "Backfill events/sec (tracked, not gated)"
+run = ["bash .github/workflows/backfill-throughput.sh"]
+no_cache = true
+
+[tasks.tip-lag]
+desc = "Tip lag against MAX_SEEN_P50_MS"
+run = ["bash .github/workflows/tip-lag.sh"]
+no_cache = true
+
+[tasks.multinest-footprint]
+desc = "Peak RSS at tip, 20 nests on one cursor"
+run = ["bash .github/workflows/multinest-footprint.sh"]
+no_cache = true
+
+[tasks.wideabi-footprint]
+desc = "Peak RSS, wide ABI, one nest"
+run = ["bash .github/workflows/wideabi-footprint.sh"]
+no_cache = true
+
+[tasks.rolling-upgrade]
+desc = "Replace followers, then the writer, with a query answered at every step (binary in NUTHATCH_BIN)"
+shell = true
+run = ['bash scripts/rolling-upgrade.sh "${NUTHATCH_BIN:-target/release/nuthatch}"']
+no_cache = true
+
+[tasks.failover]
+desc = "Two writers, one lease (binary in NUTHATCH_BIN)"
+shell = true
+run = ['bash scripts/failover-gate.sh "${NUTHATCH_BIN:-target/release/nuthatch}"']
+no_cache = true
 
 [tasks.fuzz-smoke]
 desc = "Short fuzz run over each target (needs a nightly toolchain)"
@@ -120,6 +440,38 @@ run = ["cargo +nightly fuzz run abi_arbitrary -- -max_total_time=60"]
 cwd = "fuzz"
 no_cache = true
 allow_failure = true
+
+# CI's fuzz jobs. fuzz-decode needs nightly (CI sets RUSTUP_TOOLCHAIN); sql and embed build with -s none.
+[tasks.fuzz-decode]
+desc = "Fuzz the decode path (nuthatch#290)"
+run = [
+  "cargo fuzz run abi_json -- -runs=300000 -max_total_time=180 -print_final_stats=1",
+  "cargo fuzz run decode_log -- -runs=300000 -max_total_time=180 -print_final_stats=1",
+  "cargo fuzz run abi_arbitrary -- -runs=300000 -max_total_time=60 -print_final_stats=1",
+]
+no_cache = true
+
+[tasks.fuzz-sql]
+desc = "Fuzz /sql confinement"
+run = ["cargo fuzz run --fuzz-dir fuzz/sql -s none -O sql_confinement -- -runs=200000 -max_total_time=300 -print_final_stats=1"]
+no_cache = true
+
+[tasks.fuzz-sql-parsers]
+desc = "Fuzz IPFS CAR and subgraph manifest parsing, on fuzz-sql's build"
+run = [
+  "cargo fuzz run --fuzz-dir fuzz/sql -s none -O cid_car -- -runs=300000 -max_total_time=120 -print_final_stats=1",
+  "cargo fuzz run --fuzz-dir fuzz/sql -s none -O subgraph_manifest -- -runs=300000 -max_total_time=120 -print_final_stats=1",
+]
+no_cache = true
+
+[tasks.fuzz-embed]
+desc = "Fuzz header chains and attach"
+run = [
+  "cargo fuzz build --fuzz-dir fuzz/embed -s none -O",
+  "cargo fuzz run --fuzz-dir fuzz/embed -s none -O header_chain -- -runs=300000 -max_total_time=120 -print_final_stats=1",
+  "cargo fuzz run --fuzz-dir fuzz/embed -s none -O attach_ipc -- -runs=300000 -max_total_time=120 -print_final_stats=1",
+]
+no_cache = true
 
 [tasks.ci]
 desc = "What CI runs: fmt-check, lint, test, decode, crates, features, deny"
