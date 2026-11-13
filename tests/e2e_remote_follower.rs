@@ -591,6 +591,45 @@ async fn a_seal_waits_for_a_slow_mirror_and_never_answers_short() {
     rig.writer.stop();
 }
 
+/// A fresh follower whose first snapshot waits on a slow mirror says which file it is fetching, from
+/// the moment it starts, rather than leaving the reason empty until the first attempt answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_follower_names_the_file_it_waits_for() {
+    let rig = rig(6, None, None).await;
+    rig.seal(1, 2);
+    rig.publish().await;
+    let knobs = Arc::new(MirrorKnobs::default());
+    knobs.delay_ms.store(15_000, Ordering::SeqCst);
+    let served = serve_mirror(PathBuf::from(&rig.mirror), knobs.clone()).await;
+    let (_f, remote, _) = rig.remote(&served, 2).await;
+    let mut seen = serde_json::Value::Null;
+    for _ in 0..200 {
+        let (_, ready) = get(&remote, "/ready").await;
+        let mirror = &ready["nests"][ROUTE]["mirror"];
+        if mirror["waiting_for"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty())
+        {
+            seen = mirror.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let file = seen["waiting_for"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !file.is_empty(),
+        "the follower never said it was waiting: {seen}"
+    );
+    let error = seen["error"].as_str().unwrap_or("");
+    assert!(error.contains(&file), "{seen}");
+    knobs.delay_ms.store(0, Ordering::SeqCst);
+    agree(&rig, &remote, "once the mirror served it").await;
+    rig.writer.stop();
+}
+
 /// A seal naming a file the mirror does not have is never applied: the follower answers the
 /// generation before it, says what it waits for, and applies it once the publisher catches up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -608,6 +647,21 @@ async fn a_seal_naming_a_file_the_mirror_lacks_is_never_applied() {
     let ready = holds_before_the_seal(&remote, 6, Duration::from_millis(1_500)).await;
     let error = ready["follower"]["mirror"]["error"].as_str().unwrap_or("");
     assert!(error.contains("does not have"), "{ready}");
+    // Ready, since what it serves is whole, and saying it holds an earlier generation and since when.
+    let held = &ready["follower"]["holding_earlier_generation"];
+    assert!(held["since_unixtime"].as_u64().is_some(), "{ready}");
+    assert!(held["generation"].as_u64().is_some(), "{ready}");
+    let metrics = reqwest::get(format!("{remote}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let gauge = metrics
+        .lines()
+        .find(|l| l.starts_with("nuthatch_follower_held_generation_seconds{"))
+        .and_then(|l| l.rsplit(' ').next()?.parse::<f64>().ok());
+    assert!(gauge.is_some_and(|s| s > 0.0), "{metrics}");
     assert!(!cache
         .join("segments")
         .join(format!("{hash}.parquet"))
@@ -616,6 +670,13 @@ async fn a_seal_naming_a_file_the_mirror_lacks_is_never_applied() {
     rig.publish().await;
     let after = agree(&rig, &remote, "once the publisher caught up").await;
     assert_eq!(after["sealed_through"], 2);
+    let (_, ready) = get(&remote, &format!("/{ROUTE}/ready")).await;
+    assert!(
+        ready["follower"]
+            .get("holding_earlier_generation")
+            .is_none(),
+        "{ready}"
+    );
     rig.writer.stop();
 }
 

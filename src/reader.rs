@@ -1616,6 +1616,18 @@ impl Follower {
         };
         if let Some(p) = self.lock().pending.get_mut(dataset) {
             p.waiting_for = segments.iter().map(|(_, s)| s.file.clone()).collect();
+            // Before the first attempt answers, say what it is fetching rather than nothing.
+            if p.error.is_none() {
+                p.error = segments.first().map(|(_, s)| {
+                    let more = segments.len() - 1;
+                    let others = if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    };
+                    format!("fetching {}{others} from the mirror", s.file)
+                });
+            }
         }
         let me = Arc::downgrade(self);
         let ready = cx.ready.clone();
@@ -2116,6 +2128,7 @@ impl Follower {
         let inner = self.lock();
         let ready = self.clone();
         let nests = self.clone();
+        let held = self.clone();
         let mut app = axum::Router::new()
             .route("/health", axum::routing::get(|| async { "ok" }))
             .route(
@@ -2134,16 +2147,20 @@ impl Follower {
             )
             .route(
                 "/metrics",
-                axum::routing::get(|| async {
-                    let mut s = String::new();
-                    crate::feed_metrics::metrics().render(&mut s);
-                    (
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4",
-                        )],
-                        s,
-                    )
+                axum::routing::get(move || {
+                    let f = held.clone();
+                    async move {
+                        let mut s = String::new();
+                        crate::feed_metrics::metrics().render(&mut s);
+                        s.push_str(&f.held_metrics());
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            s,
+                        )
+                    }
                 }),
             );
         for (route, r) in &inner.routes {
@@ -2497,6 +2514,26 @@ impl Follower {
         }
     }
 
+    /// Per dataset, how long this follower has held an earlier generation while the mirror lacks a
+    /// file the next one names; 0 when it holds the latest.
+    fn held_metrics(&self) -> String {
+        let inner = self.lock();
+        let mut out = String::from(
+            "# HELP nuthatch_follower_held_generation_seconds How long this follower has served an earlier generation while the mirror lacks a file the next names.\n\
+             # TYPE nuthatch_follower_held_generation_seconds gauge\n",
+        );
+        for dataset in inner.datasets.keys() {
+            let held = inner
+                .pending
+                .get(dataset)
+                .map_or(0.0, |p| p.since.elapsed().as_secs_f64());
+            out.push_str(&format!(
+                "nuthatch_follower_held_generation_seconds{{dataset=\"{dataset}\"}} {held}\n"
+            ));
+        }
+        out
+    }
+
     fn lag(&self, inner: &Inner, dataset: &str) -> serde_json::Value {
         let applied = inner.datasets.get(dataset).map(|d| d.store.applied());
         let writer = inner.positions.get(dataset).copied();
@@ -2523,6 +2560,13 @@ impl Follower {
                 "waiting_secs": p.since.elapsed().as_secs_f64(),
                 "error": p.error,
             });
+            // Still ready, since what it serves is whole, but not the writer's latest.
+            if let Some((_, generation)) = applied {
+                out["holding_earlier_generation"] = serde_json::json!({
+                    "generation": generation,
+                    "since_unixtime": crate::metrics::now_unix().saturating_sub(p.since.elapsed().as_secs()),
+                });
+            }
         }
         // Cached files that did not hash to their names, removed and fetched again.
         if let Some(refused) = self

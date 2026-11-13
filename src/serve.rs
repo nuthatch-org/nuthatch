@@ -1699,6 +1699,7 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     }
     body.push_str(&entity_metrics(&s));
     body.push_str(&snapshot_metrics(&s));
+    body.push_str(&integrity_metrics(&s));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1797,6 +1798,30 @@ fn snapshot_metrics(s: &AppState) -> String {
         "# HELP nuthatch_snapshot_retained_bytes Bytes that versions still being read hold beside the latest.\n\
          # TYPE nuthatch_snapshot_retained_bytes gauge\n\
          nuthatch_snapshot_retained_bytes{{nest=\"{nest}\"}} {bytes}\n"
+    )
+}
+
+/// What the integrity passes took from this nest since its segments were last whole, as gauges an
+/// operator can alert on; zero on a healthy nest.
+fn integrity_metrics(s: &AppState) -> String {
+    let nest = match &s.runtime_health {
+        Some((name, _)) => name.as_str(),
+        None => s
+            .nest_info
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    };
+    let found = crate::seal::integrity(&s.dir).unwrap_or_default();
+    format!(
+        "# HELP nuthatch_quarantined_segments Sealed segments this nest names that an integrity pass quarantined and no seal has restored.\n\
+         # TYPE nuthatch_quarantined_segments gauge\n\
+         nuthatch_quarantined_segments{{nest=\"{nest}\"}} {}\n\
+         # HELP nuthatch_derived_state_stale 1 when derived state was rebuilt at start from a segment quarantined since.\n\
+         # TYPE nuthatch_derived_state_stale gauge\n\
+         nuthatch_derived_state_stale{{nest=\"{nest}\"}} {}\n",
+        found.quarantined_segments,
+        u8::from(found.derived_stale)
     )
 }
 
@@ -12114,6 +12139,54 @@ mod tests {
                 "derived_state_stale": false,
             }),
             "{after}"
+        );
+    }
+
+    /// A restart forgets nothing it can read off disk: the reduction is on `/ready` and `/metrics`
+    /// until a seal puts the segment back.
+    #[tokio::test]
+    async fn a_quarantine_is_still_reported_after_a_restart_until_the_segment_is_resealed() {
+        let (tmp, state) = sealed_transfer_nest("quarantine-survives", false);
+        let router = router(SharedNest::new(state.clone()));
+        let quarantined = |metrics: &str| {
+            metrics
+                .lines()
+                .find(|l| {
+                    l.starts_with("nuthatch_quarantined_segments{nest=\"quarantine-survives\"}")
+                })
+                .map(|l| l.rsplit(' ').next().unwrap().to_string())
+        };
+        let (_, m) = get(router.clone(), "/metrics").await;
+        assert_eq!(
+            quarantined(&String::from_utf8(m).unwrap()).as_deref(),
+            Some("0")
+        );
+
+        rot_and_verify_in_background(tmp.path());
+        crate::seal::forget_findings(tmp.path());
+        let (_, r) = ready_and_code(&state).await;
+        assert!(
+            r.get("integrity").is_none(),
+            "the fixture did not forget: {r}"
+        );
+        // The next start.
+        assert_eq!(crate::seal::verify_and_quarantine(tmp.path()).unwrap(), 0);
+        crate::seal::record_rebuild(tmp.path());
+        let (code, r) = ready_and_code(&state).await;
+        assert_eq!(code, StatusCode::OK, "{r}");
+        assert_eq!(r["integrity"]["quarantined_segments"], json!(1), "{r}");
+        assert_eq!(r["integrity"]["derived_state_stale"], json!(false), "{r}");
+        let (_, m) = get(router.clone(), "/metrics").await;
+        let m = String::from_utf8(m).unwrap();
+        assert_eq!(quarantined(&m).as_deref(), Some("1"), "{m}");
+        assert!(m.contains("nuthatch_derived_state_stale{nest=\"quarantine-survives\"} 0"));
+
+        let row = r#"{"table":"usdc__transfer","from":"0xa","to":"0xb","value":"1","block_number":100,"tx_hash":"0xt","log_index":0}"#;
+        crate::seal::seal_range(tmp.path(), &[row.to_string()], 100, 100).unwrap();
+        let (_, r) = ready_and_code(&state).await;
+        assert!(
+            r.get("integrity").is_none(),
+            "a resealed segment is still reported: {r}"
         );
     }
 
