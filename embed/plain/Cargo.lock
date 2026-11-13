@@ -1053,7 +1053,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=2e00b11f8d747106b2d3b418f075a4a6e89ee39a#2e00b11f8d747106b2d3b418f075a4a6e89ee39a"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=24cc93e1179ab80ea9fbbb0aed10574e6866b65c#24cc93e1179ab80ea9fbbb0aed10574e6866b65c"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -1627,7 +1627,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.2.0"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=2e00b11f8d747106b2d3b418f075a4a6e89ee39a#2e00b11f8d747106b2d3b418f075a4a6e89ee39a"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=24cc93e1179ab80ea9fbbb0aed10574e6866b65c#24cc93e1179ab80ea9fbbb0aed10574e6866b65c"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",

@@ -45,7 +45,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 # RFC-0075 S4: the engine the binary's `/sql` runs, at its pinned rev, and what the tab binds with it.
 sqlparser = { version = "0.62", features = ["visitor"] }
-burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "2e00b11f8d747106b2d3b418f075a4a6e89ee39a", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "24cc93e1179ab80ea9fbbb0aed10574e6866b65c", default-features = false, features = ["datafusion"] }
 object_store = { version = "0.13", default-features = false }
 arrow-array = { version = "=59.3.0", default-features = false }
 # RFC-0081 S1: `/sql` answered as an Arrow IPC stream, and another nest's answers attached from one.
@@ -94,7 +94,7 @@ web-sys = { version = "0.3", features = [
 # the patch (RFC-0077 S1). Burrmill's vendored parquet source is repeated from its manifest at its rev,
 # because its own patch does not reach this workspace.
 [patch.crates-io]
-datafusion-datasource-parquet = { git = "https://github.com/nuthatch-org/burrmill", rev = "2e00b11f8d747106b2d3b418f075a4a6e89ee39a" }
+datafusion-datasource-parquet = { git = "https://github.com/nuthatch-org/burrmill", rev = "24cc93e1179ab80ea9fbbb0aed10574e6866b65c" }
 dbsp = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
 feldera-types = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
 feldera-storage = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
