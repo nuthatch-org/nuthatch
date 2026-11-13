@@ -25,7 +25,9 @@ arrow-schema = { version = "=59.3.0", default-features = false }
 path = "../../embed"
 default-features = false
 
+# Burrmill's vendored parquet source is repeated from its manifest at its rev, for the same reason.
 [patch.crates-io]
+datafusion-datasource-parquet = { git = "https://github.com/nuthatch-org/burrmill", rev = "24cc93e1179ab80ea9fbbb0aed10574e6866b65c" }
 dbsp = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
 feldera-types = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }
 feldera-storage = { git = "https://github.com/nuthatch-org/feldera", rev = "4813166949da26fa75c94f59dd13eec2655e2a43" }

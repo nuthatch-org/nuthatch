@@ -413,6 +413,24 @@ impl std::fmt::Display for QueryMemoryExceeded {
 
 impl std::error::Error for QueryMemoryExceeded {}
 
+/// The engine panicked planning or running a statement: a fault in nuthatch or below it, not in the
+/// statement. Its own type so `/sql` answers 500 rather than telling the caller to fix their SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEngineFault(pub String);
+
+impl std::fmt::Display for QueryEngineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the analytics engine failed on this statement, a fault in nuthatch and not in the \
+             query: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for QueryEngineFault {}
+
 /// How often the `/sql` watchdog measures a running query's spill directory.
 const SPILL_POLL: Duration = Duration::from_millis(250);
 /// How often it reads the pool under a mount's memory cap: an atomic load, so cheap.
@@ -11236,6 +11254,40 @@ mod confinement {
         }
         // A view that calls nothing off the list still answers, beside one that does.
         run(Some("a"), "SELECT * FROM v").unwrap();
+    }
+
+    /// Strict reads a statement's calls as the engine parses it, so syntax only the engine's
+    /// dialect reads is checked, not refused as unparseable.
+    #[test]
+    fn strict_answers_engine_only_syntax_in_statements_and_views() {
+        let f = two_datasets();
+        std::fs::write(
+            f.a.join("views").join("n.sql"),
+            "CREATE VIEW n AS SELECT last_value(x IGNORE NULLS) OVER () AS y FROM t__e;\n",
+        )
+        .unwrap();
+        let tenant: Arc<str> = Arc::from("a");
+        for sql in [
+            "SELECT * FROM n",
+            "SELECT x ^@ 'mi' AS s FROM t__e",
+            "SELECT last_value(x IGNORE NULLS) OVER () AS y FROM t__e",
+        ] {
+            isolated(Some(&tenant), || {
+                query_hot_cold(&f.a, sql, guard(), &HotRows::new(), 10, &[])
+            })
+            .unwrap_or_else(|e| panic!("strict: {sql}: {e:#}"));
+        }
+        let refused = isolated(Some(&tenant), || {
+            query_hot_cold(
+                &f.a,
+                "SELECT last_value(version() IGNORE NULLS) OVER () FROM t__e",
+                guard(),
+                &HotRows::new(),
+                10,
+                &[],
+            )
+        });
+        assert!(format!("{:#}", refused.unwrap_err()).contains("`version`"));
     }
 
     /// FR8 review: explaining a missing view replayed every authored statement in a fresh engine,
