@@ -45,6 +45,10 @@ while IFS= read -r hit; do
   case "$file" in
     ./docs/releases/v[0-9]*.md) want=$(basename "$file" .md); want=${want#v} ;;
   esac
+  # A variable with a default (${TAG:-4.0.0}) is judged on its default; one without has no tag to judge.
+  case "$tag" in
+    *'$'*':-'*) tag=${tag#*:-}; tag=${tag%%\}*} ;;
+  esac
   case "$tag" in
     "$want"|"$want"-*|'<version>'*|'{version}'*|*'$'*) verdict=OK ;;
     *) verdict=STALE; fail=$((fail + 1)) ;;
@@ -55,7 +59,7 @@ while IFS= read -r hit; do
     ./docs/operators.md:*) operators_seen=$((operators_seen + 1)) ;;
   esac
   printf "  %-5s %s:%s: %s\n" "$verdict" "$file" "$line" "$tag"
-done < <(grep -rnoE "ghcr\.io/nuthatch-org/nuthatch:[A-Za-z0-9._<>{}\$-]*" --include="*.md" --include="docker-compose*.yml" \
+done < <(grep -rnoE "ghcr\.io/nuthatch-org/nuthatch:[A-Za-z0-9._<>{}:\$-]*" --include="*.md" --include="docker-compose*.yml" \
   --exclude-dir=target --exclude-dir=.git --exclude-dir=rfcs . 2>/dev/null)
 
 # A check that finds nothing has stopped checking. operators.md is the document an operator follows
