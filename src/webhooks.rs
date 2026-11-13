@@ -123,8 +123,9 @@ const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 /// The task that owns `dir`'s webhook outbox and cursors once the nest is running, so a seal only
 /// wakes it ([`sealed`]) and the writer never waits on a delivery query. It is the
 /// only writer of those keys after startup (`init_cursors` runs before the first seal), and a
-/// cursor still moves only after its rows are queued, so delivery stays in order and exactly once
-/// across slices and restarts.
+/// cursor moves in the same commit as the rows it covers (on the redb store), so the outbox is queued in
+/// order and no row twice across slices and a stop between chunks. Delivery to the endpoint is still
+/// at least once.
 pub struct Collector {
     dir: std::path::PathBuf,
     id: u64,
@@ -387,7 +388,20 @@ fn deliver_sealed_bounded(
                     through = last - 1;
                 }
             }
+            // Where the cursor and the partial mark stand once the whole slice is queued.
+            let settled = match next_partial {
+                Some((b, pos)) => vec![(partial_key(&w.name), format!("{b}:{pos}"))],
+                // Clears the mark too: an earlier chunk of this slice may have left one.
+                None => vec![
+                    (cursor_key(&w.name), through.to_string()),
+                    (partial_key(&w.name), String::new()),
+                ],
+            };
+            // Each chunk is committed with the position it leaves the cursor at, so a crash between
+            // chunks leaves every queued row behind the cursor and none of them to be queued again.
+            let mut done = 0usize;
             for chunk in rows.chunks(batch_max) {
+                done += chunk.len();
                 let payload = json!({
                     "event": "rows",
                     "webhook": w.name,
@@ -397,17 +411,20 @@ fn deliver_sealed_bounded(
                     "count": chunk.len(),
                     "rows": chunk,
                 });
-                store.outbox_push(&payload.to_string())?;
+                let meta = if done == rows.len() {
+                    settled.clone()
+                } else {
+                    position_after(&w.name, &rows, done, partial)?
+                };
+                store.outbox_push_with_meta(&[payload.to_string()], &meta)?;
                 enqueued += 1;
-            }
-            match next_partial {
-                Some((b, pos)) => store.set_meta(&partial_key(&w.name), &format!("{b}:{pos}"))?,
-                None => {
-                    store.set_meta(&cursor_key(&w.name), &through.to_string())?;
-                    if partial.is_some() {
-                        store.set_meta(&partial_key(&w.name), "")?;
-                    }
+                #[cfg(test)]
+                if between_chunks_fault() {
+                    anyhow::bail!("stopped between chunks");
                 }
+            }
+            if rows.is_empty() {
+                store.outbox_push_with_meta(&[], &settled)?;
             }
             if !rows.is_empty() {
                 match next_partial {
@@ -603,6 +620,56 @@ pub fn forget(dir: &std::path::Path) {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .remove(dir);
+}
+
+/// The cursor and partial mark that leave `rows[..done]` queued and the rest not, for a slice that has
+/// more rows than that. `partial` is the block a continued slice is already part-way through.
+fn position_after(
+    name: &str,
+    rows: &[serde_json::Value],
+    done: usize,
+    partial: Option<(u64, u64)>,
+) -> Result<Vec<(String, String)>> {
+    if let Some((b, pos)) = partial {
+        return Ok(vec![(
+            partial_key(name),
+            format!("{b}:{}", pos + done as u64),
+        )]);
+    }
+    let last = row_block(&rows[done - 1])?;
+    if last != row_block(&rows[done])? {
+        return Ok(vec![
+            (cursor_key(name), last.to_string()),
+            (partial_key(name), String::new()),
+        ]);
+    }
+    let queued = rows[..done]
+        .iter()
+        .filter(|r| row_block(r).is_ok_and(|b| b == last))
+        .count();
+    Ok(vec![
+        (cursor_key(name), (last - 1).to_string()),
+        (partial_key(name), format!("{last}:{queued}")),
+    ])
+}
+
+#[cfg(test)]
+thread_local! {
+    static STOP_AFTER_CHUNKS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam: whether this thread has been told to stop after the chunk it just committed, as a crash
+/// would, counting down once per chunk.
+#[cfg(test)]
+fn between_chunks_fault() -> bool {
+    STOP_AFTER_CHUNKS.with(|c| match c.get() {
+        Some(0) => true,
+        Some(n) => {
+            c.set(Some(n - 1));
+            n == 1
+        }
+        None => false,
+    })
 }
 
 /// A relation name as a SQL identifier, whatever characters an alias gave it.
@@ -1270,10 +1337,11 @@ mod tests {
         got
     }
 
-    /// Delivery is the collector's, not the caller's: `sealed` returns at once, rows arrive in order
-    /// and exactly once across slices, a block wider than a slice, and a store reopened between runs.
+    /// Delivery is the collector's, not the caller's: `sealed` returns at once, rows are queued in
+    /// order and once each across slices, a block wider than a slice, and a store reopened between runs
+    /// after a clean stop.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_collector_delivers_in_order_exactly_once_across_slices_and_restarts() {
+    async fn a_collector_queues_each_row_once_in_order_across_slices_and_a_reopened_store() {
         let dir = tempfile::tempdir().unwrap();
         let webhooks = vec![wh("w", "t__transfer", "genesis")];
         {
@@ -1412,6 +1480,37 @@ mod tests {
         );
         task.abort();
         let _ = task.await;
+    }
+
+    /// A stop after any chunk of a slice, with the store reopened, leaves each row queued once and in
+    /// order: a chunk and the cursor position it leaves are committed together, mid-block included.
+    #[test]
+    fn a_stop_between_chunks_queues_no_row_twice() {
+        let mut want: Vec<(u64, u64)> = vec![(1, 0), (2, 0)];
+        want.extend((0..25).map(|i| (3, i)));
+        want.extend([(4, 0), (5, 0), (6, 0)]);
+        let rows: Vec<String> = want.iter().map(|(b, l)| transfer(*b, *l)).collect();
+        let mut w = wh("w", "t__transfer", "genesis");
+        w.batch_max = Some(4);
+        let chunks = want.len().div_ceil(4);
+        for stop in 1..chunks {
+            let dir = tempfile::tempdir().unwrap();
+            crate::seal::seal_range(dir.path(), &rows, 1, 6).unwrap();
+            let webhooks = vec![w.clone()];
+            let mut got = vec![];
+            {
+                let store = Store::open(&dir.path().join("t.redb")).unwrap();
+                init_cursors(&store, &webhooks, 0).unwrap();
+                STOP_AFTER_CHUNKS.with(|c| c.set(Some(stop)));
+                assert!(deliver_sealed(&store, dir.path(), &webhooks, 6).is_err());
+                STOP_AFTER_CHUNKS.with(|c| c.set(None));
+                got.extend(drain(&store));
+            }
+            let store = Store::open(&dir.path().join("t.redb")).unwrap();
+            deliver_sealed(&store, dir.path(), &webhooks, 6).unwrap();
+            got.extend(drain(&store));
+            assert_eq!(got, want, "stopped after chunk {stop}");
+        }
     }
 
     /// Two nests may name a webhook alike: each keeps its own series under its mount, and an unmounted
