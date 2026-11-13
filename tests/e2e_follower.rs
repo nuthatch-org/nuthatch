@@ -1025,6 +1025,13 @@ async fn sealing_by_hand(tmp: &Path) -> (PathBuf, Writer, Arc<Follower>, String)
     let dir = root.join("data").join(ROUTE);
     std::fs::create_dir_all(&dir).unwrap();
     scaffold_nest(&dir, ROUTE, USDC);
+    // A runtime's datasets share `<root>/segments` because its mounts file says it is one.
+    std::fs::write(
+        root.join(nuthatch::runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n\n[[chains]]\nchain = \"arbitrum-one\"\nchain_id = 42161\n\
+         rpc_urls = []\n",
+    )
+    .unwrap();
     let via: PathBuf = tmp.join("follower-view");
     std::os::unix::fs::symlink(&root, &via).unwrap();
     let tape = Arc::new(TapeSource::new());

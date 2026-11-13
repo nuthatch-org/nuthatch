@@ -2971,6 +2971,11 @@ fn define_views_bound(
                             return None;
                         }
                         let p = crate::seal::segment_path(dir, &s.file, &s.hash);
+                        if crate::seal::refused(&p) {
+                            // Logged at `error!` when the integrity pass could not move it.
+                            degraded.insert(table.clone());
+                            return None;
+                        }
                         // Skip a manifest segment whose file is gone from disk (quarantined as corrupt
                         // by the startup integrity pass, or externally removed). Without this, one
                         // missing file makes `read_parquet` throw and the whole query fail; instead the
@@ -10842,8 +10847,14 @@ mod confinement {
     /// config, the text of one of its views and an offchain snapshot.
     fn two_datasets() -> Fixture {
         let root = tempfile::tempdir().unwrap();
-        let a = root.path().join(crate::runtime::DATA_DIR).join("aaaa");
-        let b = root.path().join(crate::runtime::DATA_DIR).join("bbbb");
+        let a = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("a".repeat(64));
+        let b = root
+            .path()
+            .join(crate::runtime::DATA_DIR)
+            .join("b".repeat(64));
         for (dir, x) in [(&a, "mine"), (&b, SECRET)] {
             std::fs::create_dir_all(dir.join("views")).unwrap();
             let row = json!({"table": "t__e", "block_number": 10, "log_index": 0, "x": x});

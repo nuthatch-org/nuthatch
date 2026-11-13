@@ -3231,6 +3231,39 @@ pub struct Hosts {
     /// Answered as the public, behind the operator's proxy: watched data is read, nothing is changed
     /// or lent.
     pub public: Vec<String>,
+    /// Required besides locality for what only this machine may do, when `--write-token-env` is given.
+    pub write_token: Option<WriteToken>,
+}
+
+/// The token `--write-token-env` names. `Debug` never shows it.
+#[derive(Clone)]
+pub struct WriteToken(String);
+
+impl std::fmt::Debug for WriteToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WriteToken(..)")
+    }
+}
+
+const WRITE_TOKEN_MIN: usize = 16;
+
+impl WriteToken {
+    /// The token in the variable `var`, refused when it is unset, short, or not sendable in a header.
+    pub fn from_env(var: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let token = lookup(var)
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default();
+        if token.is_empty() {
+            bail!("--write-token-env {var}: the environment variable {var} is unset or empty");
+        }
+        if token.len() < WRITE_TOKEN_MIN || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            bail!(
+                "--write-token-env {var}: the token in {var} must be at least {WRITE_TOKEN_MIN} \
+                 printable ASCII characters with no spaces, such as the output of `openssl rand -hex 32`"
+            );
+        }
+        Ok(Self(token))
+    }
 }
 
 impl Hosts {
@@ -3269,7 +3302,11 @@ impl Hosts {
                 bail!("{p} is given to both --local-host and --public-host; a name is one or the other");
             }
         }
-        Ok(Self { local, public })
+        Ok(Self {
+            local,
+            public,
+            write_token: None,
+        })
     }
 }
 
@@ -3423,6 +3460,20 @@ fn classify(loopback: bool, hosts: &Hosts, headers: &HeaderMap) -> Result<Caller
                     "its Sec-Fetch-Site is {site:?}, not same-origin"
                 )));
             }
+        }
+    }
+    // A requirement on a local caller, never a way to become one.
+    if let Some(token) = &hosts.write_token {
+        if !crate::serve::token_ok(Some(&token.0), None, headers) {
+            let sent = match headers.contains_key(axum::http::header::AUTHORIZATION) {
+                true => "its Authorization is not",
+                false => "it carries no",
+            };
+            return Ok(Caller::remote(format!(
+                "{sent} `Authorization: Bearer` with the write token, which this nest requires \
+                 (--write-token-env) to watch, unwatch, lend its RPC, trace by hash or search \
+                 timestamps"
+            )));
         }
     }
     Ok(Caller::local())
@@ -4846,7 +4897,24 @@ fn refuse_event_flags(args: &crate::cli::DevArgs) -> Result<()> {
 }
 
 fn hosts(args: &crate::cli::DevArgs) -> Result<Hosts> {
-    Hosts::declared(&args.local_host, &args.public_host)
+    let mut hosts = Hosts::declared(&args.local_host, &args.public_host)?;
+    hosts.write_token = args
+        .write_token_env
+        .as_deref()
+        .map(|var| WriteToken::from_env(var, |v| std::env::var(v).ok()))
+        .transpose()?;
+    Ok(hosts)
+}
+
+/// Off loopback nothing is lent or changed for anyone, so a token there would only look like a way in.
+fn refuse_token_off_loopback(hosts: &Hosts, loopback: bool) -> Result<()> {
+    if hosts.write_token.is_some() && !loopback {
+        bail!(
+            "--write-token-env does nothing off a loopback bind: watch, unwatch and the RPC are \
+             refused to every caller there, token or not"
+        );
+    }
+    Ok(())
 }
 
 /// `nuthatch dev` on a rotki-mode nest.
@@ -4863,6 +4931,7 @@ pub async fn dev(
     let hosts = hosts(args)?;
     let poll_interval = poll_interval(args.poll_interval, ah)?;
     let (listener, loopback) = bind(&args.listen).await?;
+    refuse_token_off_loopback(&hosts, loopback)?;
     let urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     if urls.is_empty() {
         bail!(
@@ -4962,6 +5031,7 @@ pub async fn dev_chains(
         );
     }
     let (listener, loopback) = bind(&args.listen).await?;
+    refuse_token_off_loopback(&hosts, loopback)?;
     // Every chain's RPCs before any cursor starts: a chain without one is refused with nothing running.
     let mut pools = Vec::with_capacity(chains.len());
     for (sub, config) in &chains {
@@ -8173,6 +8243,7 @@ mod tests {
         let hosts = Hosts {
             local: vec!["host.docker.internal".into()],
             public: vec!["wallet.example.com".into()],
+            ..Default::default()
         };
         let addr = listen(router_for(s.clone(), hosts)).await;
         let port = addr.port();
@@ -8339,6 +8410,148 @@ mod tests {
             }
         }
         assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was searched");
+    }
+
+    /// With a write token a local caller must carry it for everything only this machine may do, and
+    /// reads still need none. A wrong token is not echoed, and the right one does not make a public
+    /// caller local.
+    #[tokio::test]
+    async fn a_write_token_is_required_of_a_local_caller_and_grants_no_locality() {
+        const TOKEN: &str = "write-token-0123456789abcdef";
+        const WRONG: &str = "not-the-token-0123456789abc";
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let (forward, calls) = counted_forward();
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true)
+                .with_forward(forward)
+                .with_deadline(Duration::from_millis(200)),
+        );
+        let hosts = Hosts {
+            public: vec!["wallet.example.com".into()],
+            write_token: Some(WriteToken(TOKEN.into())),
+            ..Default::default()
+        };
+        let addr = listen(router_for(s.clone(), hosts)).await;
+        let host = format!("Host: 127.0.0.1:{}", addr.port());
+        let bearer = |t: &str| format!("Authorization: Bearer {t}");
+        let txlist = format!("/api?module=account&action=txlist&address={ALICE}");
+        let proxy = "/api?module=proxy&action=eth_call&to=0x0000000000000000000000000000000000000001&data=0x";
+        let trace = format!(
+            "/api?module=account&action=txlistinternal&txhash=0x{}",
+            "cd".repeat(32)
+        );
+        let time = "/api?module=block&action=getblocknobytime&timestamp=1700000000&closest=before";
+        let cases = [
+            (vec![host.clone()], "carries no `Authorization: Bearer`"),
+            (vec![host.clone(), bearer(WRONG)], "Authorization is not"),
+            (
+                vec![host.clone(), "Authorization: Basic Zm9vOmJhcg==".into()],
+                "Authorization is not",
+            ),
+            (
+                vec!["Host: wallet.example.com".into(), bearer(TOKEN)],
+                "a --public-host",
+            ),
+        ];
+        for (headers, why) in &cases {
+            let (list, listed) = raw(addr, "GET", "/api/watch", headers, None).await;
+            let (read, rows) = raw(addr, "GET", &txlist, headers, None).await;
+            assert_eq!((list, read), (200, 200), "{headers:?}: {listed} {rows}");
+            for (path, body) in [
+                ("/api/watch", json!({ "address": BOB })),
+                ("/api/unwatch", json!({ "address": ALICE })),
+            ] {
+                let (code, refused) = raw(addr, "POST", path, headers, Some(body)).await;
+                assert_eq!(code, 403, "{headers:?} {path}");
+                assert!(refused.contains(why), "{headers:?} {path}: {refused}");
+                assert!(
+                    !refused.contains(WRONG) && !refused.contains(TOKEN),
+                    "{refused}"
+                );
+            }
+            let (_, body) = raw(addr, "GET", proxy, headers, None).await;
+            assert!(body.contains("NUTHATCH_UNSUPPORTED"), "{headers:?}: {body}");
+            for path in [trace.as_str(), time] {
+                let (_, body) = raw(addr, "GET", path, headers, None).await;
+                assert!(
+                    body.contains("NUTHATCH_UNSUPPORTED") && body.contains(why),
+                    "{headers:?} {path}: {body}"
+                );
+            }
+            assert_eq!(s.history.watched().unwrap().len(), 1, "{headers:?}");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "the RPC was lent");
+
+        let with = vec![host.clone(), bearer(TOKEN)];
+        let (_, lent) = raw(addr, "GET", proxy, &with, None).await;
+        assert!(lent.contains("0x10"), "{lent}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        for path in ["/api/watch", "/api/unwatch"] {
+            let (code, body) =
+                raw(addr, "POST", path, &with, Some(json!({ "address": BOB }))).await;
+            assert_eq!(code, 200, "{path}: {body}");
+        }
+        for path in [trace.as_str(), time] {
+            let (_, body) = raw(addr, "GET", path, &with, None).await;
+            assert!(!body.contains("this request is not one"), "{path}: {body}");
+        }
+        for path in ["/ready", "/metrics"] {
+            let (_, body) = raw(addr, "GET", path, &with, None).await;
+            assert!(!body.contains(TOKEN), "{path} shows the token");
+        }
+    }
+
+    /// Without a write token an `Authorization` header is not looked at, so a local caller is as before.
+    #[tokio::test]
+    async fn without_a_write_token_an_authorization_header_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let addr = listen(router(s.clone())).await;
+        let headers = [
+            format!("Host: 127.0.0.1:{}", addr.port()),
+            "Authorization: Bearer anything".into(),
+        ];
+        let (code, body) = raw(
+            addr,
+            "POST",
+            "/api/watch",
+            &headers,
+            Some(json!({ "address": BOB })),
+        )
+        .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(s.history.watched().unwrap().len(), 2);
+    }
+
+    /// The token is read from the variable named, and one a client could not send, or guess, is refused.
+    #[test]
+    fn a_write_token_is_refused_at_startup_unless_long_and_sendable() {
+        let env = |v: &'static str| move |_: &str| Some(v.to_string());
+        let unset = WriteToken::from_env("NEST_TOKEN", |_| None)
+            .unwrap_err()
+            .to_string();
+        assert!(unset.contains("NEST_TOKEN is unset or empty"), "{unset}");
+        for bad in [
+            "",
+            "   ",
+            "short-token",
+            "has a space in it, long",
+            "tab\tinside-0123456789",
+        ] {
+            let err = WriteToken::from_env("NEST_TOKEN", env(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("--write-token-env NEST_TOKEN"),
+                "{bad:?}: {err}"
+            );
+            assert!(bad.trim().is_empty() || !err.contains(bad.trim()), "{err}");
+        }
+        let ok = WriteToken::from_env("NEST_TOKEN", env(" 0123456789abcdef ")).unwrap();
+        assert_eq!(ok.0, "0123456789abcdef");
+        assert_eq!(format!("{ok:?}"), "WriteToken(..)");
     }
 
     /// A declared name that could not do what its flag says is refused at startup: a loopback name

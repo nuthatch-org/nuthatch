@@ -24,17 +24,47 @@ fail=0
 
 # 1. The copy-paste commands. These are what someone actually runs, so a stale tag here is not a
 #    documentation nit - it hands them an old binary that works, which is the hardest kind to notice.
+#
+#    One verdict per image reference, not per line: a line naming two images must have both current.
+#    A tag may carry a flavour suffix (`-scaled`, `-flight`) and may be a placeholder. A past
+#    release's own notes (`docs/releases/vA.B.C.md`) name that release's tag, which is what they
+#    should say, so there the tag is judged against A.B.C and not against the current version.
 echo "container tags in docs and compose defaults (copy-paste commands):"
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  case "$line" in
-    # Globbed on both sides: these lines are whole shell commands, so the tag is rarely the last
-    # thing on them (`... :2.5.0-scaled worker --help`). Anchoring at the end reported a correct tag
-    # as stale, which is the failure mode that gets a checker switched off.
-    *":$WANT"*|*':<version>'*|*':{version}'*) printf "  OK   %s\n" "$line" ;;
-    *) printf "  STALE %s\n" "$line"; fail=$((fail + 1)) ;;
+tags_seen=0
+operators_seen=0
+while IFS= read -r hit; do
+  [ -z "$hit" ] && continue
+  file=${hit%%:*}
+  rest=${hit#*:}
+  line=${rest%%:*}
+  tag=${rest#*:}
+  tag=${tag#ghcr.io/nuthatch-org/nuthatch:}
+  case "$tag" in *'{'*) ;; *) tag=${tag%\}} ;; esac
+  while case "$tag" in *.|*-) true ;; *) false ;; esac; do tag=${tag%?}; done
+  want=$WANT
+  case "$file" in
+    ./docs/releases/v[0-9]*.md) want=$(basename "$file" .md); want=${want#v} ;;
   esac
-done < <(grep -rn "ghcr.io/nuthatch-org/nuthatch:" --include="*.md" --include="docker-compose*.yml" . 2>/dev/null | grep -v "^./target" | grep -v "/rfcs/")
+  case "$tag" in
+    "$want"|"$want"-*|'<version>'*|'{version}'*) verdict=OK ;;
+    *) verdict=STALE; fail=$((fail + 1)) ;;
+  esac
+  tags_seen=$((tags_seen + 1))
+  case "$file:$tag" in
+    ./docs/operators.md:'<version>'*) ;;
+    ./docs/operators.md:*) operators_seen=$((operators_seen + 1)) ;;
+  esac
+  printf "  %-5s %s:%s: %s\n" "$verdict" "$file" "$line" "$tag"
+done < <(grep -rnoE "ghcr\.io/nuthatch-org/nuthatch:[A-Za-z0-9._<>{}-]*" --include="*.md" --include="docker-compose*.yml" \
+  --exclude-dir=target --exclude-dir=.git --exclude-dir=rfcs . 2>/dev/null)
+
+# A check that finds nothing has stopped checking. operators.md is the document an operator follows
+# verbatim, so it must keep naming at least one concrete image tag for this to judge.
+if [ "$operators_seen" -eq 0 ]; then
+  echo "  STALE docs/operators.md names no concrete image tag; the check below has nothing to read"
+  fail=$((fail + 1))
+fi
+[ "$tags_seen" -eq 0 ] && { echo "  STALE no image tag found anywhere"; fail=$((fail + 1)); }
 
 # 2. Cargo.toml is the source of truth and must agree with itself.
 have=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
@@ -57,11 +87,19 @@ else
   echo "server.json: STALE (version $reg_version, image tag $reg_image, expected $WANT)"; fail=$((fail + 1))
 fi
 
-# SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). The section names
-# no version at all now, so any number that appears in it is a regression.
+# SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). Each release now
+# restates the policy for itself ("when 5.20.0 is released, 5.19 keeps ..."), so the section may name
+# only the current minor and the one before it; any other line it names is a regression.
 echo
-if sed -n '/^## Supported versions/,/^## /p' SECURITY.md | grep -qE '\b[0-9]+\.[0-9x]+(\.[0-9x]+)?\b'; then
-  echo "SECURITY.md supported versions: STALE (names a version; say \"the latest release\" instead)"
+current_minor=${WANT%.*}
+major=${current_minor%.*}
+minor=${current_minor#*.}
+previous_minor="$major.$((minor > 0 ? minor - 1 : 0))"
+stale_minors=$(sed -n '/^## Supported versions/,/^## /p' SECURITY.md \
+  | grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' | sed -E 's/^([0-9]+\.[0-9]+).*/\1/' | sort -u \
+  | grep -vxF -e "$current_minor" -e "$previous_minor" | tr '\n' ' ')
+if [ -n "$stale_minors" ]; then
+  echo "SECURITY.md supported versions: STALE (names ${stale_minors}; only $current_minor and $previous_minor may appear)"
   fail=$((fail + 1))
 else
   echo "SECURITY.md supported versions: OK"
