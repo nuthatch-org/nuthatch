@@ -34,8 +34,8 @@ anonymous.
 ## Supported versions
 
 The latest minor release receives security fixes, and so does the **previous minor for 30 days**
-after the next one ships. When 5.20.0 is released, 5.19 keeps receiving security fixes until 30 days
-after that date, then only 5.20 does. A backport is a patch release cut from `release/<major>.<minor>`
+after the next one ships. When 5.21.0 is released, 5.20 keeps receiving security fixes until 30 days
+after that date, then only 5.21 does. A backport is a patch release cut from `release/<major>.<minor>`
 by the process in [docs/releases/README.md](docs/releases/README.md#patch-releases-on-4x); it
 carries the security fix and nothing else, so an operator pinned to that minor can take it without
 taking the next minor's features. Older lines are not patched: upgrading is the remedy.
