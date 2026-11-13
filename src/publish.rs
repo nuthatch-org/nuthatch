@@ -1346,13 +1346,10 @@ async fn sync_pass(
     }
 
     if let Some(m) = metrics {
-        m.set_publish_lag_blocks(
-            missing
-                .iter()
-                .map(|(_, s)| s.to_block - s.from_block + 1)
-                .sum(),
-        );
-        m.set_publish_pending(missing.len() as u64);
+        // A quarantined segment the mirror lacks is still behind, though it is not sent.
+        let behind = || missing.iter().chain(&lost);
+        m.set_publish_lag_blocks(behind().map(|(_, s)| s.to_block - s.from_block + 1).sum());
+        m.set_publish_pending(behind().count() as u64);
     }
     let mirror_ref = mirror.as_ref();
     let attempts: Vec<((String, String), String, Result<u64>)> =
