@@ -315,11 +315,13 @@ async fn explain_bare_404(error: String, session: &Session<'_>) -> String {
     if !error.starts_with("HTTP 404:") {
         return error;
     }
-    let mounts = session.root_mounts().await;
-    if mounts.is_empty() {
-        return error;
+    match session.root_mounts().await {
+        Some(mounts) if mounts.is_empty() => {
+            format!("{error} - this URL is a runtime's root, which has nothing mounted yet")
+        }
+        Some(mounts) => format!("{error} - {}", root_explanation(&mounts)),
+        None => error,
     }
-    format!("{error} - {}", root_explanation(&mounts))
 }
 
 /// One bridge session: the URL it bridges to and, once `/nests` has answered, whether that is a
@@ -340,32 +342,45 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// The mounts to name if this URL is a runtime's root. A URL `/nests` once said is not one is
-    /// never asked again; one that could not be asked is asked next time.
-    async fn root_mounts(&self) -> Vec<String> {
+    /// The mounts to name if this URL is a runtime's root, `None` if it is not known to be one. Only a 404 from `/nests` settles that it is
+    /// not one; a root, even one with nothing mounted yet, is asked again each time.
+    async fn root_mounts(&self) -> Option<Vec<String>> {
         if self.root.get() == Some(&false) {
-            return Vec::new();
+            return None;
         }
-        let Some(mounts) = listed_mounts(self.client, self.base).await else {
-            return Vec::new();
-        };
-        let _ = self.root.set(!mounts.is_empty());
-        mounts
+        match listed_mounts(self.client, self.base).await {
+            Nests::NotRoot => {
+                let _ = self.root.set(false);
+                None
+            }
+            Nests::Root(mounts) => Some(mounts),
+            Nests::Unknown => None,
+        }
     }
 }
 
-/// The mounts `/nests` lists, as URLs under `base`: empty unless `base` is a runtime's root, and
-/// `None` when nothing answered, or a proxy's 5xx did, which may say nothing about `base`.
-async fn listed_mounts(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
+/// What `/nests` says about `base`.
+enum Nests {
+    /// A 404: `base` is a nest or a mount.
+    NotRoot,
+    /// A runtime's root, and its mounts as URLs under `base`, which may be none yet.
+    Root(Vec<String>),
+    /// No answer, or one that says nothing about `base`, such as a proxy's 5xx.
+    Unknown,
+}
+
+async fn listed_mounts(client: &reqwest::Client, base: &str) -> Nests {
     let body = match get(client, &format!("{base}/nests")).await {
         Ok(body) => body,
-        Err(e) if e.to_string().starts_with("HTTP 4") => return Some(Vec::new()),
-        Err(_) => return None,
+        Err(e) if e.to_string().starts_with("HTTP 404:") => return Nests::NotRoot,
+        Err(_) => return Nests::Unknown,
     };
-    let nests = serde_json::from_str::<Value>(&body)
+    let Some(nests) = serde_json::from_str::<Value>(&body)
         .ok()
         .and_then(|v| v.get("nests").and_then(Value::as_array).cloned())
-        .unwrap_or_default();
+    else {
+        return Nests::Unknown;
+    };
     let mounts = nests
         .iter()
         .filter_map(|e| {
@@ -375,7 +390,7 @@ async fn listed_mounts(client: &reqwest::Client, base: &str) -> Option<Vec<Strin
             Some(format!("{}{path}", base.trim_end_matches('/')))
         })
         .collect();
-    Some(mounts)
+    Nests::Root(mounts)
 }
 
 fn root_explanation(mounts: &[String]) -> String {
@@ -450,7 +465,7 @@ async fn fetch_shape(session: &Session<'_>) -> Shape {
     };
     let Ok(body) = get(client, &format!("{base}/shape")).await else {
         // A runtime's root has no `/shape` either, and nothing it could offer would answer.
-        let runtime_root = !session.root_mounts().await.is_empty();
+        let runtime_root = session.root_mounts().await.is_some();
         return Shape {
             runtime_root,
             ..all
@@ -640,13 +655,15 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
             .await?;
             Ok(format_sql_result(&raw, limit))
         }
-        "mounts" => {
-            let mounts = listed_mounts(client, base).await.unwrap_or_default();
-            if mounts.is_empty() {
-                bail!("this URL is not a runtime's root: it lists no mounts");
+        "mounts" => match listed_mounts(client, base).await {
+            Nests::Root(mounts) if mounts.is_empty() => {
+                bail!("this runtime's root has nothing mounted yet")
             }
-            Ok(root_explanation(&mounts))
-        }
+            Nests::Root(mounts) => Ok(root_explanation(&mounts)),
+            Nests::NotRoot | Nests::Unknown => {
+                bail!("this URL is not a runtime's root: it lists no mounts")
+            }
+        },
         "queries" => get(client, &format!("{base}/queries")).await,
         "query" => {
             let name = args["name"]
@@ -2352,7 +2369,7 @@ mod tests {
         use axum::{extract::State, http::Uri, Router};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
-        for (root, status) in [(false, 404), (true, 404), (false, 503)] {
+        for (root, status) in [(false, 404), (true, 404), (false, 503), (false, 403)] {
             let asked = Arc::new(AtomicUsize::new(0));
             let app = Router::new()
                 .fallback(
@@ -2388,7 +2405,7 @@ mod tests {
                 let text = tool_text(&out);
                 assert_eq!(text.contains(&format!("{base}/usdc")), root, "{text}");
             }
-            let once = !root && status < 500;
+            let once = !root && status == 404;
             assert_eq!(
                 asked.load(Ordering::SeqCst),
                 if once { 1 } else { 3 },
@@ -2396,6 +2413,46 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    /// A root with nothing mounted yet is still a root: the mount added later is named.
+    #[tokio::test]
+    async fn an_empty_root_names_a_mount_added_mid_session() {
+        use axum::{extract::State, http::Uri, response::IntoResponse, Router};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let mounted = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .fallback(
+                |State(mounted): State<Arc<AtomicBool>>, uri: Uri| async move {
+                    if uri.path() == "/nests" {
+                        return if mounted.load(Ordering::SeqCst) {
+                            r#"{"runtime":"r","nests":[{"name":"usdc"}]}"#
+                        } else {
+                            r#"{"runtime":"r","nests":[]}"#
+                        }
+                        .into_response();
+                    }
+                    (axum::http::StatusCode::NOT_FOUND, "no such route").into_response()
+                },
+            )
+            .with_state(mounted.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let session = Session::new(&client, &base);
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "schema", "arguments": {} } });
+        let before = respond(&req, &session, None).await.unwrap();
+        let before = tool_text(&before);
+        assert!(!before.contains(&format!("{base}/usdc")), "{before}");
+        assert!(before.contains("nothing mounted yet"), "{before}");
+        mounted.store(true, Ordering::SeqCst);
+        let after = respond(&req, &session, None).await.unwrap();
+        let after = tool_text(&after);
+        assert!(after.contains(&format!("{base}/usdc")), "{after}");
+        server.abort();
     }
 
     #[test]
