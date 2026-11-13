@@ -678,6 +678,27 @@ impl<F: Feed> Store<F> {
         Ok(seq)
     }
 
+    /// [`Store::outbox_push`] for several payloads and the meta writes that go with them, in one commit.
+    pub fn outbox_push_with_meta(
+        &self,
+        payloads: &[String],
+        meta: &[(String, String)],
+    ) -> Result<u64> {
+        let wtx = self.db.begin_write()?;
+        self.guard_fence(&wtx)?;
+        let mut rec = self.tap.recorder();
+        let first = Self::outbox_push_in(&wtx, payloads, &mut rec)?;
+        {
+            let mut t = wtx.open_table(META)?;
+            for (k, v) in meta {
+                t.insert(k.as_str(), v.as_str())?;
+                rec.meta(k, v);
+            }
+        }
+        self.commit_fed(wtx, false, rec)?;
+        Ok(first)
+    }
+
     /// Push `payloads` inside `wtx`; returns the first one's sequence number.
     fn outbox_push_in(
         wtx: &redb::WriteTransaction,
@@ -2080,6 +2101,9 @@ impl<F: Feed> HotStore for Store<F> {
 
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         Store::outbox_push(self, payload)
+    }
+    fn outbox_push_with_meta(&self, payloads: &[String], meta: &[(String, String)]) -> Result<u64> {
+        Store::outbox_push_with_meta(self, payloads, meta)
     }
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
         Store::outbox_pending(self, limit)

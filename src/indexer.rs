@@ -3937,10 +3937,21 @@ async fn build_nest(
             config.alerts.len(),
             config.webhooks.len()
         );
-        tokio::spawn(alerts::run_delivery_worker(
-            std::sync::Arc::new(store) as std::sync::Arc<dyn crate::store::HotStore>,
-            crate::webhooks::secrets(&config.webhooks),
-        ))
+        let store = std::sync::Arc::new(store) as std::sync::Arc<dyn crate::store::HotStore>;
+        // One task, so a nest's webhook collector stops with its alert worker and lets go of the
+        // store when it does.
+        let collector = (!webhooks.is_empty()).then(|| crate::webhooks::collector(&dir));
+        let webhooks = webhooks.clone();
+        let secrets = crate::webhooks::secrets(&config.webhooks);
+        tokio::spawn(async move {
+            let delivery = alerts::run_delivery_worker(store.clone(), secrets);
+            match collector {
+                Some(c) => {
+                    tokio::join!(delivery, c.run(store, webhooks));
+                }
+                None => delivery.await,
+            }
+        })
     });
     Ok((nest, app_state, alert_worker, window))
 }
@@ -7312,6 +7323,8 @@ impl NestIngest {
             if let Ok(tip) = source.tip().await {
                 if let Err(e) = crate::webhooks::init_cursors(&self.store, &self.webhooks, tip) {
                     tracing::warn!("webhook cursor init failed: {e:#}");
+                } else {
+                    crate::webhooks::sealed(&self.dir);
                 }
             }
         }
@@ -7512,7 +7525,7 @@ impl NestIngest {
                 }
                 // Fire webhooks for the freshly-sealed history (a `since = "genesis"`/block webhook wants
                 // it; a `since = "registration"` one is cursored past it, so this is a no-op there).
-                if !self.webhooks.is_empty() {
+                if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir) {
                     if let Err(e) = crate::webhooks::deliver_sealed(
                         &self.store,
                         &self.dir,
@@ -8163,18 +8176,19 @@ impl nuthatch_core::hooks::WindowHooks for NodeHooks {
     }
 
     #[cfg_attr(not(feature = "folds"), allow(unused_variables))]
-    fn sealed(&self, finalized_through: u64, sealed_through: u64, at_tip: bool) {
+    fn sealed(&self, _finalized_through: u64, sealed_through: u64, at_tip: bool) {
         if at_tip {
             crate::maintained::changed(&self.dir);
         }
-        // Deliver user webhooks for whatever just sealed (RFC-0010 Part B) - enqueue only,
-        // the background worker POSTs; a slow endpoint never blocks the loop.
-        if !self.webhooks.is_empty() {
+        // Deliver user webhooks for whatever just sealed (RFC-0010 Part B). The collector task
+        // queries and enqueues, the delivery worker POSTs; neither holds this loop. With no collector
+        // (a node built without one) the rows are queued here instead.
+        if !self.webhooks.is_empty() && !crate::webhooks::sealed(&self.dir) {
             if let Err(e) = crate::webhooks::deliver_sealed(
                 &self.store,
                 &self.dir,
                 &self.webhooks,
-                finalized_through,
+                sealed_through,
             ) {
                 tracing::warn!("webhook delivery failed: {e:#}");
             }
@@ -30605,5 +30619,48 @@ template="pool"
             "an identity-keyed dataset must log the skip at the default level - #727: this fired only \
              at debug! before, invisible under the default `nuthatch=info` filter this test pins to"
         );
+    }
+
+    /// The seal hook records how far it got and returns: the rows are queried and queued by the
+    /// webhook's collector, not on the writer. With no collector to hand it to, it queues them itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seal_hands_webhook_delivery_to_the_collector() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::store::Store::open(&dir.path().join("t.redb")).unwrap());
+        let webhook = crate::config::Webhook {
+            name: "w".into(),
+            table: "t__transfer".into(),
+            where_clause: None,
+            url: "http://127.0.0.1:9/hook".into(),
+            batch_max: None,
+            finality: None,
+            since: Some("genesis".into()),
+            secret: None,
+        };
+        let webhooks = Arc::new(vec![webhook]);
+        crate::webhooks::init_cursors(store.as_ref(), &webhooks, 0).unwrap();
+        let row = r#"{"table":"t__transfer","from":"0xa","to":"0xb","value":"1","block_number":5,"log_index":0,"tx_hash":"0xt"}"#;
+        crate::seal::seal_range(dir.path(), &[row.to_string()], 1, 10).unwrap();
+        let hooks = NodeHooks {
+            dir: dir.path().to_path_buf(),
+            store: store.clone(),
+            registry: Arc::new(DecodeRegistry::build(Vec::new()).unwrap()),
+            entities: Arc::new(Vec::new()),
+            webhooks,
+            #[cfg(feature = "folds")]
+            folds: None,
+            balances: BalanceView::start(crate::drive::Driver::Threaded).unwrap(),
+            exposure: ExposureView::start(crate::drive::Driver::Threaded, false).unwrap(),
+            velocity: VelocityView::start(crate::drive::Driver::Threaded, false).unwrap(),
+            publisher: Arc::default(),
+        };
+
+        let collector = crate::webhooks::collector(dir.path());
+        nuthatch_core::hooks::WindowHooks::sealed(&hooks, 10, 10, true);
+        assert_eq!(store.outbox_len(), 0, "the seal queued nothing itself");
+        drop(collector);
+
+        nuthatch_core::hooks::WindowHooks::sealed(&hooks, 10, 10, true);
+        assert_eq!(store.outbox_len(), 1, "no collector, so the hook delivers");
     }
 }

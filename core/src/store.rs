@@ -328,6 +328,20 @@ pub trait HotStore: Send + Sync {
 
     // ---- delivery outbox --------------------------------------------------------------------
     fn outbox_push(&self, payload: &str) -> Result<u64>;
+    /// Push `payloads` and set `meta` as one commit, so a crash leaves both or neither. Returns the first
+    /// sequence number. The default is two steps and does not have that property; a backend that can
+    /// commit them together overrides it.
+    fn outbox_push_with_meta(&self, payloads: &[String], meta: &[(String, String)]) -> Result<u64> {
+        let mut first = None;
+        for p in payloads {
+            let seq = self.outbox_push(p)?;
+            first.get_or_insert(seq);
+        }
+        for (k, v) in meta {
+            self.set_meta(k, v)?;
+        }
+        Ok(first.unwrap_or(0))
+    }
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>>;
     /// [`Self::outbox_pending`] from `seq` on, so a drain can page past entries it is not sending.
     fn outbox_pending_from(&self, seq: u64, limit: usize) -> Result<Vec<(u64, String)>> {
@@ -551,6 +565,9 @@ impl<T: HotStore + ?Sized> HotStore for Arc<T> {
     }
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         (**self).outbox_push(payload)
+    }
+    fn outbox_push_with_meta(&self, payloads: &[String], meta: &[(String, String)]) -> Result<u64> {
+        (**self).outbox_push_with_meta(payloads, meta)
     }
     fn outbox_pending(&self, limit: usize) -> Result<Vec<(u64, String)>> {
         (**self).outbox_pending(limit)

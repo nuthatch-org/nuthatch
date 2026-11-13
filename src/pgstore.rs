@@ -1183,6 +1183,22 @@ impl nuthatch_core::store::HotStore for PgStore {
         self.held.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    fn outbox_push_with_meta(&self, payloads: &[String], meta: &[(String, String)]) -> Result<u64> {
+        let schema = self.schema.clone();
+        let held = self.held_fence();
+        let (payloads, meta) = (payloads.to_vec(), meta.to_vec());
+        self.conn.with(move |c| {
+            let mut tx = c.transaction()?;
+            guard_fence_in_tx(&mut tx, &schema, held)?;
+            let first = outbox_push_in_tx(&mut tx, &schema, &payloads)?;
+            for (k, v) in &meta {
+                set_meta_in_tx(&mut tx, &schema, k, v)?;
+            }
+            tx.commit()?;
+            Ok(first)
+        })
+    }
+
     fn outbox_push(&self, payload: &str) -> Result<u64> {
         let schema = self.schema.clone();
         let held = self.held_fence();
