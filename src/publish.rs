@@ -1157,14 +1157,16 @@ async fn put_segment(
         tokio::task::spawn_blocking(move || {
             // A shared file, or a nest a running writer holds, is the writer's to quarantine: moving it
             // from here would pull it from under that writer, and its own passes find it in their cycle.
+            // Unheld is asked first: a stopped nest's verifier stays registered until its thread
+            // notices, and would answer only after this publish has returned.
             let own = src.starts_with(dir.join(seal::SEGMENTS_DIR));
-            if seal::request_verify(&dir, &table, &seg) {
+            if own && !crate::prune::store_is_held(&dir) {
+                seal::quarantine_mismatched(&dir, &table, &seg);
+            } else if seal::request_verify(&dir, &table, &seg) {
                 tracing::error!(
                     "{} does not hash to its address; this process's writer verifies it now",
                     src.display()
                 );
-            } else if own && !crate::prune::store_is_held(&dir) {
-                seal::quarantine_mismatched(&dir, &table, &seg);
             } else {
                 tracing::error!(
                     "{} does not hash to its address; left for the writer's own integrity pass",
@@ -2763,6 +2765,37 @@ abi = "abis/usdc.json"
             "{:?}",
             report.uploaded
         );
+    }
+
+    /// A nest's verifier stays registered for a moment after its nest stops. A publish in that window
+    /// finds nobody holding the store, so it quarantines the segment itself before it returns.
+    #[tokio::test]
+    async fn a_publish_after_its_nest_stopped_quarantines_before_its_verifier_goes() {
+        let nest = sealed_nest();
+        let (stopping_tx, stopping_rx) = std::sync::mpsc::channel::<()>();
+        let stopping = std::sync::Mutex::new(stopping_rx);
+        let verifier = seal::verify_in_background(
+            nest.path().to_path_buf(),
+            move || {
+                let _ = stopping.lock().unwrap().recv();
+                false
+            },
+            Duration::ZERO,
+        );
+        let (seg, path) = rot_first_final(nest.path());
+        let mirror = tempfile::tempdir().unwrap();
+        let err = sync(nest.path(), mirror.path().to_str().unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains(&seg.file), "{err:#}");
+        let quarantined = !path.exists();
+        drop(stopping_tx);
+        verifier.join().unwrap();
+        assert!(
+            quarantined,
+            "the publish left it to a verifier that was going"
+        );
+        assert!(seal::is_quarantined(nest.path(), &seg));
     }
 
     /// A publish beside a running writer refuses the bad segment by name and leaves it where it is:
