@@ -2021,8 +2021,10 @@ corrupted segment is never mirrored. It quarantines the file itself only for a s
 `dev` holds, and never a provisional tail; a shared segment, or one a running writer holds, is left
 for that writer's own pass. A publisher inside the writer's own process (`dev --publish-target`,
 or a runtime's `[mounts.publish]`) asks that writer to verify the segment at once. Once a segment
-the mirror never held is quarantined, the next publish leaves it out of the catalogue and logs that
-it did: the mirror is published reduced, as the nest itself now answers.
+the mirror never held is quarantined, the next publish goes ahead with its entry still catalogued and
+no file behind it, and logs that it did: a follower then refuses a query that would read it rather
+than answer short, `nuthatch publish verify` names it, and `nuthatch seed` refuses, naming the
+segment and its blocks.
 `nuthatch doctor --catalogue` checks the same thing and only reports.
 
 **Restart safety.** SIGTERM and SIGINT drain in-flight requests and exit **0**. Progress is

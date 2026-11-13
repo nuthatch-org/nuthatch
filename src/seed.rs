@@ -284,11 +284,16 @@ async fn fetch_one(mirror: &dyn Mirror, segments: &Path, dataset: &str, w: &Want
     let got = match got {
         Ok(Some(h)) => h,
         Ok(None) => {
+            let (key, from, to) = (&w.key, w.segment.from_block, w.segment.to_block);
+            let why = format!(
+                "the mirror's catalogue names {key} (blocks {from}..={to}) but it is not there, so a \
+                 seed would be short. Restore it on the publisher, or seed from another mirror"
+            );
             return Err(crate::distribution::RegistryError::new(
                 crate::distribution::FailureCode::NotFound,
-                format!("the mirror's catalogue names {} but it is not there", w.key),
+                why,
             )
-            .into())
+            .into());
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);

@@ -211,7 +211,7 @@ impl SegmentSink for FsSink<'_> {
         };
         replace_durable(&target, bytes)?;
         unrefuse(&target);
-        record_restored(&s.hash);
+        record_restored(self.dir, &s.hash);
         Ok(())
     }
 
@@ -2133,9 +2133,16 @@ pub(crate) fn forget_findings(dir: &Path) {
 
 /// A seal wrote `hash`'s own bytes back: it no longer reduces anything, though state derived from the
 /// bad copy stays stale.
-fn record_restored(hash: &str) {
+fn record_restored(dir: &Path, hash: &str) {
+    // Only what this dataset or its store lost: another runtime may hold the same hash, still bad.
+    let me = lease_key(dir);
+    let store = outer_store(dir).map(|s| lease_key(&s));
     let mut f = findings().lock().unwrap_or_else(|e| e.into_inner());
-    for q in f.quarantined.iter_mut().filter(|q| q.hash == hash) {
+    for q in f
+        .quarantined
+        .iter_mut()
+        .filter(|q| q.hash == hash && (q.dataset == me || (q.store.is_some() && q.store == store)))
+    {
         q.restored = true;
     }
 }
