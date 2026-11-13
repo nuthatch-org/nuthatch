@@ -1634,7 +1634,13 @@ fn map_exact_field_tables(
             } else {
                 None
             };
-            if simple.is_none() && composed.is_none() {
+            #[cfg(feature = "graph")]
+            let bytes_id = simple.is_none()
+                && composed.is_none()
+                && crate::port_report::is_tx_log_bytes_id(&asg.expr, func, &mappings.functions);
+            #[cfg(not(feature = "graph"))]
+            let bytes_id = false;
+            if simple.is_none() && composed.is_none() && !bytes_id {
                 continue;
             }
             let Some(handler) = event_handler_for(func, mappings) else {
@@ -1652,7 +1658,10 @@ fn map_exact_field_tables(
                     Some(sql) => sql,
                     None => continue,
                 },
-                (None, None) => continue,
+                (None, None) => match tx_log_id_sql(&table, schema) {
+                    Some(sql) => sql,
+                    None => continue,
+                },
             };
             out.entry(table).or_insert(expr);
         }
@@ -1690,6 +1699,23 @@ fn concat_sql(
         return None;
     }
     Some(out.join(" || "))
+}
+
+/// `tx_hash.concatI32(log_index)` as the hex graph-node serves a `Bytes` id: `0x`, lowercase, the hash's
+/// 32 bytes then the index's low four bytes, least significant first. `tx_hash` is stored as that hex.
+fn tx_log_id_sql(table: &str, schema: &[nuthatch_decode::registry::TableSchema]) -> Option<String> {
+    let hash = resolve_column(table, "tx_hash", schema)?;
+    let index = resolve_column(table, "log_index", schema)?;
+    // `log_index` is a DECIMAL. Each byte is an exact difference of remainders, so the division is exact
+    // whether `/` truncates or not.
+    let x = format!("CAST(\"{index}\" AS BIGINT)");
+    let bytes: Vec<String> = (0..4u32)
+        .map(|k| {
+            let (lo, hi) = (1u64 << (8 * k), 1u64 << (8 * (k + 1)));
+            format!("lpad(to_hex(CAST(({x} % {hi} - {x} % {lo}) / {lo} AS BIGINT)), 2, '0')")
+        })
+        .collect();
+    Some(format!("\"{hash}\" || {}", bytes.join(" || ")))
 }
 
 /// A table that writes other Exact fields still needs an id column so UNION ALL can fold

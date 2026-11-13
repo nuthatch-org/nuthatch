@@ -155,6 +155,9 @@ mod gate_refresh_script;
 #[path = "graph_over_indexed_data.rs"]
 mod graph_over_indexed_data;
 #[cfg(feature = "graph")]
+#[path = "graph_scaffold_id.rs"]
+mod graph_scaffold_id;
+#[cfg(feature = "graph")]
 #[path = "graph_schema_golden.rs"]
 mod graph_schema_golden;
 #[path = "ivm_claims.rs"]
@@ -227,3 +230,5 @@ mod verification_non_claims;
 mod window_is_a_ceiling;
 #[path = "workflow_permission_keys.rs"]
 mod workflow_permission_keys;
+#[path = "write_token_flag.rs"]
+mod write_token_flag;

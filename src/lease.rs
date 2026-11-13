@@ -831,9 +831,9 @@ mod tests {
             self.up()?;
             self.inner.put(k, b).await
         }
-        async fn put_file(&self, k: &str, s: &std::path::Path) -> Result<()> {
+        async fn put_file(&self, k: &str, s: &std::path::Path, x: Option<&str>) -> Result<()> {
             self.up()?;
-            self.inner.put_file(k, s).await
+            self.inner.put_file(k, s, x).await
         }
         async fn put_if(&self, k: &str, b: &[u8], e: Option<&[u8]>) -> Result<()> {
             self.up()?;
@@ -858,7 +858,7 @@ mod tests {
         async fn put(&self, _: &str, _: &[u8]) -> Result<()> {
             anyhow::bail!("connection refused")
         }
-        async fn put_file(&self, _: &str, _: &std::path::Path) -> Result<()> {
+        async fn put_file(&self, _: &str, _: &std::path::Path, _: Option<&str>) -> Result<()> {
             anyhow::bail!("connection refused")
         }
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
