@@ -5,14 +5,15 @@
 # `check`: `yatr check` is a builtin that validates this file, and it shadows
 # any task of that name without warning.
 
-# `yatr ci` runs what the required `fmt · clippy · test` check runs (the default and exex legs in
-# .github/workflows/ci.yml: fmt, clippy and test for the root crate and for decode/, and the exex
-# leg), the non-required counter and graph legs, and cargo-deny.
+# `yatr ci` runs what the required `fmt · clippy · test` check runs on its default leg (fmt, clippy
+# and test for the root crate, decode/ and the other path crates), the optional-features leg, and
+# cargo-deny.
 #
 # It leaves these to CI, because they need Docker, a Postgres or S3 server, a Linux runner, a long
 # soak or the nightly toolchain, and a local `yatr ci` would either skip them or lie about them:
-#   pg-parity, crash-points, minio-publish, trino-contract, fleet (compose), footprint and RAM
-#   budget, point-read latency, build release, fuzz smoke (`yatr fuzz-smoke` runs it by hand).
+#   the head-count-deleted leg (it deletes files), the wasm checks, pg-parity, minio-publish,
+#   trino-contract, fleet (compose), footprint and RAM budget, point-read latency, build release,
+#   fuzz smoke (`yatr fuzz-smoke` runs it by hand).
 # `scripts/verify.sh` is a runbook for a running nest or fleet, not part of this gate.
 
 [env]
@@ -30,17 +31,18 @@ no_cache = true
 [tasks.fmt-check]
 desc = "Fail if the tree is unformatted"
 run = ["cargo fmt --all -- --check"]
-sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs"]
+sources = ["**/*.rs"]
 
 [tasks.lint]
 desc = "Clippy with warnings denied"
 run = ["cargo clippy --all-targets -- -D warnings"]
-sources = ["src/**/*.rs", "decode/**/*.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
 
 [tasks.test]
 desc = "Run the test suite (needs cargo-nextest, as CI does)"
 run = ["cargo nextest run --locked", "cargo test --doc --locked"]
-sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
+# Tests read fixtures, docs, scripts and .github/ from across the tree.
+sources = ["**/*"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
 
 [tasks.decode]
@@ -52,49 +54,65 @@ run = [
 ]
 sources = ["decode/**/*.rs", "decode/Cargo.toml", "decode/Cargo.lock"]
 
-[tasks.exex]
-desc = "clippy and test with --features exex"
+[tasks.features]
+desc = "The optional-features leg: clippy per feature, then the tests with all of them"
 run = [
-  "cargo clippy --features exex --all-targets -- -D warnings",
-  "cargo nextest run --features exex --locked",
-  "cargo test --doc --features exex --locked",
+  "cargo clippy --locked --features graph --all-targets -- -D warnings",
+  "cargo clippy --locked --features folds --all-targets -- -D warnings",
+  "cargo clippy --locked --features counter --all-targets -- -D warnings",
+  "cargo clippy --locked --features crash-points --all-targets -- -D warnings",
+  "cargo clippy --locked --features flight --all-targets -- -D warnings",
+  "cargo clippy --locked --features sync-server --all-targets -- -D warnings",
+  "cargo nextest run --locked --features graph,counter,crash-points,flight,sync-server",
+  "cargo test --doc --locked --features graph,counter,crash-points,flight,sync-server",
 ]
-sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["**/*"]
 
-[tasks.counter]
-desc = "clippy and test with --features counter"
+[tasks.crates]
+desc = "fmt, clippy and test for the path crates CI checks beside decode"
 run = [
-  "cargo clippy --features counter --all-targets -- -D warnings",
-  "cargo nextest run --features counter --locked",
-  "cargo test --doc --features counter --locked",
+  "cargo fmt --check --manifest-path count/receiver/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path count/receiver/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path count/receiver/Cargo.toml",
+  "cargo fmt --check --manifest-path tools/fixture-rpc/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path tools/fixture-rpc/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path tools/fixture-rpc/Cargo.toml",
+  "cargo fmt --check --manifest-path tools/lodestar-parity/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings",
+  "cargo fmt --check --manifest-path seal/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path seal/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path seal/Cargo.toml",
+  "cargo fmt --check --manifest-path identity/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path identity/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path identity/Cargo.toml",
+  "cargo fmt --check --manifest-path scaffold/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path scaffold/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path scaffold/Cargo.toml",
+  "cargo fmt --check --manifest-path timelapse/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path timelapse/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path timelapse/Cargo.toml",
+  "cargo fmt --check --manifest-path eval/runner/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path eval/runner/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path eval/runner/Cargo.toml",
 ]
-sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
-
-[tasks.graph]
-desc = "clippy (graph, folds alone) and test with --features graph"
-run = [
-  "cargo clippy --features graph --all-targets -- -D warnings",
-  "cargo clippy --features folds --all-targets -- -D warnings",
-  "cargo nextest run --locked --features graph",
-  "cargo test --doc --locked --features graph",
-]
-sources = ["src/**/*.rs", "decode/**/*.rs", "tests/**/*.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["count/receiver/**", "tools/fixture-rpc/**", "tools/lodestar-parity/**", "seal/**", "identity/**", "scaffold/**", "timelapse/**", "eval/runner/**", "decode/**", "core/**"]
 
 [tasks.deny]
 desc = "cargo-deny: licences, bans, advisories, sources"
 run = ["cargo deny check"]
-sources = ["deny.toml", "Cargo.lock"]
+# Advisories arrive without Cargo.lock changing, so a cached pass would hide them.
+no_cache = true
 
 [tasks.build]
 desc = "Build the release binary"
 run = ["cargo build --release"]
-sources = ["src/**/*.rs", "decode/**/*.rs", "Cargo.toml", "Cargo.lock"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
 outputs = ["target/release/nuthatch"]
 
 [tasks.doc]
 desc = "Build the API docs"
 run = ["cargo doc --no-deps"]
-sources = ["src/**/*.rs", "decode/**/*.rs"]
+sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src/**", "server.json"]
 
 [tasks.fuzz-smoke]
 desc = "Short fuzz run over each target (needs a nightly toolchain)"
@@ -104,6 +122,6 @@ no_cache = true
 allow_failure = true
 
 [tasks.ci]
-desc = "What CI runs: fmt-check, lint, test, decode, exex, counter, graph, deny"
-depends = ["fmt-check", "lint", "test", "decode", "exex", "counter", "graph", "deny"]
+desc = "What CI runs: fmt-check, lint, test, decode, crates, features, deny"
+depends = ["fmt-check", "lint", "test", "decode", "crates", "features", "deny"]
 run = []
