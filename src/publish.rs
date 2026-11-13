@@ -1329,7 +1329,7 @@ async fn sync_pass(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        missing.retain(|(_, s)| !lost.iter().any(|(_, l)| l.hash == s.hash));
+        missing.retain(|(t, s)| !lost.iter().any(|(lt, l)| lt == t && l.hash == s.hash));
     }
 
     if dry_run {

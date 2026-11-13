@@ -2393,21 +2393,7 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
     let until = Instant::now() + d;
     let key = lease_key(dir);
     while alive() {
-        let asked = requests()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&key)
-            .map(std::mem::take)
-            .unwrap_or_default();
-        for (table, s) in asked {
-            let path = segment_path(dir, &s.file, &s.hash);
-            let mut throttle = Throttle::new(u64::MAX);
-            if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
-                if got != s.hash {
-                    quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
-                }
-            }
-        }
+        serve_requests(dir, &key, alive);
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
@@ -2415,6 +2401,54 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
         std::thread::sleep(left.min(Duration::from_millis(200)));
     }
     false
+}
+
+/// Answer what publishers have asked of `dir`'s verifier. Only a final segment the catalogue still
+/// names is checked: a provisional tail is the writer's own to rewrite, and an entry a fold replaced
+/// is not served any more.
+fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
+    let asked = requests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(key)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    if asked.is_empty() {
+        return;
+    }
+    let Ok(manifest) = load_manifest(dir) else {
+        return;
+    };
+    for (table, s) in asked {
+        let current = manifest
+            .tables
+            .get(&table)
+            .and_then(|segs| segs.iter().find(|c| c.hash == s.hash && c.file == s.file));
+        if current.is_none_or(|c| c.provisional) {
+            continue;
+        }
+        let path = segment_path(dir, &s.file, &s.hash);
+        let mut throttle = Throttle::new(u64::MAX);
+        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
+            if got != s.hash {
+                quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
+            }
+        }
+    }
+}
+
+/// [`serve_requests`] for every dataset with one waiting, keyed by its canonical path.
+fn serve_all_requests(alive: &impl Fn() -> bool) {
+    let waiting: Vec<PathBuf> = requests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(_, pending)| !pending.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in waiting {
+        serve_requests(&key, &key, alive);
+    }
 }
 
 /// One full pass. `None` when the nest went away part way; the next start runs a whole pass again.
@@ -2425,6 +2459,9 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
     let mut throttle = Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC);
     for (table, segs) in &manifest.tables {
         for s in segs {
+            // A publisher waiting on this pass, or on another dataset's verifier queued behind it, is
+            // answered between segments rather than at its end.
+            serve_all_requests(alive);
             let path = segment_path(dir, &s.file, &s.hash);
             let stamp = file_stamp(&path);
             let reason = match hash_throttled(&path, &mut throttle, alive) {
@@ -4095,6 +4132,67 @@ mod tests {
             serde_json::to_value(&fresh).unwrap()
         );
         assert_eq!(hash, fresh_hash);
+    }
+
+    /// A publisher's request moves only a final segment the catalogue still names: a provisional tail
+    /// is the writer's to rewrite, and a request from an older snapshot is answered by the current one.
+    #[test]
+    fn a_verify_request_moves_only_a_final_segment_still_catalogued() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let tail = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        assert!(tail.provisional);
+        let tail_path = segment_path(dir.path(), &tail.file, &tail.hash);
+        let rot = |path: &Path| {
+            let mut bytes = std::fs::read(path).unwrap();
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0x01;
+            std::fs::write(path, &bytes).unwrap();
+        };
+        rot(&tail_path);
+        let mut stale = tail.clone();
+        stale.provisional = false;
+        stale.file = "usdc__transfer-gone.parquet".into();
+
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        verify_in_background(
+            dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        assert!(request_verify(dir.path(), "usdc__transfer", &tail));
+        assert!(request_verify(dir.path(), "usdc__transfer", &stale));
+        // Served in order, so by the time this one is taken the two before it were answered.
+        let final_dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(final_dir.path(), 0);
+        seal_range(final_dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(final_dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(final_dir.path(), &seg.file, &seg.hash);
+        rot(&path);
+        let held = alive.clone();
+        verify_in_background(
+            final_dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        assert!(request_verify(final_dir.path(), "usdc__transfer", &seg));
+        let start = Instant::now();
+        while path.exists() && start.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The first verifier has had as long as the second, which answered.
+        std::thread::sleep(Duration::from_millis(500));
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !path.exists(),
+            "a final rotten segment was not quarantined on request"
+        );
+        assert!(
+            tail_path.exists(),
+            "a provisional tail was moved on a request"
+        );
+        assert!(!dir.path().join(QUARANTINE_DIR).exists());
     }
 
     #[test]
