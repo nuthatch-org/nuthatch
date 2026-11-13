@@ -6060,6 +6060,14 @@ fn sql_error_response(s: &AppState, e: anyhow::Error, sql: &str) -> axum::respon
         )
             .into_response();
     }
+    if let Some(fault) = e.downcast_ref::<crate::analytics::QueryEngineFault>() {
+        METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Internal);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": sanitize_sql_error(&fault.to_string(), &s.dir) })),
+        )
+            .into_response();
+    }
     let reason = if e.downcast_ref::<crate::store::HotScanTooLarge>().is_some()
         || e.downcast_ref::<crate::store::HotScanBudgetExceeded>()
             .is_some()
@@ -12923,6 +12931,59 @@ mod tests {
         );
         let resp = explain(State(state), dies()).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK, "/explain ran the statement");
+    }
+
+    /// A panic in the engine is nuthatch's fault, so `/sql` answers 500 and counts it as such,
+    /// not 400 with a hint to fix the statement.
+    #[tokio::test]
+    async fn sql_answers_an_engine_panic_as_an_internal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        state
+            .store
+            .put_entity(
+                "k1",
+                &json!({"table": "t", "block_number": 1, "who": "a"}).to_string(),
+            )
+            .unwrap();
+        crate::engine_burrmill::panic_in(tmp.path());
+        let before = rejections("internal").unwrap_or(0);
+        let resp = sql(
+            State(state.clone()),
+            Query(SqlQuery {
+                q: "SELECT nuthatch_test_panic(who) AS p FROM t".into(),
+                max_rows: None,
+                format: None,
+            }),
+        )
+        .await
+        .into_response();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        let error = v["error"].as_str().unwrap();
+        assert!(error.contains("nuthatch_test_panic ran"), "{v}");
+        assert!(!error.contains("hint:"), "{v}");
+        assert!(rejections("internal").unwrap_or(0) > before);
+
+        let resp = sql(
+            State(state),
+            Query(SqlQuery {
+                q: "SELECT who FROM t".into(),
+                max_rows: None,
+                format: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the session answers after it"
+        );
     }
 
     /// RFC-0010 Part A: the admin UI serves when enabled and 404s when disabled (`--no-admin` or a

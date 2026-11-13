@@ -1439,7 +1439,8 @@ Rejections surface as a `4xx` or `503` and count in the backward-compatible aggr
 `nuthatch_sql_rejections_total`, and in `nuthatch_sql_rejections_total{reason=…}`. The fixed
 `reason` values distinguish `busy`, `too_large`, `invalid`, `bounded`, declared-query
 `admission`, `timeout`, `out_of_memory` (the engine ran out of its memory budget, still a `400`
-to the caller), and `tenant_share` (a runtime tenant at its own share, answered `429`); they are the useful series for separating saturation from a caller error. A declared
+to the caller), `tenant_share` (a runtime tenant at its own share, answered `429`), and `internal` (the engine panicked
+on the statement, a fault in nuthatch answered `500`); they are the useful series for separating saturation from a caller error. A declared
 query refused by its scan bound answers `422` and also counts in
 `nuthatch_named_scan_refusals_total`; the bounds of those admitted are the
 `nuthatch_named_scan_bytes` histogram.

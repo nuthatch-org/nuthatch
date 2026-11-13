@@ -413,6 +413,24 @@ impl std::fmt::Display for QueryMemoryExceeded {
 
 impl std::error::Error for QueryMemoryExceeded {}
 
+/// The engine panicked planning or running a statement: a fault in nuthatch or below it, not in the
+/// statement. Its own type so `/sql` answers 500 rather than telling the caller to fix their SQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryEngineFault(pub String);
+
+impl std::fmt::Display for QueryEngineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the analytics engine failed on this statement, a fault in nuthatch and not in the \
+             query: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for QueryEngineFault {}
+
 /// How often the `/sql` watchdog measures a running query's spill directory.
 const SPILL_POLL: Duration = Duration::from_millis(250);
 /// How often it reads the pool under a mount's memory cap: an atomic load, so cheap.

@@ -184,6 +184,14 @@ impl BurrmillSession {
         .map_err(engine_err)?;
         #[cfg(feature = "graph")]
         crate::analytics_scalars::register(&mut engine);
+        #[cfg(test)]
+        if nest.is_some_and(|(dir, _)| PANICS_IN.lock().unwrap().iter().any(|d| d == dir)) {
+            engine.register_text_function(
+                "nuthatch_test_panic",
+                1,
+                Arc::new(|_| panic!("nuthatch_test_panic ran")),
+            );
+        }
         let engine = Arc::new(RwLock::new(engine));
         let dir = nest.map(|(dir, _)| dir.to_path_buf());
         LIVE.lock()
@@ -226,6 +234,15 @@ impl Drop for BurrmillSession {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|(_, e)| !Weak::ptr_eq(e, &Arc::downgrade(&self.engine)));
     }
+}
+
+#[cfg(test)]
+static PANICS_IN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Sessions opened over `dir` from now on can call `nuthatch_test_panic`, which panics in the engine.
+#[cfg(test)]
+pub(crate) fn panic_in(dir: &Path) {
+    PANICS_IN.lock().unwrap().push(dir.to_path_buf());
 }
 
 // A statement that finds the cached session busy opens another, so the limit has to bound the
@@ -352,6 +369,7 @@ fn died(e: burrmill::BurrmillError) -> Died {
                 .into(),
             )
         }
+        Internal(m) => Died::Executing(crate::analytics::QueryEngineFault(m).into()),
         _ => Died::Executing(engine_err(e)),
     }
 }

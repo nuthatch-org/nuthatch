@@ -27,10 +27,12 @@ pub enum SqlRejection {
     OutOfMemory,
     /// A tenant label at its own share of the gate (RFC-0073 FR2), where `Busy` is the gate full.
     TenantShare,
+    /// The engine panicked: a fault in nuthatch or below it, answered `500`.
+    Internal,
 }
 
 impl SqlRejection {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Busy,
         Self::TooLarge,
         Self::Invalid,
@@ -39,6 +41,7 @@ impl SqlRejection {
         Self::Timeout,
         Self::OutOfMemory,
         Self::TenantShare,
+        Self::Internal,
     ];
 
     const fn index(self) -> usize {
@@ -51,6 +54,7 @@ impl SqlRejection {
             Self::Timeout => 5,
             Self::OutOfMemory => 6,
             Self::TenantShare => 7,
+            Self::Internal => 8,
         }
     }
 
@@ -64,6 +68,7 @@ impl SqlRejection {
             Self::Timeout => "timeout",
             Self::OutOfMemory => "out_of_memory",
             Self::TenantShare => "tenant_share",
+            Self::Internal => "internal",
         }
     }
 }
