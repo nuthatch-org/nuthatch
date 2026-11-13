@@ -134,6 +134,8 @@ impl Writer {
 #[derive(Default)]
 struct MirrorKnobs {
     delay_ms: AtomicU64,
+    /// When any are set, only the files whose names begin with one are delayed.
+    slow: Mutex<HashSet<String>>,
     hidden: Mutex<HashSet<String>>,
     corrupt: Mutex<HashSet<String>>,
     served: AtomicU64,
@@ -150,11 +152,21 @@ async fn serve_mirror(dir: PathBuf, knobs: Arc<MirrorKnobs>) -> String {
                 |State((dir, knobs)): State<(PathBuf, Arc<MirrorKnobs>)>,
                  method: Method,
                  Key(key): Key<String>| async move {
-                    let delay = knobs.delay_ms.load(Ordering::SeqCst);
-                    if delay > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
                     let name = key.rsplit('/').next().unwrap_or("").to_string();
+                    let slowed = {
+                        let slow = knobs.slow.lock().unwrap();
+                        slow.is_empty() || slow.iter().any(|h| name.starts_with(h))
+                    };
+                    let delay = knobs.delay_ms.load(Ordering::SeqCst);
+                    if delay > 0 && slowed {
+                        // Released early when the test sets the delay back to 0.
+                        let until = std::time::Instant::now() + Duration::from_millis(delay);
+                        while knobs.delay_ms.load(Ordering::SeqCst) > 0
+                            && std::time::Instant::now() < until
+                        {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
                     if knobs
                         .hidden
                         .lock()
@@ -599,11 +611,14 @@ async fn a_fresh_follower_names_the_file_it_waits_for() {
     rig.seal(1, 2);
     rig.publish().await;
     let knobs = Arc::new(MirrorKnobs::default());
-    knobs.delay_ms.store(15_000, Ordering::SeqCst);
+    // Only the segment is slow, and held well past the wait below: the follower can learn what
+    // to fetch at its own pace, and the report is read while that fetch is still in flight.
+    knobs.slow.lock().unwrap().insert(rig.segment_hash());
+    knobs.delay_ms.store(300_000, Ordering::SeqCst);
     let served = serve_mirror(PathBuf::from(&rig.mirror), knobs.clone()).await;
     let (_f, remote, _) = rig.remote(&served, 2).await;
     let mut seen = serde_json::Value::Null;
-    for _ in 0..200 {
+    for _ in 0..1200 {
         let (_, ready) = get(&remote, "/ready").await;
         let mirror = &ready["nests"][ROUTE]["mirror"];
         if mirror["waiting_for"]
