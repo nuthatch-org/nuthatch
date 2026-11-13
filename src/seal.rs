@@ -2428,7 +2428,7 @@ fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
             continue;
         }
         let path = segment_path(dir, &s.file, &s.hash);
-        let mut throttle = Throttle::new(u64::MAX);
+        let mut throttle = Throttle::process();
         if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
             if got != s.hash {
                 quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
@@ -2456,7 +2456,7 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
     let manifest = load_manifest(dir)?;
     let mut verified = Verified::default();
     let mut quarantined = 0;
-    let mut throttle = Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC);
+    let mut throttle = Throttle::process();
     for (table, segs) in &manifest.tables {
         for s in segs {
             // A publisher waiting on this pass, or on another dataset's verifier queued behind it, is
@@ -2496,11 +2496,26 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
     Ok(Some(quarantined))
 }
 
-/// Paces reads to a byte rate measured from its creation.
+/// Paces reads to a byte rate measured from its creation, or, for [`Throttle::process`], to
+/// [`BACKGROUND_VERIFY_BYTES_PER_SEC`] across every reader in the process.
 struct Throttle {
     started: Instant,
     bytes: u64,
     per_sec: u64,
+    shared: bool,
+}
+
+/// When the process-wide verify budget is next free.
+static VERIFY_BUDGET: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Reserve `n` bytes at `per_sec` on `budget`, after whatever is already reserved: when they are paid for.
+fn reserve(budget: &Mutex<Option<Instant>>, n: usize, per_sec: u64) -> Instant {
+    let cost = Duration::from_secs_f64(n as f64 / per_sec as f64);
+    let now = Instant::now();
+    let mut next = budget.lock().unwrap_or_else(|e| e.into_inner());
+    let end = next.filter(|t| *t > now).unwrap_or(now) + cost;
+    *next = Some(end);
+    end
 }
 
 impl Throttle {
@@ -2509,10 +2524,25 @@ impl Throttle {
             started: Instant::now(),
             bytes: 0,
             per_sec,
+            shared: false,
+        }
+    }
+
+    /// The budget every verify read in the process shares, so neither a pass nor a burst of
+    /// publisher requests can take more of the disk than it.
+    fn process() -> Self {
+        Throttle {
+            shared: true,
+            ..Throttle::new(BACKGROUND_VERIFY_BYTES_PER_SEC)
         }
     }
 
     fn read(&mut self, n: usize) {
+        if self.shared {
+            let until = reserve(&VERIFY_BUDGET, n, self.per_sec);
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            return;
+        }
         self.bytes += n as u64;
         let due = Duration::from_secs_f64(self.bytes as f64 / self.per_sec as f64);
         let ahead = due.saturating_sub(self.started.elapsed());
@@ -4132,6 +4162,23 @@ mod tests {
             serde_json::to_value(&fresh).unwrap()
         );
         assert_eq!(hash, fresh_hash);
+    }
+
+    /// Readers on one budget queue behind each other: eight threads reserving a second's worth each
+    /// are paid for over eight seconds, not one.
+    #[test]
+    fn verify_readers_share_one_budget() {
+        let budget = Mutex::new(None);
+        let start = Instant::now();
+        let ends: Vec<Instant> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| reserve(&budget, 1 << 20, 1 << 20)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let last = ends.iter().max().unwrap().duration_since(start);
+        assert!(last >= Duration::from_secs(8), "{last:?}");
+        assert!(last < Duration::from_secs(9), "{last:?}");
     }
 
     /// A publisher's request moves only a final segment the catalogue still names: a provisional tail
