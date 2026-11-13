@@ -287,6 +287,49 @@ async fn the_two_backends_agree_through_an_indexing_lifecycle() {
     assert_agree(redb.as_ref(), pg.as_ref(), "prune_and_set_meta(1,2)");
 }
 
+/// A webhook chunk and the cursor it leaves are one commit on both backends, with the same sequence
+/// numbers and the same meta, and an empty push still sets its meta.
+#[tokio::test]
+async fn an_outbox_push_with_meta_agrees_across_backends() {
+    let Some((redb, pg, _dir)) = pair("outbox_meta") else {
+        return;
+    };
+    let meta = |c: &str, p: &str| {
+        vec![
+            ("webhook_cursor_w".to_string(), c.to_string()),
+            ("webhook_partial_w".to_string(), p.to_string()),
+        ]
+    };
+    let batches = [
+        (
+            vec![r#"{"n":0}"#.to_string(), r#"{"n":1}"#.to_string()],
+            meta("2", ""),
+        ),
+        (vec![r#"{"n":2}"#.to_string()], meta("2", "3:1")),
+        (vec![], meta("3", "")),
+    ];
+    for (payloads, m) in &batches {
+        let (a, b) = (
+            redb.outbox_push_with_meta(payloads, m).unwrap(),
+            pg.outbox_push_with_meta(payloads, m).unwrap(),
+        );
+        assert_eq!(a, b, "first sequence of {payloads:?}");
+        for k in ["webhook_cursor_w", "webhook_partial_w"] {
+            assert_eq!(
+                redb.get_meta(k).unwrap(),
+                pg.get_meta(k).unwrap(),
+                "{k} after {payloads:?}"
+            );
+        }
+        assert_agree(redb.as_ref(), pg.as_ref(), "outbox_push_with_meta");
+    }
+    assert_eq!(pg.outbox_len(), 3);
+    assert_eq!(
+        pg.get_meta("webhook_cursor_w").unwrap().as_deref(),
+        Some("3")
+    );
+}
+
 /// The outbox is at-least-once delivery; a sequence that diverges silently drops or double-sends.
 #[tokio::test]
 async fn the_outbox_sequence_is_identical_across_backends() {

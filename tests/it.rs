@@ -132,6 +132,8 @@ mod e2e_tab_mirror;
 mod e2e_tab_parity;
 #[path = "e2e_trino_contract.rs"]
 mod e2e_trino_contract;
+#[path = "e2e_webhook_backfill.rs"]
+mod e2e_webhook_backfill;
 #[path = "embed_versions.rs"]
 mod embed_versions;
 #[path = "engine_batch_boundary.rs"]
