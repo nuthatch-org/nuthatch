@@ -2133,8 +2133,31 @@ pub(crate) mod tests {
         }
     }
 
-    /// Blocks its thread outright in `put_file`, as a synchronous call on a slow disk does.
-    struct Blocking;
+    /// Blocks its thread outright in `put_file`, as a synchronous call on a slow disk does, until the
+    /// test lets it go.
+    #[derive(Default)]
+    struct Blocking {
+        /// Whether a put is inside the store, and whether it may leave.
+        state: std::sync::Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl Blocking {
+        fn wait_until(&self, what: impl Fn(&(bool, bool)) -> bool) -> bool {
+            let held = self.state.lock().unwrap();
+            let (held, timed_out) = self
+                .changed
+                .wait_timeout_while(held, Duration::from_secs(120), |s| !what(s))
+                .unwrap();
+            drop(held);
+            !timed_out.timed_out()
+        }
+
+        fn set(&self, f: impl FnOnce(&mut (bool, bool))) {
+            f(&mut self.state.lock().unwrap());
+            self.changed.notify_all();
+        }
+    }
 
     #[async_trait]
     impl Mirror for Blocking {
@@ -2145,7 +2168,8 @@ pub(crate) mod tests {
             Ok(())
         }
         async fn put_file(&self, _: &str, _: &Path, _: Option<&str>) -> Result<()> {
-            std::thread::sleep(Duration::from_secs(5));
+            self.set(|s| s.0 = true);
+            self.wait_until(|s| s.1);
             Ok(())
         }
         async fn put_if(&self, _: &str, _: &[u8], _: Option<&[u8]>) -> Result<()> {
@@ -2270,35 +2294,36 @@ pub(crate) mod tests {
         eventually("a seal to wake the mirror inside its hour", matches).await;
     }
 
+    /// The caller's runtime and a seal both finish while the publisher is held inside a blocking
+    /// store. Judged by order, not by time: a seal that waited on the store would never finish here.
     #[tokio::test(flavor = "current_thread")]
     async fn a_blocking_store_never_holds_the_callers_runtime() {
         let nest = sealed_nest();
-        let target = install("blocking", std::sync::Arc::new(Blocking));
+        let store = std::sync::Arc::new(Blocking::default());
+        let target = install("blocking", store.clone());
         let _publisher = spawn(
             nest.path().to_path_buf(),
             "publish-blocking".into(),
             settings(target, Duration::from_secs(3600), 1),
         )
         .unwrap();
-        // Long enough for the publisher to be inside its five-second put.
-        std::thread::sleep(Duration::from_millis(500));
-        let started = std::time::Instant::now();
+        assert!(
+            store.wait_until(|s| s.0),
+            "the publisher never reached the store"
+        );
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let sealing = nest.path().to_path_buf();
+        let (done, sealed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(seal_range(&sealing, &[row(12, 9)], 12, 12).map(|s| s.is_some()));
+        });
+        let outcome = sealed.recv_timeout(Duration::from_secs(120));
+        store.set(|s| s.1 = true);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the caller's runtime waited {:?} on the store",
-            started.elapsed()
-        );
-        let started = std::time::Instant::now();
-        seal_range(nest.path(), &[row(12, 9)], 12, 12)
-            .unwrap()
-            .expect("sealed");
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "a seal waited {:?} on the store",
-            started.elapsed()
+            matches!(outcome, Ok(Ok(true))),
+            "the seal did not finish while the store held the publisher: {outcome:?}"
         );
     }
 
