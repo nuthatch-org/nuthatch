@@ -2312,10 +2312,12 @@ pub fn verify_in_background(
     delay: Duration,
 ) -> std::thread::JoinHandle<()> {
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    // Before the thread starts, so a publisher that asks straight after the start is heard.
+    let verifying = Verifying::register(&dir);
     std::thread::Builder::new()
         .name("segment-verify".into())
         .spawn(move || {
-            let _verifying = Verifying::register(&dir);
+            let _verifying = verifying;
             let mut wait = delay;
             loop {
                 if !sleep_serving(wait, &alive, &dir) {
