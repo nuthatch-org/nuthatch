@@ -362,7 +362,10 @@ the same `as_of`, `sealed_through` and `nid`.
   follower takes fresh snapshots as a full queue does. Meanwhile it answers the generation before
   the seal, whole, and `/<tenant>/<alias>/ready`'s `follower.mirror` says what it waits for and why
   the last attempt failed: the publisher has not uploaded it yet, or the bytes did not hash to the
-  name and were refused. It never names a segment it cannot read, and never answers short. The
+  name and were refused; before the first attempt answers, which file it is fetching. It stays ready,
+  since what it serves is whole, and `follower.holding_earlier_generation` gives the generation it
+  holds and `since_unixtime`; `nuthatch_follower_held_generation_seconds{dataset}` counts the same
+  for alerts. It never names a segment it cannot read, and never answers short. The
   publisher uploads after the writer's catalogue moves and the writer never waits for a follower,
   so a slow mirror shows as seal visibility lag on remote followers, which is reported apart from
   tip visibility, and never anywhere else.
