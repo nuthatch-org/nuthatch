@@ -2343,8 +2343,9 @@ pub fn verify_in_background(
         .expect("spawning the segment verifier")
 }
 
-/// Segments a publisher in this process found wrong, waiting for the dataset's own verifier.
-type Requests = Mutex<HashMap<PathBuf, Vec<(String, Segment)>>>;
+/// Per dataset, how many verifiers run for it here, and the segments a publisher in this process found
+/// wrong, waiting for one of them. Counted, so a verifier ending as another starts leaves it registered.
+type Requests = Mutex<HashMap<PathBuf, (usize, Vec<(String, Segment)>)>>;
 
 fn requests() -> &'static Requests {
     static R: OnceLock<Requests> = OnceLock::new();
@@ -2360,21 +2361,43 @@ impl Verifying {
         requests()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key.clone(), Vec::new());
+            .entry(key.clone())
+            .or_default()
+            .0 += 1;
         Verifying(key)
     }
 }
 
 impl Drop for Verifying {
     fn drop(&mut self) {
-        let pending = requests()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0)
-            .unwrap_or_default();
-        // A request taken just before the nest went away was promised an answer: give it one.
-        answer_requests(&self.0, pending);
+        // A request taken just before the nest went away was promised an answer: give it one, and
+        // unregister only once none is left, so [`verifier_stopped`] means every request is answered.
+        loop {
+            let pending = {
+                let mut r = requests().lock().unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = r.get_mut(&self.0) else {
+                    return;
+                };
+                if entry.1.is_empty() {
+                    entry.0 -= 1;
+                    if entry.0 == 0 {
+                        r.remove(&self.0);
+                    }
+                    return;
+                }
+                std::mem::take(&mut entry.1)
+            };
+            answer_requests(&self.0, pending);
+        }
     }
+}
+
+/// Whether no verifier for `dir` runs in this process, so every request it took has been answered.
+pub fn verifier_stopped(dir: &Path) -> bool {
+    !requests()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&lease_key(dir))
 }
 
 /// Ask the writer in this process that verifies `dir` to hash `s` now and quarantine it if it does
@@ -2382,7 +2405,7 @@ impl Drop for Verifying {
 pub fn request_verify(dir: &Path, table: &str, s: &Segment) -> bool {
     let mut r = requests().lock().unwrap_or_else(|e| e.into_inner());
     match r.get_mut(&lease_key(dir)) {
-        Some(pending) => {
+        Some((_, pending)) => {
             pending.push((table.to_string(), s.clone()));
             true
         }
@@ -2414,7 +2437,7 @@ fn serve_requests(dir: &Path, key: &Path) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(key)
-        .map(std::mem::take)
+        .map(|(_, pending)| std::mem::take(pending))
         .unwrap_or_default();
     answer_requests(dir, asked);
 }
@@ -2451,7 +2474,7 @@ fn serve_all_requests() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .filter(|(_, pending)| !pending.is_empty())
+        .filter(|(_, (_, pending))| !pending.is_empty())
         .map(|(key, _)| key.clone())
         .collect();
     for key in waiting {

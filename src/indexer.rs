@@ -464,12 +464,14 @@ pub struct NestRuntime {
 pub const STORE_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wait for `released` (from [`crate::store::HotStore::released`]), failing after
-/// [`STORE_RELEASE_TIMEOUT`] rather than hanging on a handle someone kept.
+/// [`STORE_RELEASE_TIMEOUT`] rather than hanging on a handle someone kept. Then for the nest's segment
+/// verifier, which notices the store has gone at its next step and answers what it took first.
 pub async fn await_store_release(
     released: futures::future::BoxFuture<'static, ()>,
     dir: &std::path::Path,
 ) -> Result<()> {
-    tokio::time::timeout(STORE_RELEASE_TIMEOUT, released)
+    let deadline = tokio::time::Instant::now() + STORE_RELEASE_TIMEOUT;
+    tokio::time::timeout_at(deadline, released)
         .await
         .map_err(|_| {
             anyhow::anyhow!(
@@ -477,7 +479,20 @@ pub async fn await_store_release(
                 dir.display(),
                 STORE_RELEASE_TIMEOUT.as_secs()
             )
-        })
+        })?;
+    // A publish that ran straight after the stop would otherwise hand a bad segment to a verifier
+    // about to go, and find it still in place.
+    while !seal::verifier_stopped(dir) {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the segment verifier for {} was still running {}s after its nest stopped",
+                dir.display(),
+                STORE_RELEASE_TIMEOUT.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
 }
 
 /// Stop a nest that never joined a cursor and return `err` once its store is closed (#1768). Drop

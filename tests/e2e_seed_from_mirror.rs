@@ -121,6 +121,11 @@ pub(crate) async fn stopped_publisher(dir: &Path) {
     );
     drop(store);
     rt.shutdown().await.expect("the publisher stops");
+    // Its verifier has gone with it, so nothing can take a request after the stop and drop it.
+    assert!(
+        nuthatch::seal::verifier_stopped(dir),
+        "the nest stopped with its segment verifier still running"
+    );
     force_seal_through(dir, 8);
 }
 
