@@ -2367,10 +2367,13 @@ impl Verifying {
 
 impl Drop for Verifying {
     fn drop(&mut self) {
-        requests()
+        let pending = requests()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+            .remove(&self.0)
+            .unwrap_or_default();
+        // A request taken just before the nest went away was promised an answer: give it one.
+        answer_requests(&self.0, pending, &|| true);
     }
 }
 
@@ -2413,6 +2416,10 @@ fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
         .get_mut(key)
         .map(std::mem::take)
         .unwrap_or_default();
+    answer_requests(dir, asked, alive);
+}
+
+fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>, alive: &impl Fn() -> bool) {
     if asked.is_empty() {
         return;
     }
@@ -4179,6 +4186,35 @@ mod tests {
         let last = ends.iter().max().unwrap().duration_since(start);
         assert!(last >= Duration::from_secs(8), "{last:?}");
         assert!(last < Duration::from_secs(9), "{last:?}");
+    }
+
+    /// A request taken by a verifier whose nest then goes away is still answered as it ends, rather
+    /// than dropped with the publisher told the writer had it.
+    #[test]
+    fn a_request_to_a_verifier_that_is_stopping_is_still_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        let verifier = verify_in_background(
+            dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        // Ends before its next step, so it never serves this from its loop.
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(request_verify(dir.path(), "usdc__transfer", &seg));
+        verifier.join().unwrap();
+        assert!(!path.exists(), "the request was dropped with the verifier");
+        assert!(!request_verify(dir.path(), "usdc__transfer", &seg));
     }
 
     /// A publisher's request moves only a final segment the catalogue still names: a provisional tail
