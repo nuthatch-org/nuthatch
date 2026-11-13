@@ -19,6 +19,61 @@ pub fn is_out_of_memory(raw: &str) -> bool {
         && !raw.contains("Catalog Error")
 }
 
+/// Where a hint's reader is, and so what lists the tables and columns for them and where a query
+/// that binds is run. `enrich` and `/explain` write `Http`'s pointers; `for_surface` turns them into
+/// another surface's. `Http`'s are SQL `/sql` answers, so a tab, which has no `/schema`, says the
+/// same bytes as a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    Http,
+    Mcp,
+    Repl,
+}
+
+impl Surface {
+    const ALL: [Surface; 3] = [Surface::Http, Surface::Mcp, Surface::Repl];
+
+    fn tables(self) -> &'static str {
+        match self {
+            Surface::Http => "`SELECT table_name FROM information_schema.tables` lists the tables.",
+            Surface::Mcp => "Call the `schema` tool for the list of tables.",
+            Surface::Repl => "`.tables` in the `nuthatch sql` REPL lists them.",
+        }
+    }
+
+    fn columns(self) -> &'static str {
+        match self {
+            Surface::Http => {
+                "`SELECT column_name FROM information_schema.columns WHERE table_name = '<table>'` \
+                 lists a table's columns."
+            }
+            Surface::Mcp => "Call the `schema` tool for each table's columns.",
+            Surface::Repl => "`.schema <table>` in the REPL lists its columns.",
+        }
+    }
+
+    pub(crate) fn explain_note(self) -> &'static str {
+        match self {
+            Surface::Http => "query binds; run it at `/sql`",
+            Surface::Mcp => "query binds; run it with the sql tool",
+            Surface::Repl => "query binds; run it in `nuthatch sql`",
+        }
+    }
+}
+
+/// `text`, an error carrying an `enrich` hint, with the hint's pointers aimed at `surface`. Any
+/// surface's pointer is turned, so text relayed through another surface first comes out the same.
+pub fn for_surface(text: &str, surface: Surface) -> String {
+    let mut out = text.to_string();
+    for from in Surface::ALL.into_iter().filter(|s| *s != surface) {
+        out = out
+            .replace(from.tables(), surface.tables())
+            .replace(from.columns(), surface.columns())
+            .replace(from.explain_note(), surface.explain_note());
+    }
+    out
+}
+
 /// Classify an engine error for `query` against the nest `schema`, returning an actionable hint if the
 /// failure matches a known class (`None` otherwise - an unrecognised error is relayed raw, unadorned).
 /// The classes mirror the RFC-0016 §4 table. Burrmill opens each DataFusion error it recognises with
@@ -52,9 +107,10 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         let tables: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
         return Some(match closest(name, &tables) {
             Some(c) => format!(
-                "no table `{name}`; the closest is `{c}`. Call the `schema` tool for the full list."
+                "no table `{name}`; the closest is `{c}`. {}",
+                Surface::Http.tables()
             ),
-            None => format!("no table `{name}`. Call the `schema` tool for the list of tables."),
+            None => format!("no table `{name}`. {}", Surface::Http.tables()),
         });
     }
 
@@ -99,9 +155,10 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
         let refs: Vec<&str> = in_scope.iter().map(String::as_str).collect();
         return Some(match closest(&col, &refs) {
             Some(c) => format!(
-                "no column `{col}`; the closest is `{c}`. Call `schema` for this table's columns."
+                "no column `{col}`; the closest is `{c}`. {}",
+                Surface::Http.columns()
             ),
-            None => format!("no column `{col}`. Call `schema` for the columns."),
+            None => format!("no column `{col}`. {}", Surface::Http.columns()),
         });
     }
 
@@ -438,6 +495,37 @@ mod tests {
                 },
             ],
         }]
+    }
+
+    #[test]
+    fn each_surface_is_pointed_at_what_it_has() {
+        let table = enrich("Table with name nope does not exist!", "", &schema()).unwrap();
+        let column = enrich("Referenced column \"nope\" not found", "", &schema()).unwrap();
+        for hint in [&table, &column] {
+            assert!(hint.contains("FROM information_schema."), "{hint}");
+            let mcp = for_surface(hint, Surface::Mcp);
+            assert!(
+                mcp.contains("Call the `schema` tool") && !mcp.contains("information_schema"),
+                "{mcp}"
+            );
+            let repl = for_surface(&mcp, Surface::Repl);
+            assert!(
+                repl.contains("in the") && !repl.contains("schema` tool"),
+                "{repl}"
+            );
+            assert_eq!(for_surface(&repl, Surface::Http), *hint);
+        }
+        assert!(for_surface(&table, Surface::Repl).contains("`.tables`"));
+        assert!(for_surface(&column, Surface::Repl).contains("`.schema <table>`"));
+        let note = Surface::Http.explain_note();
+        assert_eq!(
+            for_surface(note, Surface::Mcp),
+            "query binds; run it with the sql tool"
+        );
+        assert_eq!(
+            for_surface(&for_surface(note, Surface::Mcp), Surface::Http),
+            note
+        );
     }
 
     /// Burrmill's message for a segment whose pages were overwritten and footer left intact

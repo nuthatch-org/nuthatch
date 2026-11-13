@@ -1158,7 +1158,12 @@ async fn put_segment(
             // A shared file, or a nest a running writer holds, is the writer's to quarantine: moving it
             // from here would pull it from under that writer, and its own passes find it in their cycle.
             let own = src.starts_with(dir.join(seal::SEGMENTS_DIR));
-            if own && !crate::prune::store_is_held(&dir) {
+            if seal::request_verify(&dir, &table, &seg) {
+                tracing::error!(
+                    "{} does not hash to its address; this process's writer verifies it now",
+                    src.display()
+                );
+            } else if own && !crate::prune::store_is_held(&dir) {
                 seal::quarantine_mismatched(&dir, &table, &seg);
             } else {
                 tracing::error!(
@@ -1291,14 +1296,14 @@ async fn sync_pass(
         None => stopped_publisher(dir),
     };
     let (local_bytes, local) = read_local(dir)?;
-    let catalogue = published_catalogue(&local_bytes, &local)?;
     let (data_identity, nid, bundle_hash, chain_id) = identity_of(dir)?;
     let mirror = open_mirror(target)?;
     let prefix = |k: &str| format!("{data_identity}/{k}");
 
     let remote_bytes = mirror.get(&prefix(MANIFEST_FILE)).await?;
+    let catalogue = published_catalogue(&local_bytes, &local)?;
     let want = want_entries(&local);
-    let (missing, skipped) = missing_entries(
+    let (mut missing, skipped) = missing_entries(
         mirror.as_ref(),
         &data_identity,
         &want,
@@ -1306,6 +1311,26 @@ async fn sync_pass(
         present,
     )
     .await?;
+    // A segment quarantined before the mirror held it cannot be sent, and would hold the catalogue
+    // still for good. It stays catalogued with no file, so a follower refuses rather than answers
+    // short and a seed refuses naming it: dropping the entry made a seeded nest silently short.
+    let lost: Vec<(String, &Segment)> = missing
+        .iter()
+        .filter(|(_, s)| seal::is_quarantined(dir, s))
+        .cloned()
+        .collect();
+    if !lost.is_empty() {
+        tracing::warn!(
+            "publishing {data_identity} with {} quarantined segment(s) catalogued and not on the \
+             mirror: {}",
+            lost.len(),
+            lost.iter()
+                .map(|(t, s)| format!("{t} {} (blocks {}..={})", s.file, s.from_block, s.to_block))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        missing.retain(|(t, s)| !lost.iter().any(|(lt, l)| lt == t && l.hash == s.hash));
+    }
 
     if dry_run {
         return Ok(SyncReport {
@@ -1321,13 +1346,10 @@ async fn sync_pass(
     }
 
     if let Some(m) = metrics {
-        m.set_publish_lag_blocks(
-            missing
-                .iter()
-                .map(|(_, s)| s.to_block - s.from_block + 1)
-                .sum(),
-        );
-        m.set_publish_pending(missing.len() as u64);
+        // A quarantined segment the mirror lacks is still behind, though it is not sent.
+        let behind = || missing.iter().chain(&lost);
+        m.set_publish_lag_blocks(behind().map(|(_, s)| s.to_block - s.from_block + 1).sum());
+        m.set_publish_pending(behind().count() as u64);
     }
     let mirror_ref = mirror.as_ref();
     let attempts: Vec<((String, String), String, Result<u64>)> =
@@ -1547,7 +1569,17 @@ pub async fn verify(dir: &Path, target: &str, deep: bool, etag_md5: bool) -> Res
         } else {
             mirror.head_content(&key).await?
         }
-        .with_context(|| format!("missing {key}"))?;
+        .with_context(|| {
+            let why = if seal::is_quarantined(dir, seg) {
+                ", quarantined here before it was published"
+            } else {
+                ""
+            };
+            format!(
+                "missing {key}: {table} {} (blocks {}..={}){why}",
+                seg.file, seg.from_block, seg.to_block
+            )
+        })?;
         let src = seal::segment_path(dir, &seg.file, &seg.hash);
         let local_size = std::fs::metadata(&src)
             .with_context(|| format!("stat {}", src.display()))?
@@ -2656,6 +2688,56 @@ abi = "abis/usdc.json"
         bytes[mid] ^= 0x01;
         std::fs::write(&path, &bytes).unwrap();
         (seg, path)
+    }
+
+    /// A publisher in the writer's process asks that writer to verify the bad segment at once, so the
+    /// next publish goes ahead, the entry catalogued and its file not sent, instead of waiting up to
+    /// a day for the full pass.
+    #[tokio::test]
+    async fn an_in_process_publisher_has_its_writer_quarantine_a_bad_segment_now() {
+        let nest = sealed_nest();
+        let _writer = crate::store::Store::open(&nest.path().join(crate::config::DB_FILE)).unwrap();
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        seal::verify_in_background(
+            nest.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        let (seg, _) = rot_first_final(nest.path());
+        let mirror = tempfile::tempdir().unwrap();
+        let target = mirror.path().to_str().unwrap().to_string();
+        let err = sync(nest.path(), &target, false).await.unwrap_err();
+        assert!(format!("{err:#}").contains(&seg.file), "{err:#}");
+        let start = std::time::Instant::now();
+        while !seal::is_quarantined(nest.path(), &seg) && start.elapsed() < Duration::from_secs(30)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            seal::is_quarantined(nest.path(), &seg),
+            "the writer was not asked"
+        );
+
+        let report = sync(nest.path(), &target, false).await.unwrap();
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        let catalogue = std::fs::read_to_string(
+            mirror
+                .path()
+                .join(&report.dataset)
+                .join(seal::MANIFEST_FILE),
+        )
+        .unwrap();
+        assert!(
+            catalogue.contains(&seg.hash),
+            "the entry left the catalogue"
+        );
+        assert!(report.uploaded.iter().any(|k| k == seal::MANIFEST_FILE));
+        assert!(
+            !report.uploaded.iter().any(|k| k.contains(&seg.hash)),
+            "{:?}",
+            report.uploaded
+        );
     }
 
     /// A publish beside a running writer refuses the bad segment by name and leaves it where it is:
