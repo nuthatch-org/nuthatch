@@ -47,3 +47,8 @@ path = "fuzz_targets/subgraph_manifest.rs"
 test = false
 doc = false
 bench = false
+
+# Burrmill's vendored parquet source, at its rev: a patch applies only from the root manifest, so
+# burrmill's own does not reach this build.
+[patch.crates-io]
+datafusion-datasource-parquet = { git = "https://github.com/nuthatch-org/burrmill", rev = "2e00b11f8d747106b2d3b418f075a4a6e89ee39a" }

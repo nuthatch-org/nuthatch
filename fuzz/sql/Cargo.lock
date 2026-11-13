@@ -1563,7 +1563,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=9104d4b025ab321142a4dbcd81a0dd8410b43205#9104d4b025ab321142a4dbcd81a0dd8410b43205"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=2e00b11f8d747106b2d3b418f075a4a6e89ee39a#2e00b11f8d747106b2d3b418f075a4a6e89ee39a"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -2312,8 +2312,7 @@ dependencies = [
 [[package]]
 name = "datafusion-datasource-parquet"
 version = "55.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c521ae91b6d899d7190812881f45fe9463c222c11d90149f5332a2e56555904"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=2e00b11f8d747106b2d3b418f075a4a6e89ee39a#2e00b11f8d747106b2d3b418f075a4a6e89ee39a"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",

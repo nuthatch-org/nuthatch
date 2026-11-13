@@ -251,7 +251,7 @@ fn statement_pools() -> Vec<(PathBuf, String, Arc<burrmill::SharedPool>)> {
 
 fn nest_pool(dir: &Path, tenant: Option<&str>, memory_bytes: usize) -> Arc<burrmill::SharedPool> {
     if let Some(tenant) = tenant {
-        let pool = Arc::new(burrmill::SharedPool::new(memory_bytes));
+        let pool = Arc::new(burrmill::SharedPool::spilling(memory_bytes));
         let mut pools = STATEMENT_POOLS.lock().unwrap_or_else(|p| p.into_inner());
         pools.retain(|(_, _, p)| p.strong_count() > 0);
         pools.push((dir.to_path_buf(), tenant.to_string(), Arc::downgrade(&pool)));
@@ -262,7 +262,7 @@ fn nest_pool(dir: &Path, tenant: Option<&str>, memory_bytes: usize) -> Arc<burrm
     pools.retain(|_, p| Arc::strong_count(p) > 1 || p.reserved() > 0);
     pools
         .entry(dir.to_path_buf())
-        .or_insert_with(|| Arc::new(burrmill::SharedPool::new(memory_bytes)))
+        .or_insert_with(|| Arc::new(burrmill::SharedPool::spilling(memory_bytes)))
         .clone()
 }
 
