@@ -152,12 +152,10 @@ impl TabQuery {
         for e in entities {
             bind_relation(&mut engine, e)?;
         }
-        for (path, text) in files {
-            if path.starts_with("views/") && path.ends_with(".sql") {
-                define_views(&mut engine, text)?;
-            }
+        // Children and labels before the authored views, which may read them, as the node binds them.
+        for (_, ddl) in children {
+            define_views(&mut engine, ddl)?;
         }
-        // As the node binds them after its authored views (RFC-0077 S5), and as best-effort.
         let labels = nuthatch_core::bind::label_rows(
             files
                 .iter()
@@ -169,8 +167,10 @@ impl TabQuery {
                 .register_rows("labels", &labels)
                 .map_err(engine_err)?;
         }
-        for (_, ddl) in children {
-            define_views(&mut engine, ddl)?;
+        for (path, text) in files {
+            if path.starts_with("views/") && path.ends_with(".sql") {
+                define_views(&mut engine, text)?;
+            }
         }
         Ok(TabQuery { engine })
     }
@@ -221,12 +221,12 @@ impl TabQuery {
                     ));
                 }
             }
-            let body = if rows.is_empty() {
+            let (raw, body) = if rows.is_empty() {
                 let nulls: Vec<String> = casts
                     .iter()
                     .map(|(c, ty)| format!("CAST(NULL AS {ty}) AS \"{c}\""))
                     .collect();
-                format!("SELECT {} WHERE false", nulls.join(", "))
+                (None, format!("SELECT {} WHERE false", nulls.join(", ")))
             } else {
                 let raw = format!("{}__raw", t.name);
                 self.engine.register_rows(&raw, &rows).map_err(engine_err)?;
@@ -234,11 +234,18 @@ impl TabQuery {
                     .iter()
                     .map(|(c, ty)| format!("CAST(\"{c}\" AS {ty}) AS \"{c}\""))
                     .collect();
-                format!("SELECT {} FROM \"{raw}\"", cast.join(", "))
+                let body = format!("SELECT {} FROM \"{raw}\"", cast.join(", "));
+                (Some(raw), body)
             };
-            self.engine
+            let registered = self
+                .engine
                 .register_view(&t.name, &body)
-                .map_err(engine_err)?;
+                .map_err(engine_err);
+            // The view's plan holds the rows, so the name is only something more to reach.
+            if let Some(raw) = raw {
+                self.engine.drop_relation(&raw);
+            }
+            registered?;
         }
         Ok(())
     }
@@ -529,7 +536,9 @@ fn bind_relation(engine: &mut burrmill::Engine, entity: &TabEntity) -> Result<()
     let (raw, rows, view) =
         nuthatch_core::bind::relation(&table, &entity.relation_types(), &entity.rows());
     engine.register_rows(&raw, &rows).map_err(engine_err)?;
-    engine.register_view(&table, &view).map_err(engine_err)
+    let registered = engine.register_view(&table, &view).map_err(engine_err);
+    engine.drop_relation(&raw);
+    registered
 }
 
 /// Each `CREATE VIEW` in one authored file, in order, as the node's session registers it.
@@ -576,6 +585,105 @@ mod tests {
         ]);
         let got = referenced_tables("SELECT count(*) AS n FROM all_approvals", &files).unwrap();
         assert!(got.contains("tab__transfer"), "{got:?}");
+    }
+
+    fn bound(files: &NestFiles, entities: &[TabEntity], schema: &[TableSchema]) -> TabQuery {
+        let db = redb::Builder::new()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let store = Store::from_db(db, None).unwrap();
+        let cellar = Arc::new(Cellar::default());
+        crate::window::block_on(TabQuery::bind(
+            &store,
+            &cellar,
+            schema,
+            entities,
+            files,
+            TabBudget::default(),
+            &[],
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_authored_view_over_labels_answers() {
+        let files = files(&[
+            (
+                "labels/a.json",
+                r#"[{"address":"0x11","label":"mixer"},{"address":"0x22","label":"exchange"}]"#,
+            ),
+            (
+                "views/mixers.sql",
+                "CREATE VIEW mixers AS SELECT address FROM labels WHERE label = 'mixer'",
+            ),
+        ]);
+        let q = bound(&files, &[], &[]);
+        let rows = crate::window::block_on(q.rows("SELECT address FROM mixers")).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"address": "0x11"})]);
+    }
+
+    #[test]
+    fn a_bound_entity_or_attachment_leaves_no_raw_registration() {
+        let files = files(&[
+            (
+                "entities.toml",
+                "[[entities]]\nname = \"received\"\nsql = \"entities/received.sql\"\nkey = [\"to\"]\nmax_rows = 10\n",
+            ),
+            (
+                "entities/received.sql",
+                "SELECT t.\"to\", COUNT(*) AS n FROM tab__transfer t GROUP BY t.\"to\"",
+            ),
+        ]);
+        let registry = crate::tab::erc20("0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a").unwrap();
+        let entities =
+            crate::derived::start(&files, &registry, false, TabBudget::default()).unwrap();
+        let mut q = bound(&files, &entities, &registry.schema());
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(vec!["0xab"]))],
+        )
+        .unwrap();
+        q.attach(&[crate::attach::Table {
+            attachment: "pools".into(),
+            name: "indexers".into(),
+            schema,
+            batches: vec![batch],
+        }])
+        .unwrap();
+        let tables = q.engine.tables();
+        assert!(tables.iter().any(|t| t == "received"), "{tables:?}");
+        assert!(!tables.iter().any(|t| t.ends_with("__raw")), "{tables:?}");
+        let rows = crate::window::block_on(q.rows("SELECT id FROM indexers")).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"id": "0xab"})]);
+        let rows = crate::window::block_on(q.rows("SELECT count(*) AS n FROM received")).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"n": 0})]);
+    }
+
+    /// A hint's pointer is the node's bytes, so it has to be something the tab answers too.
+    #[test]
+    fn a_hints_pointer_answers_in_the_tab() {
+        let registry = crate::tab::erc20("0x0c26fe5e579c3b007ba16d921ba8204a47c05f1a").unwrap();
+        let schema = registry.schema();
+        let q = bound(&NestFiles::new(), &[], &schema);
+        for raw in [
+            "Table with name nope does not exist!",
+            "Referenced column \"nope\" not found in FROM clause!",
+        ] {
+            let hint = nuthatch_core::sql_errors::enrich(raw, "", &schema).unwrap();
+            let sql = hint
+                .split('`')
+                .find(|s| s.starts_with("SELECT"))
+                .expect(&hint);
+            let sql = sql.replace("<table>", "tab__transfer");
+            referenced_tables(&sql, &NestFiles::new()).unwrap();
+            let rows = crate::window::block_on(q.rows(&sql)).unwrap();
+            assert!(!rows.is_empty(), "{sql}");
+        }
     }
 
     #[test]

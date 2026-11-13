@@ -82,7 +82,10 @@ pub fn check(args: CheckArgs) -> Result<()> {
         for issue in issues {
             let hint = issue
                 .hint
-                .map(|h| format!("\n    hint: {h}"))
+                .map(|h| {
+                    let h = crate::sql_errors::for_surface(&h, crate::sql_errors::Surface::Repl);
+                    format!("\n    hint: {h}")
+                })
                 .unwrap_or_default();
             let first = issue.error.lines().next().unwrap_or(&issue.error);
             println!("✗ view {}: {first}{hint}", issue.file);
