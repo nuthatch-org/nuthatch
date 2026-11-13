@@ -2367,10 +2367,13 @@ impl Verifying {
 
 impl Drop for Verifying {
     fn drop(&mut self) {
-        requests()
+        let pending = requests()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+            .remove(&self.0)
+            .unwrap_or_default();
+        // A request taken just before the nest went away was promised an answer: give it one.
+        answer_requests(&self.0, pending);
     }
 }
 
@@ -2393,7 +2396,7 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
     let until = Instant::now() + d;
     let key = lease_key(dir);
     while alive() {
-        serve_requests(dir, &key, alive);
+        serve_requests(dir, &key);
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
@@ -2406,13 +2409,18 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
 /// Answer what publishers have asked of `dir`'s verifier. Only a final segment the catalogue still
 /// names is checked: a provisional tail is the writer's own to rewrite, and an entry a fold replaced
 /// is not served any more.
-fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
+fn serve_requests(dir: &Path, key: &Path) {
     let asked = requests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(key)
         .map(std::mem::take)
         .unwrap_or_default();
+    answer_requests(dir, asked);
+}
+
+/// Hashed to the end even if the nest goes away meanwhile: each was promised an answer.
+fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>) {
     if asked.is_empty() {
         return;
     }
@@ -2429,7 +2437,7 @@ fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
         }
         let path = segment_path(dir, &s.file, &s.hash);
         let mut throttle = Throttle::process();
-        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
+        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, &|| true) {
             if got != s.hash {
                 quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
             }
@@ -2438,7 +2446,7 @@ fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
 }
 
 /// [`serve_requests`] for every dataset with one waiting, keyed by its canonical path.
-fn serve_all_requests(alive: &impl Fn() -> bool) {
+fn serve_all_requests() {
     let waiting: Vec<PathBuf> = requests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2447,7 +2455,7 @@ fn serve_all_requests(alive: &impl Fn() -> bool) {
         .map(|(key, _)| key.clone())
         .collect();
     for key in waiting {
-        serve_requests(&key, &key, alive);
+        serve_requests(&key, &key);
     }
 }
 
@@ -2461,7 +2469,7 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
         for s in segs {
             // A publisher waiting on this pass, or on another dataset's verifier queued behind it, is
             // answered between segments rather than at its end.
-            serve_all_requests(alive);
+            serve_all_requests();
             let path = segment_path(dir, &s.file, &s.hash);
             let stamp = file_stamp(&path);
             let reason = match hash_throttled(&path, &mut throttle, alive) {
@@ -4179,6 +4187,35 @@ mod tests {
         let last = ends.iter().max().unwrap().duration_since(start);
         assert!(last >= Duration::from_secs(8), "{last:?}");
         assert!(last < Duration::from_secs(9), "{last:?}");
+    }
+
+    /// A request taken by a verifier whose nest then goes away is still answered as it ends, rather
+    /// than dropped with the publisher told the writer had it.
+    #[test]
+    fn a_request_to_a_verifier_that_is_stopping_is_still_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = load_manifest(dir.path()).unwrap().tables["usdc__transfer"][0].clone();
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = alive.clone();
+        let verifier = verify_in_background(
+            dir.path().to_path_buf(),
+            move || held.load(std::sync::atomic::Ordering::SeqCst),
+            Duration::from_secs(3600),
+        );
+        // Ends before its next step, so it never serves this from its loop.
+        alive.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(request_verify(dir.path(), "usdc__transfer", &seg));
+        verifier.join().unwrap();
+        assert!(!path.exists(), "the request was dropped with the verifier");
+        assert!(!request_verify(dir.path(), "usdc__transfer", &seg));
     }
 
     /// A publisher's request moves only a final segment the catalogue still names: a provisional tail
