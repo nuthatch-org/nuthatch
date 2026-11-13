@@ -2373,7 +2373,7 @@ impl Drop for Verifying {
             .remove(&self.0)
             .unwrap_or_default();
         // A request taken just before the nest went away was promised an answer: give it one.
-        answer_requests(&self.0, pending, &|| true);
+        answer_requests(&self.0, pending);
     }
 }
 
@@ -2396,7 +2396,7 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
     let until = Instant::now() + d;
     let key = lease_key(dir);
     while alive() {
-        serve_requests(dir, &key, alive);
+        serve_requests(dir, &key);
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return true;
@@ -2409,17 +2409,18 @@ fn sleep_serving(d: Duration, alive: &impl Fn() -> bool, dir: &Path) -> bool {
 /// Answer what publishers have asked of `dir`'s verifier. Only a final segment the catalogue still
 /// names is checked: a provisional tail is the writer's own to rewrite, and an entry a fold replaced
 /// is not served any more.
-fn serve_requests(dir: &Path, key: &Path, alive: &impl Fn() -> bool) {
+fn serve_requests(dir: &Path, key: &Path) {
     let asked = requests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_mut(key)
         .map(std::mem::take)
         .unwrap_or_default();
-    answer_requests(dir, asked, alive);
+    answer_requests(dir, asked);
 }
 
-fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>, alive: &impl Fn() -> bool) {
+/// Hashed to the end even if the nest goes away meanwhile: each was promised an answer.
+fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>) {
     if asked.is_empty() {
         return;
     }
@@ -2436,7 +2437,7 @@ fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>, alive: &impl Fn() 
         }
         let path = segment_path(dir, &s.file, &s.hash);
         let mut throttle = Throttle::process();
-        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, alive) {
+        if let Ok(Some(got)) = hash_throttled(&path, &mut throttle, &|| true) {
             if got != s.hash {
                 quarantine_segment(dir, &table, &s, &path, HASH_MISMATCH);
             }
@@ -2445,7 +2446,7 @@ fn answer_requests(dir: &Path, asked: Vec<(String, Segment)>, alive: &impl Fn() 
 }
 
 /// [`serve_requests`] for every dataset with one waiting, keyed by its canonical path.
-fn serve_all_requests(alive: &impl Fn() -> bool) {
+fn serve_all_requests() {
     let waiting: Vec<PathBuf> = requests()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2454,7 +2455,7 @@ fn serve_all_requests(alive: &impl Fn() -> bool) {
         .map(|(key, _)| key.clone())
         .collect();
     for key in waiting {
-        serve_requests(&key, &key, alive);
+        serve_requests(&key, &key);
     }
 }
 
@@ -2468,7 +2469,7 @@ fn background_pass(dir: &Path, alive: &impl Fn() -> bool) -> Result<Option<usize
         for s in segs {
             // A publisher waiting on this pass, or on another dataset's verifier queued behind it, is
             // answered between segments rather than at its end.
-            serve_all_requests(alive);
+            serve_all_requests();
             let path = segment_path(dir, &s.file, &s.hash);
             let stamp = file_stamp(&path);
             let reason = match hash_throttled(&path, &mut throttle, alive) {
