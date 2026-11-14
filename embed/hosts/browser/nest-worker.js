@@ -21,6 +21,27 @@ async function follow(stop) {
   };
 }
 
+// One pruned backend behind a public RPC's balancer refuses at random (#2933), and the next pass
+// starts again from the store, so the first pass gets the retries later passes already have.
+async function firstFollow() {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await follow();
+    } catch (e) {
+      if (attempt >= 5 || e?.fault !== "follow_failed") throw e;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+    }
+  }
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host || null;
+  } catch {
+    return null;
+  }
+}
+
 function keepFollowing(secs) {
   const pass = async () => {
     try {
@@ -41,14 +62,16 @@ self.onmessage = async (m) => {
     if (d.nest === "open") {
       const bytes = await (await fetch(d.module)).arrayBuffer();
       const module_sha256 = hex(await crypto.subtle.digest("SHA-256", bytes));
+      // Named by its host too, so a refusal says which endpoint it was; a `config` names it `main`.
+      const host = hostOf(d.rpc);
       engine = await load(bytes, {
         storage: await opfsStorage(d.nid),
-        rpc: fetchRpc({ main: d.rpc }),
+        rpc: fetchRpc(host ? { main: d.rpc, [host]: d.rpc } : { main: d.rpc }),
         log: (level, s) => console.log(`guest[${level}]: ${s}`),
       });
       // `config` is a whole `nh_open` config, as a page opening a mirrored nest sends one (RFC-0077 S4).
       engine.open(d.config ?? {
-        nid: d.nid, contract: d.contract, start: Number(d.start), rpc: ["main"], storage: "host",
+        nid: d.nid, contract: d.contract, start: Number(d.start), rpc: [host ?? "main"], storage: "host",
         fresh: d.fresh ?? true,
         memory_mib: d.memoryCeilingMib, poll_interval_secs: d.pollIntervalSecs, files: d.files,
       });
@@ -56,7 +79,7 @@ self.onmessage = async (m) => {
         self.postMessage({ nest: "stopped", module_sha256, ...(await follow(onceSealed(engine))) });
         return;
       }
-      self.postMessage({ nest: "opened", module_sha256, abi: engine.abi(), ...(await follow()) });
+      self.postMessage({ nest: "opened", module_sha256, abi: engine.abi(), ...(await firstFollow()) });
       if (d.keepFollowing) keepFollowing(d.pollIntervalSecs || 12);
     } else if (d.nest === "follow") {
       self.postMessage({ nest: "followed", ...(await follow()) });
