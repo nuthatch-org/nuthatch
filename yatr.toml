@@ -19,9 +19,6 @@
 # step sets in the environment, so they are `no_cache`.
 # `scripts/verify.sh` is a runbook for a running nest or fleet, not part of this gate.
 
-[env]
-RUST_BACKTRACE = "1"
-
 [settings]
 cache = true
 watch_debounce_ms = 200

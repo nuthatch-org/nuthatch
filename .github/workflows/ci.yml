@@ -50,7 +50,7 @@ env:
   # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
   CFLAGS: -std=gnu17
   # The commands the jobs run live in yatr.toml. Bump deliberately.
-  YATR_VERSION: "1.2.0"
+  YATR_VERSION: "1.3.0"
 
 jobs:
   # Two tiers, to fit a 20-job org on a single PR. `full` is false for a change only to docs/ (bar
