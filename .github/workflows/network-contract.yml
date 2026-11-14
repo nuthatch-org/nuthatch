@@ -12,6 +12,8 @@ env:
   CARGO_TERM_COLOR: always
   # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
   CFLAGS: -std=gnu17
+  # The commands live in yatr.toml; keep this with ci.yml's.
+  YATR_VERSION: "1.3.0"
 
 jobs:
   build:
@@ -32,15 +34,13 @@ jobs:
           df -h /
           sudo nohup rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
             /opt/hostedtoolcache >/dev/null 2>&1 &
-      # .config/nextest.toml requires target/parity-bin in every archive (4d16a9db, #2635).
-      - name: build the parity comparison into the test archive
-        run: |
-          t=${CARGO_TARGET_DIR:-target}
-          cargo build --locked --manifest-path tools/lodestar-parity/Cargo.toml --target-dir "$t/lodestar-parity"
-          mkdir -p "$t/parity-bin" && cp "$t/lodestar-parity/debug/lodestar-parity-compare" "$t/parity-bin/"
+      - uses: ./.github/actions/install-yatr
+        with:
+          version: ${{ env.YATR_VERSION }}
       - uses: ./.github/actions/install-nextest
-      - name: build the test archive
-        run: cargo nextest archive --locked --features graph,counter,crash-points --archive-file "$RUNNER_TEMP/nextest-network.tar.zst"
+      # .config/nextest.toml requires target/parity-bin in every archive (4d16a9db, #2635).
+      - name: build the parity comparison and the test archive
+        run: yatr archive-network
       - name: upload the test archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
