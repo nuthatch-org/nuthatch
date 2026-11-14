@@ -2611,8 +2611,17 @@ pub fn redact_url(url: &str) -> String {
             Some(host) => format!("{}://{host}", u.scheme()),
             None => format!("{}:<no host>", u.scheme()),
         },
+        // An embedding host names its endpoints (`main`, or a bare host) rather than passing a URL.
+        Err(_) if is_endpoint_name(url) => url.to_string(),
         Err(_) => "<unparseable url>".to_string(),
     }
+}
+
+fn is_endpoint_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
 }
 
 /// `host[:port]` of a parsed URL and nothing else, for labels that must not carry a scheme.

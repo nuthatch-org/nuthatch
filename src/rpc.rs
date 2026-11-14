@@ -2096,6 +2096,13 @@ mod tests {
             "https://rpc.example.com:8545"
         );
         assert!(!redact_url("not a url with SECRET").contains("SECRET"));
+        assert!(!redact_url("rpc.example.com/v2/SECRET").contains("SECRET"));
+        // An embedding host's endpoint name is all it has to say which endpoint refused (#2933).
+        assert_eq!(redact_url("main"), "main");
+        assert_eq!(
+            redact_url("ethereum-rpc.publicnode.com"),
+            "ethereum-rpc.publicnode.com"
+        );
     }
 
     /// **RFC-0029 §6g.** A body-read *timeout* must narrow; a body *syntax* error must not.
