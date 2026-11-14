@@ -414,6 +414,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `agents-check` | Fail if the task table in CLAUDE.md has drifted from this file |  | cached on its inputs |
 | `archive-default` | nextest archive of the default build | `parity-bin` | always runs |
 | `archive-features` | nextest archive with the optional features on | `parity-bin` | always runs |
+| `archive-network` | nextest archive for the parked RFC-0060 replays | `parity-bin` | always runs |
 | `archive-no-count` | nextest archive with the head count deleted (run scripts/delete-count.sh first) | `parity-bin` | always runs |
 | `backfill-throughput` | Backfill events/sec (tracked, not gated) |  | always runs |
 | `build` | Build the release binary |  | cached on its inputs |
@@ -443,7 +444,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `doctest-features` |  |  | cached on its inputs |
 | `embed-lint` | fmt and clippy for embed/ |  | cached on its inputs |
 | `embed-native` | The native step test of embed/, release |  | cached on its inputs |
-| `embed-node` | The Node step test of the tab module in embed/pkg |  | always runs |
+| `embed-node` | The Node step test of the tab module in embed/pkg | `tab-module` | always runs |
 | `failover` | Two writers, one lease (binary in NUTHATCH_BIN) |  | always runs |
 | `features` | The optional-features leg: clippy per feature, then the tests with all of them | `clippy-graph`, `clippy-folds`, `clippy-counter`, `clippy-crash-points`, `clippy-flight`, `clippy-sync-server`, `test-features` | runs its dependencies only |
 | `fixture-rpc` | The fixture chains, release, in tools/fixture-rpc/target |  | cached on its inputs |
@@ -459,14 +460,22 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `fuzz-sql-parsers` | Fuzz IPFS CAR and subgraph manifest parsing, on fuzz-sql's build |  | always runs |
 | `lint` | Clippy with warnings denied |  | cached on its inputs |
 | `multinest-footprint` | Peak RSS at tip, 20 nests on one cursor |  | always runs |
-| `opfs-live` | OPFS and the live cursor in headless Chrome |  | always runs |
+| `opfs-live` | OPFS and the live cursor in headless Chrome | `fixture-rpc` | always runs |
 | `parity-bin` | Build the parity comparison into target/parity-bin |  | always runs |
 | `pg-parity` | Every Postgres-backed suite, serially (needs NUTHATCH_TEST_PG) |  | always runs |
 | `plain` | fmt, clippy and test for the plain module and the wasmtime host, and the host's release build |  | cached on its inputs |
+| `plain-hosts` | The plain module in Node, wasmtime, Chrome and Firefox (needs CHROME, FIREFOX, GECKODRIVER) | `plain-module`, `fixture-rpc` | always runs |
+| `plain-module` | The plain module, checked for its imports, size and abi (needs wasm-opt and the wasm32 C toolchain) | `plain` | cached on its inputs |
 | `point-read` | Entity point-read p50/p99 against MAX_P50_US |  | always runs |
 | `rolling-upgrade` | Replace followers, then the writer, with a query answered at every step (binary in NUTHATCH_BIN) |  | always runs |
+| `rss-spread` | RUNS (default 7) sequential runs of the dense multi-nest scenario, and their spread | `build` | always runs |
 | `s3-suites` | Publish, registry, seed and remote follower suites against a real S3 server (needs NUTHATCH_MINIO_*) |  | always runs |
 | `skill-refs` | Regenerate the skill's CLI reference from the binary |  | always runs |
+| `tab-answers` | RFC-0075 S5: the query routes in Node, byte for byte against the node's pin | `tab-module`, `fixture-rpc` | always runs |
+| `tab-budget` | RFC-0075 S6: the 600 MiB and 2 GiB ceilings in Node | `tab-module`, `fixture-rpc` | always runs |
+| `tab-entities` | RFC-0075 S4: entities and views in Node through the fixture's reorg | `tab-module`, `fixture-rpc` | always runs |
+| `tab-live` | RFC-0075 S3: the tab's live cursor in Node against the recording | `tab-module`, `fixture-rpc` | always runs |
+| `tab-module` | The tab module, nodejs target, into embed/pkg (needs wasm-bindgen, wasm-opt and the wasm32 C toolchain) |  | cached on its inputs |
 | `test` | Run the test suite (needs cargo-nextest, as CI does) | `doctest` | cached on its inputs |
 | `test-features` | The suite with every optional feature on | `doctest-features` | cached on its inputs |
 | `tip-lag` | Tip lag against MAX_SEEN_P50_MS |  | always runs |

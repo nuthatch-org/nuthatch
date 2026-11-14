@@ -85,6 +85,14 @@ shell = true
 run = ['cargo nextest archive --locked --archive-file "${RUNNER_TEMP:-target}/nextest-no-count.tar.zst"']
 no_cache = true
 
+# network-contract.yml's nightly replays.
+[tasks.archive-network]
+desc = "nextest archive for the parked RFC-0060 replays"
+depends = ["parity-bin"]
+shell = true
+run = ['cargo nextest archive --locked --features graph,counter,crash-points --archive-file "${RUNNER_TEMP:-target}/nextest-network.tar.zst"']
+no_cache = true
+
 [tasks.archive-features]
 desc = "nextest archive with the optional features on"
 depends = ["parity-bin"]
@@ -291,19 +299,87 @@ sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "
 outputs = ["tests/wasmtime-host/target/release/wasmtime-host"]
 env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown"]
 
-# The step test on the tab module CI builds into embed/pkg with build-tab.sh.
+# RFC-0075 S6 and RFC-0077 S5: the module the tab ships, held to 5.5 MB brotli. Its last line is
+# the size, which CI puts in the job summary.
+[tasks.tab-module]
+desc = "The tab module, nodejs target, into embed/pkg (needs wasm-bindgen, wasm-opt and the wasm32 C toolchain)"
+cwd = "embed"
+run = ["./build-tab.sh nodejs pkg", "node size.mjs pkg/nuthatch_embed_bg.wasm --max-brotli 5500000"]
+sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "../scaffold/**", "../rust-toolchain.toml"]
+outputs = ["pkg/**"]
+env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown"]
+tool_inputs = ["wasm-bindgen --version", "wasm-opt --version"]
+
 [tasks.embed-node]
 desc = "The Node step test of the tab module in embed/pkg"
 cwd = "embed"
+depends = ["tab-module"]
 run = ["node --stack-trace-limit=60 run-node.mjs pkg"]
 no_cache = true
 
-# CI starts the recorded chain and passes the browser through CHROMEDRIVER, WASM_BINDGEN_TEST_* and
-# TAB_PARITY_RPC.
+# The tab against the recorded chain, each held to the node's pins in tests/fixtures/tab-parity.
+[tasks.tab-live]
+desc = "RFC-0075 S3: the tab's live cursor in Node against the recording"
+cwd = "embed"
+depends = ["tab-module", "fixture-rpc"]
+run = ["./with-fixture-rpc.sh 8947 recorded --file ../tests/fixtures/tab-parity/chain.json.gz -- node run-live.mjs pkg http://127.0.0.1:8947/ ../tests/fixtures/tab-parity"]
+no_cache = true
+
+[tasks.tab-entities]
+desc = "RFC-0075 S4: entities and views in Node through the fixture's reorg"
+cwd = "embed"
+depends = ["tab-module", "fixture-rpc"]
+run = ["./with-fixture-rpc.sh 8949 recorded --fork --file ../tests/fixtures/tab-parity/chain.json.gz -- node run-entities.mjs pkg http://127.0.0.1:8949/ ../tests/fixtures/tab-parity"]
+no_cache = true
+
+[tasks.tab-answers]
+desc = "RFC-0075 S5: the query routes in Node, byte for byte against the node's pin"
+cwd = "embed"
+depends = ["tab-module", "fixture-rpc"]
+run = ["./with-fixture-rpc.sh 8950 recorded --fork --file ../tests/fixtures/tab-parity/chain.json.gz -- node run-answers.mjs pkg http://127.0.0.1:8950/ ../tests/fixtures/tab-parity"]
+no_cache = true
+
+[tasks.tab-budget]
+desc = "RFC-0075 S6: the 600 MiB and 2 GiB ceilings in Node"
+cwd = "embed"
+depends = ["tab-module", "fixture-rpc"]
+run = ["./with-fixture-rpc.sh 8952 recorded --file ../tests/fixtures/tab-parity/chain.json.gz -- node run-budget.mjs pkg http://127.0.0.1:8952/ ../tests/fixtures/tab-parity"]
+no_cache = true
+
+# RFC-0077 S0: the plain module, its imports and its pinned interface, into embed/target/plain.
+# sizes.json and compile.log are what CI puts in the job summary.
+[tasks.plain-module]
+desc = "The plain module, checked for its imports, size and abi (needs wasm-opt and the wasm32 C toolchain)"
+cwd = "embed"
+depends = ["plain"]
+shell = true
+run = [
+  "mkdir -p target/plain && plain/build.sh \"$PWD/target/plain/plain.wasm\"",
+  "node plain/imports.mjs target/plain/plain.wasm",
+  # sh has no pipefail, so each writes its file and then shows it.
+  "node size.mjs target/plain/plain.wasm --max-brotli 5500000 > target/plain/sizes.json && cat target/plain/sizes.json",
+  "tests/wasmtime-host/target/release/wasmtime-host compile target/plain/plain.wasm target/plain/plain.cwasm > target/plain/compile.log && cat target/plain/compile.log",
+  "tests/wasmtime-host/target/release/wasmtime-host abi target/plain/plain.wasm --cache target/plain/cwasm > target/plain/abi.log && tail -1 target/plain/abi.log",
+]
+sources = ["**", "../core/**", "../decode/**", "../seal/**", "../identity/**", "../scaffold/**", "../rust-toolchain.toml"]
+outputs = ["target/plain/**"]
+env_inputs = ["CC_wasm32_unknown_unknown", "AR_wasm32_unknown_unknown", "CFLAGS_wasm32_unknown_unknown"]
+tool_inputs = ["wasm-opt --version"]
+
+[tasks.plain-hosts]
+desc = "The plain module in Node, wasmtime, Chrome and Firefox (needs CHROME, FIREFOX, GECKODRIVER)"
+cwd = "embed"
+depends = ["plain-module", "fixture-rpc"]
+run = ["./run-hosts.sh"]
+no_cache = true
+
+# CI's test-browsers step exports CHROMEDRIVER, and the step sets WASM_BINDGEN_TEST_WEBDRIVER_JSON.
 [tasks.opfs-live]
 desc = "OPFS and the live cursor in headless Chrome"
 cwd = "embed"
-run = ["cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture"]
+depends = ["fixture-rpc"]
+env = { CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner", TAB_PARITY_RPC = "http://127.0.0.1:8948/" }
+run = ["./with-fixture-rpc.sh 8948 recorded --file ../tests/fixtures/tab-parity/chain.json.gz -- cargo test --locked --release --target wasm32-unknown-unknown --test opfs --test live -- --nocapture"]
 no_cache = true
 
 # Two builds of the same crate: the wasm jobs run it from its own target/, the measurement jobs from
@@ -363,11 +439,12 @@ no_cache = true
 
 [tasks.deny]
 desc = "cargo-deny: advisories, licences, bans, sources, for each manifest CI checks"
+# --all-features because cargo-deny-action, which CI runs instead, passes it by default.
 run = [
-  "cargo deny check advisories licenses bans sources",
-  "cargo deny --manifest-path timelapse/Cargo.toml check advisories licenses bans sources",
-  "cargo deny --manifest-path embed/Cargo.toml check advisories licenses bans sources",
-  "cargo deny --manifest-path embed/plain/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --all-features check advisories licenses bans sources",
+  "cargo deny --all-features --manifest-path timelapse/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --all-features --manifest-path embed/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --all-features --manifest-path embed/plain/Cargo.toml check advisories licenses bans sources",
 ]
 # Advisories arrive without Cargo.lock changing, so a cached pass would hide them.
 no_cache = true
@@ -419,6 +496,14 @@ no_cache = true
 [tasks.wideabi-footprint]
 desc = "Peak RSS, wide ABI, one nest"
 run = ["bash .github/workflows/wideabi-footprint.sh"]
+no_cache = true
+
+# rss-band.yml. Run it on the machine whose band you mean, and bare: see the script's header.
+[tasks.rss-spread]
+desc = "RUNS (default 7) sequential runs of the dense multi-nest scenario, and their spread"
+depends = ["build"]
+shell = true
+run = ['bash scripts/multinest-rss-spread.sh "${RUNS:-7}"']
 no_cache = true
 
 [tasks.rolling-upgrade]
