@@ -2612,6 +2612,7 @@ pub fn redact_url(url: &str) -> String {
             None => format!("{}:<no host>", u.scheme()),
         },
         // An embedding host names its endpoints (`main`, or a bare host) rather than passing a URL.
+        // A bare token has the same shape and would print, so a key must never be an endpoint name.
         Err(_) if is_endpoint_name(url) => url.to_string(),
         Err(_) => "<unparseable url>".to_string(),
     }
