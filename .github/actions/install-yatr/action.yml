@@ -32,6 +32,6 @@ runs:
       env:
         RUSTFLAGS: ""
         VERSION: ${{ inputs.version }}
-      run: cargo install yatr --version "$VERSION" --locked
+      run: cargo install yatr --version "$VERSION" --locked --force
     - shell: bash
       run: yatr --version
