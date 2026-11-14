@@ -20,6 +20,9 @@ runs:
       with:
         path: ~/.cargo/bin/yatr
         key: yatr-${{ runner.os }}-${{ steps.image.outputs.os }}-${{ inputs.version }}
+    # The measurement jobs set up no Rust of their own, so a miss brings its own toolchain.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
     - name: build yatr on a cache miss
       if: steps.cache.outputs.cache-hit != 'true'
       shell: bash

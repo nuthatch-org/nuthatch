@@ -18,9 +18,8 @@
 # Their tasks are below, for CI to call; the measurement and service-backed ones read what CI's
 # step sets in the environment, so they are `no_cache`.
 # `scripts/verify.sh` is a runbook for a running nest or fleet, not part of this gate.
-
-[env]
-RUST_BACKTRACE = "1"
+#
+# `yatr ci` also checks that the task table in CLAUDE.md matches this file. CI does not run that check.
 
 [settings]
 cache = true
@@ -558,7 +557,14 @@ run = [
 ]
 no_cache = true
 
+[tasks.agents-check]
+desc = "Fail if the task table in CLAUDE.md has drifted from this file"
+run = ["yatr agents --check CLAUDE.md"]
+sources = ["yatr.toml", "CLAUDE.md"]
+# The section's wording belongs to the yatr that wrote it.
+tool_inputs = ["yatr --version"]
+
 [tasks.ci]
-desc = "What CI runs: fmt-check, lint, test, decode, crates, features, deny"
-depends = ["fmt-check", "lint", "test", "decode", "crates", "features", "deny"]
+desc = "What CI runs (fmt-check, lint, test, decode, crates, features, deny) and agents-check"
+depends = ["fmt-check", "lint", "test", "decode", "crates", "features", "deny", "agents-check"]
 run = []
