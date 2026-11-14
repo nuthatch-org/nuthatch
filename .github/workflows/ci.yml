@@ -647,12 +647,11 @@ jobs:
       - name: wasm-bindgen and binaryen
         uses: ./.github/actions/wasm-tools
       - name: the tab module (embed)
-        # `shell: bash` for pipefail: the build is piped into tee.
-        shell: bash
         run: |
-          yatr tab-module | tee "$RUNNER_TEMP/tab-nodejs.log"
-          # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary.
-          size=$(tail -1 "$RUNNER_TEMP/tab-nodejs.log")
+          yatr tab-module
+          # RFC-0075 S6: every gate below runs this module, whose size goes to the job summary. Read
+          # from the file, since a cache hit prints nothing.
+          size=$(stat -c %s embed/pkg/nuthatch_embed_bg.wasm)
           echo "tab module bytes after wasm-bindgen and wasm-opt: \`$size\` (burrmill-wasm: 5.6 MB brotli)" >> "$GITHUB_STEP_SUMMARY"
       - name: Node step test (embed)
         run: yatr embed-node

@@ -373,7 +373,7 @@ depends = ["plain-module", "fixture-rpc"]
 run = ["./run-hosts.sh"]
 no_cache = true
 
-# CI passes the browser through CHROMEDRIVER and WASM_BINDGEN_TEST_WEBDRIVER_JSON.
+# CI's test-browsers step exports CHROMEDRIVER, and the step sets WASM_BINDGEN_TEST_WEBDRIVER_JSON.
 [tasks.opfs-live]
 desc = "OPFS and the live cursor in headless Chrome"
 cwd = "embed"
