@@ -412,18 +412,70 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | Task | What it does | Runs after | Notes |
 |---|---|---|---|
 | `agents-check` | Fail if the task table in CLAUDE.md has drifted from this file |  | cached on its inputs |
+| `archive-default` | nextest archive of the default build | `parity-bin` | always runs |
+| `archive-features` | nextest archive with the optional features on | `parity-bin` | always runs |
+| `archive-no-count` | nextest archive with the head count deleted (run scripts/delete-count.sh first) | `parity-bin` | always runs |
+| `backfill-throughput` | Backfill events/sec (tracked, not gated) |  | always runs |
 | `build` | Build the release binary |  | cached on its inputs |
+| `build-scaled` | Build the release binary with the scaled backend |  | always runs |
 | `ci` | What CI runs (fmt-check, lint, test, decode, crates, features, deny) and agents-check | `fmt-check`, `lint`, `test`, `decode`, `crates`, `features`, `deny`, `agents-check` | runs its dependencies only |
-| `crates` | fmt, clippy and test for the path crates CI checks beside decode |  | cached on its inputs |
+| `clippy-counter` |  |  | cached on its inputs |
+| `clippy-crash-points` |  |  | cached on its inputs |
+| `clippy-flight` |  |  | cached on its inputs |
+| `clippy-folds` |  |  | cached on its inputs |
+| `clippy-graph` |  |  | cached on its inputs |
+| `clippy-postgres` | Clippy for the scaled backend |  | cached on its inputs |
+| `clippy-sync-server` |  |  | cached on its inputs |
+| `core` | fmt, clippy and test for nuthatch-core |  | cached on its inputs |
+| `crate-count-receiver` |  |  | cached on its inputs |
+| `crate-eval-runner` |  |  | cached on its inputs |
+| `crate-fixture-rpc` |  |  | cached on its inputs |
+| `crate-identity` |  |  | cached on its inputs |
+| `crate-lodestar-parity` |  |  | cached on its inputs |
+| `crate-scaffold` |  |  | cached on its inputs |
+| `crate-seal` |  |  | cached on its inputs |
+| `crate-timelapse` |  |  | cached on its inputs |
+| `crates` | fmt, clippy and test for the path crates CI checks beside decode | `crate-count-receiver`, `crate-fixture-rpc`, `crate-lodestar-parity`, `crate-seal`, `crate-identity`, `crate-scaffold`, `crate-timelapse`, `crate-eval-runner` | runs its dependencies only |
 | `decode` | fmt, clippy and test for the decode crate (its own workspace, so the root cargo never runs its tests) |  | cached on its inputs |
-| `deny` | cargo-deny: licences, bans, advisories, sources |  | always runs |
+| `deny` | cargo-deny: advisories, licences, bans, sources, for each manifest CI checks |  | always runs |
 | `doc` | Build the API docs |  | cached on its inputs |
-| `features` | The optional-features leg: clippy per feature, then the tests with all of them |  | cached on its inputs |
+| `doctest` | Doctests, which nextest does not run |  | cached on its inputs |
+| `doctest-features` |  |  | cached on its inputs |
+| `embed-lint` | fmt and clippy for embed/ |  | cached on its inputs |
+| `embed-native` | The native step test of embed/, release |  | cached on its inputs |
+| `embed-node` | The Node step test of the tab module in embed/pkg |  | always runs |
+| `failover` | Two writers, one lease (binary in NUTHATCH_BIN) |  | always runs |
+| `features` | The optional-features leg: clippy per feature, then the tests with all of them | `clippy-graph`, `clippy-folds`, `clippy-counter`, `clippy-crash-points`, `clippy-flight`, `clippy-sync-server`, `test-features` | runs its dependencies only |
+| `fixture-rpc` | The fixture chains, release, in tools/fixture-rpc/target |  | cached on its inputs |
+| `fixture-rpc-bin` | The fixture chains, release, in target/release beside nuthatch |  | cached on its inputs |
+| `flight-client` | The ADBC Flight SQL client, to $NUTHATCH_FLIGHT_GO_CLIENT |  | always runs |
 | `fmt` | Format the tree |  | always runs |
-| `fmt-check` | Fail if the tree is unformatted |  | cached on its inputs |
+| `fmt-check` | Fail if the root crate is unformatted (the path crates are checked by their own tasks) |  | cached on its inputs |
+| `footprint` | Peak RSS against MAX_RSS_MB |  | always runs |
+| `fuzz-decode` | Fuzz the decode path (nuthatch#290) |  | always runs |
+| `fuzz-embed` | Fuzz header chains and attach |  | always runs |
 | `fuzz-smoke` | Short fuzz run over each target (needs a nightly toolchain) |  | always runs |
+| `fuzz-sql` | Fuzz /sql confinement |  | always runs |
+| `fuzz-sql-parsers` | Fuzz IPFS CAR and subgraph manifest parsing, on fuzz-sql's build |  | always runs |
 | `lint` | Clippy with warnings denied |  | cached on its inputs |
-| `test` | Run the test suite (needs cargo-nextest, as CI does) |  | cached on its inputs |
+| `multinest-footprint` | Peak RSS at tip, 20 nests on one cursor |  | always runs |
+| `opfs-live` | OPFS and the live cursor in headless Chrome |  | always runs |
+| `parity-bin` | Build the parity comparison into target/parity-bin |  | always runs |
+| `pg-parity` | Every Postgres-backed suite, serially (needs NUTHATCH_TEST_PG) |  | always runs |
+| `plain` | fmt, clippy and test for the plain module and the wasmtime host, and the host's release build |  | cached on its inputs |
+| `point-read` | Entity point-read p50/p99 against MAX_P50_US |  | always runs |
+| `rolling-upgrade` | Replace followers, then the writer, with a query answered at every step (binary in NUTHATCH_BIN) |  | always runs |
+| `s3-suites` | Publish, registry, seed and remote follower suites against a real S3 server (needs NUTHATCH_MINIO_*) |  | always runs |
+| `skill-refs` | Regenerate the skill's CLI reference from the binary |  | always runs |
+| `test` | Run the test suite (needs cargo-nextest, as CI does) | `doctest` | cached on its inputs |
+| `test-features` | The suite with every optional feature on | `doctest-features` | cached on its inputs |
+| `tip-lag` | Tip lag against MAX_SEEN_P50_MS |  | always runs |
+| `trino-contract` | Trino over the published prefix matches $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |
+| `trino-fixture` | Publish the drifted nest and record the local numbers to $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |
+| `version-check` | No stale version in what a reader copies and pastes |  | cached on its inputs |
+| `wasm-check` | decode, seal, identity, scaffold and timelapse still build for wasm32-unknown-unknown and wasm32-wasip2 |  | cached on its inputs |
+| `wasm-check-core` | nuthatch-core builds for wasm32 on embed/'s patched dbsp (needs the wasm32 C toolchain) |  | cached on its inputs |
+| `wideabi-footprint` | Peak RSS, wide ABI, one nest |  | always runs |
 <!-- yatr:end -->
 
 ## Out of scope - do not build, do not suggest
