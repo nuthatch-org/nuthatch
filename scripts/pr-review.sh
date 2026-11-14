@@ -633,6 +633,7 @@ cat "$tmp/system-post.txt" >> "$tmp/system.txt"
 
 # ── the request payload, and the call itself ─────────────────────────────────────────────────────
 
+# Thinking at high effort is spent from max_tokens: 32000 ran out before the verdict on #2932.
 jq -n -a \
   --rawfile system "$tmp/system.txt" \
   --rawfile user "$tmp/user.txt" \
@@ -640,7 +641,7 @@ jq -n -a \
   --arg model "$model" \
   '{
     model: $model,
-    max_tokens: 32000,
+    max_tokens: 64000,
     system: $system,
     messages: [ {role: "user", content: $user} ],
     output_config: {
@@ -656,7 +657,7 @@ last_err=""
 success=0
 while [ "$attempt" -le "$attempts" ]; do
   curl_exit=0
-  http_code="$(curl -sS -o "$tmp/response.json" -w '%{http_code}' --max-time 300 \
+  http_code="$(curl -sS -o "$tmp/response.json" -w '%{http_code}' --max-time 600 \
     -X POST "$ENDPOINT" \
     -H "x-api-key: $api_key" \
     -H "anthropic-version: 2026-10-21" \
