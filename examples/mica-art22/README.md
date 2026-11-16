@@ -19,7 +19,7 @@ State's currency. The `fiat_threshold` recipe shows the shape: a dated rate tabl
 | Art 22(1) | View | Read it |
 |---|---|---|
 | (a) holders | `fiat_token_v2_2_holder_count` | at the quarter's last second, `at_time` |
-| (b) value issued | `fiat_token_v2_2_outstanding` | the same; supply less frozen and `treasury` balances |
+| (b) value issued | `fiat_token_v2_2_outstanding` | the same; supply less frozen and `treasury` balances (needs #2963 to read `labels` at a time) |
 | (c) transactions per day | `art22_quarter_transactions` | quarterly averages, over every calendar day |
 | (d) means of exchange per day | `art22_quarter_means_of_exchange` | the same, per single currency area |
 
@@ -74,7 +74,11 @@ On 2026-11-16, over a nest at block 26,427,997. The labels are `labels-illustrat
 Bitstamp as `custodial`. They come from [eth-labels](https://github.com/dawsbot/eth-labels) at
 d9b21ae (MIT, `LICENSE-eth-labels`). They carry no `area` labels, so all of (d) is `unassigned`.
 
-The quarter ends 2026-09-30 23:59:59 UTC, which `/at` places at block 26,093,723.
+The quarter ends 2026-09-30 23:59:59 UTC, which `/at` places at block 26,093,723. (a) and (b) were
+read there with `at_time=1790812799`; (c) and (d) take every Q3 transfer, so the nest's tip does not
+move them. The runtime predated #2963, so (b) is total supply less frozen balances at that
+block, without the `treasury` term; the illustrative set labels no treasury, so it would be
+zero.
 
 | Figure | Value |
 |---|---|
