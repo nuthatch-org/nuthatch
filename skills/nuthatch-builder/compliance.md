@@ -14,6 +14,7 @@ throughout are i128 base units, returned as decimal strings. Flags are authorita
 | **Pack** | Build/sign/verify a manifest of the registry hash, flag thresholds and alert sinks (ed25519). | `nuthatch pack keygen` → `pack build --key …` → `pack verify --pubkey …` |
 | **Audit** | `report` summarises the threshold flags in a block range. | `nuthatch audit report --from … --to … --json` |
 | **As of a time** | Where the nest stood at a time (`block`, `next_block`, `exact`, `final`), and any SQL answered over the facts as they stood at a block or time. | `/at?time=<unix>` or the `at` MCP tool; `at_block` / `at_time` on `/sql` |
+| **Issuer recipes** | For a FiatToken-style stablecoin (Blacklisted, UnBlacklisted, Mint, Burn): `frozen` (blacklisted now, with balances), `outstanding` (supply less frozen and `treasury`-labelled balances, as an attestation counts it; needs a label set) and `mint_burn_daily` (minted and burned per UTC day beside the Mint and Burn events, with supply). Views, so `at_time` on `/sql` gives any of them at a report date. | `nuthatch recipe add frozen` (and `outstanding`, `mint_burn_daily`) |
 
 Live sanctions screening and the WASM screening component were removed on 2026-10-08. A
 `nuthatch.toml` that still declares `[screening]` is refused at load; delete the table.
