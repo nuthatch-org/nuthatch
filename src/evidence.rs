@@ -118,6 +118,14 @@ async fn answer(client: &reqwest::Client, url: &str, q: &str, block: u64) -> Res
     Ok(rows)
 }
 
+/// The block `/at` places `time` at.
+async fn place(client: &reqwest::Client, url: &str, time: u64) -> Result<u64> {
+    let at = get(client, &format!("{url}/at?time={time}")).await?;
+    at["block"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("{time} is before any block this nest holds a time for"))
+}
+
 /// Ask the nest at `url` for `q` as of `block`, or as of `time` placed by `/at`.
 pub async fn make(
     url: &str,
@@ -130,12 +138,7 @@ pub async fn make(
     let id = identity(&client, url).await?;
     let block = match (block, time) {
         (Some(b), None) => b,
-        (None, Some(t)) => {
-            let at = get(&client, &format!("{url}/at?time={t}")).await?;
-            at["block"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("{t} is before any block this nest holds a time for"))?
-        }
+        (None, Some(t)) => place(&client, url, t).await?,
         _ => bail!("give --at-block or --at-time"),
     };
     let rows = answer(&client, url, q, block).await?;
@@ -181,8 +184,8 @@ impl Report {
     }
 }
 
-/// Check `bundle` against the nest at `url`: the same identity, the same rows at the same block, and,
-/// given a trusted key, a signature by it.
+/// Check `bundle` against the nest at `url`: the same identity, the same block for its time, the same
+/// rows at that block, and, given a trusted key, a signature by it.
 pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) -> Result<Report> {
     let mut report = Report::default();
     let e = &bundle.evidence;
@@ -218,8 +221,23 @@ pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) 
             ));
         }
     }
+    if e.chain_id != id.chain_id {
+        report.mismatches.push(format!(
+            "chain_id: the bundle says {}, this nest is {}",
+            e.chain_id, id.chain_id
+        ));
+    }
     if !report.mismatches.is_empty() {
         return Ok(report);
+    }
+    if let Some(t) = e.time {
+        let placed = place(&client, url, t).await?;
+        if placed != e.block {
+            report.mismatches.push(format!(
+                "time: {t} places at block {placed}, the bundle says {}",
+                e.block
+            ));
+        }
     }
     let rows = answer(&client, url, &e.statement, e.block).await?;
     let got = rows_hash(&rows);

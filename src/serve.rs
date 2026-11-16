@@ -10378,6 +10378,25 @@ mod tests {
             "{report:?}"
         );
 
+        let mut forged = evidence::make(&url, q, Some(20), None, None).await.unwrap();
+        forged.evidence.chain_id = 10;
+        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        assert!(
+            report.mismatches.iter().any(|m| m.starts_with("chain_id")),
+            "{report:?}"
+        );
+
+        let timed = evidence::make(&url, q, None, Some(20), None).await.unwrap();
+        assert_eq!(timed.evidence.block, 20);
+        assert!(evidence::verify(&timed, &url, None).await.unwrap().ok());
+        let mut forged = timed;
+        forged.evidence.time = Some(15);
+        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        assert!(
+            report.mismatches.iter().any(|m| m.starts_with("time: 15")),
+            "{report:?}"
+        );
+
         let err = evidence::make(&url, q, Some(40), None, None)
             .await
             .unwrap_err();
