@@ -163,7 +163,8 @@ pub fn outstanding_select(alias: &str) -> String {
 pub fn mint_burn_daily_select(alias: &str) -> String {
     let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     let amount = crate::analytics::exact_or_null("amount", "HUGEINT");
-    let day = "CAST(to_timestamp(block_timestamp) AS DATE)";
+    // Epoch arithmetic, so the day is UTC whatever the session time zone.
+    let day = "DATE '1970-01-01' + CAST(block_timestamp // 86400 AS INTEGER)";
     format!(
         "SELECT day, minted, burned, mint_events, burn_events, \
            SUM(minted - burned) OVER (ORDER BY day) AS supply \
@@ -221,7 +222,8 @@ pub fn view_sql(name: &str, alias: &str) -> Result<String> {
             "-- Recipe: outstanding (#2943) - supply as an attestation counts it: total supply, less frozen\n\
              -- balances, less what addresses labelled `{TREASURY_LABEL}` hold (minted but not issued). The\n\
              -- treasury addresses are yours to supply: `nuthatch labels import` a set labelling them.\n\
-             -- Add `at_time` or `at_block` to the query for the figure at a report date. Query it:\n\
+             -- `at_time` or `at_block` gives supply and freezes at a report date; the label set is the one\n\
+             -- imported now, so import the treasury addresses as they were then. Query it:\n\
              -- SELECT * FROM {alias}_outstanding\n\
              CREATE VIEW {alias}_outstanding AS\n{};\n",
             outstanding_select(alias)
@@ -268,6 +270,19 @@ pub fn add_cli(dir: &Path, name: &str, alias: Option<&str>) -> Result<()> {
         None => Config::load(dir)?.primary()?.alias.clone(),
     };
     let sql = view_sql(name, &alias)?;
+    if let Some(have) = nest_tables(dir) {
+        let missing: Vec<String> = required_tables(name)
+            .iter()
+            .map(|t| format!("{alias}__{t}"))
+            .filter(|t| !have.contains(t))
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "the {name} recipe reads {}, which this nest does not index",
+                missing.join(", ")
+            );
+        }
+    }
     if name == "outstanding" && !has_label_snapshot(dir) {
         bail!(
             "the outstanding recipe nets off addresses labelled `{TREASURY_LABEL}`, and this nest has no \
@@ -290,6 +305,29 @@ pub fn add_cli(dir: &Path, name: &str, alias: Option<&str>) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// The event tables a recipe reads, by suffix after `{alias}__`.
+fn required_tables(name: &str) -> &'static [&'static str] {
+    match name {
+        "frozen" | "outstanding" => &["transfer", "blacklisted", "un_blacklisted"],
+        "mint_burn_daily" => &["transfer", "mint", "burn"],
+        "reserves" => &["sync"],
+        _ => &["transfer"],
+    }
+}
+
+/// The tables `schema.json` declares, or `None` where there is none to check against.
+fn nest_tables(dir: &Path) -> Option<std::collections::BTreeSet<String>> {
+    let raw = std::fs::read(dir.join("schema.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    Some(
+        v["tables"]
+            .as_array()?
+            .iter()
+            .filter_map(|t| t["table"].as_str().map(String::from))
+            .collect(),
+    )
 }
 
 /// Whether `labels import` has written a snapshot, without which a view naming `labels` cannot bind.
@@ -425,6 +463,24 @@ mod tests {
                 ["0", "100", "0", "100", "1400"].map(String::from),
             ]
         );
+    }
+
+    #[test]
+    fn a_recipe_refuses_a_nest_without_the_events_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"usdc__transfer"}]}"#,
+        )
+        .unwrap();
+        let err = add_cli(dir.path(), "frozen", Some("usdc"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("usdc__blacklisted, usdc__un_blacklisted"),
+            "{err}"
+        );
+        add_cli(dir.path(), "total_supply", Some("usdc")).unwrap();
     }
 
     #[test]
