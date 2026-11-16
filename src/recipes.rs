@@ -192,6 +192,7 @@ pub fn mint_burn_daily_select(alias: &str) -> String {
 }
 
 /// What the `fiat_threshold` recipe needs that the nest does not say (#2945).
+#[derive(Clone)]
 pub struct Fiat {
     /// The threshold in the rate table's currency, as a decimal. A transfer above it is flagged.
     pub amount: String,
@@ -207,9 +208,15 @@ impl Fiat {
     fn check(&self) -> Result<()> {
         let (whole, frac) = self.amount.split_once('.').unwrap_or((&self.amount, ""));
         let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-        if whole.is_empty() || !digits(whole) || !digits(frac) || frac.len() > 10 {
+        if whole.is_empty()
+            || whole.len() > 20
+            || !digits(whole)
+            || !digits(frac)
+            || frac.len() > 10
+        {
             bail!(
-                "--amount must be a decimal like 1000 or 1000.50, with at most 10 decimal places"
+                "--amount must be a decimal like 1000 or 1000.50, under 10^20 and with at most 10 \
+                 decimal places"
             );
         }
         if self.decimals > 30 {
@@ -220,7 +227,7 @@ impl Fiat {
         }
         crate::offchain::validate_table(&self.rates)?;
         for l in &self.unless {
-            if l.is_empty() || l.contains('\'') {
+            if l.is_empty() || l.chars().any(|c| c == '\'' || c.is_control()) {
                 bail!("--unless-label {l:?} is not a label name");
             }
         }
@@ -231,12 +238,20 @@ impl Fiat {
 /// The `SELECT` body of the `fiat_threshold` recipe: each transfer whose value, at its UTC day's rate,
 /// is above `amount`, and whose recipient carries none of the `unless` labels. Mints and burns are not
 /// transfers between parties and are left out. A transfer the rate table cannot price, because its day
-/// has no rate or two different ones, is returned with `priced = false` rather than passed over, and a
-/// rate that will not parse refuses the query.
+/// has no rate or two different ones, or because it moves 10^17 tokens or more, is returned with
+/// `priced = false` rather than passed over, and a rate that will not parse refuses the query.
 pub fn fiat_threshold_select(alias: &str, f: &Fiat) -> String {
     let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
     let day = "DATE '1970-01-01' + CAST(block_timestamp // 86400 AS INTEGER)";
-    let scale = format!("1{}", "0".repeat(f.decimals as usize));
+    let scale = format!("CAST('1{}' AS HUGEINT)", "0".repeat(f.decimals as usize));
+    // Checked arithmetic refuses the whole query on an overflow, so no product here may overflow: whole
+    // tokens below 10^17 times the rate, plus the fraction cut to 10 places of a token.
+    let tenth = |n: u32| format!("CAST('1{}' AS HUGEINT)", "0".repeat(n as usize));
+    let frac10 = if f.decimals >= 10 {
+        format!("(t.value % {scale}) // {}", tenth(f.decimals - 10))
+    } else {
+        format!("(t.value % {scale}) * {}", tenth(10 - f.decimals))
+    };
     let unless = if f.unless.is_empty() {
         String::new()
     } else {
@@ -257,8 +272,11 @@ pub fn fiat_threshold_select(alias: &str, f: &Fiat) -> String {
            fiat_value, priced \
          FROM (\
            SELECT t.*, r.rate, \
-             CAST(t.value AS DECIMAL(38,0)) * r.rate / CAST('{scale}' AS DECIMAL(38,0)) AS fiat_value, \
-             r.rate IS NOT NULL AND t.value IS NOT NULL AS priced \
+             CASE WHEN t.value // {scale} < 100000000000000000 THEN \
+               CAST(t.value // {scale} AS DECIMAL(38,0)) * r.rate \
+               + CAST({frac10} AS DECIMAL(38,0)) * r.rate / CAST('10000000000' AS DECIMAL(38,0)) \
+             END AS fiat_value, \
+             r.rate IS NOT NULL AND COALESCE(t.value // {scale} < 100000000000000000, false) AS priced \
            FROM (SELECT block_number, log_index, block_timestamp, {day} AS day, \
                    lower(\"from\") AS sender, lower(\"to\") AS recipient, {d} AS value \
                  FROM \"{alias}__transfer\") t \
@@ -624,8 +642,9 @@ mod tests {
             transfer(5, day + 86_400, a, b, "1250000001"),
             transfer(6, day + 86_410, a, b, "2000000001"),
             transfer(7, day + 172_800, a, b, "10"),
+            transfer(8, day + 40, a, b, "1000000000000000000000000000000"),
         ];
-        crate::seal::seal_range(dir.path(), &rows, 1, 7).unwrap();
+        crate::seal::seal_range(dir.path(), &rows, 1, 8).unwrap();
         let rates = dir.path().join("eur.csv");
         std::fs::write(&rates, "day,rate\n2023-11-15,0.8\n2023-11-16,0.5\n").unwrap();
         crate::offchain::drop_file(dir.path(), &rates, "eur").unwrap();
@@ -645,7 +664,15 @@ mod tests {
                 .iter()
                 .map(|r| (r["block_number"].as_u64().unwrap(), r["priced"] == true))
                 .collect();
-        assert_eq!(got, [(3, true), (6, true), (7, false)]);
+        assert_eq!(got, [(3, true), (6, true), (7, false), (8, false)]);
+        for decimals in [18, 30] {
+            let wide = Fiat {
+                decimals,
+                ..fiat.clone()
+            };
+            crate::analytics::query(dir.path(), &fiat_threshold_select("usdc", &wide))
+                .unwrap_or_else(|e| panic!("decimals {decimals}: {e:#}"));
+        }
 
         let again = dir.path().join("eur2.csv");
         std::fs::write(&again, "day,rate\n2023-11-16,0.6\n").unwrap();
@@ -659,7 +686,7 @@ mod tests {
                 .collect();
         assert_eq!(
             unpriced,
-            [5, 6, 7],
+            [5, 6, 7, 8],
             "two rates for one day price none of its transfers"
         );
 
