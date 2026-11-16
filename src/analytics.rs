@@ -1751,11 +1751,10 @@ fn attempt(
             Default::default()
         };
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
-        // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
-        if as_of.is_none()
-            && !slot.labels_bound
-            && wanted.as_ref().is_none_or(|w| w.contains("labels"))
-        {
+        // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view. An
+        // as-of read binds them too, as imported now, which is what a report date's `outstanding` needs
+        // (#2962); an offchain snapshot stays out, since an entity over one would mix today into history.
+        if !slot.labels_bound && wanted.as_ref().is_none_or(|w| w.contains("labels")) {
             slot.labels_bound = define_labels_view(session, dir);
         }
         // A nest can ship derived-entity views (`views/*.sql`) that build on the per-event tables; the
