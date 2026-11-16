@@ -1496,6 +1496,11 @@ async fn nest(State(s): State<AppState>) -> impl IntoResponse {
     let mut info = (*s.nest_info).clone();
     if let Some(obj) = info.as_object_mut() {
         obj.insert("undecoded".into(), undecoded(&s));
+        // Live, since `labels import` does not restart the runtime (#2961).
+        obj.insert(
+            "labels_sha256".into(),
+            json!(crate::labels::set_hash(&s.dir)),
+        );
     }
     Json(info)
 }
@@ -6471,6 +6476,7 @@ fn sql_facts_envelope(
             entities: sql_entity_provenance(s, out.referenced_tables.as_ref(), watermarks),
             reproducible_by_snapshot: read.is_some() || through_entity,
             offchain: read,
+            labels: out.labels.as_deref(),
         },
         rows,
     )
@@ -10395,6 +10401,39 @@ mod tests {
         assert!(
             report.mismatches.iter().any(|m| m.starts_with("time: 15")),
             "{report:?}"
+        );
+
+        // #2961: rows that read `labels` pin the set, and fail by its name once it is deleted.
+        assert_eq!(bundle.evidence.labels_sha256, None);
+        let set = tmp.path().join("set.csv");
+        std::fs::write(
+            &set,
+            "address,label\n0x00000000000000000000000000000000000000a1,x\n",
+        )
+        .unwrap();
+        crate::labels::import(tmp.path(), &set).unwrap();
+        let read = evidence::make(
+            &url,
+            "SELECT count(*) AS n FROM labels",
+            Some(20),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(read.evidence.labels_sha256.is_some());
+        assert_eq!(
+            read.evidence.labels_sha256,
+            crate::labels::set_hash(tmp.path())
+        );
+        assert!(evidence::verify(&read, &url, None).await.unwrap().ok());
+        std::fs::remove_dir_all(tmp.path().join(crate::labels::LABELS_DIR)).unwrap();
+        let report = evidence::verify(&read, &url, None).await.unwrap();
+        assert_eq!(report.mismatches.len(), 1, "{report:?}");
+        assert!(report.mismatches[0].starts_with("labels:"), "{report:?}");
+        assert!(
+            evidence::verify(&bundle, &url, None).await.unwrap().ok(),
+            "rows that read no labels outlive the set"
         );
 
         let err = evidence::make(&url, q, Some(40), None, None)

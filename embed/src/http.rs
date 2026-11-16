@@ -401,6 +401,7 @@ async fn route_sql(
             entities,
             reproducible_by_snapshot: false,
             offchain: None,
+            labels: None,
         },
         Value::Array(rows),
     );

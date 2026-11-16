@@ -552,6 +552,8 @@ pub struct QueryOutput {
     /// it was defined over, or `None` where that is not known. Such an answer is reproducible by
     /// snapshot, not re-derivable from chain (RFC-0045 §6).
     pub offchain: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// The label set this answer read, by [`crate::labels::set_hash`], where it read `labels` (#2961).
+    pub labels: Option<String>,
     /// The bound a declared query was admitted against; `None` on every other path.
     pub scan_bound: Option<ScanBound>,
     /// The answer as an Arrow IPC stream, in place of `rows`, when [`QueryGuard::arrow`] asked.
@@ -569,6 +571,7 @@ impl QueryOutput {
             tip_unavailable: self.tip_unavailable,
             referenced_tables: self.referenced_tables.clone(),
             offchain: self.offchain.clone(),
+            labels: self.labels.clone(),
             scan_bound: self.scan_bound.clone(),
             ipc: None,
         }
@@ -1678,7 +1681,16 @@ fn attempt(
         slot: Some(slot),
         restore: cached,
     };
-    let (referenced, offchain, degraded_tables, interrupted, (spilled, held), outcome, cap, scan) = {
+    let (
+        referenced,
+        (offchain, labels),
+        degraded_tables,
+        interrupted,
+        (spilled, held),
+        outcome,
+        cap,
+        scan,
+    ) = {
         let slot = warm.slot.as_mut().expect("session");
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
@@ -1766,6 +1778,10 @@ fn attempt(
                 .filter(|(view, _)| referenced.contains(&view.to_ascii_lowercase()))
                 .collect(),
         );
+        let labels = referenced
+            .contains("labels")
+            .then(|| crate::labels::set_hash(dir))
+            .flatten();
 
         // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
         // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
@@ -1888,7 +1904,7 @@ fn attempt(
         }
         (
             (Some(referenced), copies),
-            offchain,
+            (offchain, labels),
             degraded_tables,
             interrupted,
             (spilled, held),
@@ -1916,6 +1932,7 @@ fn attempt(
             degraded_tables,
             referenced_tables: referenced,
             offchain,
+            labels,
             scan_bound: scan,
             ..Default::default()
         }));
@@ -1980,6 +1997,7 @@ fn attempt(
         referenced_tables: referenced,
         scan_bound: scan,
         offchain,
+        labels,
         ipc,
     }))
 }

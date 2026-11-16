@@ -116,6 +116,32 @@ pub fn import(dir: &Path, source: &Path) -> Result<(String, usize)> {
     Ok((hash, entries.len()))
 }
 
+/// The identity of the label set `/sql` binds: every `*.json` under `dir/labels/`, by name and by the
+/// hash of its bytes, so an edited snapshot moves it as an added or deleted one does (#2961). `None`
+/// when there is none.
+pub fn set_hash(dir: &Path) -> Option<String> {
+    let mut files: Vec<(String, String)> = std::fs::read_dir(dir.join(LABELS_DIR))
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| {
+            let bytes = std::fs::read(&p).ok()?;
+            let name = p.file_name()?.to_string_lossy().into_owned();
+            Some((name, hex::encode(Sha256::digest(&bytes))))
+        })
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    files.sort();
+    let mut h = Sha256::new();
+    for (name, digest) in &files {
+        h.update(format!("{name}\0{digest}\n").as_bytes());
+    }
+    Some(hex::encode(h.finalize()))
+}
+
 /// Load and merge every label snapshot under `dir/labels/` into a queryable [`LabelSet`]. Missing
 /// directory → empty set (labels are optional). A single corrupt snapshot is skipped with a warning
 /// rather than failing the whole load - one bad file shouldn't blind the indexer to the rest.
