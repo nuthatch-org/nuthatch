@@ -10285,6 +10285,22 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        // #2962: an as-of read sees the label sets imported now.
+        let set = tmp.path().join("set.csv");
+        std::fs::write(
+            &set,
+            "address,label\n0x00000000000000000000000000000000000000a1,x\n",
+        )
+        .unwrap();
+        crate::labels::import(tmp.path(), &set).unwrap();
+        let (status, body) = get_json(
+            state.clone(),
+            "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20labels&at_block=20",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["rows"][0]["n"].as_u64(), Some(1));
+
         let (status, _) = get_json(state.clone(), &format!("/at?time={}", ts(5))).await;
         assert_eq!(
             status,
