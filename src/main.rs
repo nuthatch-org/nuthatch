@@ -377,6 +377,7 @@ async fn main() -> Result<()> {
                 std::path::Path::new(&a.dir),
                 &a.name,
                 a.alias.as_deref(),
+                a.fiat().as_ref(),
             ),
         },
         cli::Command::Metadata(args) => match args.what {

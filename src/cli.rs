@@ -632,6 +632,29 @@ pub struct RecipeAddArgs {
     /// The nest directory.
     #[arg(long, default_value = ".")]
     pub dir: String,
+    /// fiat_threshold: flag a transfer above this amount in the rate table's currency, e.g. 1000.
+    #[arg(long, requires_all = ["rates", "decimals"])]
+    pub amount: Option<String>,
+    /// fiat_threshold: the offchain table of `day` and `rate` (currency per whole token).
+    #[arg(long, requires = "amount")]
+    pub rates: Option<String>,
+    /// fiat_threshold: the token's decimals.
+    #[arg(long, requires = "amount")]
+    pub decimals: Option<u32>,
+    /// fiat_threshold: a label whose addresses are not flagged as recipients (repeatable).
+    #[arg(long = "unless-label", requires = "amount")]
+    pub unless_label: Vec<String>,
+}
+
+impl RecipeAddArgs {
+    pub fn fiat(&self) -> Option<crate::recipes::Fiat> {
+        Some(crate::recipes::Fiat {
+            amount: self.amount.clone()?,
+            rates: self.rates.clone()?,
+            decimals: self.decimals?,
+            unless: self.unless_label.clone(),
+        })
+    }
 }
 
 #[derive(Subcommand)]
