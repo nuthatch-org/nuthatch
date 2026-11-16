@@ -470,6 +470,10 @@ Add a recipe's derived view to a nest's `views/` (never clobbers an existing fil
 - `<NAME>` - The recipe name (see `nuthatch recipe list`), e.g. `total_supply`
 - `--alias <ALIAS>` - The contract alias whose table the view derives over. Defaults to the nest's first contract
 - `--dir <DIR>` - The nest directory
+- `--amount <AMOUNT>` - fiat_threshold: flag a transfer above this amount in the rate table's currency, e.g. 1000
+- `--rates <RATES>` - fiat_threshold: the offchain table of `day` and `rate` (currency per whole token)
+- `--decimals <DECIMALS>` - fiat_threshold: the token's decimals
+- `--unless-label <UNLESS_LABEL>` - fiat_threshold: a label whose addresses are not flagged as recipients (repeatable)
 
 ## `nuthatch recipe list`
 

@@ -552,7 +552,7 @@ fn read_parquet_handle(mut file: std::fs::File) -> Result<(Vec<u8>, usize, Vec<S
     Ok((bytes, rows, columns))
 }
 
-fn validate_table(table: &str) -> Result<()> {
+pub(crate) fn validate_table(table: &str) -> Result<()> {
     if table.is_empty()
         || !table
             .bytes()
