@@ -121,6 +121,9 @@ impl Manifest {
     pub fn nid(&self) -> String {
         let mut canonical = self.clone();
         canonical.generator_version = NID_GENERATOR_SENTINEL.to_string();
+        // A manifest packed before an input rule existed still lists the file; it names the nest its
+        // files install as (#2946).
+        canonical.files.retain(|f| is_input(&f.path));
         let mut h = Sha256::new();
         h.update(NID_DOMAIN);
         h.update(canonical.canonical_bytes());
@@ -152,7 +155,11 @@ impl Manifest {
         };
         feed(&self.registry_hash);
         // `files` is sorted by path at build time, so this is deterministic.
-        for f in self.files.iter().filter(|f| affects_data(&f.path)) {
+        for f in self
+            .files
+            .iter()
+            .filter(|f| is_input(&f.path) && affects_data(&f.path))
+        {
             feed(&f.path);
             feed(&f.sha256);
         }
@@ -401,6 +408,26 @@ mod tests {
             nid(vec![file("views/a.sql"), file("views/labels/a.sql")]),
             nid(vec![file("views/a.sql")])
         );
+    }
+
+    /// A bundle packed before #2946 lists its label files; its manifest names the nest it installs as.
+    #[test]
+    fn an_old_manifest_listing_labels_names_the_nest_without_them() {
+        let m = manifest(
+            "n".into(),
+            1,
+            "0".into(),
+            "00".into(),
+            vec![file("views/a.sql")],
+        )
+        .unwrap();
+        let mut old = m.clone();
+        old.files.push(FileEntry {
+            path: "labels/0a.json".into(),
+            sha256: "00".into(),
+        });
+        assert_eq!(old.nid(), m.nid());
+        assert_eq!(old.data_identity(), m.data_identity());
     }
 
     /// The documented `[address_history.sweep]` and `.mirror` sub-tables are part of the table (#2188).

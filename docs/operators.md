@@ -2075,15 +2075,20 @@ TFR Art 26, 31 CFR 1010.430, FATF R.11), and then for personal data to go.
   retention is the bucket's to enforce, not nuthatch's.
 - *How an answer is kept.* An evidence bundle (#2944) records one answer with the NID, the
   registry hash and a hash of the rows, and verifying it re-asks any nest of that NID, a
-  mirror-seeded one included. A bundle holds whatever its statement selected, so it is yours to retain or delete.
+  mirror-seeded one included. A bundle holds whatever its statement selected, so it is yours to
+  retain or delete. The NID does not pin a label set, so a statement that reads `labels` or exposure
+  verifies only against a nest holding the same set; keep chain-only statements in evidence that
+  must outlive a deletion.
 - *Label sets are not part of the nest.* `labels/` and `labels.manifest.json` count toward neither
   the NID nor the data identity, no sealed byte is derived from them, bundles do not carry them and
   the mirror does not copy them. Exposure is rebuilt from them in memory at start, maintained views
   refuse to read `labels`, and the analytical memo is process-local. To delete a set, remove its
   `labels/<sha256>.json` and its entry in `labels.manifest.json`, then restart: every chain table and
   the NID stay as they were. Until #2946 a label import moved the NID, so a runtime whose mount
-  record was written with labels present logs `identity drift` for it after the upgrade; its data is
-  untouched.
+  record was written with labels present logs `identity drift` for it after the upgrade, and keeps
+  serving the `data/<nid>` the record names. `publish sync` keys the mirror by the data identity, so
+  such a nest's next sync writes a full copy under the new key; the old prefix is safe to delete
+  once it lands. A bundle packed with labels still loads, as the nest without them.
 
 **Reading sealed data without this binary.** The sealed directory is plain Parquet plus a catalogue.
 [Reading Nuthatch segments without Nuthatch](reading-segments.md) is the contract: layout, catalogue
