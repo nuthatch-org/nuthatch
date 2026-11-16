@@ -120,16 +120,24 @@ pub fn import(dir: &Path, source: &Path) -> Result<(String, usize)> {
 /// hash of its bytes, so an edited snapshot moves it as an added or deleted one does (#2961). `None`
 /// when there is none.
 pub fn set_hash(dir: &Path) -> Option<String> {
-    let mut files: Vec<(String, String)> = std::fs::read_dir(dir.join(LABELS_DIR))
+    let files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir.join(LABELS_DIR))
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
         .filter_map(|p| {
             let bytes = std::fs::read(&p).ok()?;
-            let name = p.file_name()?.to_string_lossy().into_owned();
-            Some((name, hex::encode(Sha256::digest(&bytes))))
+            Some((p.file_name()?.to_string_lossy().into_owned(), bytes))
         })
+        .collect();
+    set_hash_of(files.iter().map(|(n, b)| (n.as_str(), b.as_slice())))
+}
+
+/// [`set_hash`] over snapshots already in hand, as `(file name, bytes)`: the tab has no directory.
+pub fn set_hash_of<'a>(snapshots: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Option<String> {
+    let mut files: Vec<(&str, String)> = snapshots
+        .into_iter()
+        .map(|(name, bytes)| (name, hex::encode(Sha256::digest(bytes))))
         .collect();
     if files.is_empty() {
         return None;

@@ -76,15 +76,9 @@ impl NestSpec {
         let factory = FactorySet::resolved(config.declared(), &registry)?;
         let factory = (!factory.is_empty()).then_some(factory);
         let mut labels = LabelSet::default();
-        for (path, text) in files {
-            let in_labels = path
-                .strip_prefix(LABELS_DIR)
-                .and_then(|p| p.strip_prefix('/'))
-                .is_some_and(|p| !p.contains('/') && p.ends_with(".json"));
-            // Skipped unread as the node skips it, with nothing said: a module has no log to say it in.
-            if in_labels {
-                labels.merge_snapshot(text);
-            }
+        // Skipped unread as the node skips it, with nothing said: a module has no log to say it in.
+        for (_, text) in label_snapshots(files) {
+            labels.merge_snapshot(text);
         }
         // A factory nest asks by address in `fetch_window`; an empty list marks it, as on a node.
         let addresses = if factory.is_some() {
@@ -197,4 +191,17 @@ impl NestSpec {
             ),
         }
     }
+}
+
+/// The `labels/*.json` snapshots among `files`, as `(file name, text)`.
+fn label_snapshots(files: &NestFiles) -> impl Iterator<Item = (&str, &String)> {
+    files.iter().filter_map(|(path, text)| {
+        let name = path.strip_prefix(LABELS_DIR)?.strip_prefix('/')?;
+        (!name.contains('/') && name.ends_with(".json")).then_some((name, text))
+    })
+}
+
+/// The label set's hash as a node reports it (#2961), over the same snapshots the tab loads.
+pub fn labels_sha256(files: &NestFiles) -> Option<String> {
+    nuthatch_core::labels::set_hash_of(label_snapshots(files).map(|(n, t)| (n, t.as_bytes())))
 }
