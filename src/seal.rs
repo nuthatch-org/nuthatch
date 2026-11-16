@@ -4522,11 +4522,16 @@ mod tests {
     /// hash, and not another dataset's or another store's loss of the same one.
     #[test]
     fn a_restore_clears_only_this_datasets_or_its_stores_loss_of_that_hash() {
-        let me = tempfile::tempdir().unwrap();
+        // Under `data/`, so `me` reads from a store outside itself that a sibling's loss names.
+        let root = tempfile::tempdir().unwrap();
+        let me = root.path().join(crate::runtime::DATA_DIR).join("a");
+        std::fs::create_dir_all(&me).unwrap();
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
         let other = tempfile::tempdir().unwrap();
         let (h, h2) = (
-            format!("{}-restored", me.path().display()),
-            format!("{}-kept", me.path().display()),
+            format!("{}-restored", me.display()),
+            format!("{}-kept", me.display()),
         );
         let lost = |dataset: &Path, store: Option<PathBuf>, hash: &str| Quarantined {
             dataset: lease_key(dataset),
@@ -4543,12 +4548,13 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .quarantined
             .extend([
-                lost(me.path(), None, &h),
-                lost(me.path(), None, &h2),
+                lost(&me, None, &h),
+                lost(&me, None, &h2),
                 lost(other.path(), None, &h),
                 lost(other.path(), Some(other.path().join(SEGMENTS_DIR)), &h),
+                lost(other.path(), Some(lease_key(&store)), &h),
             ]);
-        record_restored(me.path(), &h);
+        record_restored(&me, &h);
         let restored: Vec<bool> = findings()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4557,7 +4563,7 @@ mod tests {
             .filter(|q| q.hash == h || q.hash == h2)
             .map(|q| q.restored)
             .collect();
-        assert_eq!(restored, [true, false, false, false]);
+        assert_eq!(restored, [true, false, false, false, true]);
     }
 
     /// A request from a catalogue that expected other bytes of a file is not answered against the

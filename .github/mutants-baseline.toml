@@ -73,14 +73,6 @@ way.
 
 [[survivor]]
 file = "src/seal.rs"
-mutation = "replace > with >= in integrity"
-reason = """
-`at > r.at` asks whether a quarantine came after the rebuild. They are two `Instant::now()` reads taken at
-different moments, so they are never equal, and only equality tells the mutant apart.
-"""
-
-[[survivor]]
-file = "src/seal.rs"
 mutation = "replace > with >= in parsed_catalogue"
 reason = """
 Both comparisons against `PARSED_CATALOGUE_BYTES` differ only when a catalogue, or the cache's sum, is
@@ -88,6 +80,15 @@ exactly 32 MiB, where keeping it or dropping it are both within the bound the co
 """
 
 # --- Untestable in a test's time. -----------------------------------------------------------------
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in integrity"
+reason = """
+`at > r.at` asks whether a quarantine came after the rebuild. Only two equal `Instant`s tell the
+mutant apart, and both are `Instant::now()` reads in different code paths: a test cannot make them equal
+without an injected clock, which this would be the only use of.
+"""
 
 [[survivor]]
 file = "src/seal.rs"
