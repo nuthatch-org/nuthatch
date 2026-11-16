@@ -18,7 +18,7 @@ use std::path::Path;
 /// Directory (under a nest) holding content-addressed label snapshots.
 pub const LABELS_DIR: &str = "labels";
 /// Human-readable provenance index at the nest root: which snapshots were imported, when, from where.
-const INDEX_FILE: &str = "labels.manifest.json";
+pub const INDEX_FILE: &str = "labels.manifest.json";
 
 /// One (address, label) pair. `address` is normalised to a lowercase `0x…40hex` string on import, so
 /// membership checks against decoded transfer addresses (also lowercase hex) are a plain equality.

@@ -302,7 +302,7 @@ Package a nest as a content-addressed blob - the deploy unit (RFC-0012)
 
 ## `nuthatch nest bundle`
 
-Bundle a nest into one portable, content-addressed `.bundle` file - its authored inputs (config, ABIs, views, labels, skills) plus a `manifest.json` pinning the expected decode-registry hash. Share the `.bundle` anywhere (a URL, a file); anyone can `load` it to run your exact nest, verified by hash. Prints the bundle's content address
+Bundle a nest into one portable, content-addressed `.bundle` file - its authored inputs (config, ABIs, views, skills; never label sets) plus a `manifest.json` pinning the expected decode-registry hash. Share the `.bundle` anywhere (a URL, a file); anyone can `load` it to run your exact nest, verified by hash. Prints the bundle's content address
 
 - `<DIR>` - Nest directory to bundle
 - `--out <OUT>` - Output path for the `.bundle` (default: `<nest-name>-<hash>.bundle` beside the nest). With `--as-dir`, an unpacked bundle *directory* is written here instead of a single file

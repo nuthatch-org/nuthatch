@@ -640,7 +640,7 @@ pub struct RecipeAddArgs {
 #[derive(Subcommand)]
 pub enum NestWhat {
     /// Bundle a nest into one portable, content-addressed `.bundle` file - its authored inputs (config,
-    /// ABIs, views, labels, skills) plus a `manifest.json` pinning the expected decode-registry hash.
+    /// ABIs, views, skills; never label sets) plus a `manifest.json` pinning the expected decode-registry hash.
     /// Share the `.bundle` anywhere (a URL, a file); anyone can `load` it to run your exact nest,
     /// verified by hash. Prints the bundle's content address.
     Bundle(NestBundleArgs),

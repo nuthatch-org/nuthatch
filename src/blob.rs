@@ -3,8 +3,9 @@
 //! deploy unit. `nest bundle` writes a single `.bundle` file (`bundle` here); `nest load` verifies +
 //! installs one (`load`), resolving a `.bundle` file, an `http(s)` URL, or an unpacked bundle dir.
 //!
-//! The blob pins **inputs** (`nuthatch.toml`, ABIs, views, labels, skills, `schema.json`, `llms.txt`),
-//! never build artifacts (the generated decode registry) or sealed data (`segments/`, `nuthatch.redb`).
+//! The blob pins **inputs** (`nuthatch.toml`, ABIs, views, skills, `schema.json`, `llms.txt`), never
+//! label sets (#2946), never build artifacts (the generated decode registry) or sealed data
+//! (`segments/`, `nuthatch.redb`).
 //! Instead the manifest records the *expected* `registry_hash`; a `mount` regenerates the registry from
 //! the packed inputs and asserts it matches - extending determinism from the data path (RFC-0009's
 //! content-addressed segments) to the *authoring* path: same inputs + same generator → same blob →
@@ -1118,6 +1119,7 @@ abi = "abis/c.json"
 
     /// RFC-0066 S0: the identities of fixed nests, pinned before the identity left this crate. A tab
     /// computes these with the same code, so a moved byte here re-indexes every published nest.
+    /// The first moved once, deliberately, when label sets left the identity (#2946).
     #[test]
     fn the_identity_of_fixed_nests_is_pinned() {
         let a = tempfile::tempdir().unwrap();
@@ -1152,8 +1154,8 @@ abi = "abis/c.json"
         .collect();
         let want = [
             (
-                "944109352f7e5e92e6307a14ce70c0b58c01f69c4d95644af5fa0bc91755ecad",
-                "1bc66ea1d7ce3e8eb21b2e9c1b9156d1688e77d9c1d7d9c7fc767c86add0d1f0",
+                "1456c2a0aa793c4595495af52e0f3da6953a8a85fce6e05fce42afe6a3325f07",
+                "01f823d871d8ea76fff075cf7967bc57885529c8afa0f85d8855bd0629c6d8c6",
             ),
             (
                 "9dd6d3c6a305597bd84e87c8a4b406d8e1b867ff67a066e8537a5ee67ae1adde",
@@ -1355,6 +1357,8 @@ abi = "abis/c.json"
     /// operator holding that nest.
     /// The `scaffold/*` NIDs have since moved with the scaffolded `llms.txt` and `SKILL.md`, which are
     /// part of the package; their data identities have not.
+    /// `diff/control` moved once, deliberately, when its label set left the identity (#2946), and its
+    /// goldens, which sit inside it, were reblessed for the new data identity.
     #[test]
     fn the_fixture_nests_keep_their_identities() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
@@ -1362,7 +1366,7 @@ abi = "abis/c.json"
         for (nest, nid, data) in [
             ("scaffold/pair", "c68d2b35b8ffe781450f040349b212dd0e568a7fc0d93078b671e6bc801ea2b3", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
             ("scaffold/two", "3a88fafe7f48340c898e28587221f849ef0df4379e4c11ecc011c0711074cd03", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
-            ("diff/control", "409f7c7db35d5dab9db410e849be7420e7ab69460c06d3114024df2d7fe1c164", "8a12eac0c6604e0df102425c78ce588b7ac1b58434208e561166b9cc4e19ceff"),
+            ("diff/control", "deb96b155fb20346b00750e08a8aab5f7cd1770d5bdfc52ba7d1b5a2799fc9f3", "7466bae56f2e552de298263e1676c35ea49e029a147e8b80650373cbef6f2b60"),
             ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
             ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),
             ("upgrade/config-4.0/nest", "9fac46172d71472f25f6f8f93d1dc27c995195cff238854a43854210704b33fc", "b52c44602be972b99191267aac8601223b4c4f76a94b044f9ef50759cf3e9274"),
