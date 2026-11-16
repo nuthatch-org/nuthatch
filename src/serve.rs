@@ -10298,6 +10298,92 @@ mod tests {
         assert_eq!(placed(state, ts(5)).await, (None, 10, false, true));
     }
 
+    /// #2944: a bundle made from one nest verifies against it over HTTP, and fails by name when its rows,
+    /// its nest or its signer differ, or when its block is not sealed.
+    #[tokio::test]
+    async fn an_evidence_bundle_verifies_only_against_the_same_answer() {
+        use crate::evidence;
+        let tmp = tempfile::tempdir().unwrap();
+        let row = |b: u64| {
+            json!({"table":"t","block_number":b,"log_index":0,"block_timestamp":b,"v":"x"})
+                .to_string()
+        };
+        crate::seal::seal_range(tmp.path(), &[row(10), row(20), row(21)], 1, 30).unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        state.store.set_meta("sealed_through", "30").unwrap();
+        state.store.set_meta("last_block", "50").unwrap();
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(true),
+        }]);
+        let serve = |state: AppState, nid: &str| {
+            let state = AppState {
+                nest_info: Arc::new(json!({
+                    "name": "t", "chain": "mainnet", "chain_id": 1, "nid": nid, "registry_hash": "0xr"
+                })),
+                ..state
+            };
+            async move {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", l.local_addr().unwrap());
+                tokio::spawn(async move { axum::serve(l, router(SharedNest::new(state))).await });
+                url
+            }
+        };
+        let url = serve(state.clone(), "n1").await;
+        let other = serve(state, "n2").await;
+        let q = "SELECT count(*) AS n FROM t";
+        let key = tmp.path().join("k.json");
+        crate::pack::keygen(&key).unwrap();
+        let trusted = crate::pack::parse_pubkey(key.to_str().unwrap()).unwrap();
+
+        let bundle = evidence::make(&url, q, Some(20), None, Some(&key))
+            .await
+            .unwrap();
+        assert_eq!(bundle.evidence.rows, vec![json!({"n": 2})]);
+        let report = evidence::verify(&bundle, &url, Some(&trusted))
+            .await
+            .unwrap();
+        assert!(report.ok(), "{report:?}");
+        assert_eq!(report.signature, Some(true));
+
+        let other_key = tmp.path().join("k2.json");
+        crate::pack::keygen(&other_key).unwrap();
+        let wrong = crate::pack::parse_pubkey(other_key.to_str().unwrap()).unwrap();
+        let report = evidence::verify(&bundle, &url, Some(&wrong)).await.unwrap();
+        assert_eq!(report.signature, Some(false));
+        assert!(!report.ok());
+
+        let report = evidence::verify(&bundle, &other, None).await.unwrap();
+        assert!(
+            report.mismatches.iter().any(|m| m.starts_with("nid")),
+            "{report:?}"
+        );
+
+        let mut forged = evidence::make(&url, q, Some(20), None, None).await.unwrap();
+        forged.evidence.rows = vec![json!({"n": 3})];
+        forged.evidence.rows_sha256 = evidence::rows_hash(&forged.evidence.rows);
+        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .any(|m| m.starts_with("rows at block 20")),
+            "{report:?}"
+        );
+
+        let err = evidence::make(&url, q, Some(40), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not sealed"), "{err}");
+    }
+
     /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never
     /// in the one its dataset's other mounts share, and the allow-list holds on the route.
     #[tokio::test]
