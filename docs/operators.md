@@ -2078,7 +2078,9 @@ TFR Art 26, 31 CFR 1010.430, FATF R.11), and then for personal data to go.
   mirror-seeded one included. A bundle holds whatever its statement selected, so it is yours to
   retain or delete. The NID does not pin a label set, so a statement that reads `labels` or exposure
   verifies only against a nest holding the same set; keep chain-only statements in evidence that
-  must outlive a deletion.
+  must outlive a deletion. A bundle made before this release over a nest that held labels names
+  that nest's old NID, which no current nest reports; its rows still reproduce at the same block,
+  so make it again against the upgraded nest and keep both.
 - *Label sets are not part of the nest.* `labels/` and `labels.manifest.json` count toward neither
   the NID nor the data identity, no sealed byte is derived from them, bundles do not carry them and
   the mirror does not copy them. Exposure is rebuilt from them in memory at start, maintained views

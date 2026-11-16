@@ -4,7 +4,7 @@
     "name": "control-plane",
     "chain": "mainnet",
     "chain_id": 1,
-    "data_identity": "03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba"
+    "data_identity": "1446e0486b291bb9b07d5063f04b3c9e12951afaf4eee867c357e2251feedb84"
   },
   "request": {
     "from": 26242000,
@@ -865,7 +865,7 @@
   "not_seen": "Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.",
   "provenance": {
     "version": "{version}",
-    "data_identity": "03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba",
+    "data_identity": "1446e0486b291bb9b07d5063f04b3c9e12951afaf4eee867c357e2251feedb84",
     "first_row": {
       "block": 26242002,
       "log_index": 364,

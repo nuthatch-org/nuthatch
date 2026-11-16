@@ -23,9 +23,12 @@ pub const LABELS_INDEX: &str = "labels.manifest.json";
 /// operator must be able to delete them without the nest becoming another one, so they are not part of
 /// what the nest is either (#2946).
 pub fn is_input(path: &str) -> bool {
-    path.rsplit('/').next() != Some(".gitignore")
-        && path != LABELS_INDEX
-        && path.split_once('/').map(|(top, _)| top) != Some(LABELS_DIR)
+    path.rsplit('/').next() != Some(".gitignore") && !is_label(path)
+}
+
+/// Whether `path` is a label set or their index.
+pub fn is_label(path: &str) -> bool {
+    path == LABELS_INDEX || path.split_once('/').map(|(top, _)| top) == Some(LABELS_DIR)
 }
 
 /// One packed input file: its path relative to the nest root and the hash of its bytes.
@@ -121,9 +124,9 @@ impl Manifest {
     pub fn nid(&self) -> String {
         let mut canonical = self.clone();
         canonical.generator_version = NID_GENERATOR_SENTINEL.to_string();
-        // A manifest packed before an input rule existed still lists the file; it names the nest its
-        // files install as (#2946).
-        canonical.files.retain(|f| is_input(&f.path));
+        // A manifest packed before #2946 may list label sets; it names the nest without them. Only
+        // labels: an old manifest listing a .gitignore keeps the NID it always had.
+        canonical.files.retain(|f| !is_label(&f.path));
         let mut h = Sha256::new();
         h.update(NID_DOMAIN);
         h.update(canonical.canonical_bytes());
@@ -158,7 +161,7 @@ impl Manifest {
         for f in self
             .files
             .iter()
-            .filter(|f| is_input(&f.path) && affects_data(&f.path))
+            .filter(|f| !is_label(&f.path) && affects_data(&f.path))
         {
             feed(&f.path);
             feed(&f.sha256);
@@ -428,6 +431,12 @@ mod tests {
         });
         assert_eq!(old.nid(), m.nid());
         assert_eq!(old.data_identity(), m.data_identity());
+        let mut ignored = m.clone();
+        ignored.files.push(FileEntry {
+            path: ".gitignore".into(),
+            sha256: "00".into(),
+        });
+        assert_ne!(ignored.nid(), m.nid(), "a pre-#2722 manifest keeps its NID");
     }
 
     /// The documented `[address_history.sweep]` and `.mirror` sub-tables are part of the table (#2188).

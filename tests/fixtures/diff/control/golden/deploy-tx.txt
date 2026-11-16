@@ -1,5 +1,5 @@
 Transaction 0x639e88f0ffa722a7e871fe13dff7e3f9e998f3e7107c1af44b9aba1d4baf7e2e in block 26,243,031 on mainnet (chain 1).
-Nest control-plane, data identity 03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba. 19 rows in range across 11 tables.
+Nest control-plane, data identity 1446e0486b291bb9b07d5063f04b3c9e12951afaf4eee867c357e2251feedb84. 19 rows in range across 11 tables.
 All final: sealed through 26,243,100.
 
 Control plane: every ownership, admin, role, pause and upgrade event, uncapped
@@ -52,7 +52,7 @@ Other events in range, not part of the flow: 3 rows in 3 tables, 0 of them told 
   vlsquill__initialized, Initialized(uint64): 1 row in block 26,243,031, from 1 contract
 Not seen by this nest: native ETH, internal calls, tokens it does not index, and any balance change made without one of these events (a rebase, for one). Net flow is the sum of the transfers seen, not a balance.
 
-nuthatch {version}; data identity 03760f3318a05cb7201fe0283a5c3a2dbe5cc431574c694bb9393578a2e9c2ba; sealed through 26,243,100.
+nuthatch {version}; data identity 1446e0486b291bb9b07d5063f04b3c9e12951afaf4eee867c357e2251feedb84; sealed through 26,243,100.
 First row read: block 26,243,031 log 343 (0x0ad2bd8601f67c9bb85ea9be31845b97cf7bc90818e91bf2c5d42558d2962a2e). Last: block 26,243,031 log 378 (0x0ad2bd8601f67c9bb85ea9be31845b97cf7bc90818e91bf2c5d42558d2962a2e).
 metadata.json: sha256 34feba9edbf8c6d28119142dfc5990eb1a914d7ab1bec33465a20ee1b1e58c2a. Label snapshots: 2d67934b23d3623ba99b201ddc36004d9eb06739eb54de8e379830a9aefcbda2.
 semantic.toml: sha256 d9b9728e18c5af8e1248ecba9a4f7fe3011bec823de5f35351f944e84a42b0a7.
