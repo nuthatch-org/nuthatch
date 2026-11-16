@@ -117,6 +117,8 @@ pub async fn reply(n: &Nest<'_>, method: &str, target: &str, body: &[u8]) -> Rep
                         q,
                         max_rows,
                         format,
+                        at_block: number("at_block")?.map(|v| v as u64),
+                        at_time: number("at_time")?.map(|v| v as u64),
                     },
                     None,
                     false,
@@ -276,6 +278,10 @@ async fn route_sql(
             Answer::json(400, &json!({ "error": msg }))
         })
     };
+    // The node answers these from its hot store and window checkpoints, which the engine does not keep.
+    if q.at_block.is_some() || q.at_time.is_some() {
+        return refuse("at_block and at_time are answered by a node, not by the engine".into());
+    }
     let referenced = match referenced_tables(&q.q, n.files) {
         Ok(tables) => tables,
         Err(e) => return refuse(engine_error(&e, &q.q, n)),
