@@ -13,6 +13,7 @@ throughout are i128 base units, returned as decimal strings. Flags are authorita
 | **Exposure** | An address's direct counterparty exposure to the labeled set. | the `exposure` MCP tool / `/exposure/{addr}` |
 | **Pack** | Build/sign/verify a manifest of the registry hash, flag thresholds and alert sinks (ed25519). | `nuthatch pack keygen` → `pack build --key …` → `pack verify --pubkey …` |
 | **Audit** | `report` summarises the threshold flags in a block range. | `nuthatch audit report --from … --to … --json` |
+| **As of a time** | Where the nest stood at a time (`block`, `next_block`, `exact`, `final`), and any SQL answered over the facts as they stood at a block or time. | `/at?time=<unix>` or the `at` MCP tool; `at_block` / `at_time` on `/sql` |
 
 Live sanctions screening and the WASM screening component were removed on 2026-10-08. A
 `nuthatch.toml` that still declares `[screening]` is refused at load; delete the table.
