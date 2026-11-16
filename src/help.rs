@@ -32,7 +32,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         ],
     ),
     ("SCALED", &["worker", "control"]),
-    ("COMPLIANCE", &["labels", "lists", "pack", "audit"]),
+    (
+        "COMPLIANCE",
+        &["labels", "lists", "pack", "audit", "evidence"],
+    ),
     (
         "ADVANCED",
         &[
