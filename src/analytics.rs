@@ -1228,7 +1228,7 @@ pub fn query_named(
 /// surface with no auth and two concurrency permits. What bounds the sweep is `tables` below: the
 /// tables the failed query actually referenced, which for that query is none.
 enum Attempt {
-    Ok(QueryOutput),
+    Ok(Box<QueryOutput>),
     DiedExecuting {
         error: anyhow::Error,
         /// The base tables the query named, lowercased - the reachability bound on the sweep. `None`
@@ -1489,12 +1489,12 @@ fn run(
             want,
             true,
         )? {
-            Attempt::Ok(out) => Ok(out),
+            Attempt::Ok(out) => Ok(*out),
             Attempt::DiedExecuting { error, .. } => Err(error),
         };
     }
     let (e, tables) = match first? {
-        Attempt::Ok(out) => return Ok(out),
+        Attempt::Ok(out) => return Ok(*out),
         Attempt::DiedExecuting { error, tables, .. } => (error, tables),
     };
     #[cfg(test)]
@@ -1562,7 +1562,7 @@ fn run(
         want,
         true,
     )? {
-        Attempt::Ok(out) => Ok(out),
+        Attempt::Ok(out) => Ok(*out),
         Attempt::DiedExecuting { error, .. } => Err(error),
     }
 }
@@ -1927,14 +1927,14 @@ fn attempt(
         None => None,
     };
     let Some(outcome) = outcome else {
-        return Ok(Attempt::Ok(QueryOutput {
+        return Ok(Attempt::Ok(Box::new(QueryOutput {
             degraded_tables,
             referenced_tables: referenced,
             offchain,
             labels,
             scan_bound: scan,
             ..Default::default()
-        }));
+        })));
     };
     let Collected {
         mut rows,
@@ -1987,7 +1987,7 @@ fn attempt(
         }
         _ => false,
     };
-    Ok(Attempt::Ok(QueryOutput {
+    Ok(Attempt::Ok(Box::new(QueryOutput {
         rows,
         columns,
         truncated,
@@ -1998,7 +1998,7 @@ fn attempt(
         offchain,
         labels,
         ipc,
-    }))
+    })))
 }
 
 /// Skip leading whitespace and SQL comments (`-- line` and `/* block */`) so the read-only guard
