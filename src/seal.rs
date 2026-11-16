@@ -1170,6 +1170,14 @@ fn catalogue_parses() -> &'static Mutex<HashMap<PathBuf, usize>> {
     PARSES.get_or_init(Default::default)
 }
 
+/// Held by every test that counts parses, and by the one that fills the cache past its bound, which
+/// would otherwise evict their entries when the tests share a process.
+#[cfg(test)]
+pub(crate) fn catalogue_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn catalogue_parses_of(dir: &Path) -> usize {
     catalogue_parses()
@@ -4130,6 +4138,7 @@ mod tests {
 
     #[test]
     fn a_catalogue_is_parsed_once_until_its_bytes_change() {
+        let _cache = catalogue_cache_test_lock();
         let dir = tempfile::tempdir().unwrap();
         test_set_table_floor(dir.path(), 0);
         seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
@@ -4413,6 +4422,234 @@ mod tests {
         alive.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(quarantined.exists(), "the background pass missed the rot");
         assert!(!path.exists());
+    }
+
+    fn flip_middle_byte(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// The other tests of the background pass only ever give it rot to find.
+    #[test]
+    fn a_background_pass_keeps_and_stamps_intact_segments_and_moves_the_rotten() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        let path = |s: &Segment| segment_path(dir.path(), &s.file, &s.hash);
+        flip_middle_byte(&path(&segs[1]));
+
+        assert_eq!(background_pass(dir.path(), &|| true).unwrap(), Some(1));
+        assert!(path(&segs[0]).exists(), "an intact segment was moved");
+        assert!(dir.path().join(QUARANTINE_DIR).join(&segs[1].file).exists());
+        let record = verified_record(dir.path());
+        assert!(record.last_full.is_some());
+        assert_eq!(
+            record.stamps.keys().collect::<Vec<_>>(),
+            [&verified_key(&path(&segs[0]), &segs[0].hash)]
+        );
+    }
+
+    #[test]
+    fn a_background_pass_skips_a_missing_segment_without_making_a_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        std::fs::remove_file(segment_path(dir.path(), &seg.file, &seg.hash)).unwrap();
+
+        assert_eq!(background_pass(dir.path(), &|| true).unwrap(), Some(0));
+        assert!(
+            !dir.path().join(QUARANTINE_DIR).exists(),
+            "a missing segment took the unreadable arm"
+        );
+    }
+
+    #[test]
+    fn clearing_the_verified_record_fails_only_on_a_real_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(SEGMENTS_DIR)).unwrap();
+        save_verified(dir.path(), &Verified::default())
+            .expect("no record to remove is not an error");
+        std::fs::create_dir(dir.path().join(SEGMENTS_DIR).join(VERIFIED_FILE)).unwrap();
+        assert!(save_verified(dir.path(), &Verified::default()).is_err());
+    }
+
+    #[test]
+    fn a_throttle_paces_reads_to_its_rate() {
+        let start = Instant::now();
+        let mut throttle = Throttle::new(1 << 20);
+        throttle.read(1 << 19);
+        throttle.read(1 << 19);
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(900), "{took:?}");
+    }
+
+    /// Only a copy of this segment in a quarantine says it was taken aside, and only while the
+    /// segment is gone from where it is read.
+    #[test]
+    fn a_segment_is_quarantined_only_while_gone_with_its_own_copy_held() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        let quarantine = dir.path().join(QUARANTINE_DIR);
+        std::fs::create_dir_all(&quarantine).unwrap();
+        let first = segment_path(dir.path(), &segs[0].file, &segs[0].hash);
+        std::fs::copy(&first, quarantine.join(&segs[1].file)).unwrap();
+
+        assert!(
+            !is_quarantined(dir.path(), &segs[1]),
+            "a segment still in place"
+        );
+        std::fs::remove_file(&first).unwrap();
+        assert!(
+            !is_quarantined(dir.path(), &segs[0]),
+            "another segment's copy"
+        );
+        let stem = segs[0].file.strip_suffix(".parquet").unwrap();
+        std::fs::write(quarantine.join(format!("{stem}.1.000000001.parquet")), b"x").unwrap();
+        assert!(
+            is_quarantined(dir.path(), &segs[0]),
+            "an earlier copy kept under a stamped name"
+        );
+    }
+
+    /// A seal restoring a hash clears only this dataset's loss of it, or its store's: not another
+    /// hash, and not another dataset's or another store's loss of the same one.
+    #[test]
+    fn a_restore_clears_only_this_datasets_or_its_stores_loss_of_that_hash() {
+        // Under `data/`, so `me` reads from a store outside itself that a sibling's loss names.
+        let root = tempfile::tempdir().unwrap();
+        let me = root.path().join(crate::runtime::DATA_DIR).join("a");
+        std::fs::create_dir_all(&me).unwrap();
+        let store = root.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let (h, h2) = (
+            format!("{}-restored", me.display()),
+            format!("{}-kept", me.display()),
+        );
+        let lost = |dataset: &Path, store: Option<PathBuf>, hash: &str| Quarantined {
+            dataset: lease_key(dataset),
+            store,
+            table: "usdc__transfer".into(),
+            hash: hash.into(),
+            provisional: false,
+            from_block: 100,
+            at: Instant::now(),
+            restored: false,
+        };
+        findings()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quarantined
+            .extend([
+                lost(&me, None, &h),
+                lost(&me, None, &h2),
+                lost(other.path(), None, &h),
+                lost(other.path(), Some(other.path().join(SEGMENTS_DIR)), &h),
+                lost(other.path(), Some(lease_key(&store)), &h),
+            ]);
+        record_restored(&me, &h);
+        let restored: Vec<bool> = findings()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .quarantined
+            .iter()
+            .filter(|q| q.hash == h || q.hash == h2)
+            .map(|q| q.restored)
+            .collect();
+        assert_eq!(restored, [true, false, false, false, true]);
+    }
+
+    /// A request from a catalogue that expected other bytes of a file is not answered against the
+    /// file the current catalogue names.
+    #[test]
+    fn a_request_naming_a_file_by_another_hash_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        seal_range(dir.path(), &[transfer(101, 0, "7")], 101, 101).unwrap();
+        let segs = load_manifest(dir.path()).unwrap().tables["usdc__transfer"].clone();
+        let intact = segment_path(dir.path(), &segs[0].file, &segs[0].hash);
+        let rotten = segment_path(dir.path(), &segs[1].file, &segs[1].hash);
+        flip_middle_byte(&rotten);
+        let mut older = segs[0].clone();
+        older.hash = "0".repeat(64);
+
+        answer_requests(
+            dir.path(),
+            vec![
+                ("usdc__transfer".into(), older),
+                ("usdc__transfer".into(), segs[1].clone()),
+            ],
+        );
+        assert!(!rotten.exists(), "the rotten segment was not answered");
+        assert!(
+            intact.exists(),
+            "an intact file was judged by a hash it never had"
+        );
+    }
+
+    /// A verifier queued behind another dataset's pass is not its only way to be answered.
+    #[test]
+    fn a_waiting_request_is_answered_for_any_dataset_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        flip_middle_byte(&path);
+        let verifying = Verifying::register(dir.path());
+        assert!(request_verify(dir.path(), "usdc__transfer", &seg));
+
+        serve_all_requests();
+        assert!(!path.exists(), "the waiting request was not answered");
+        drop(verifying);
+    }
+
+    /// A solo nest under `data/` reads a file it holds itself before one of the same hash in the store
+    /// its layout sealed into before 5.21.
+    #[test]
+    fn a_solo_nest_under_data_reads_its_own_file_first() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(crate::runtime::DATA_DIR).join("a");
+        std::fs::create_dir_all(dir.join(SEGMENTS_DIR)).unwrap();
+        std::fs::create_dir_all(root.path().join(SEGMENTS_DIR)).unwrap();
+        let own = dir.join(SEGMENTS_DIR).join("usdc__transfer-1.parquet");
+        std::fs::write(&own, b"own").unwrap();
+        std::fs::write(
+            root.path().join(SEGMENTS_DIR).join("abc.parquet"),
+            b"earlier",
+        )
+        .unwrap();
+        assert_eq!(segment_path(&dir, "usdc__transfer-1.parquet", "abc"), own);
+    }
+
+    #[test]
+    fn the_parsed_catalogue_cache_drops_the_least_recent_past_its_bound() {
+        let _cache = catalogue_cache_test_lock();
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        for d in &dirs {
+            seal_range(d.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+            // Whitespace still parses, so three of these together pass the bound.
+            let path = manifest_path(d.path());
+            let mut raw = std::fs::read(&path).unwrap();
+            raw.resize(raw.len() + PARSED_CATALOGUE_BYTES / 3 + 1, b' ');
+            std::fs::write(&path, raw).unwrap();
+            shared_manifest(d.path()).unwrap();
+        }
+        let before = catalogue_parses_of(dirs[0].path());
+        shared_manifest(dirs[0].path()).unwrap();
+        assert_eq!(
+            catalogue_parses_of(dirs[0].path()),
+            before + 1,
+            "the oldest parse was kept past the bound"
+        );
     }
 
     #[test]
@@ -6033,6 +6270,16 @@ mod tests {
         assert!(load_manifest(dir.path()).is_err());
         assert!(load_manifest_with_hash(dir.path()).is_err());
         assert!(catalogue_hash(dir.path()).is_err());
+        assert!(shared_manifest(dir.path()).is_err());
+        assert!(shared_manifest_with_hash(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_dataset_that_never_sealed_has_an_empty_catalogue_and_no_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let (manifest, hash) = load_manifest_with_hash(dir.path()).unwrap();
+        assert!(manifest.tables.is_empty());
+        assert_eq!(hash, None);
     }
 
     #[test]

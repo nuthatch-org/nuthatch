@@ -518,6 +518,7 @@ mod tests {
     /// A memo hit reads the catalogue three times and a miss four; one parse serves them all.
     #[test]
     fn one_catalogue_is_parsed_once_across_requests() {
+        let _cache = crate::seal::catalogue_cache_test_lock();
         let tmp = tempfile::tempdir().unwrap();
         let row = r#"{"table":"usdc__transfer","value":"5","block_number":1,"tx_hash":"0xcc","log_index":0}"#;
         crate::seal::seal_range(tmp.path(), &[row.to_string()], 1, 1).unwrap();
