@@ -107,6 +107,9 @@ pub enum Command {
     /// Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a
     /// second endpoint.
     Audit(AuditArgs),
+    /// An answer as of a sealed block, with what someone else needs to get it again: `make` asks a
+    /// running nest, `verify` asks another nest of the same NID (#2944).
+    Evidence(EvidenceArgs),
 
     // --- ADVANCED: authoring extras, packaging, and one-off dataset lifecycle. ---
     /// Derive-first recipes (RFC-0023): add a view that computes a read (e.g. `total_supply`) from
@@ -822,6 +825,54 @@ pub struct PackVerifyArgs {
     /// is never trusted; anyone who edits a pack can re-sign it with a key of their own.
     #[arg(long)]
     pub pubkey: String,
+}
+
+#[derive(Args)]
+pub struct EvidenceArgs {
+    #[command(subcommand)]
+    pub what: EvidenceWhat,
+}
+
+#[derive(Subcommand)]
+pub enum EvidenceWhat {
+    /// Ask the running nest for a statement as of a sealed block, and write the bundle.
+    Make(EvidenceMakeArgs),
+    /// Re-ask a nest of the same NID and say whether the bundle's answer reproduces.
+    Verify(EvidenceVerifyArgs),
+}
+
+#[derive(Args)]
+#[command(group(clap::ArgGroup::new("at").required(true).args(["at_block", "at_time"])))]
+pub struct EvidenceMakeArgs {
+    /// The statement (SELECT/WITH). Aggregate it: a bundle carries at most 10,000 rows.
+    pub query: String,
+    /// The sealed block to answer at.
+    #[arg(long)]
+    pub at_block: Option<u64>,
+    /// A time in unix seconds, placed as `/at` places it.
+    #[arg(long)]
+    pub at_time: Option<u64>,
+    /// The running nest's API.
+    #[arg(long, default_value = "http://127.0.0.1:8288")]
+    pub url: String,
+    /// Sign with this key file (`nuthatch pack keygen`).
+    #[arg(long)]
+    pub key: Option<std::path::PathBuf>,
+    /// Write the bundle here instead of to stdout.
+    #[arg(long)]
+    pub out: Option<std::path::PathBuf>,
+}
+
+#[derive(Args)]
+pub struct EvidenceVerifyArgs {
+    /// The bundle `evidence make` wrote.
+    pub bundle: std::path::PathBuf,
+    /// The API of a nest with the same NID, sealed past the bundle's block.
+    #[arg(long, default_value = "http://127.0.0.1:8288")]
+    pub url: String,
+    /// The signer's public key, hex or a key file, given to you by the signer out of band.
+    #[arg(long)]
+    pub pubkey: Option<String>,
 }
 
 #[derive(Args)]

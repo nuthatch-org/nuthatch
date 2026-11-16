@@ -305,6 +305,7 @@ async fn main() -> Result<()> {
         cli::Command::Lists(args) => run_lists(args).await,
         cli::Command::Pack(args) => pack::run(args, &now_stamp()),
         cli::Command::Audit(args) => audit::run(args).await,
+        cli::Command::Evidence(args) => nuthatch::evidence::run(args).await,
         cli::Command::Nest(args) => match args.what {
             cli::NestWhat::Bundle(a) => blob::bundle(
                 std::path::Path::new(&a.dir),

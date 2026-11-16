@@ -188,6 +188,30 @@ Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width,
 - `--publish <PUBLISH>` - Check the mirror of the nest in `--dir` at this target, as `publish verify` does without `--deep`. Exit 1 if an object is missing, differs, or cannot be content-checked
 - `--publish-etag-md5` - For stores whose ETag is the object's MD5 (AWS S3 without SSE-KMS or SSE-C, MinIO); use `publish verify --deep` otherwise
 
+## `nuthatch evidence`
+
+An answer as of a sealed block, with what someone else needs to get it again: `make` asks a running nest, `verify` asks another nest of the same NID (#2944)
+
+
+## `nuthatch evidence make`
+
+Ask the running nest for a statement as of a sealed block, and write the bundle
+
+- `<QUERY>` - The statement (SELECT/WITH). Aggregate it: a bundle carries at most 10,000 rows
+- `--at-block <AT_BLOCK>` - The sealed block to answer at
+- `--at-time <AT_TIME>` - A time in unix seconds, placed as `/at` places it
+- `--url <URL>` - The running nest's API
+- `--key <KEY>` - Sign with this key file (`nuthatch pack keygen`)
+- `--out <OUT>` - Write the bundle here instead of to stdout
+
+## `nuthatch evidence verify`
+
+Re-ask a nest of the same NID and say whether the bundle's answer reproduces
+
+- `<BUNDLE>` - The bundle `evidence make` wrote
+- `--url <URL>` - The API of a nest with the same NID, sealed past the bundle's block
+- `--pubkey <PUBKEY>` - The signer's public key, hex or a key file, given to you by the signer out of band
+
 ## `nuthatch init`
 
 Scaffold an indexer for a contract: resolve its ABI and write a project here
