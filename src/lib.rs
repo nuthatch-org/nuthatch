@@ -66,6 +66,7 @@ pub(crate) mod engine_burrmill;
 pub mod entities;
 pub mod entity_offchain;
 pub mod entity_view;
+pub mod evidence;
 pub mod factory;
 pub mod fair_share;
 pub mod feed;

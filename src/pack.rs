@@ -110,7 +110,7 @@ fn default_key_path(home: Option<std::ffi::OsString>) -> Result<PathBuf> {
         .join("nuthatch-key.json"))
 }
 
-fn load_signing_key(path: &Path) -> Result<SigningKey> {
+pub(crate) fn load_signing_key(path: &Path) -> Result<SigningKey> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read key file {}", path.display()))?;
     let kf: KeyFile = serde_json::from_str(&raw).context("corrupt key file")?;
