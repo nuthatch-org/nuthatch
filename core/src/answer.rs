@@ -334,6 +334,12 @@ pub struct SqlRequest {
     /// `arrow` for an Arrow IPC stream (RFC-0079), as `Accept` can ask; absent is JSON.
     #[serde(default)]
     pub format: Option<String>,
+    /// Answer over the facts as they stood at this block (#2942).
+    #[serde(default)]
+    pub at_block: Option<u64>,
+    /// Answer as of this time in unix seconds, placed as `/at` places it (#2942).
+    #[serde(default)]
+    pub at_time: Option<u64>,
 }
 
 /// A POST body as a [`SqlRequest`], or the 400 refusing it in the route's own envelope.

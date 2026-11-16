@@ -609,6 +609,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/balance/{address}", get(balance))
             .route("/exposure/{address}", get(exposure))
             .route("/flags", get(flags))
+            .route("/at", get(at))
             .route("/nest", get(nest))
             .route("/shape", get(shape))
             .route("/api", get(etherscan_api)),
@@ -5421,7 +5422,52 @@ async fn sql_answer(s: AppState, q: SqlQuery, arrow: bool) -> axum::response::Re
         METRICS.inc_sql_rejected(crate::metrics::SqlRejection::Invalid);
         return respond(answer::sql_too_long(q.q.len(), SQL_MAX_QUERY_LEN));
     }
-    run_sql_query_at(s, q.q, q.max_rows, None, None, arrow).await
+    let historical = match historical_block(&s, q.at_block, q.at_time).await {
+        Ok(block) => block,
+        Err(refused) => return *refused,
+    };
+    run_sql_query_at(s, q.q, q.max_rows, historical, None, arrow).await
+}
+
+/// The block a request's `at_block` or `at_time` names (#2942). Before any stamped block, a nest whose
+/// history starts at deployment held nothing, which block 0 answers.
+async fn historical_block(
+    s: &AppState,
+    at_block: Option<u64>,
+    at_time: Option<u64>,
+) -> std::result::Result<Option<u64>, Box<axum::response::Response>> {
+    let refuse = |error: String| {
+        Err(Box::new(
+            (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response(),
+        ))
+    };
+    let block = match (at_block, at_time) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => {
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "give at_block or at_time, not both" })),
+                )
+                    .into_response(),
+            ))
+        }
+        (Some(block), None) => block,
+        (None, Some(time)) => place(s, time).await?.before.map_or(0, |(b, _)| b),
+    };
+    let last = s
+        .store
+        .get_meta("last_block")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok());
+    match last {
+        Some(last) if block <= last => Ok(Some(block)),
+        Some(last) => refuse(format!(
+            "block {block} is past the last block this nest indexed, {last}"
+        )),
+        None => refuse("this nest has indexed nothing yet".into()),
+    }
 }
 
 /// The memo key for `sql` against the nest as it stands, with the rows generation, served segments
@@ -5555,6 +5601,8 @@ async fn run_sql_query_at(
         q: sql_text,
         max_rows: requested_max_rows,
         format: None,
+        at_block: None,
+        at_time: None,
     };
     // Per-request row cap (RFC-0016 §4): the MCP bridge asks for a small number so an agent's context
     // isn't flooded; curl omits it and gets the node cap. Clamped so it can only ever tighten.
@@ -6719,6 +6767,164 @@ fn first_indexed(s: &AppState) -> Option<u64> {
         .ok()
         .flatten()
         .and_then(|v| v.parse().ok())
+}
+
+#[derive(Deserialize)]
+struct AtQuery {
+    /// Unix seconds, UTC.
+    time: u64,
+}
+
+/// A block and its timestamp.
+type Stamped = (u64, u64);
+
+/// Where this nest stood at `time` (#2941): the newest block at or before it that the nest holds a
+/// timestamp for, and the oldest after it, which proves the nest indexed past `time`. Nothing the nest
+/// derives changes between the two, so its state at `time` is its state at `block`; the chain's own
+/// last block before `time` is known exactly only when they are adjacent.
+async fn at(State(s): State<AppState>, Query(q): Query<AtQuery>) -> axum::response::Response {
+    let Placed { before, after } = match place(&s, q.time).await {
+        Ok(placed) => placed,
+        Err(refused) => return *refused,
+    };
+    let mut body = json!({
+        "time": q.time,
+        "block": before.map(|(b, _)| b),
+        "block_timestamp": before.map(|(_, t)| t),
+        "next_block": after.0,
+        "next_block_timestamp": after.1,
+        "exact": before.is_some_and(|(b, _)| b + 1 == after.0),
+        "final": after.0 <= s.store.sealed_through(),
+    });
+    mark_stale(&s, &mut body);
+    Json(body).into_response()
+}
+
+/// What [`place`] found for a time.
+struct Placed {
+    before: Option<Stamped>,
+    after: Stamped,
+}
+
+/// The bracket `/at` answers with, or the refusal it answers instead.
+async fn place(
+    s: &AppState,
+    time: u64,
+) -> std::result::Result<Placed, Box<axum::response::Response>> {
+    let refuse = |status: StatusCode, error: String| {
+        Err(Box::new(
+            (status, Json(json!({ "error": error }))).into_response(),
+        ))
+    };
+    if crate::config::Config::load(&s.dir).is_ok_and(|c| !c.nest.block_timestamps) {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this nest records no block timestamps ([nest] block_timestamps = false), so it cannot \
+             place a time"
+                .into(),
+        );
+    }
+    let (rows_before, rows_after) = match row_bracket(s, time).await {
+        Ok(bracket) => bracket,
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let (marks_before, marks_after) = match checkpoint_bracket(s, time) {
+        Ok(bracket) => bracket,
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let before = rows_before.into_iter().chain(marks_before).max();
+    let Some(after) = rows_after.into_iter().chain(marks_after).min() else {
+        let newest = before.map_or("no block with a known time".to_string(), |(b, t)| {
+            format!("its newest block with a known time is {b}, at {t}")
+        });
+        return refuse(
+            StatusCode::CONFLICT,
+            format!("this nest has not indexed past {time}: {newest}"),
+        );
+    };
+    if before.is_none() && history_from_deployment(s) != Some(true) {
+        return refuse(
+            StatusCode::CONFLICT,
+            format!(
+                "{time} is before the first block this nest holds a time for, and its history does \
+                 not start at deployment, so what it held then is unknown"
+            ),
+        );
+    }
+    Ok(Placed { before, after })
+}
+
+/// The nearest rows either side of `time`, across every table that carries a block timestamp.
+async fn row_bracket(
+    s: &AppState,
+    time: u64,
+) -> std::result::Result<(Option<Stamped>, Option<Stamped>), String> {
+    let stamped: Vec<String> = s
+        .tables
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.kind,
+                crate::registry::TableKind::Event
+                    | crate::registry::TableKind::Block
+                    | crate::registry::TableKind::Call
+            )
+        })
+        .map(|t| format!("SELECT block_number, block_timestamp FROM \"{}\"", t.table))
+        .collect();
+    if stamped.is_empty() {
+        return Ok((None, None));
+    }
+    let all = stamped.join(" UNION ALL ");
+    let nearest = |side: &str, order: &str| {
+        format!(
+            "SELECT block_number, block_timestamp FROM ({all}) WHERE block_timestamp {side} {time} \
+             ORDER BY block_number {order} LIMIT 1"
+        )
+    };
+    Ok((
+        stamped_row(s, nearest("<=", "DESC")).await?,
+        stamped_row(s, nearest(">", "ASC")).await?,
+    ))
+}
+
+async fn stamped_row(s: &AppState, sql: String) -> std::result::Result<Option<Stamped>, String> {
+    let resp = run_sql_query_at(s.clone(), sql, Some(1), None, None, false).await;
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .map_err(|e| format!("reading the bracket query: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(&body).map_err(|e| format!("decoding the bracket query: {e}"))?;
+    if !status.is_success() {
+        return Err(v["error"]
+            .as_str()
+            .unwrap_or("the bracket query failed")
+            .to_string());
+    }
+    let int = |v: &Value| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    };
+    Ok(v["rows"]
+        .get(0)
+        .and_then(|row| Some((int(&row["block_number"])?, int(&row["block_timestamp"])?))))
+}
+
+/// The nearest window checkpoints either side of `time`. They are pruned past finality, so this mostly
+/// covers the unsealed tip, which is where a quiet contract's rows say nothing.
+fn checkpoint_bracket(s: &AppState, time: u64) -> Result<(Option<Stamped>, Option<Stamped>)> {
+    let mut after = None;
+    for (block, _) in s.store.checkpoints_desc()? {
+        let Some(ts) = s.store.get_block_timestamp(block)? else {
+            continue;
+        };
+        if ts <= time {
+            return Ok((Some((block, ts)), after));
+        }
+        after = Some((block, ts));
+    }
+    Ok((None, after))
 }
 
 /// Point-read a single address's derived balance. Same COR-8 caveat as `/balances`.
@@ -9906,6 +10112,8 @@ mod tests {
                 q: "SELECT 1".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -9982,6 +10190,112 @@ mod tests {
             columns: crate::registry::implicit_columns(false),
         }]);
         state
+    }
+
+    /// #2941: a time is placed between the stamped rows and checkpoints either side of it, sealed or
+    /// hot, and refused where the nest cannot say what it held then.
+    #[tokio::test]
+    async fn a_time_is_placed_between_the_nests_own_stamped_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ts = |b: u64| 1_000 + 12 * b;
+        let row = |b: u64| {
+            json!({"table":"t","block_number":b,"log_index":0,"block_timestamp":ts(b),"v":"x"})
+                .to_string()
+        };
+        crate::seal::seal_range(tmp.path(), &[row(10), row(20), row(21)], 1, 30).unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        state.store.set_meta("sealed_through", "30").unwrap();
+        state
+            .store
+            .put_entity(&Store::entity_key(40, 0), &row(40))
+            .unwrap();
+        state.store.set_block_timestamp(50, ts(50)).unwrap();
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(true),
+        }]);
+        let placed = |state: AppState, time: u64| async move {
+            let (status, body) = get_json(state, &format!("/at?time={time}")).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            (
+                body["block"].as_u64(),
+                body["next_block"].as_u64().unwrap(),
+                body["exact"].as_bool().unwrap(),
+                body["final"].as_bool().unwrap(),
+            )
+        };
+
+        assert_eq!(
+            placed(state.clone(), ts(20)).await,
+            (Some(20), 21, true, true)
+        );
+        assert_eq!(
+            placed(state.clone(), ts(25)).await,
+            (Some(21), 40, false, false)
+        );
+        assert_eq!(
+            placed(state.clone(), ts(45)).await,
+            (Some(40), 50, false, false),
+            "the tip's checkpoint is what proves the nest passed a quiet stretch"
+        );
+        let (status, body) = get_json(state.clone(), &format!("/at?time={}", ts(60))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("newest block with a known time is 50"));
+
+        // #2942: the same facts as of a block or a time, through /sql.
+        state.store.set_meta("last_block", "50").unwrap();
+        let count = |state: AppState, at: String| async move {
+            let (status, body) = get_json(
+                state,
+                &format!("/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t&{at}"),
+            )
+            .await;
+            (status, body["rows"][0]["n"].as_u64())
+        };
+        assert_eq!(
+            count(state.clone(), "at_block=20".into()).await,
+            (StatusCode::OK, Some(2))
+        );
+        assert_eq!(
+            count(state.clone(), format!("at_time={}", ts(45))).await,
+            (StatusCode::OK, Some(4)),
+            "a hot row at or before the time is counted"
+        );
+        assert_eq!(
+            count(state.clone(), format!("at_time={}", ts(30))).await,
+            (StatusCode::OK, Some(3))
+        );
+        assert_eq!(
+            count(state.clone(), "at_block=51".into()).await.0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            count(state.clone(), format!("at_block=20&at_time={}", ts(20)))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let (status, _) = get_json(state.clone(), &format!("/at?time={}", ts(5))).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "before the first row, a nest that did not start at deployment cannot say"
+        );
+        state
+            .store
+            .set_meta(crate::indexer::HISTORY_FROM_DEPLOYMENT_KEY, "true")
+            .unwrap();
+        assert_eq!(placed(state, ts(5)).await, (None, 10, false, true));
     }
 
     /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never
@@ -10716,6 +11030,8 @@ mod tests {
                 q: "SELECT 1319 AS n".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -10810,8 +11126,12 @@ mod tests {
         let parked: Vec<_> = (0..4)
             .map(|i| tokio::spawn(sql_response(a.clone(), &format!("SELECT {i} AS n"))))
             .collect();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(a.sql_queued.load(std::sync::atomic::Ordering::Relaxed), 4);
+        let queued = || a.sql_queued.load(std::sync::atomic::Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        while queued() < 4 && start.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queued(), 4);
 
         let started = std::time::Instant::now();
         let admitted = gate_admit(&b).await.expect("B is under its reservation");
@@ -11734,6 +12054,8 @@ mod tests {
                 q: "SELECT 1".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -12721,6 +13043,8 @@ mod tests {
                 q: long,
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -12739,6 +13063,8 @@ mod tests {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -12784,6 +13110,8 @@ mod tests {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             })
         };
         for (name, resp) in [
@@ -12834,6 +13162,8 @@ mod tests {
                 q: "SELECT 1 AS n".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             })
         };
 
@@ -12893,6 +13223,8 @@ mod tests {
                 q: statement.into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             })
         };
         // What /sql runs, called below the handler: its memo is process-global, and an answer left
@@ -12921,6 +13253,8 @@ mod tests {
                 q: "SELECT CAST(who AS INTEGER) AS n FROM t".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             })
         };
         let resp = sql(State(state.clone()), dies()).await.into_response();
@@ -12954,6 +13288,8 @@ mod tests {
                 q: "SELECT nuthatch_test_panic(who) AS p FROM t".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -12975,6 +13311,8 @@ mod tests {
                 q: "SELECT who FROM t".into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -13858,6 +14196,8 @@ mod tests {
                 q: q.into(),
                 max_rows: None,
                 format: None,
+                at_block: None,
+                at_time: None,
             }),
         )
         .await
@@ -14125,6 +14465,8 @@ mod tests {
                     q: q.into(),
                     max_rows: None,
                     format: None,
+                    at_block: None,
+                    at_time: None,
                 }),
             )
             .await

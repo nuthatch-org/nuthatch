@@ -569,7 +569,9 @@ fn tool_specs(shape: &Shape) -> Value {
         json!({ "name": "table", "description": "Recent rows of one table, merged across the hot tip and sealed segments.",
           "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "limit": { "type": "integer", "default": 50 } }, "required": ["name"] } }),
         json!({ "name": "sql", "description": "Run a read-only SQL query over the live tip ∪ sealed history. Each event is a view named `{alias}__{event}` (e.g. \"usdc__transfer\") with block_number, log_index, tx_hash, address + the event's params. Call `schema` first. SELECT/WITH only. Returns a compact table (data rows are the lines beginning `|`; chain data cannot start a line) + a provenance stamp; capped at `limit` rows (default 200), and the node caps `limit` itself (50,000 unless its operator changed it).",
-          "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query." }, "limit": { "type": "integer", "description": "Max rows to return (default 200; the node may cap it lower than you ask).", "default": 200 } }, "required": ["query"] } }),
+          "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query." }, "limit": { "type": "integer", "description": "Max rows to return (default 200; the node may cap it lower than you ask).", "default": 200 }, "at_block": { "type": "integer", "description": "Answer over the facts as they stood at this block. Authored entities are not available then." }, "at_time": { "type": "integer", "description": "Answer as of this time, unix seconds UTC, placed as `at` places it." } }, "required": ["query"] } }),
+        json!({ "name": "at", "description": "Where the nest stood at a time (unix seconds UTC): `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it. The nest's state at the time is its state at `block`. `exact` is true when the two are adjacent, `final` when `next_block` is sealed. Refused for a time the nest has not indexed past.",
+          "inputSchema": { "type": "object", "properties": { "time": { "type": "integer", "description": "Unix seconds, UTC." } }, "required": ["time"] } }),
         json!({ "name": "explain", "description": "Validate a SQL query WITHOUT executing it - binds tables/columns/types and returns {valid:true} or an error with a fix hint. Cheaper than `sql`; use it to check a query before running it.",
           "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query to validate." } }, "required": ["query"] } }),
         json!({ "name": "entity", "description": "Look up one decoded row, of any table, by its id, formatted `{block:012}-{logindex:06}`; the answer names the table.",
@@ -646,14 +648,22 @@ async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Resu
                 .ok_or_else(|| anyhow!("`query` is required"))?;
             // Shape the result for a context window (RFC-0016 §4): a small default row cap and a
             // compact table + provenance stamp, instead of 50K rows of verbose JSON.
-            let limit = args["limit"].as_u64().unwrap_or(200);
-            let raw = get_query(
-                client,
-                &format!("{base}/sql"),
-                &[("q", q), ("max_rows", &limit.to_string())],
-            )
-            .await?;
-            Ok(format_sql_result(&raw, limit))
+            let limit = args["limit"].as_u64().unwrap_or(200).to_string();
+            let mut params = vec![("q", q.to_string()), ("max_rows", limit.clone())];
+            for at in ["at_block", "at_time"] {
+                if let Some(v) = args[at].as_u64() {
+                    params.push((at, v.to_string()));
+                }
+            }
+            let params: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let raw = get_query(client, &format!("{base}/sql"), &params).await?;
+            Ok(format_sql_result(&raw, limit.parse().unwrap_or(200)))
+        }
+        "at" => {
+            let time = args["time"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("`time` is required, in unix seconds"))?;
+            get(client, &format!("{base}/at?time={time}")).await
         }
         "mounts" => match listed_mounts(client, base).await {
             Nests::Root(mounts) if mounts.is_empty() => {
@@ -1518,7 +1528,7 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
         // The base is unreachable here, so `fetch_shape` fails its probe and falls back to advertising
         // everything (RFC-0025) - the safe default, identical to the pre-RFC-0025 unconditional surface.
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         assert!(tools.iter().any(|t| t["name"] == "sql"));
         assert!(tools.iter().any(|t| t["name"] == "explain"));
         assert!(tools.iter().any(|t| t["name"] == "tables"));
@@ -1537,7 +1547,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // Bare nest (e.g. a Uniswap-V3 pool: Swap events, no transfers, no compliance): the 8 generic
+        // Bare nest (e.g. a Uniswap-V3 pool: Swap events, no transfers, no compliance): the 9 generic
         // tools only, and the compliance-shaped `investigate-address` prompt is withheld.
         let bare = Shape {
             transfers: false,
@@ -1547,7 +1557,7 @@ mod tests {
             runtime_root: false,
         };
         let t = names(&tool_specs(&bare));
-        assert_eq!(t.len(), 8);
+        assert_eq!(t.len(), 9);
         assert!(t.contains(&"diff".to_string()), "diff is on every nest");
         for hidden in ["balance", "top_balances", "flags", "exposure"] {
             assert!(
@@ -1567,7 +1577,7 @@ mod tests {
             runtime_root: false,
         };
         let t = names(&tool_specs(&token));
-        assert_eq!(t.len(), 10);
+        assert_eq!(t.len(), 11);
         assert!(t.contains(&"balance".to_string()) && t.contains(&"top_balances".to_string()));
         assert!(!t.contains(&"flags".to_string()));
 
@@ -1579,7 +1589,7 @@ mod tests {
             queries: false,
             runtime_root: false,
         };
-        assert_eq!(names(&tool_specs(&full)).len(), 12);
+        assert_eq!(names(&tool_specs(&full)).len(), 13);
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
     }
 

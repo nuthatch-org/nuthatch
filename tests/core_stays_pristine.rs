@@ -193,7 +193,7 @@ fn the_graph_lane_reads_through_the_same_sql_path() {
     // `/sql`'s own lane, JSON or Arrow (RFC-0079), reaches the same shared function.
     let lane = src.split_once("async fn sql_answer(").unwrap().1;
     let lane = &lane[..lane.find("\n}\n").unwrap()];
-    assert!(lane.contains("run_sql_query_at(s, q.q, q.max_rows, None, None, arrow).await"));
+    assert!(lane.contains("run_sql_query_at(s, q.q, q.max_rows, historical, None, arrow).await"));
     let shared = src.split_once("async fn run_sql_query_at(").unwrap().1;
     let shared = &shared[..shared.find("\n}\n").unwrap()];
     assert!(
