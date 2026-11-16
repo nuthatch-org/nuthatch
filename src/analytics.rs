@@ -1732,11 +1732,16 @@ fn attempt(
         // Factory children views before the authored ones. A view in `views/*.sql` may read
         // `{template}__children`, and that relation has to exist when the authored view is planned (#2723).
         define_children_views(session, dir);
-        // Offchain snapshots and labels before the authored views too, which may read them. An as-of
-        // read binds them as imported now: they are the operator's, not chain state (#2962).
-        let offchain = define_offchain_views(session, dir, wanted.as_ref())?;
+        // Offchain snapshots and labels before the authored views too, which may read them.
+        let offchain = if as_of.is_none() {
+            define_offchain_views(session, dir, wanted.as_ref())?
+        } else {
+            Default::default()
+        };
         // The compliance substrate: expose imported label snapshots as a `labels` view so `/sql` (and the
-        // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view.
+        // internal `cold_exposure` fold) can join against them. Best-effort - no snapshots, no view. An
+        // as-of read binds them too, as imported now, which is what a report date's `outstanding` needs
+        // (#2962); an offchain snapshot stays out, since an entity over one would mix today into history.
         if !slot.labels_bound && wanted.as_ref().is_none_or(|w| w.contains("labels")) {
             slot.labels_bound = define_labels_view(session, dir);
         }

@@ -10285,7 +10285,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        // #2962: an as-of read sees the label sets and offchain tables imported now.
+        // #2962: an as-of read sees the label sets imported now.
         let set = tmp.path().join("set.csv");
         std::fs::write(
             &set,
@@ -10293,20 +10293,13 @@ mod tests {
         )
         .unwrap();
         crate::labels::import(tmp.path(), &set).unwrap();
-        let rates = tmp.path().join("eur.csv");
-        std::fs::write(&rates, "day,rate\n2023-11-15,0.8\n").unwrap();
-        crate::offchain::drop_file(tmp.path(), &rates, "eur").unwrap();
         let (status, body) = get_json(
             state.clone(),
-            "/sql?q=SELECT%20(SELECT%20count(*)%20FROM%20labels)%20AS%20l,%20\
-             (SELECT%20count(*)%20FROM%20offchain__eur)%20AS%20r&at_block=20",
+            "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20labels&at_block=20",
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(
-            (body["rows"][0]["l"].as_u64(), body["rows"][0]["r"].as_u64()),
-            (Some(1), Some(1))
-        );
+        assert_eq!(body["rows"][0]["n"].as_u64(), Some(1));
 
         let (status, _) = get_json(state.clone(), &format!("/at?time={}", ts(5))).await;
         assert_eq!(
