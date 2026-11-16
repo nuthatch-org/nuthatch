@@ -10287,8 +10287,11 @@ mod tests {
 
         // #2962: an as-of read sees the label sets and offchain tables imported now.
         let set = tmp.path().join("set.csv");
-        std::fs::write(&set, "address,label\n0x00000000000000000000000000000000000000a1,x\n")
-            .unwrap();
+        std::fs::write(
+            &set,
+            "address,label\n0x00000000000000000000000000000000000000a1,x\n",
+        )
+        .unwrap();
         crate::labels::import(tmp.path(), &set).unwrap();
         let rates = tmp.path().join("eur.csv");
         std::fs::write(&rates, "day,rate\n2023-11-15,0.8\n").unwrap();
