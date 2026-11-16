@@ -14,10 +14,18 @@ pub const BLOB_FORMAT_VERSION: u32 = 1;
 /// The nest's config, the one input whose bytes the identity does not take verbatim.
 pub const CONFIG_FILE: &str = "nuthatch.toml";
 
+/// The label snapshots `labels import` writes, and its index of them, at the nest root.
+pub const LABELS_DIR: &str = "labels";
+pub const LABELS_INDEX: &str = "labels.manifest.json";
+
 /// Whether the file at `path` (relative, `/`-separated) counts toward the identity. A `.gitignore`,
-/// at any depth, is local hygiene and must not move it (#2722).
+/// at any depth, is local hygiene and must not move it (#2722). Label sets may name people, and the
+/// operator must be able to delete them without the nest becoming another one, so they are not part of
+/// what the nest is either (#2946).
 pub fn is_input(path: &str) -> bool {
     path.rsplit('/').next() != Some(".gitignore")
+        && path != LABELS_INDEX
+        && path.split_once('/').map(|(top, _)| top) != Some(LABELS_DIR)
 }
 
 /// One packed input file: its path relative to the nest root and the hash of its bytes.
@@ -368,6 +376,29 @@ mod tests {
         );
         assert_ne!(
             nid(vec![file("views/a.sql"), file("gitignore")]),
+            nid(vec![file("views/a.sql")])
+        );
+    }
+
+    /// #2946: label sets and their index are deletable without the nest becoming another one. Only the
+    /// root `labels/` is theirs; an authored directory of that name deeper down still counts.
+    #[test]
+    fn label_sets_are_not_inputs() {
+        let nid = |files: Vec<(String, Vec<u8>)>| {
+            manifest("n".into(), 1, "0".into(), "00".into(), files)
+                .unwrap()
+                .nid()
+        };
+        assert_eq!(
+            nid(vec![
+                file("views/a.sql"),
+                file("labels/0a.json"),
+                file(LABELS_INDEX)
+            ]),
+            nid(vec![file("views/a.sql")])
+        );
+        assert_ne!(
+            nid(vec![file("views/a.sql"), file("views/labels/a.sql")]),
             nid(vec![file("views/a.sql")])
         );
     }

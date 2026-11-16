@@ -26,7 +26,16 @@ fn guard() -> analytics::QueryGuard {
 /// `usdc__transfer` segment content-hashes. Called twice over identical fixtures to prove the sealed
 /// content address is deterministic across runs.
 async fn drive_land_seal_query(dir: &std::path::Path) -> Vec<String> {
+    drive_land_seal_query_with(dir, |_| {}).await
+}
+
+/// [`drive_land_seal_query`], with `before` run on the scaffolded nest before it is spawned.
+async fn drive_land_seal_query_with(
+    dir: &std::path::Path,
+    before: impl FnOnce(&std::path::Path),
+) -> Vec<String> {
     let cfg = scaffold_nest(dir, "usdc", USDC);
+    before(dir);
     let tape = Arc::new(TapeSource::new());
 
     // Ten blocks, one USDC transfer each, distinct value 100*b. Finality stays at 0 → nothing seals.
@@ -164,6 +173,48 @@ async fn golden_land_seal_query_is_deterministic() {
     assert_eq!(
         h1, h2,
         "sealed content-address hashes must be identical across two runs over identical fixtures"
+    );
+}
+
+/// #2946: a label set may name people, so deleting it must not change what the nest is. Labelling
+/// the receiver seals every chain table to the same bytes, and the nest has the same NID and data
+/// identity with the set, without it and after deleting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_label_set_seals_no_byte_and_is_not_part_of_the_nest() {
+    let plain = tempfile::tempdir().unwrap();
+    let labelled = tempfile::tempdir().unwrap();
+    let h1 = drive_land_seal_query(plain.path()).await;
+    let h2 = drive_land_seal_query_with(labelled.path(), |dir| {
+        let csv = dir.join("people.csv");
+        std::fs::write(&csv, format!("address,label\n{},alice\n", account(2))).unwrap();
+        nuthatch::labels::import(dir, &csv).unwrap();
+        std::fs::remove_file(&csv).unwrap();
+    })
+    .await;
+    assert!(!h1.is_empty());
+    assert_eq!(h1, h2, "a label set changed a sealed byte");
+
+    let identity = |dir: &std::path::Path| {
+        let m = nuthatch::blob::build_manifest(dir, None).unwrap();
+        (m.nid(), m.data_identity())
+    };
+    let dir = labelled.path();
+    assert!(
+        dir.join(nuthatch::labels::LABELS_DIR).is_dir(),
+        "premise: a set was imported"
+    );
+    let with = identity(dir);
+    assert_eq!(with, identity(plain.path()));
+    std::fs::remove_dir_all(dir.join(nuthatch::labels::LABELS_DIR)).unwrap();
+    std::fs::remove_file(dir.join(nuthatch::labels::INDEX_FILE)).unwrap();
+    assert_eq!(identity(dir), with);
+    assert_eq!(
+        (nuthatch::labels::LABELS_DIR, nuthatch::labels::INDEX_FILE),
+        (
+            nuthatch_identity::LABELS_DIR,
+            nuthatch_identity::LABELS_INDEX
+        ),
+        "the identity must leave out the files labels import writes"
     );
 }
 

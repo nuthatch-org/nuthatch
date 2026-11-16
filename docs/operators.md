@@ -2063,6 +2063,28 @@ hot store is not optional: every resume marker lives in it, so a nest directory 
 backfills from its start block again, and with a store older than its segments it re-reads the
 difference. Back the two up together.
 
+**Retention and deletion (#2946).** Record-keeping rules ask for five to seven years (MiCA Art 68(9),
+TFR Art 26, 31 CFR 1010.430, FATF R.11), and then for personal data to go.
+
+- *How long sealed history lives.* As long as you keep the dataset; nothing expires on a timer. A
+  running nest never rewrites or removes a sealed segment, except a provisional tail of under 1,000
+  rows, which a later seal folds into a new segment and leaves for `nuthatch prune`. `prune` deletes
+  a dataset only once no mount names it, and only with `--yes`. Keep the years by keeping the
+  directory and a copy elsewhere: `nuthatch publish sync` mirrors every sealed segment and the
+  catalogue, whose segment hashes say whether a copy is still the same bytes. Object lock or bucket
+  retention is the bucket's to enforce, not nuthatch's.
+- *How an answer is kept.* An evidence bundle (#2944) records one answer with the NID, the
+  registry hash and a hash of the rows, and verifying it re-asks any nest of that NID, a
+  mirror-seeded one included. A bundle holds whatever its statement selected, so it is yours to retain or delete.
+- *Label sets are not part of the nest.* `labels/` and `labels.manifest.json` count toward neither
+  the NID nor the data identity, no sealed byte is derived from them, bundles do not carry them and
+  the mirror does not copy them. Exposure is rebuilt from them in memory at start, maintained views
+  refuse to read `labels`, and the analytical memo is process-local. To delete a set, remove its
+  `labels/<sha256>.json` and its entry in `labels.manifest.json`, then restart: every chain table and
+  the NID stay as they were. Until #2946 a label import moved the NID, so a runtime whose mount
+  record was written with labels present logs `identity drift` for it after the upgrade; its data is
+  untouched.
+
 **Reading sealed data without this binary.** The sealed directory is plain Parquet plus a catalogue.
 [Reading Nuthatch segments without Nuthatch](reading-segments.md) is the contract: layout, catalogue
 schema, ordering, and the 256-bit encoding (canonical decimal text in `Utf8`; `_dec` / `_overflow`
@@ -2193,7 +2215,7 @@ needed.
 
 ## Nest lifecycle operations
 
-The deploy unit is a **content-addressed bundle**: config, ABIs, views, labels and skills, plus a
+The deploy unit is a **content-addressed bundle**: config, ABIs, views and skills (never label sets), plus a
 manifest pinning the expected decode-registry hash.
 
 ```sh
