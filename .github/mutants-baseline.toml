@@ -36,7 +36,71 @@ file = "src/seal.rs"
 mutation = "replace > with >= in verify_and_quarantine"
 reason = "Only gates the summary error line; the returned count and the quarantine moves are unchanged."
 
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace += with *= in verify_and_quarantine"
+reason = "Counts segments read from the pre-5.21 store, for the warning that names it and nothing else."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace match guard n > 0 with false in verify_in_background"
+reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace match guard n > 0 with true in verify_in_background"
+reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with == in verify_in_background"
+reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in verify_in_background"
+reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
+
 # --- Equivalent. ---------------------------------------------------------------------------------
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in reserve"
+reason = """
+`next.filter(|t| *t > now).unwrap_or(now)`: a reservation ending exactly at `now` yields `now` either
+way.
+"""
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in integrity"
+reason = """
+`at > r.at` asks whether a quarantine came after the rebuild. They are two `Instant::now()` reads taken at
+different moments, so they are never equal, and only equality tells the mutant apart.
+"""
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with >= in parsed_catalogue"
+reason = """
+Both comparisons against `PARSED_CATALOGUE_BYTES` differ only when a catalogue, or the cache's sum, is
+exactly 32 MiB, where keeping it or dropping it are both within the bound the constant states.
+"""
+
+# --- Untestable in a test's time. -----------------------------------------------------------------
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace * with +"
+reason = """
+`FULL_VERIFY_EVERY = 24 * 60 * 60` s, the wait between full background passes. A test cannot wait a
+day, and asserting the literal would test the literal. The first pass's delay is a parameter, tested.
+"""
+
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace * with /"
+reason = "As `replace * with +`: the one-day interval between full background passes."
 
 [[survivor]]
 file = "src/seal.rs"
