@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=./node_modules/envio/evm.schema.json
+name: weth
+disable_default_cross_chain: true
+chains:
+- id: 1
+  start_block: 26400000
+  end_block: 26400999
+  rpc:
+  - url: https://eth.drpc.org
+    for: sync
+  contracts:
+  - name: WETH
+    address:
+    - "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+    events:
+    - event: Approval(address indexed src, address indexed guy, uint256 wad)
+    - event: Deposit(address indexed dst, uint256 wad)
+    - event: Transfer(address indexed src, address indexed dst, uint256 wad)
+    - event: Withdrawal(address indexed src, uint256 wad)
+strict_hex_type: true

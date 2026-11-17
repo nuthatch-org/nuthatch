@@ -1,0 +1,24 @@
+# envio dev on the generated config (HyperSync, empty token)
+$ envio dev
+Connected to Docker via DOCKER_HOST (unix://~/.colima/default/docker.sock)
+Pulling image hasura/graphql-engine:v2.43.0...
+Pulling image postgres:18.3...
+Pulled hasura/graphql-engine:v2.43.0
+Pulled postgres:18.3
+Started envio-postgres
+.... ready (4.0s)
+[23:36:21.491] INFO: Initializing the indexer storage...
+
+[23:36:21.518] INFO: No saved effect cache to load from .envio/cache.
+
+[23:36:21.522] INFO: Tracking tables in Hasura
+
+[23:36:21.736] INFO: Hasura configuration completed
+
+[23:36:21.736] INFO: The indexer storage is ready. Starting indexing!
+
+[23:36:21.837] ERROR: An Envio API token is required for using HyperSync as a data-source.
+Set the ENVIO_API_TOKEN environment variable in your .env file.
+Learn more or get a free Envio API token at: https://envio.dev/app/api-tokens
+
+[ELIFECYCLE] Command failed with exit code 1.

@@ -1,0 +1,9 @@
+graph-node admin port up 11.90 s
+codegen+build 1.63 s
+deployed 15.02 s after compose up
+first query 188.62 s after compose up (173.60 s after deploy)
+range indexed 566.58 s after compose up (551.56 s after deploy)
+transfer=33329
+approval=2630
+deposit=5810
+withdrawal=7585

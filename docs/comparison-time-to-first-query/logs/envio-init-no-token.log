@@ -1,0 +1,2 @@
+# envio init without a token
+[23:34:57.362] ERROR: Failed during interactive input: Running non-interactively but no Envio API token was provided. Pass `--api-token <token>` or set the ENVIO_API_TOKEN environment variable. Create one at https://envio.dev/app/api-tokens.

@@ -1,0 +1,20 @@
+# nuthatch dev, run 3, untrimmed
+2026-11-17T21:28:32.392532Z  INFO mainnet blocks every 12050ms; polling every 300s (--poll-interval overrides)
+2026-11-17T21:28:32.397223Z  INFO admin token in ./.admin-token; open http://127.0.0.1:8301/_admin/?token=<redacted>
+2026-11-17T21:28:32.436645Z  INFO indexing nest 'run3' on mainnet: 1 contract(s), 4 table(s), 0 anonymous skipped, finality Depth(64), window 20, registry 0b5732a3bd91…
+2026-11-17T21:28:32.441540Z  INFO API live on http://127.0.0.1:8301  (try GET /  and  /metrics)
+2026-11-17T21:28:32.510490Z  INFO cold start: backfilling from block 26400000 (from deployment) (tip 26437456)
+2026-11-17T21:28:32.510533Z  INFO that is 37456 blocks of history; to index only the last 300 instead, stop, remove ./nuthatch.redb and ./segments, and rerun with `--backfill 300`
+2026-11-17T21:28:32.567486Z  INFO following, behind tip block=26399999 tip=26437456 blocks_behind=37457
+2026-11-17T21:28:33.748431Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 976ms as asked before trying again
+2026-11-17T21:28:35.255102Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 972ms as asked before trying again
+2026-11-17T21:28:36.299929Z  WARN tip lookup failed: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; retrying
+2026-11-17T21:28:39.457468Z  WARN reorg check could not complete: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; not indexing until it does
+2026-11-17T21:28:41.591859Z  WARN reorg check could not complete: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; not indexing until it does
+2026-11-17T21:28:43.826987Z  WARN get_logs 26400106..=26400148 failed: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; retrying
+2026-11-17T21:28:47.456612Z  INFO backfilling 0.4% - block 26400148 of 26437456, 7156 events, 480 ev/s
+2026-11-17T21:28:48.099862Z  WARN reorg check could not complete: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; not indexing until it does
+2026-11-17T21:28:50.181910Z  WARN tip lookup failed: HTTP 429 Too Many Requests: {"id":1,"jsonrpc":"2.0","error":{"message":"You reached Public endpoint rate limit, please upgrade to paid plan","code":15}}; retrying
+2026-11-17T21:28:56.249870Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 999ms as asked before trying again
+2026-11-17T21:29:02.900130Z  INFO backfilling 1.6% - block 26400605 of 26437456, 29143 events, 960 ev/s
+2026-11-17T21:29:11.093392Z  INFO shutdown signal received; API stopped
