@@ -67,6 +67,10 @@ pub fn files(nest: &Nest) -> Result<BTreeMap<String, Vec<u8>>> {
         ".claude/skills/nuthatch/SKILL.md".into(),
         skill_md(&nest.chain, &contracts, &schema).into_bytes(),
     );
+    out.insert(
+        AGENTS_MD.into(),
+        agents_md(&nest.chain, &contracts, &schema).into_bytes(),
+    );
     out.insert(".gitattributes".into(), GITATTRIBUTES.into());
     out.insert(".gitignore".into(), GITIGNORE.into());
     out.insert("views/README.md".into(), VIEWS_README.into());
@@ -232,19 +236,7 @@ fn has_transfers(schema: &[TableSchema]) -> bool {
 /// `llms.txt`: how an AI agent queries this nest. `contracts` is (alias, address).
 pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]) -> String {
     let list = contract_list(contracts);
-    let tables: String = schema
-        .iter()
-        .map(|t| {
-            let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
-            let source = match t.kind {
-                TableKind::Event => t.event.clone(),
-                TableKind::Block => "block headers".to_string(),
-                TableKind::Call => format!("calls to {}", t.function),
-                TableKind::State => "storage writes".to_string(),
-            };
-            format!("- `{}` - {} ({})\n", t.table, source, cols.join(", "))
-        })
-        .collect();
+    let tables = table_list(schema);
     let (balance_routes, balance_tools) = if has_transfers(schema) {
         (
             "- `GET /balances?limit=N`    top balances: net flow since `start_block`, holders only when `GET /` says `history_from_deployment: true` (false or null means net flow)\n\
@@ -344,6 +336,82 @@ pub fn skill_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          `sql` reads hot and sealed rows together, so it covers the live tip. Each answer's\n\
          `provenance.sealed_through` is the block through which this nest has sealed history; newer rows\n\
          may still be hot, and it is not the chain's finality head.\n"
+    )
+}
+
+/// One `- `table` - source (columns)` line per table, as `llms.txt` and `AGENTS.md` list them.
+fn table_list(schema: &[TableSchema]) -> String {
+    schema
+        .iter()
+        .map(|t| {
+            let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+            let source = match t.kind {
+                TableKind::Event => t.event.clone(),
+                TableKind::Block => "block headers".to_string(),
+                TableKind::Call => format!("calls to {}", t.function),
+                TableKind::State => "storage writes".to_string(),
+            };
+            format!("- `{}` - {} ({})\n", t.table, source, cols.join(", "))
+        })
+        .collect()
+}
+
+/// The nest's `AGENTS.md`, the file Codex, Cursor, Copilot, Gemini CLI and others read.
+pub const AGENTS_MD: &str = "AGENTS.md";
+
+/// The first line of every `AGENTS.md` nuthatch writes. A file without it is the author's own, which
+/// `init` and `schema` leave alone.
+pub const AGENTS_MD_MARK: &str =
+    "<!-- Written by nuthatch from nuthatch.toml; `nuthatch schema` rewrites it. -->";
+
+/// `AGENTS.md`: how a coding agent starts, queries and wires up this nest. `contracts` is
+/// (alias, address).
+pub fn agents_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]) -> String {
+    let list = contract_list(contracts);
+    let tables = table_list(schema);
+    let example = schema
+        .first()
+        .map(|t| t.table.as_str())
+        .unwrap_or("<alias>__<event>");
+    format!(
+        "{AGENTS_MD_MARK}\n\
+         # AGENTS.md\n\
+         \n\
+         This directory is a nuthatch nest: a local SQL index of these contracts on {chain}.\n\
+         Query it here; never call a third-party API for this data.\n\
+         \n\
+         {list}\n\
+         ## Tables\n\
+         {tables}\n\
+         ## Run it headless\n\
+         \n\
+         `nuthatch dev` runs until it is stopped. Start it in the background with its log outside the\n\
+         nest, whose identity counts every file in it, then wait until `/ready` puts it fewer than ten\n\
+         blocks behind the tip:\n\
+         \n\
+         ```sh\n\
+         nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &\n\
+         for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '\"lag_blocks\":[0-9],' && break; sleep 2; done\n\
+         ```\n\
+         \n\
+         `--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's\n\
+         start block. A nest that has already indexed ignores it. The log says why if it never gets\n\
+         there.\n\
+         \n\
+         ## Query\n\
+         \n\
+         ```sh\n\
+         nuthatch sql \"SELECT count(*) FROM {example}\" --json\n\
+         ```\n\
+         \n\
+         `llms.txt` has the HTTP routes and the SQL type rules: wide integers are text with a `_dec`\n\
+         companion, and `\"from\"` and `\"to\"` must be double-quoted.\n\
+         \n\
+         ## MCP\n\
+         \n\
+         `nuthatch mcp --print-config --client <name>` prints the config file for `claude`, `cursor`,\n\
+         `codex`, `vscode`, `windsurf` or `gemini`, and says on stderr where it goes. The server bridges\n\
+         to the running `nuthatch dev`; call its `schema` tool first.\n"
     )
 }
 

@@ -173,6 +173,9 @@ async fn scaffold(args: InitArgs) -> Result<()> {
     println!("    semantic.toml              what the data means (edit freely)");
     println!("    views/                     authored SQL derivations (a commented starter to uncomment)");
     println!("    llms.txt                   how an AI agent queries this index");
+    println!(
+        "    AGENTS.md                  how a coding agent runs, queries and wires up this nest"
+    );
     println!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
     println!();
     // The line a person copies. On a long history (#1607) it is the last fifteen windows, which
@@ -450,7 +453,7 @@ pub fn refresh_stale_artifacts(dir: &Path, config: &Config) -> Result<Option<Str
     // and `nuthatch schema` regenerates them when someone asks.
     let n = write_nest_artifacts(dir, &config.nest.chain, config, AgentDocs::KeepExisting)?;
     Ok(Some(format!(
-        "{why} - regenerated schema.json ({n} table(s)); llms.txt and SKILL.md are left as they \
+        "{why} - regenerated schema.json ({n} table(s)); llms.txt, AGENTS.md and SKILL.md are left as they \
          are, `nuthatch schema` regenerates them. The `{{col}}_dec` companions the schema tool \
          recommends come from schema.json."
     )))
@@ -1025,8 +1028,16 @@ pub fn agent_docs_lag(dir: &Path) -> Option<String> {
             .filter_map(|t| t.get("table")?.as_str().map(str::to_string))
             .collect();
     let mut stale = Vec::new();
-    if let Ok(llms) = std::fs::read_to_string(dir.join("llms.txt")) {
-        let listed: std::collections::BTreeSet<String> = llms
+    for doc in ["llms.txt", nuthatch_scaffold::AGENTS_MD] {
+        let Ok(text) = std::fs::read_to_string(dir.join(doc)) else {
+            continue;
+        };
+        if doc == nuthatch_scaffold::AGENTS_MD
+            && !text.starts_with(nuthatch_scaffold::AGENTS_MD_MARK)
+        {
+            continue;
+        }
+        let listed: std::collections::BTreeSet<String> = text
             .lines()
             .skip_while(|l| !l.starts_with("## Tables"))
             .skip(1)
@@ -1034,7 +1045,7 @@ pub fn agent_docs_lag(dir: &Path) -> Option<String> {
             .filter_map(|l| l.strip_prefix("- `")?.split('`').next().map(str::to_string))
             .collect();
         if listed != tables {
-            stale.push("llms.txt");
+            stale.push(doc);
         }
     }
     if let Ok(skill) = std::fs::read_to_string(dir.join(".claude/skills/nuthatch/SKILL.md")) {
@@ -1054,7 +1065,7 @@ pub fn agent_docs_lag(dir: &Path) -> Option<String> {
 #[derive(Clone, Copy, PartialEq)]
 enum AgentDocs {
     Rewrite,
-    /// Write `llms.txt` and `SKILL.md` only where missing: they are hashed into the NID.
+    /// Write `llms.txt`, `AGENTS.md` and `SKILL.md` only where missing: they are hashed into the NID.
     KeepExisting,
 }
 
@@ -2083,6 +2094,16 @@ fn scaffold_ai_surface_with(
         nuthatch_scaffold::skill_md(chain, &contracts, schema),
     )
     .context("failed to write SKILL.md")?;
+    let agents = dir.join(nuthatch_scaffold::AGENTS_MD);
+    let authored = std::fs::read(&agents)
+        .is_ok_and(|b| !b.starts_with(nuthatch_scaffold::AGENTS_MD_MARK.as_bytes()));
+    if !authored {
+        write(
+            &agents,
+            nuthatch_scaffold::agents_md(chain, &contracts, schema),
+        )
+        .context("failed to write AGENTS.md")?;
+    }
     Ok(())
 }
 
@@ -2224,6 +2245,38 @@ mod tests {
                 "{name}: Config saves a different nuthatch.toml than the scaffold writes"
             );
         }
+    }
+
+    /// #2981: a nest gets an `AGENTS.md` naming its tables, and a repository's own one is kept.
+    #[test]
+    fn the_nest_agents_md_is_written_and_an_authored_one_is_left_alone() {
+        let contracts: Vec<Contract> = vec![serde_json::from_value(serde_json::json!({
+            "alias": "usdc", "address": "0xa0b8", "abi": "abis/usdc.json"
+        }))
+        .unwrap()];
+        let schema: Vec<crate::registry::TableSchema> = vec![serde_json::from_value(
+            serde_json::json!({"table": "usdc__transfer", "alias": "usdc", "event": "Transfer", "columns": []}),
+        )
+        .unwrap()];
+
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        scaffold_ai_surface(dir.path(), "mainnet", &contracts, &schema).unwrap();
+        let ours = std::fs::read_to_string(&agents).unwrap();
+        assert!(ours.contains("- `usdc__transfer`"), "{ours}");
+        assert!(ours.contains("FROM usdc__transfer\" --json"), "{ours}");
+        assert!(ours.contains("/ready"), "{ours}");
+
+        std::fs::write(&agents, format!("{ours}stale\n")).unwrap();
+        scaffold_ai_surface(dir.path(), "mainnet", &contracts, &schema).unwrap();
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), ours);
+
+        std::fs::write(&agents, "# My repository's agent rules\n").unwrap();
+        scaffold_ai_surface(dir.path(), "mainnet", &contracts, &schema).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&agents).unwrap(),
+            "# My repository's agent rules\n"
+        );
     }
 
     /// #1662: the scaffolded skill's example names a table the nest has, and it does not steer an

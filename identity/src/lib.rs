@@ -276,7 +276,7 @@ fn table_header(line: &str) -> Option<String> {
 ///   state only. Slice one validates them, and slice two rebuilds that state from the adopted facts;
 ///   they must move the package NID without forcing the decoded dataset to be re-indexed.
 /// - `semantic.toml` - descriptions and derived footguns, read by the MCP/semantic surface only.
-/// - `llms.txt`, `README.md` - documentation.
+/// - `llms.txt`, `README.md`, `AGENTS.md` - documentation.
 /// - `.claude/**` - the scaffolded agent skill.
 ///
 /// Deliberately **not** excluded, though a reader might expect them to be: `labels/**` (labels drive
@@ -302,6 +302,7 @@ const NON_DATA_INPUTS: &[&str] = &[
     "semantic.toml",
     "llms.txt",
     "README.md",
+    "AGENTS.md",
     ".claude/",
 ];
 

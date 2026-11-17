@@ -24,7 +24,7 @@ nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT valu
 ```
 
 - `init` resolves the ABI (Sourcify → Blockscout → Etherscan), writes `nuthatch.toml`, `abis/`, `schema.json`,
-  `semantic.toml`, `views/`, `llms.txt`, and a `.claude/skills/` scaffold. **Omit `--chain`** - it
+  `semantic.toml`, `views/`, `llms.txt`, `AGENTS.md`, and a `.claude/skills/` scaffold. **Omit `--chain`** - it
   probes the known chains for the contract's bytecode. Pass several addresses to index them together.
   Without `--alias` the table prefix is the contract's name from the ABI (`fiat_token_v2_2__transfer`
   for USDC), so name it if you want `usdc__transfer`.

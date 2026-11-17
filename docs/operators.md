@@ -2285,7 +2285,7 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   inputs, a view or a description included, yields a different NID. Its files must be regular files:
   a symbolic link anywhere in the nest other than `nuthatch.redb` or `segments/` is refused by `dev`,
   `init --from` and every command that computes the NID, because the NID cannot see what it points to. Whether it is indexed again
-  depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt` and the
+  depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt`, `AGENTS.md` and the
   scaffolded skill are outside the **data identity**. On a runtime, or through `migrate`, a new NID
   whose data identity and recorded decode (registry hash) both match a dataset that holds data adopts
   that dataset's decoded facts instead of re-indexing, and says so at startup (RFC-0033 §5). An edit

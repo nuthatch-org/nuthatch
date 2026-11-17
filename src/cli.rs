@@ -1210,6 +1210,13 @@ pub struct McpArgs {
     #[arg(long)]
     pub print_config: bool,
 
+    /// With --print-config, print only this client's config file, ready to save: Claude Code's
+    /// `.mcp.json`, Cursor's `.cursor/mcp.json`, Codex's `~/.codex/config.toml`, VS Code's
+    /// `.vscode/mcp.json`, Windsurf's `mcp_config.json` or Gemini CLI's `settings.json`. Where it goes
+    /// is printed on stderr.
+    #[arg(long, value_enum, requires = "print_config")]
+    pub client: Option<McpClient>,
+
     /// Name of an environment variable holding a bearer token, sent as `Authorization: Bearer` on every
     /// request to --url. Defaults to `NUTHATCH_MCP_TOKEN` when that is set. The token itself never
     /// goes on the command line.
@@ -1226,6 +1233,17 @@ pub struct McpArgs {
     /// With --authoring: the directory the nest is created in and indexed from.
     #[arg(long, default_value = ".", requires = "authoring")]
     pub dir: String,
+}
+
+/// The MCP clients `nuthatch mcp --print-config --client` writes a config file for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum McpClient {
+    Claude,
+    Cursor,
+    Codex,
+    Vscode,
+    Windsurf,
+    Gemini,
 }
 
 #[derive(Args)]
