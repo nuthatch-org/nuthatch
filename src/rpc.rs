@@ -941,6 +941,8 @@ mod tests {
     /// Arc testnet's public RPC: more than 10 topic0 values refused at any width, one block included.
     async fn topic_capped_rpc(
         asked: Arc<std::sync::Mutex<Vec<usize>>>,
+        max_topics: usize,
+        logs_per_topic: u64,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
@@ -954,18 +956,20 @@ mod tests {
                         .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
                         .unwrap_or_default();
                     asked.lock().unwrap().push(topics.len());
-                    if topics.len() > 10 {
+                    if topics.len() > max_topics {
                         return Json(json!({"jsonrpc":"2.0","id":1,
                             "error":{"code":-32012,"message":"requested range too large"}}));
                     }
                     let logs: Vec<Value> = topics
                         .iter()
                         .rev()
-                        .map(|t| {
+                        .flat_map(|t| {
                             let n = u64::from_str_radix(&t[2..], 16).unwrap();
-                            json!({"address": "0x01", "topics": [t], "data": "0x",
-                                "blockNumber": "0x64", "transactionHash": "0x01",
-                                "logIndex": format!("0x{n:x}")})
+                            (0..logs_per_topic).map(move |k| {
+                                json!({"address": "0x01", "topics": [t], "data": "0x",
+                                    "blockNumber": "0x64", "transactionHash": "0x01",
+                                    "logIndex": format!("0x{:x}", n * logs_per_topic + k)})
+                            })
                         })
                         .collect();
                     Json(json!({"jsonrpc":"2.0","id":1,"result": logs}))
@@ -986,7 +990,7 @@ mod tests {
     #[tokio::test]
     async fn a_one_block_getlogs_refused_for_its_topic_count_is_split_and_remembered() {
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (url, server) = topic_capped_rpc(asked.clone()).await;
+        let (url, server) = topic_capped_rpc(asked.clone(), 10, 1).await;
         let c = super::RpcClient::new(vec![url]).unwrap();
         let topics: Vec<String> = (1..=17u64).map(|i| format!("0x{i:064x}")).collect();
 
@@ -1012,6 +1016,34 @@ mod tests {
             asked.lock().unwrap().clone(),
             vec![9, 8],
             "the next call starts at the group size that worked"
+        );
+    }
+
+    /// A dense block refused for its size reads like a topic cap; it is split for the request in
+    /// hand, but the pool keeps asking with the whole list, or every nest on it would pay.
+    #[tokio::test]
+    async fn a_dense_block_split_by_topic_does_not_lower_the_pools_topic_cap() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, server) = topic_capped_rpc(asked.clone(), 1, 1_500).await;
+        let c = super::RpcClient::new(vec![url]).unwrap();
+        let topics: Vec<String> = (1..=2u64).map(|i| format!("0x{i:064x}")).collect();
+
+        let logs = c
+            .get_logs(&["0x01".into()], &topics, 100, 100)
+            .await
+            .unwrap();
+        assert_eq!(logs.len(), 3_000);
+        assert_eq!(asked.lock().unwrap().clone(), vec![2, 1, 1]);
+
+        asked.lock().unwrap().clear();
+        c.get_logs(&["0x01".into()], &topics, 101, 101)
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            vec![2, 1, 1],
+            "a size refusal is not remembered as a topic cap"
         );
     }
 

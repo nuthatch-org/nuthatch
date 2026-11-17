@@ -83,6 +83,10 @@ pub const TIMESTAMP_CACHE_MAX: usize = 262_144;
 /// ERC-20 transfers.
 pub const GETLOGS_BODY_CAP: usize = 32 << 20;
 
+/// Fewer matching logs than this in a block whose topic list was refused, and the refusal was about
+/// the list: result caps measured so far start at 10,000 (#2992).
+const TOPIC_CAP_EVIDENCE: usize = 1_000;
+
 /// A response's JSON-RPC `error`, where `"error": null` on a success is no error (#2225).
 fn error_of(resp: &Value) -> Option<&Value> {
     resp.get("error").filter(|e| !e.is_null())
@@ -2442,11 +2446,13 @@ impl<T: Transport> RpcClient<T> {
                 .get_logs_by_address(addresses, topic0s, topics, from, to)
                 .await;
         }
+        let pool_cap = self.log_topic_cap.load(Ordering::Relaxed);
+        let mut cap = pool_cap;
+        let mut refused = None;
         let mut logs = Vec::new();
         let mut groups = 0usize;
         let mut done = 0usize;
         while done < topic0s.len() {
-            let cap = self.log_topic_cap.load(Ordering::Relaxed);
             let group = &topic0s[done..topic0s.len().min(done.saturating_add(cap))];
             match self
                 .get_logs_by_address(addresses, group, topics, from, to)
@@ -2457,23 +2463,29 @@ impl<T: Transport> RpcClient<T> {
                     done += group.len();
                     groups += 1;
                 }
-                // One block cannot be narrowed, so a refusal of it is about the filter.
                 Err(e)
                     if group.len() > 1
                         && from == to
                         && (is_result_too_large(&e) || filter_refused(&e))
                         && !escalated_from_rate_limit(&e) =>
                 {
-                    let half = group.len().div_ceil(2);
-                    if self.log_topic_cap.fetch_min(half, Ordering::Relaxed) > half {
-                        tracing::info!(
-                            "eth_getLogs for one block naming {} event topics was refused ({e:#}); \
-                             asking in groups of at most {half}",
-                            group.len()
-                        );
-                    }
+                    cap = group.len().div_ceil(2);
+                    refused = Some((group.len(), e));
                 }
                 Err(e) => return Err(e),
+            }
+        }
+        // A one-block refusal is either a dense block or a topic list too long, and the error reads
+        // the same. Only a block of few logs proves it was the list, so only then is it remembered.
+        if let Some((asked, e)) =
+            refused.filter(|_| cap < pool_cap && logs.len() < TOPIC_CAP_EVIDENCE)
+        {
+            if self.log_topic_cap.fetch_min(cap, Ordering::Relaxed) > cap {
+                tracing::info!(
+                    "eth_getLogs for block {from} naming {asked} event topics was refused ({e:#}), \
+                     and the block holds only {} matching logs; asking in groups of at most {cap}",
+                    logs.len()
+                );
             }
         }
         if groups > 1 {
