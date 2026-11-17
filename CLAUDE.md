@@ -419,7 +419,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `backfill-throughput` | Backfill events/sec (tracked, not gated) |  | always runs |
 | `build` | Build the release binary |  | cached on its inputs |
 | `build-scaled` | Build the release binary with the scaled backend |  | always runs |
-| `ci` | What CI runs (fmt-check, lint, test, decode, crates, features, deny) and agents-check | `fmt-check`, `lint`, `test`, `decode`, `crates`, `features`, `deny`, `agents-check` | runs its dependencies only |
+| `ci` | What CI runs (fmt-check, lint, test, decode, crates, features, deny, npm-launcher) and agents-check | `fmt-check`, `lint`, `test`, `decode`, `crates`, `features`, `deny`, `npm-launcher`, `agents-check` | runs its dependencies only |
 | `clippy-counter` |  |  | cached on its inputs |
 | `clippy-crash-points` |  |  | cached on its inputs |
 | `clippy-flight` |  |  | cached on its inputs |
@@ -460,6 +460,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `fuzz-sql-parsers` | Fuzz IPFS CAR and subgraph manifest parsing, on fuzz-sql's build |  | always runs |
 | `lint` | Clippy with warnings denied |  | cached on its inputs |
 | `multinest-footprint` | Peak RSS at tip, 20 nests on one cursor |  | always runs |
+| `npm-launcher` | The npm launcher's tests, against a local stand-in release (needs node) |  | cached on its inputs |
 | `opfs-live` | OPFS and the live cursor in headless Chrome | `fixture-rpc` | always runs |
 | `parity-bin` | Build the parity comparison into target/parity-bin |  | always runs |
 | `pg-parity` | Every Postgres-backed suite, serially (needs NUTHATCH_TEST_PG) |  | always runs |

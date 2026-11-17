@@ -205,11 +205,12 @@ fn show_what_the_parser_sees() {
 /// that would is gated on a tag push, by its own `if:` or its job's.
 #[test]
 fn a_dispatch_never_releases() {
-    const RELEASING: [&str; 4] = [
+    const RELEASING: [&str; 5] = [
         "softprops/action-gh-release",
         "attest-build-provenance",
         "docker push",
         "gh release edit",
+        "npm publish",
     ];
     let s = release_yml();
     let jobs = s.split_once("\njobs:\n").expect("release.yml has jobs").1;

@@ -2242,6 +2242,25 @@ mod tests {
             entry["packages"][0]["identifier"],
             format!("ghcr.io/nuthatch-org/nuthatch:{v}")
         );
+        // The npm launcher fetches the release its own version names (#2985), and the registry
+        // verifies the package by `mcpName`.
+        let launcher: Value = serde_json::from_str(include_str!("../npm/package.json")).unwrap();
+        let npm = &entry["packages"][1];
+        assert_eq!(npm["registryType"], "npm");
+        assert_eq!(npm["identifier"], launcher["name"]);
+        assert_eq!(npm["version"], v);
+        assert_eq!(launcher["version"], v);
+        assert_eq!(launcher["mcpName"], entry["name"]);
+        let args = |p: &Value| -> Vec<Value> {
+            let a = p["packageArguments"].as_array().unwrap();
+            a.iter()
+                .map(|a| match &a["value"] {
+                    Value::Null => a["name"].clone(),
+                    v => v.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(args(npm), args(&entry["packages"][0]));
     }
 
     #[test]

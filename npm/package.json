@@ -1,0 +1,24 @@
+{
+  "name": "nuthatch-indexer",
+  "version": "5.22.0",
+  "description": "Runs the nuthatch release binary: a self-hosted EVM indexer with SQL and an MCP server.",
+  "mcpName": "io.github.nuthatch-org/nuthatch",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://www.nuthatch-indexer.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nuthatch-org/nuthatch.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/nuthatch-org/nuthatch/issues",
+  "keywords": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph", "nuthatch"],
+  "bin": {
+    "nuthatch": "bin/nuthatch.js"
+  },
+  "files": ["bin/nuthatch.js", "checksums.json"],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"]
+}

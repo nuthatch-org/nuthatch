@@ -53,6 +53,11 @@ desc = "Doctests, which nextest does not run"
 run = ["cargo test --doc --locked"]
 sources = ["**/*"]
 
+[tasks.npm-launcher]
+desc = "The npm launcher's tests, against a local stand-in release (needs node)"
+run = ["node --test npm/test/launcher.test.js"]
+sources = ["npm/**/*"]
+
 [tasks.version-check]
 desc = "No stale version in what a reader copies and pastes"
 run = ["scripts/version-check.sh"]
@@ -565,6 +570,6 @@ sources = ["yatr.toml", "CLAUDE.md"]
 tool_inputs = ["yatr --version"]
 
 [tasks.ci]
-desc = "What CI runs (fmt-check, lint, test, decode, crates, features, deny) and agents-check"
-depends = ["fmt-check", "lint", "test", "decode", "crates", "features", "deny", "agents-check"]
+desc = "What CI runs (fmt-check, lint, test, decode, crates, features, deny, npm-launcher) and agents-check"
+depends = ["fmt-check", "lint", "test", "decode", "crates", "features", "deny", "npm-launcher", "agents-check"]
 run = []
