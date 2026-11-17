@@ -83,6 +83,10 @@ pub const TIMESTAMP_CACHE_MAX: usize = 262_144;
 /// ERC-20 transfers.
 pub const GETLOGS_BODY_CAP: usize = 32 << 20;
 
+/// Fewer matching logs than this in a block whose topic list was refused, and the refusal was about
+/// the list: result caps measured so far start at 10,000 (#2992).
+const TOPIC_CAP_EVIDENCE: usize = 1_000;
+
 /// A response's JSON-RPC `error`, where `"error": null` on a success is no error (#2225).
 fn error_of(resp: &Value) -> Option<&Value> {
     resp.get("error").filter(|e| !e.is_null())
@@ -944,6 +948,9 @@ pub struct RpcClient<T: Transport> {
     /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
     /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
     log_address_cap: AtomicUsize,
+    /// The most topic0 values one getLogs names, lowered when a single block is refused for a list
+    /// (#2992: Arc testnet refuses more than 10 at any width).
+    log_topic_cap: AtomicUsize,
     /// Endpoints whose startup chain-id check got no answer; each is asked again before it serves
     /// anything (#2161).
     unverified: Vec<AtomicBool>,
@@ -986,6 +993,7 @@ impl<T: Transport> RpcClient<T> {
             logs_body_cap: GETLOGS_BODY_CAP,
             batch_body_cap: BATCH_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
+            log_topic_cap: AtomicUsize::new(usize::MAX),
             unverified: (0..n).map(|_| AtomicBool::new(false)).collect(),
             chain: AtomicU64::new(0),
         })
@@ -2433,6 +2441,67 @@ impl<T: Transport> RpcClient<T> {
     }
 
     async fn get_logs_matching(
+        &self,
+        addresses: &[String],
+        topic0s: &[String],
+        topics: &[Vec<String>; 3],
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Log>> {
+        if topic0s.len() <= 1 {
+            return self
+                .get_logs_by_address(addresses, topic0s, topics, from, to)
+                .await;
+        }
+        let pool_cap = self.log_topic_cap.load(Ordering::Relaxed);
+        let mut cap = pool_cap;
+        let mut refused = None;
+        let mut logs = Vec::new();
+        let mut groups = 0usize;
+        let mut done = 0usize;
+        while done < topic0s.len() {
+            let group = &topic0s[done..topic0s.len().min(done.saturating_add(cap))];
+            match self
+                .get_logs_by_address(addresses, group, topics, from, to)
+                .await
+            {
+                Ok(mut l) => {
+                    logs.append(&mut l);
+                    done += group.len();
+                    groups += 1;
+                }
+                Err(e)
+                    if group.len() > 1
+                        && from == to
+                        && (is_result_too_large(&e) || filter_refused(&e))
+                        && !escalated_from_rate_limit(&e) =>
+                {
+                    cap = group.len().div_ceil(2);
+                    refused = Some((group.len(), e));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // A one-block refusal is either a dense block or a topic list too long, and the error reads
+        // the same. Only a block of few logs proves it was the list, so only then is it remembered.
+        if let Some((asked, e)) =
+            refused.filter(|_| cap < pool_cap && logs.len() < TOPIC_CAP_EVIDENCE)
+        {
+            if self.log_topic_cap.fetch_min(cap, Ordering::Relaxed) > cap {
+                tracing::info!(
+                    "eth_getLogs for block {from} naming {asked} event topics was refused ({e:#}), \
+                     and the block holds only {} matching logs; asking in groups of at most {cap}",
+                    logs.len()
+                );
+            }
+        }
+        if groups > 1 {
+            logs.sort_by_key(|l| (l.block_number, l.log_index));
+        }
+        Ok(logs)
+    }
+
+    async fn get_logs_by_address(
         &self,
         addresses: &[String],
         topic0s: &[String],
