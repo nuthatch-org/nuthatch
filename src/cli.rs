@@ -1214,6 +1214,16 @@ pub struct McpArgs {
     /// goes on the command line.
     #[arg(long, value_name = "VAR")]
     pub token_env: Option<String>,
+
+    /// Also offer `init_nest`, `start_indexing` and `index_status`, so a client can create a nest in
+    /// --dir and index it with no shell. The indexer runs `nuthatch dev` at --url, which must then be
+    /// a loopback address, and stops when this server does.
+    #[arg(long)]
+    pub authoring: bool,
+
+    /// With --authoring: the directory the nest is created in and indexed from.
+    #[arg(long, default_value = ".", requires = "authoring")]
+    pub dir: String,
 }
 
 #[derive(Args)]

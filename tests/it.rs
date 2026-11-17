@@ -166,6 +166,8 @@ mod ivm_claims;
 mod launch_copy;
 #[path = "lodestar_panel.rs"]
 mod lodestar_panel;
+#[path = "mcp_authoring.rs"]
+mod mcp_authoring;
 #[path = "mcp_token.rs"]
 mod mcp_token;
 #[path = "mutants_check.rs"]
