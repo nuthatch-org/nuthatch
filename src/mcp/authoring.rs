@@ -16,7 +16,12 @@ const SERVING_WAIT: Duration = Duration::from_secs(30);
 /// The most of a command's output or log a tool answer carries.
 const OUTPUT_TAIL: usize = 8 * 1024;
 
-const TOOLS: &[&str] = &["init_nest", "start_indexing", "index_status"];
+const TOOLS: &[&str] = &[
+    "init_nest",
+    "start_indexing",
+    "index_status",
+    "stop_indexing",
+];
 
 pub fn is_tool(name: &str) -> bool {
     TOOLS.contains(&name)
@@ -46,6 +51,10 @@ pub fn tool_specs() -> Vec<Value> {
           "description": "Whether the local nuthatch indexer of EVM contract events is serving and caught up: its `/ready` answer (tip, last indexed and sealed block, lag), and the indexer's state and recent log when `start_indexing` started it.",
           "inputSchema": { "type": "object", "properties": {} },
           "annotations": { "title": "Indexing progress", "readOnlyHint": true, "openWorldHint": false } }),
+        json!({ "name": "stop_indexing", "title": "Stop indexing",
+          "description": "Stop indexing EVM contract events into this directory's nest: stops the nuthatch indexer `start_indexing` started, including one left running by an earlier server. The nest and its indexed data stay; `start_indexing` resumes where it stopped.",
+          "inputSchema": { "type": "object", "properties": {} },
+          "annotations": { "title": "Stop indexing", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false } }),
     ]
 }
 
@@ -56,6 +65,9 @@ pub struct Authoring {
     base: String,
     listen: String,
     log: PathBuf,
+    /// The indexer's pid and nest, outside the nest (every file in it counts toward its NID), so a
+    /// server started after this one dies can find and stop what it left running.
+    pidfile: PathBuf,
     client: reqwest::Client,
     indexer: tokio::sync::Mutex<Option<tokio::process::Child>>,
 }
@@ -70,12 +82,18 @@ impl Authoring {
 
     fn with_exe(dir: PathBuf, exe: PathBuf, base: &str, listen: String) -> Self {
         let log = std::env::temp_dir().join(format!("nuthatch-mcp-{}-dev.log", std::process::id()));
+        let key: String = listen
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let pidfile = std::env::temp_dir().join(format!("nuthatch-mcp-dev-{key}.pid"));
         Authoring {
             dir,
             exe,
             base: base.trim_end_matches('/').to_string(),
             listen,
             log,
+            pidfile,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -89,6 +107,7 @@ impl Authoring {
             "init_nest" => self.init_nest(args).await,
             "start_indexing" => self.start_indexing(args).await,
             "index_status" => self.index_status().await,
+            "stop_indexing" => self.stop_indexing().await,
             other => bail!("unknown tool `{other}`"),
         }
     }
@@ -131,6 +150,14 @@ impl Authoring {
             cmd.arg(format!("--rpc={}", rpc_url(rpc)?));
         }
         if let Some(abi) = args["abi"].as_str() {
+            // Checked here, so a path to some other file is refused without `init` quoting it back.
+            let is_abi = std::fs::read(abi)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+                .is_some_and(|v| v.as_array().is_some_and(|a| a.iter().all(Value::is_object)));
+            if !is_abi {
+                bail!("`abi` must be a readable JSON ABI file: an array of ABI entries");
+            }
             cmd.arg(flag("abi", Path::new(abi)));
         }
         if let Some(block) = args["start_block"].as_u64() {
@@ -174,6 +201,13 @@ impl Authoring {
             );
         }
         if self.serving().await {
+            if let Some(pid) = self.left_running() {
+                return Ok(format!(
+                    "Already indexing, serving at {}: an earlier server started it (pid {pid}). \
+                     Call `index_status` for progress, or `stop_indexing` to stop it.",
+                    self.base
+                ));
+            }
             bail!(
                 "something already answers at {}; stop it, or start this server with --url \
                  pointed at it and use the query tools",
@@ -201,6 +235,9 @@ impl Authoring {
             .stderr(log)
             .kill_on_drop(true);
         let mut child = cmd.spawn().context("starting `nuthatch dev`")?;
+        if let Some(pid) = child.id() {
+            let _ = std::fs::write(&self.pidfile, format!("{pid}\n{}\n", self.dir.display()));
+        }
         let deadline = tokio::time::Instant::now() + SERVING_WAIT;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -236,7 +273,12 @@ impl Authoring {
         let indexer = {
             let mut guard = self.indexer.lock().await;
             match guard.as_mut() {
-                None => json!("not started by this server"),
+                None => match self.left_running() {
+                    Some(pid) => {
+                        json!({ "running": true, "pid": pid, "started_by": "an earlier server" })
+                    }
+                    None => json!("not started by this server"),
+                },
                 Some(child) => match child.try_wait()? {
                     None => json!({ "running": true, "pid": child.id() }),
                     Some(status) => json!({
@@ -259,6 +301,44 @@ impl Authoring {
             )),
         };
         Ok(json!({ "url": self.base, "ready": ready, "indexer": indexer }).to_string())
+    }
+
+    async fn stop_indexing(&self) -> Result<String> {
+        let mut indexer = self.indexer.lock().await;
+        if let Some(mut child) = indexer.take() {
+            if child.try_wait()?.is_none() {
+                child.kill().await.context("stopping `nuthatch dev`")?;
+                let _ = std::fs::remove_file(&self.pidfile);
+                return Ok(
+                    "Stopped the indexer. `start_indexing` resumes where it stopped.".into(),
+                );
+            }
+        }
+        let Some(pid) = self.left_running() else {
+            let _ = std::fs::remove_file(&self.pidfile);
+            return Ok("No indexer started for this directory is running.".into());
+        };
+        // SAFETY: a plain signal to a pid recorded for this directory and alive a moment ago.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.serving().await && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let _ = std::fs::remove_file(&self.pidfile);
+        Ok(format!(
+            "Stopped the indexer an earlier server left running (pid {pid}). `start_indexing` \
+             resumes where it stopped."
+        ))
+    }
+
+    /// The pid recorded for this directory, if that process is still alive.
+    fn left_running(&self) -> Option<u32> {
+        let recorded = std::fs::read_to_string(&self.pidfile).ok()?;
+        let mut lines = recorded.lines();
+        let pid: u32 = lines.next()?.trim().parse().ok()?;
+        (lines.next()? == self.dir.display().to_string()).then_some(())?;
+        // SAFETY: signal 0 only asks whether the pid exists and may be signalled.
+        (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
     }
 
     async fn serving(&self) -> bool {
@@ -390,5 +470,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already holds a nest"), "{err}");
+    }
+
+    /// A path to a file that is not an ABI is refused here, so `init` never gets to quote it back.
+    #[tokio::test]
+    async fn an_abi_that_is_not_one_is_refused_without_echoing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "hunter2 is the password").unwrap();
+        let a = Authoring::with_exe(
+            dir.path().join("nest"),
+            PathBuf::from("/nonexistent/nuthatch"),
+            "http://127.0.0.1:1",
+            "127.0.0.1:1".into(),
+        );
+        let err = a
+            .call(
+                "init_nest",
+                &json!({ "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                         "abi": secret.to_str().unwrap() }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a readable JSON ABI"), "{err}");
+        assert!(!err.contains("hunter2"), "{err}");
+    }
+
+    /// A server that died leaves its indexer running; the next one adopts it, and can stop it.
+    #[tokio::test]
+    async fn an_indexer_an_earlier_server_left_running_is_adopted_and_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nuthatch.toml"), "").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let health = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(async move { axum::serve(listener, health).await });
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let a = Authoring::with_exe(
+            dir.path().to_path_buf(),
+            PathBuf::from("/nonexistent/nuthatch"),
+            &format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+        );
+        std::fs::write(
+            &a.pidfile,
+            format!("{}\n{}\n", orphan.id(), dir.path().display()),
+        )
+        .unwrap();
+
+        let said = a.call("start_indexing", &json!({})).await.unwrap();
+        assert!(said.contains("an earlier server started it"), "{said}");
+        let status: Value =
+            serde_json::from_str(&a.call("index_status", &json!({})).await.unwrap()).unwrap();
+        assert_eq!(status["indexer"]["pid"], orphan.id(), "{status}");
+
+        server.abort();
+        let said = a.call("stop_indexing", &json!({})).await.unwrap();
+        assert!(said.contains("earlier server left running"), "{said}");
+        let exited = orphan.wait().unwrap();
+        assert!(
+            !exited.success(),
+            "the orphan was signalled, not left to finish"
+        );
+        assert!(!a.pidfile.exists());
     }
 }

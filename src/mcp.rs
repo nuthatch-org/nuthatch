@@ -36,6 +36,18 @@ fn guide_if_interactive(base: &str, token_env: Option<&str>, authoring: Option<&
 /// Emit a copy-paste MCP client configuration for this binary bridging to `base`. One documented
 /// command wires a coding agent to a running nest (RFC-0015 slice 5): print it, paste it, ask your
 /// contract's data in plain English - fully offline, nothing phones home.
+/// `s` as one POSIX shell word: bare when it is plainly safe, single-quoted otherwise.
+fn sh_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Option<&Path>) {
     let base = base.trim_end_matches('/');
     // Prefer this binary's absolute path so the snippet works even off `PATH`; fall back to the bare
@@ -57,7 +69,11 @@ pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Optio
     }
     println!("Then point an AI client at it - either way is one step:\n");
     println!("  Claude Code (one-liner):");
-    println!("    claude mcp add nuthatch -- {exe} {}\n", args.join(" "));
+    let line: Vec<String> = std::iter::once(exe.as_str())
+        .chain(args.iter().copied())
+        .map(sh_quote)
+        .collect();
+    println!("    claude mcp add nuthatch -- {}\n", line.join(" "));
     println!("  Or add to .mcp.json / your client's MCP config:");
     println!(
         "{}",
@@ -459,7 +475,7 @@ fn initialize_result() -> Value {
 const INSTRUCTIONS: &str = "nuthatch indexes an EVM smart contract's onchain events (logs) into SQL \
     tables, one per event, decoded from the contract's ABI. Use these tools for questions about a \
     contract's onchain history: transfers, swaps, holders, balances, who called what and when. Call \
-    `schema` first, then answer with `sql`; every answer carries the block it is as of. When the \
+    `schema` first, then answer with `sql`; a `sql` answer carries the block it is as of. When the \
     server was started with --authoring and no nest exists yet, `init_nest` and then \
     `start_indexing` create and index one.";
 
@@ -1343,6 +1359,19 @@ fn tool_result(text: &str, tool: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The printed `claude mcp add` line survives a directory with a space or a quote in it.
+    #[test]
+    fn a_printed_argument_is_one_shell_word() {
+        assert_eq!(sh_quote("--url"), "--url");
+        assert_eq!(sh_quote("http://127.0.0.1:8288"), "http://127.0.0.1:8288");
+        assert_eq!(
+            sh_quote("--dir=/Users/me/My Nests/usdc"),
+            "'--dir=/Users/me/My Nests/usdc'"
+        );
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(sh_quote(""), "''");
+    }
 
     /// #1661: an oversized line is reported without retaining it, and the next message arrives.
     #[tokio::test]
@@ -2428,7 +2457,7 @@ mod tests {
     /// #2983: a client can tell a query tool is safe to call without asking.
     #[test]
     fn every_tool_carries_a_title_and_annotations() {
-        let writes = ["init_nest", "start_indexing"];
+        let writes = ["init_nest", "start_indexing", "stop_indexing"];
         for tool in every_tool(true) {
             let name = tool["name"].as_str().unwrap();
             assert!(tool["title"].is_string(), "{name}");
