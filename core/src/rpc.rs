@@ -937,6 +937,9 @@ pub struct RpcClient<T: Transport> {
     /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
     /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
     log_address_cap: AtomicUsize,
+    /// The most topic0 values one getLogs names, lowered when a single block is refused for a list
+    /// (#2992: Arc testnet refuses more than 10 at any width).
+    log_topic_cap: AtomicUsize,
     /// Endpoints whose startup chain-id check got no answer; each is asked again before it serves
     /// anything (#2161).
     unverified: Vec<AtomicBool>,
@@ -979,6 +982,7 @@ impl<T: Transport> RpcClient<T> {
             logs_body_cap: GETLOGS_BODY_CAP,
             batch_body_cap: BATCH_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
+            log_topic_cap: AtomicUsize::new(usize::MAX),
             unverified: (0..n).map(|_| AtomicBool::new(false)).collect(),
             chain: AtomicU64::new(0),
         })
@@ -2426,6 +2430,59 @@ impl<T: Transport> RpcClient<T> {
     }
 
     async fn get_logs_matching(
+        &self,
+        addresses: &[String],
+        topic0s: &[String],
+        topics: &[Vec<String>; 3],
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Log>> {
+        if topic0s.len() <= 1 {
+            return self
+                .get_logs_by_address(addresses, topic0s, topics, from, to)
+                .await;
+        }
+        let mut logs = Vec::new();
+        let mut groups = 0usize;
+        let mut done = 0usize;
+        while done < topic0s.len() {
+            let cap = self.log_topic_cap.load(Ordering::Relaxed);
+            let group = &topic0s[done..topic0s.len().min(done.saturating_add(cap))];
+            match self
+                .get_logs_by_address(addresses, group, topics, from, to)
+                .await
+            {
+                Ok(mut l) => {
+                    logs.append(&mut l);
+                    done += group.len();
+                    groups += 1;
+                }
+                // One block cannot be narrowed, so a refusal of it is about the filter.
+                Err(e)
+                    if group.len() > 1
+                        && from == to
+                        && (is_result_too_large(&e) || filter_refused(&e))
+                        && !escalated_from_rate_limit(&e) =>
+                {
+                    let half = group.len().div_ceil(2);
+                    if self.log_topic_cap.fetch_min(half, Ordering::Relaxed) > half {
+                        tracing::info!(
+                            "eth_getLogs for one block naming {} event topics was refused ({e:#}); \
+                             asking in groups of at most {half}",
+                            group.len()
+                        );
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if groups > 1 {
+            logs.sort_by_key(|l| (l.block_number, l.log_index));
+        }
+        Ok(logs)
+    }
+
+    async fn get_logs_by_address(
         &self,
         addresses: &[String],
         topic0s: &[String],
