@@ -16,7 +16,7 @@ USDC). If auto-detect can't find the contract (or you want a specific chain), pa
 registry name: `mainnet`, `arbitrum-one`, `base`, `bsc`, `polygon`, `gnosis`, `optimism`, `monad`,
 `robinhood`. When the history is long, `init` prints `next: nuthatch dev --backfill N` (N is fifteen
 of the chain's log windows, 300 on mainnet) and says a full backfill from deployment needs your own
-RPC: `nuthatch dev --rpc <url>`, or `rpc_urls` in `nuthatch.toml`. A short history is offered plain
+RPC: `nuthatch dev --rpc=<url>`, or `rpc_urls` in `nuthatch.toml`. A short history is offered plain
 `nuthatch dev`. To index only recent history instead of from deployment: `nuthatch dev --backfill 100000`
 (last 100k blocks) on a nest that has not indexed a block yet; once it has, the flag is ignored, so
 stop it and remove `nuthatch.redb` and `segments/` first. Point at your own node with `--rpc https://…`

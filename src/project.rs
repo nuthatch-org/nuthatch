@@ -2094,7 +2094,7 @@ fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> Ne
         command: format!("{dev} --backfill {recent}"),
         note: Some(format!(
             "(the last {recent} blocks, on the bundled public RPCs. A full backfill of {span} \
-             blocks from deployment needs your own RPC: {dev} --rpc <url>, or rpc_urls in \
+             blocks from deployment needs your own RPC: {dev} --rpc=<url>, or rpc_urls in \
              nuthatch.toml)"
         )),
     }
@@ -2570,10 +2570,13 @@ mod tests {
         let note = step.note.expect("a long backfill names the full span");
         assert!(note.contains("20013710 blocks from deployment"), "{note}");
         assert!(
-            note.contains("nuthatch dev --dir usdc --rpc <url>"),
+            note.contains("nuthatch dev --dir usdc --rpc=<url>"),
             "{note}"
         );
         assert!(note.contains("rpc_urls in nuthatch.toml"), "{note}");
+        // e2e_bare_help treats any init line containing "rpc " as a tracing line that must use
+        // the `·` idiom. The flag is written `--rpc=<url>` so this note is not one of those lines.
+        assert!(!note.contains("rpc "), "{note}");
 
         let short = next_step(".", Some(26_090_000), Some(26_096_175), 20);
         assert_eq!(short.command, "nuthatch dev");
