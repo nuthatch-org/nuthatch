@@ -320,6 +320,11 @@ impl Mirror for FsMirror {
     }
 }
 
+/// How often a 429 or 503 is asked again, and the longest wait between: about two
+/// minutes in all.
+const BUSY_RETRIES: u32 = 8;
+const BUSY_WAIT_MAX_SECS: u64 = 30;
+
 /// A mirror read over plain HTTP(S), which is what a public bucket serves. Read-only: `nuthatch seed`
 /// is its one caller, and nothing publishes through it.
 struct HttpMirror {
@@ -344,14 +349,38 @@ impl HttpMirror {
         method: reqwest::Method,
         key: &str,
     ) -> Result<Option<reqwest::Response>> {
-        // `without_url`: a presigned or keyed mirror URL must not reach a log through an error.
-        let resp = self
-            .client
-            .request(method, format!("{}/{key}", self.base))
-            .send()
-            .await
-            .map_err(|e| e.without_url())
-            .with_context(|| format!("fetching {key}"))?;
+        // A public bucket's URL is rate-limited (R2's r2.dev answers 429 within one seed), and a
+        // seed is thousands of requests, so a 429 or 503 waits and asks again.
+        let mut attempt = 0u32;
+        let resp = loop {
+            // `without_url`: a presigned or keyed mirror URL must not reach a log through an error.
+            let resp = self
+                .client
+                .request(method.clone(), format!("{}/{key}", self.base))
+                .send()
+                .await
+                .map_err(|e| e.without_url())
+                .with_context(|| format!("fetching {key}"))?;
+            let busy = matches!(
+                resp.status(),
+                reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            );
+            if !busy || attempt >= BUSY_RETRIES {
+                break resp;
+            }
+            let wait = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok())
+                .unwrap_or(1 << attempt)
+                .min(BUSY_WAIT_MAX_SECS);
+            tracing::info!(
+                "the mirror answered {} for {key}; retrying in {wait}s",
+                resp.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            attempt += 1;
+        };
         match resp.status() {
             s if s.is_success() => Ok(Some(resp)),
             reqwest::StatusCode::NOT_FOUND => Ok(None),
@@ -3919,6 +3948,43 @@ abi = "abis/usdc.json"
         let got = mirror.get_file("d/seg.parquet", &dest, 4096).await.unwrap();
         assert_eq!(got, Some(sha256_hex(&[7u8; 4096])));
         assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 4096]);
+        server.abort();
+    }
+
+    /// A rate-limited public mirror answers 429 partway through a seed; the fetch waits as told and
+    /// asks again rather than failing the seed.
+    #[tokio::test]
+    async fn an_http_mirror_retries_a_rate_limit() {
+        use axum::response::IntoResponse;
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = asked.clone();
+        let app = axum::Router::new().route(
+            "/d/seg.parquet",
+            axum::routing::get(move || {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                        )
+                            .into_response()
+                    } else {
+                        vec![7u8; 64].into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mirror = HttpMirror::new(&base).unwrap();
+
+        assert_eq!(
+            mirror.get("d/seg.parquet").await.unwrap(),
+            Some(vec![7u8; 64])
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 3);
         server.abort();
     }
 
