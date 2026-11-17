@@ -26,6 +26,38 @@ pub struct Manifest {
     pub tables: BTreeMap<String, Vec<Segment>>,
 }
 
+/// The segments of `tables` an answer as of `block` reads: each one starting at or below it.
+pub fn read_set<'a>(
+    manifest: &'a Manifest,
+    tables: &'a BTreeSet<String>,
+    block: u64,
+) -> impl Iterator<Item = (&'a str, &'a Segment)> {
+    manifest
+        .tables
+        .iter()
+        .filter(|(t, _)| tables.contains(*t))
+        .flat_map(|(t, segs)| segs.iter().map(move |s| (t.as_str(), s)))
+        .filter(move |(_, s)| s.from_block <= block)
+}
+
+/// A hash of [`read_set`] by table and segment hash (#2944), or `None` while one of them is a
+/// provisional tail, which a later seal replaces under another hash.
+pub fn read_set_hash(manifest: &Manifest, tables: &BTreeSet<String>, block: u64) -> Option<String> {
+    let mut lines = Vec::new();
+    for (t, s) in read_set(manifest, tables, block) {
+        if s.provisional {
+            return None;
+        }
+        lines.push(format!("{t}\t{}\n", s.hash));
+    }
+    lines.sort();
+    let mut h = Sha256::new();
+    for l in &lines {
+        h.update(l.as_bytes());
+    }
+    Some(hex::encode(h.finalize()))
+}
+
 /// What a `seal_range` call sealed.
 #[derive(Debug, Default)]
 pub struct SealSummary {

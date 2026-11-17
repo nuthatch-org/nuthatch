@@ -2241,6 +2241,7 @@ mod tests {
                 referenced_tables: None,
                 offchain: None,
                 labels: None,
+                segments: None,
                 scan_bound: None,
                 ipc: None,
             })
@@ -2307,6 +2308,7 @@ mod tests {
                 referenced_tables: None,
                 offchain: None,
                 labels: None,
+                segments: None,
                 scan_bound: None,
                 ipc: None,
             })
