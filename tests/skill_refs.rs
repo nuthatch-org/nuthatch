@@ -11,6 +11,99 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// #2982: the plugin manifests (`.claude-plugin/`, `.cursor-plugin/`, and the Agent Plugins
+/// `plugin.json` and `mcp.json` at the root) publish every directory under `skills/`, and
+/// `npx skills add` installs each one by its frontmatter `name`. A skill added there is therefore
+/// shipped, and must also be one whose flags `authored_files_only_mention_real_flags` checks.
+#[test]
+fn every_published_skill_is_named_for_its_directory_and_flag_checked() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir(root.join("skills")).unwrap().flatten() {
+        let dir = entry.file_name().to_string_lossy().to_string();
+        let Ok(text) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+            continue;
+        };
+        let front = text
+            .strip_prefix("---\n")
+            .and_then(|t| t.split("\n---\n").next())
+            .unwrap_or_else(|| panic!("skills/{dir}/SKILL.md has no frontmatter"));
+        let field = |key: &str| {
+            front
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            field("name:"),
+            dir,
+            "skills/{dir}/SKILL.md names another skill"
+        );
+        assert!(
+            !field("description:").is_empty(),
+            "skills/{dir}/SKILL.md has no description"
+        );
+        assert!(
+            nuthatch::skill::AUTHORED_SKILL_DIRS.contains(&format!("skills/{dir}").as_str()),
+            "skills/{dir} is published but not in AUTHORED_SKILL_DIRS"
+        );
+        seen.push(dir);
+    }
+    assert!(seen.len() >= 3, "{seen:?}");
+}
+
+#[test]
+fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
+    use clap::Parser;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let json = |p: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(root.join(p)).unwrap())
+            .unwrap_or_else(|e| panic!("{p}: {e}"))
+    };
+    let claude = json(".claude-plugin/plugin.json");
+    let agent = json("mcp.json");
+    for (file, server) in [
+        (
+            ".claude-plugin/plugin.json",
+            &claude["mcpServers"]["nuthatch"],
+        ),
+        ("mcp.json", &agent["mcpServers"]["nuthatch"]),
+    ] {
+        assert_eq!(server["command"], "nuthatch", "{file}");
+        let mut argv = vec!["nuthatch".to_string()];
+        argv.extend(
+            server["args"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{file} has no args"))
+                .iter()
+                .map(|a| a.as_str().unwrap().to_string()),
+        );
+        if let Err(e) = nuthatch::cli::Cli::try_parse_from(&argv) {
+            panic!(
+                "{file} starts `{}`, which the binary refuses: {e}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    let marketplace = json(".claude-plugin/marketplace.json");
+    assert_eq!(marketplace["plugins"][0]["name"], claude["name"]);
+    assert_eq!(marketplace["plugins"][0]["source"], "./");
+
+    let cursor = json(".cursor-plugin/plugin.json");
+    for key in ["rules", "skills", "mcpServers"] {
+        let path = cursor[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("cursor {key}"));
+        assert!(
+            root.join(path).exists(),
+            ".cursor-plugin/plugin.json {key}: {path} is missing"
+        );
+    }
+}
+
 fn skill_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(nuthatch::skill::SKILL_DIR)
 }

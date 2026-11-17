@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "nuthatch",
+  "description": "Index an EVM contract's events into a local SQL database with nuthatch, and query it over MCP. The MCP server needs the nuthatch binary on PATH and a running `nuthatch dev`.",
+  "author": {
+    "name": "nuthatch",
+    "url": "https://www.nuthatch-indexer.com"
+  },
+  "homepage": "https://www.nuthatch-indexer.com",
+  "repository": "https://github.com/nuthatch-org/nuthatch",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph", "nuthatch"]
+}
