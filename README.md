@@ -13,6 +13,7 @@ Base and BNB Chain, plus Gnosis, on your own RPC (Base and BNB Chain need an arc
 ```sh
 curl -fsSL https://nuthatch-indexer.com/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
+mkdir weth-nest && cd weth-nest
 nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth
 nuthatch dev --backfill 300
 ```
@@ -31,16 +32,37 @@ passes the rest of the line on as arguments.
 The Linux binary needs glibc 2.35 or newer to run from 4.1.0, which is also what it is built on;
 4.0.x ran on 2.34; older systems and Alpine have a static x86_64 build. On other platforms, build
 from source with Rust 1.95.0 ([docs/install.md](docs/install.md)).
-`init` creates a **nest**: a directory holding the contract's ABI, its config and, once `dev` runs,
-its indexed data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
+
+`mkdir weth-nest` is where the nest goes. `init` writes `nuthatch.toml`, `abis/` and the rest into
+the current directory, and an empty one keeps a home directory clear of them. `init` creates a
+**nest**: the directory, holding the contract's ABI, its config and, once `dev` runs, its indexed
+data. `--backfill 300` starts 300 blocks behind the tip, about an hour of mainnet, so there
 are rows to query within seconds on the bundled public endpoints. Without it, `dev` backfills from the
 contract's deployment block: for WETH that is 21 million blocks, a long backfill on free public endpoints
 and a job for your own RPC (`--rpc`).
 
-Those five lines, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
+That quickstart, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
 non-zero count in a clean macOS shell on an M5 Pro, and 21 s in a fresh `ubuntu:24.04` container
 ([docs/readme-check-2026-10-05.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/readme-check-2026-10-05.md), which records every command in
-this file).
+this file). The `mkdir` line is newer than that timing.
+
+### Bring your own RPC for real backfills
+
+The endpoints a new nest is given are for this try-out. On the bundled mainnet pair, `nuthatch doctor`
+reports `eth_getLogs` windows of 160 blocks (Tenderly) and 80 (mevblocker), and both are rate-limited.
+A 300-block window of USDC went over Tenderly's 20,000-log cap, so the same `--backfill 300` that
+finishes for WETH can stall on a busier contract.
+
+Use your own node or a paid endpoint. `--rpc` replaces the bundled pool. The first command below keeps
+the recent window. The second backfills from the deployment block:
+
+```sh
+nuthatch dev --backfill 300 --rpc https://your-endpoint.example
+nuthatch dev --rpc https://your-endpoint.example
+```
+
+The same URL can live in `nuthatch.toml` as `rpc_urls` instead of `--rpc`. More, including how to
+probe an endpoint first, is under [Bring your own RPC endpoint](#bring-your-own-rpc-endpoint).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
 |---|---|---|---|---|---|

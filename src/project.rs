@@ -174,14 +174,17 @@ async fn scaffold(args: InitArgs) -> Result<()> {
     println!("    llms.txt                   how an AI agent queries this index");
     println!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
     println!();
-    println!("next:  nuthatch dev{}", dir_hint(&args.dir));
-    if let Some(hint) = recent_history_hint(
+    // The line a person copies. On a long history (#1607) it is the last fifteen windows, which
+    // the bundled public RPCs can serve.
+    let step = next_step(
+        &args.dir,
         config.contracts.iter().filter_map(|c| c.start_block).min(),
         tip,
         chain.log_window,
-        &args.dir,
-    ) {
-        println!("{hint}");
+    );
+    println!("next:  {}", step.command);
+    if let Some(note) = step.note {
+        println!("       {note}");
     }
     println!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
@@ -2066,21 +2069,35 @@ fn scaffold_ai_surface_with(
     Ok(())
 }
 
-/// The line under `next:  nuthatch dev` when that command would backfill a long history (#1607): the
-/// same command over the last fifteen windows, which a public endpoint serves in seconds.
-fn recent_history_hint(
-    start: Option<u64>,
-    tip: Option<u64>,
-    window: u64,
-    dir: &str,
-) -> Option<String> {
-    let span = crate::indexer::long_backfill(start?, tip?, window)?;
+/// What `init` prints as the next command. A backfill longer than a thousand windows (#1607) is
+/// offered as the last fifteen of them, which a bundled public endpoint can serve, and told that
+/// the whole span is a job for the operator's own RPC. A short history, or one whose start or tip
+/// was not read, is offered plain `nuthatch dev`.
+struct NextStep {
+    command: String,
+    note: Option<String>,
+}
+
+fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> NextStep {
+    let dev = format!("nuthatch dev{}", dir_hint(dir));
+    let Some(span) = start
+        .zip(tip)
+        .and_then(|(start, tip)| crate::indexer::long_backfill(start, tip, window))
+    else {
+        return NextStep {
+            command: dev,
+            note: None,
+        };
+    };
     let recent = window.saturating_mul(15);
-    Some(format!(
-        "       nuthatch dev{} --backfill {recent}   (the last {recent} blocks only; without it, dev \
-         backfills {span} blocks from deployment)",
-        dir_hint(dir)
-    ))
+    NextStep {
+        command: format!("{dev} --backfill {recent}"),
+        note: Some(format!(
+            "(the last {recent} blocks, on the bundled public RPCs. A full backfill of {span} \
+             blocks from deployment needs your own RPC: {dev} --rpc=<url>, or rpc_urls in \
+             nuthatch.toml)"
+        )),
+    }
 }
 
 fn dir_hint(dir: &str) -> String {
@@ -2543,22 +2560,33 @@ mod tests {
         );
     }
 
-    /// #1607: the README demo, USDC from deployment, is offered its last 300 blocks; a nest with a
-    /// short history or no detected start is offered nothing.
+    /// #1607: the README demo, USDC from deployment, is offered `dev --backfill 300` as the command
+    /// to run, and told the full span needs the operator's own RPC. A nest with a short history or
+    /// no detected start is offered plain `dev`.
     #[test]
     fn init_offers_recent_history_only_beside_a_long_backfill() {
-        let hint = recent_history_hint(Some(6_082_465), Some(26_096_175), 20, "usdc").unwrap();
+        let step = next_step("usdc", Some(6_082_465), Some(26_096_175), 20);
+        assert_eq!(step.command, "nuthatch dev --dir usdc --backfill 300");
+        let note = step.note.expect("a long backfill names the full span");
+        assert!(note.contains("20013710 blocks from deployment"), "{note}");
         assert!(
-            hint.contains("nuthatch dev --dir usdc --backfill 300 "),
-            "{hint}"
+            note.contains("nuthatch dev --dir usdc --rpc=<url>"),
+            "{note}"
         );
-        assert!(hint.contains("20013710 blocks from deployment"), "{hint}");
-        assert_eq!(
-            recent_history_hint(Some(26_090_000), Some(26_096_175), 20, "."),
-            None
-        );
-        assert_eq!(recent_history_hint(None, Some(26_096_175), 20, "."), None);
-        assert_eq!(recent_history_hint(Some(6_082_465), None, 20, "."), None);
+        assert!(note.contains("rpc_urls in nuthatch.toml"), "{note}");
+        // e2e_bare_help treats any init line containing "rpc " as a tracing line that must use
+        // the `·` idiom. The flag is written `--rpc=<url>` so this note is not one of those lines.
+        assert!(!note.contains("rpc "), "{note}");
+
+        let short = next_step(".", Some(26_090_000), Some(26_096_175), 20);
+        assert_eq!(short.command, "nuthatch dev");
+        assert_eq!(short.note, None);
+        let no_tip = next_step(".", Some(6_082_465), None, 20);
+        assert_eq!(no_tip.command, "nuthatch dev");
+        assert_eq!(no_tip.note, None);
+        let no_start = next_step(".", None, Some(26_096_175), 20);
+        assert_eq!(no_start.command, "nuthatch dev");
+        assert_eq!(no_start.note, None);
     }
 
     #[test]
