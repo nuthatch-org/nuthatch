@@ -48,6 +48,10 @@ pub const RECIPES: &[Recipe] = &[
         about: "per UTC day: minted, burned, the Mint and Burn events beside them, and supply (#2943)",
     },
     Recipe {
+        name: "fiat_threshold",
+        about: "transfers above a fiat amount at the day's offchain rate, to unlabelled recipients (#2945)",
+    },
+    Recipe {
         name: "reserves",
         about: "Uniswap-V2 getReserves(): the latest Sync per pair (needs a `Sync` event) - no eth_call",
     },
@@ -187,6 +191,127 @@ pub fn mint_burn_daily_select(alias: &str) -> String {
     )
 }
 
+/// What the `fiat_threshold` recipe needs that the nest does not say (#2945).
+#[derive(Clone)]
+pub struct Fiat {
+    /// The threshold in the rate table's currency, as a decimal. A transfer above it is flagged.
+    pub amount: String,
+    /// The offchain table (`offchain drop` or `pull`) with `day` (`YYYY-MM-DD`, UTC) and `rate`
+    /// (currency per whole token) columns.
+    pub rates: String,
+    pub decimals: u32,
+    /// Labels whose addresses are already classified. A transfer to one is not flagged.
+    pub unless: Vec<String>,
+}
+
+impl Fiat {
+    fn check(&self) -> Result<()> {
+        let (whole, frac) = self.amount.split_once('.').unwrap_or((&self.amount, ""));
+        let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+        if whole.is_empty()
+            || whole.len() > 20
+            || !digits(whole)
+            || !digits(frac)
+            || frac.len() > 10
+        {
+            bail!(
+                "--amount must be a decimal like 1000 or 1000.50, under 10^20 and with at most 10 \
+                 decimal places"
+            );
+        }
+        if self.decimals > 30 {
+            bail!(
+                "--decimals {} is more than this recipe supports (30)",
+                self.decimals
+            );
+        }
+        crate::offchain::validate_table(&self.rates)?;
+        for l in &self.unless {
+            if l.is_empty() || l.chars().any(|c| c == '\'' || c.is_control()) {
+                bail!("--unless-label {l:?} is not a label name");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `SELECT` body of the `fiat_threshold` recipe: each transfer whose value, at its UTC day's rate,
+/// is above `amount`, and whose recipient carries none of the `unless` labels. Mints and burns are not
+/// transfers between parties and are left out. A transfer the rate table cannot price, because its day
+/// has no rate or two different ones, or because it moves 10^17 tokens or more, is returned with
+/// `priced = false` rather than passed over, and a rate that will not parse refuses the query.
+pub fn fiat_threshold_select(alias: &str, f: &Fiat) -> String {
+    let d = crate::analytics::exact_or_null("\"value\"", "HUGEINT");
+    let day = "DATE '1970-01-01' + CAST(block_timestamp // 86400 AS INTEGER)";
+    let scale = format!("CAST('1{}' AS HUGEINT)", "0".repeat(f.decimals as usize));
+    // Checked arithmetic refuses the whole query on an overflow, so no product here may overflow: whole
+    // tokens below 10^17 times the rate, plus the fraction cut to 10 places of a token.
+    let tenth = |n: u32| format!("CAST('1{}' AS HUGEINT)", "0".repeat(n as usize));
+    let frac10 = if f.decimals >= 10 {
+        format!("(t.value % {scale}) // {}", tenth(f.decimals - 10))
+    } else {
+        format!("(t.value % {scale}) * {}", tenth(10 - f.decimals))
+    };
+    let unless = if f.unless.is_empty() {
+        String::new()
+    } else {
+        let set = f
+            .unless
+            .iter()
+            .map(|l| format!("'{l}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // NOT IN over a NULL would hold for no row at all, so the NULLs are kept out of the set.
+        format!(
+            " AND t.recipient NOT IN (SELECT lower(address) FROM labels \
+               WHERE label IN ({set}) AND address IS NOT NULL)"
+        )
+    };
+    format!(
+        "SELECT block_number, log_index, block_timestamp, day, sender, recipient, value, rate, \
+           fiat_value, priced \
+         FROM (\
+           SELECT t.*, r.rate, \
+             CASE WHEN t.value // {scale} < 100000000000000000 THEN \
+               CAST(t.value // {scale} AS DECIMAL(38,0)) * r.rate \
+               + CAST({frac10} AS DECIMAL(38,0)) * r.rate / CAST('10000000000' AS DECIMAL(38,0)) \
+             END AS fiat_value, \
+             r.rate IS NOT NULL AND COALESCE(t.value // {scale} < 100000000000000000, false) AS priced \
+           FROM (SELECT block_number, log_index, block_timestamp, {day} AS day, \
+                   lower(\"from\") AS sender, lower(\"to\") AS recipient, {d} AS value \
+                 FROM \"{alias}__transfer\") t \
+           LEFT JOIN (SELECT day, CASE WHEN MIN(rate) = MAX(rate) AND COUNT(*) = COUNT(rate) \
+                        THEN MIN(rate) END AS rate \
+                      FROM (SELECT CAST(day AS DATE) AS day, \
+                              CAST(rate AS DECIMAL(20,10)) AS rate \
+                            FROM \"offchain__{rates}\") \
+                      GROUP BY day) r ON r.day = t.day \
+           WHERE t.sender <> '{ZERO_ADDRESS}' AND t.recipient <> '{ZERO_ADDRESS}'{unless}\
+         ) WHERE NOT priced OR fiat_value > CAST('{amount}' AS DECIMAL(38,10)) \
+         ORDER BY block_number, log_index",
+        rates = f.rates,
+        amount = f.amount,
+    )
+}
+
+fn fiat_threshold_view(alias: &str, f: &Fiat) -> String {
+    let unless = if f.unless.is_empty() {
+        "any recipient".to_string()
+    } else {
+        format!("a recipient labelled none of {}", f.unless.join(", "))
+    };
+    format!(
+        "-- Recipe: fiat_threshold (#2945) - transfers above {amount} at their UTC day's rate in\n\
+         -- offchain__{rates}, to {unless}. A transfer the table cannot price is listed with priced =\n\
+         -- false. Drop or pull the rates before querying; without them the view refuses by name.\n\
+         -- Query it: SELECT * FROM {alias}_fiat_threshold\n\
+         CREATE VIEW {alias}_fiat_threshold AS\n{};\n",
+        fiat_threshold_select(alias, f),
+        amount = f.amount,
+        rates = f.rates,
+    )
+}
+
 /// The authored `CREATE VIEW` SQL for a recipe over the given contract alias.
 pub fn view_sql(name: &str, alias: &str) -> Result<String> {
     match name {
@@ -242,6 +367,9 @@ pub fn view_sql(name: &str, alias: &str) -> Result<String> {
              CREATE VIEW {alias}_reserves AS\n{};\n",
             reserves_select(alias)
         )),
+        "fiat_threshold" => bail!(
+            "the fiat_threshold recipe needs --amount, --rates and --decimals (and any --unless-label)"
+        ),
         _ => bail!(
             "unknown recipe '{name}' - available: {}",
             RECIPES
@@ -264,12 +392,34 @@ pub fn list_cli() {
 
 /// `nuthatch recipe add <name> [--alias <a>] [--dir <d>]` - write a recipe's view into the nest's
 /// `views/`. `alias` defaults to the nest's first contract. Never clobbers an existing file.
-pub fn add_cli(dir: &Path, name: &str, alias: Option<&str>) -> Result<()> {
+pub fn add_cli(dir: &Path, name: &str, alias: Option<&str>, fiat: Option<&Fiat>) -> Result<()> {
     let alias = match alias {
         Some(a) => a.to_string(),
         None => Config::load(dir)?.primary()?.alias.clone(),
     };
-    let sql = view_sql(name, &alias)?;
+    let sql = match (name, fiat) {
+        ("fiat_threshold", Some(f)) => {
+            f.check()?;
+            if !crate::offchain::load(dir).is_ok_and(|c| c.tables.contains_key(&f.rates)) {
+                bail!(
+                    "there is no offchain table `{}`: `nuthatch offchain drop <file> --table {}` the \
+                     rates first",
+                    f.rates,
+                    f.rates
+                );
+            }
+            if !f.unless.is_empty() && !has_label_snapshot(dir) {
+                bail!(
+                    "--unless-label needs a label set: `nuthatch labels import <file>` one first"
+                );
+            }
+            fiat_threshold_view(&alias, f)
+        }
+        (_, Some(_)) => {
+            bail!("--amount, --rates, --decimals and --unless-label are for fiat_threshold")
+        }
+        _ => view_sql(name, &alias)?,
+    };
     if let Some(have) = nest_tables(dir) {
         let missing: Vec<String> = required_tables(name)
             .iter()
@@ -586,6 +736,90 @@ mod tests {
         );
     }
 
+    /// #2945: EUR 1,000 at each transfer's UTC day rate, to recipients no `vasp` label covers. The
+    /// first day's rate is 0.8, so 1,250 tokens is exactly EUR 1,000 and is not above it.
+    #[test]
+    fn the_fiat_threshold_flags_transfers_above_it_to_unlabelled_recipients() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let (a, b, v) = (
+            "0x00000000000000000000000000000000000000a1",
+            "0x00000000000000000000000000000000000000b2",
+            "0x00000000000000000000000000000000000000c3",
+        );
+        let day = 1_700_006_400u64;
+        let transfer = |block: u64, ts: u64, from: &str, to: &str, value: &str| {
+            serde_json::json!({
+                "table": "usdc__transfer", "block_number": block, "log_index": 0,
+                "block_timestamp": ts, "from": from, "to": to, "value": value,
+            })
+            .to_string()
+        };
+        let rows = vec![
+            transfer(1, day, ZERO_ADDRESS, a, "9000000000"),
+            transfer(2, day + 10, a, b, "1250000000"),
+            transfer(3, day + 20, a, b, "1250000001"),
+            transfer(4, day + 30, a, v, "5000000000"),
+            transfer(5, day + 86_400, a, b, "1250000001"),
+            transfer(6, day + 86_410, a, b, "2000000001"),
+            transfer(7, day + 172_800, a, b, "10"),
+            transfer(8, day + 40, a, b, "1000000000000000000000000000000"),
+        ];
+        crate::seal::seal_range(dir.path(), &rows, 1, 8).unwrap();
+        let rates = dir.path().join("eur.csv");
+        std::fs::write(&rates, "day,rate\n2023-11-15,0.8\n2023-11-16,0.5\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &rates, "eur").unwrap();
+        let labels = dir.path().join("vasps.csv");
+        std::fs::write(&labels, format!("address,label\n{v},vasp\n")).unwrap();
+        crate::labels::import(dir.path(), &labels).unwrap();
+        let fiat = Fiat {
+            amount: "1000".into(),
+            rates: "eur".into(),
+            decimals: 6,
+            unless: vec!["vasp".into()],
+        };
+
+        let got: Vec<(u64, bool)> =
+            crate::analytics::query(dir.path(), &fiat_threshold_select("usdc", &fiat))
+                .unwrap()
+                .iter()
+                .map(|r| (r["block_number"].as_u64().unwrap(), r["priced"] == true))
+                .collect();
+        assert_eq!(got, [(3, true), (6, true), (7, false), (8, false)]);
+        for decimals in [18, 30] {
+            let wide = Fiat {
+                decimals,
+                ..fiat.clone()
+            };
+            crate::analytics::query(dir.path(), &fiat_threshold_select("usdc", &wide))
+                .unwrap_or_else(|e| panic!("decimals {decimals}: {e:#}"));
+        }
+
+        let again = dir.path().join("eur2.csv");
+        std::fs::write(&again, "day,rate\n2023-11-16,0.6\n").unwrap();
+        crate::offchain::drop_file(dir.path(), &again, "eur").unwrap();
+        let unpriced: Vec<u64> =
+            crate::analytics::query(dir.path(), &fiat_threshold_select("usdc", &fiat))
+                .unwrap()
+                .iter()
+                .filter(|r| r["priced"] == false)
+                .map(|r| r["block_number"].as_u64().unwrap())
+                .collect();
+        assert_eq!(
+            unpriced,
+            [5, 6, 7, 8],
+            "two rates for one day price none of its transfers"
+        );
+
+        add_cli(dir.path(), "fiat_threshold", Some("usdc"), Some(&fiat)).unwrap();
+        std::fs::remove_dir_all(dir.path().join(crate::offchain::DIR)).unwrap();
+        let err =
+            crate::analytics::query(dir.path(), &fiat_threshold_select("usdc", &fiat)).unwrap_err();
+        assert!(format!("{err:#}").contains("offchain__eur"), "{err:#}");
+        let err = add_cli(dir.path(), "fiat_threshold", Some("usdc"), Some(&fiat)).unwrap_err();
+        assert!(err.to_string().contains("no offchain table `eur`"), "{err}");
+    }
+
     #[test]
     fn a_recipe_refuses_a_nest_without_the_events_it_reads() {
         let dir = tempfile::tempdir().unwrap();
@@ -594,20 +828,20 @@ mod tests {
             r#"{"tables":[{"table":"usdc__transfer"}]}"#,
         )
         .unwrap();
-        let err = add_cli(dir.path(), "frozen", Some("usdc"))
+        let err = add_cli(dir.path(), "frozen", Some("usdc"), None)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("usdc__blacklisted, usdc__un_blacklisted"),
             "{err}"
         );
-        add_cli(dir.path(), "total_supply", Some("usdc")).unwrap();
+        add_cli(dir.path(), "total_supply", Some("usdc"), None).unwrap();
     }
 
     #[test]
     fn the_outstanding_recipe_waits_for_a_label_set() {
         let dir = tempfile::tempdir().unwrap();
-        let err = add_cli(dir.path(), "outstanding", Some("usdc"))
+        let err = add_cli(dir.path(), "outstanding", Some("usdc"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("labels import"), "{err}");
