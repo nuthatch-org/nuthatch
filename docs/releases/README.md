@@ -17,9 +17,9 @@ If the notes file is missing when the tag is pushed, the `release-notes` job fai
 runs - no build, no empty release to edit afterward. There is no fallback to an empty body; a
 missing notes file is a build failure, not a warning.
 
-`server.json`, the MCP Registry entry, is bumped in the same PR: its `version` and its `ghcr.io/nuthatch-org/nuthatch:<version>` image tag. `scripts/version-check.sh` checks both, and a unit
-test fails the release PR's CI if they lag. Once the tag's image is published, run the manual `mcp registry`
-workflow to publish the entry.
+`server.json`, the MCP Registry entry, is bumped in the same PR: its `version`, its `ghcr.io/nuthatch-org/nuthatch:<version>` image tag and its npm package's `version`, with `npm/package.json`. `scripts/version-check.sh` checks all four, and a unit
+test fails the release PR's CI if they lag. Once the tag's image and npm package are published, run the manual `mcp registry`
+workflow to publish the entry: the registry refuses an entry whose npm version does not exist yet.
 
 No em dashes - spaced hyphen, matching the rest of the project's public-facing prose.
 

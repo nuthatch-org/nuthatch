@@ -91,6 +91,16 @@ else
   echo "server.json: STALE (version $reg_version, image tag $reg_image, expected $WANT)"; fail=$((fail + 1))
 fi
 
+# The npm launcher downloads the release named by its own version, so a stale package.json hands
+# `npx` users an old binary. server.json's npm entry names the same version.
+npm_pkg=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' npm/package.json | head -1)
+reg_npm=$(sed -n '/"registryType": "npm"/,/"version"/s/^ *"version": "\([^"]*\)".*/\1/p' server.json | head -1)
+if [ "$npm_pkg" = "$WANT" ] && [ "$reg_npm" = "$WANT" ]; then
+  echo "npm/package.json: OK ($npm_pkg)"
+else
+  echo "npm/package.json: STALE (package $npm_pkg, server.json npm entry $reg_npm, expected $WANT)"; fail=$((fail + 1))
+fi
+
 # SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). Each release now
 # restates the policy for itself ("when 5.20.0 is released, 5.19 keeps ..."), so the section may name
 # only the current minor and the one before it; any other line it names is a regression.

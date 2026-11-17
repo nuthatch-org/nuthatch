@@ -43,6 +43,35 @@
           "isRequired": false
         }
       ]
+    },
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "nuthatch-indexer",
+      "version": "5.22.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "command",
+          "value": "mcp"
+        },
+        {
+          "type": "named",
+          "name": "--url",
+          "description": "Base URL of the running `nuthatch dev` HTTP API; for a runtime hosting several nests, one mount of it (http://host:port/<alias>)",
+          "default": "http://127.0.0.1:8288"
+        },
+        {
+          "type": "named",
+          "name": "--token-env",
+          "description": "Name of an environment variable holding a bearer token, for a nest behind a gateway that wants one",
+          "isRequired": false
+        }
+      ]
     }
   ]
 }

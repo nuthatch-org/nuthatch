@@ -45,6 +45,10 @@ nuthatch mcp --print-config
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 
+Without installing first, the npm launcher downloads the release binary, checks its SHA-256 and
+runs it: `npx -y nuthatch-indexer mcp --url http://127.0.0.1:8288`, and the same for any other
+command (`npx -y nuthatch-indexer init 0x...`).
+
 A runtime hosting several nests serves nothing at its root: point `--url` at one mount, `http://127.0.0.1:8288/<alias>` (or `/<tenant>/<alias>`). `GET /nests` lists them.
 
 Stdio server bridging to a running `nuthatch dev`. Works offline against the local instance.

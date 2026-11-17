@@ -582,3 +582,48 @@ jobs:
           echo "published $GITHUB_REF_NAME"
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets \
             --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets | length)"'
+
+  # #2985: the npm launcher, by trusted publishing (no stored token). Skipped until a maintainer has
+  # made the first publish by hand and set the variable NPM_PUBLISH (npm/README.md).
+  npm:
+    name: publish the npm launcher
+    needs: publish
+    if: github.event_name == 'push' && vars.NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: pin the release's digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: npm
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          have=$(node -p 'require("./package.json").version')
+          [ "$have" = "$v" ] || { echo "::error::npm/package.json is $have, the tag is $v"; exit 1; }
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'nuthatch-*.tar.gz.sha256' -D sums
+          node scripts/checksums.js sums > checksums.json
+          cat checksums.json
+      - name: publish
+        working-directory: npm
+        run: |
+          set -euo pipefail
+          # As with the image's :latest, a patch to an older line must not move `latest` back to it.
+          v="${GITHUB_REF_NAME#v}"
+          now=$(npm view nuthatch-indexer dist-tags.latest 2>/dev/null || true)
+          tag=latest
+          case "$v" in
+            *-*) tag=next ;;
+            *) if [ -n "$now" ] && [ "$(printf '%s\n%s\n' "$now" "$v" | sort -V | tail -1)" != "$v" ]; then
+                 tag="line-${v%.*}"
+               fi ;;
+          esac
+          echo "publishing $v as $tag (latest is ${now:-unset})"
+          npm publish --provenance --access public --tag "$tag"
