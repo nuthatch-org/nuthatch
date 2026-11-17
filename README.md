@@ -4,6 +4,7 @@
 > subgraph to write, and an MCP server built in.
 
 [![ci](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml/badge.svg)](https://github.com/nuthatch-org/nuthatch/actions/workflows/ci.yml)
+[![nuthatch-org/nuthatch MCP server](https://glama.ai/mcp/servers/nuthatch-org/nuthatch/badges/score.svg)](https://glama.ai/mcp/servers/nuthatch-org/nuthatch)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
 **Also:** self-hosted Etherscan-compatible history for the chains that lost their free tier.
