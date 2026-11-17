@@ -743,7 +743,10 @@ mod tests {
     #[test]
     fn the_suggested_range_survives_a_non_2xx() {
         assert_eq!(
-            super::classify_status(400, ALCHEMY_400_BODY),
+            super::classify_status(
+                400,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range and no limit on the response size, or you can request any block range with a cap of 10K logs in the response. Based on your parameters and the response size limit, this block range should work: [0x1000000, 0x1007fff]"}}"#,
+            ),
             super::FailureClass::Narrowable {
                 suggested: Some((0x1000000, 0x1007fff)),
                 escalated_from_rate_limit: false,
@@ -3454,6 +3457,11 @@ mod rfc0036_tests {
             (
                 200,
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade your subscription at https://nodies.app/pricing for larger ranges."}}"#,
+            ),
+            // Alchemy, as measured for ALCHEMY_400_BODY: the "Log response size exceeded" page.
+            (
+                400,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range and no limit on the response size, or you can request any block range with a cap of 10K logs in the response. Based on your parameters and the response size limit, this block range should work: [0x1000000, 0x1007fff]"}}"#,
             ),
             // eth.blockrazor.xyz
             (

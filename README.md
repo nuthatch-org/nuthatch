@@ -222,14 +222,6 @@ measured, not taken from the provider's documentation:
 nuthatch doctor --rpc https://your-endpoint.example --address 0xADDR
 ```
 
-Got here from an `eth_getLogs` error? The common ones each have a page, quoted as providers send them:
-[`query returned more than 10000 results`](https://nuthatch-indexer.com/docs/errors/query-returned-more-than-10000-results/),
-[`Log response size exceeded`](https://nuthatch-indexer.com/docs/errors/log-response-size-exceeded/),
-[`exceed maximum block range`](https://nuthatch-indexer.com/docs/errors/exceed-maximum-block-range/),
-[`query timeout exceeded`](https://nuthatch-indexer.com/docs/errors/query-timeout-exceeded/),
-[`limit exceeded` on BNB Chain](https://nuthatch-indexer.com/docs/errors/bnb-chain-limit-exceeded/) and
-Etherscan's [`Free API access is not supported for this chain`](https://nuthatch-indexer.com/docs/errors/free-api-access-is-not-supported-for-this-chain/).
-
 **Use your own endpoint for anything you care about** - your own node, or a paid provider:
 
 ```sh

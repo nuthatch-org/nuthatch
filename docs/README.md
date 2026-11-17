@@ -26,9 +26,6 @@ not to infer work that remains.
 
 ## Operating and verifying nuthatch
 
-- [getLogs errors](https://nuthatch-indexer.com/docs/errors/query-returned-more-than-10000-results/) -
-  one page per RPC or explorer error people search for, on the website; the refusals they say
-  nuthatch narrows for are pinned by `the_refusals_the_error_pages_quote_narrow` in `src/rpc.rs`.
 - [Production readiness](prod-readiness.md)
 - [Verification](verification.md)
 - [Production guide](production.md)
