@@ -253,11 +253,17 @@ impl Config {
             );
         }
         let path = dir.join(CONFIG_FILE);
-        let raw = std::fs::read_to_string(&path).with_context(|| {
-            format!(
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            let absent = e.kind() == std::io::ErrorKind::NotFound;
+            let e = anyhow::Error::new(e).context(format!(
                 "no {CONFIG_FILE} in {} - run `nuthatch init` first",
                 dir.display()
-            )
+            ));
+            if absent {
+                crate::cli_error::tag(crate::cli_error::Code::NoNest, e)
+            } else {
+                e
+            }
         })?;
         // v2 first; fall back to migrating a v1 file.
         let cfg = match toml::from_str::<Config>(&raw) {

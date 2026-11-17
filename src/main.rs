@@ -32,6 +32,7 @@ use nuthatch::{
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
+use nuthatch::cli_error::Code;
 use std::io::{IsTerminal as _, Write as _};
 
 #[tokio::main]
@@ -63,7 +64,11 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
 
-    let cli = cli::Cli::parse();
+    let cli = match cli::Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => nuthatch::cli_error::refuse_usage(e, &argv),
+    };
+    let (reaches, json_errors) = nuthatch::cli_error::for_command(&cli.command);
 
     let filter = || {
         tracing_subscriber::EnvFilter::try_from_default_env()
@@ -78,6 +83,8 @@ async fn main() -> Result<()> {
     let data_on_stdout = matches!(cli.command, cli::Command::Fold(_));
     #[cfg(not(feature = "folds"))]
     let data_on_stdout = false;
+    // So do the logs of a command printing JSON there.
+    let data_on_stdout = data_on_stdout || json_errors;
     let writer = || {
         if data_on_stdout {
             tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
@@ -119,7 +126,14 @@ async fn main() -> Result<()> {
     }
 
     nuthatch::count::alive(&cli.command); // RFC-0054 hook
-    match cli.command {
+    if let Err(e) = run(cli.command).await {
+        std::process::exit(nuthatch::cli_error::report(&e, reaches, json_errors));
+    }
+    Ok(())
+}
+
+async fn run(command: cli::Command) -> Result<()> {
+    match command {
         cli::Command::Init(args) => project::init(args).await,
         cli::Command::Count(a) => nuthatch::count::run(a).await, // RFC-0054 hook
         cli::Command::Add(args) => project::add(args).await,
@@ -908,6 +922,31 @@ fn sql_failure_message(raw: &str) -> String {
     format!("{hint}\n\n{first}")
 }
 
+/// A refused query as [`sql_failure_message`] prints it, tagged `sql_invalid` with its hint as the
+/// next step when the query itself was at fault.
+fn sql_refusal(raw: &str, invalid: bool) -> anyhow::Error {
+    let err = anyhow::anyhow!("{}", sql_failure_message(raw));
+    if !invalid {
+        return err;
+    }
+    match raw.split_once("\n\nhint: ") {
+        Some((_, hint)) => nuthatch::cli_error::tag_with_next(
+            Code::SqlInvalid,
+            nuthatch::sql_errors::for_surface(hint, nuthatch::sql_errors::Surface::Http),
+            err,
+        ),
+        None => nuthatch::cli_error::tag(Code::SqlInvalid, err),
+    }
+}
+
+/// A local query stopped by a limit, which says nothing about the SQL.
+fn query_was_cut_short(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<analytics::QueryBudgetExceeded>().is_some()
+        || e.downcast_ref::<analytics::QuerySpillExceeded>().is_some()
+        || e.downcast_ref::<analytics::QueryMemoryExceeded>().is_some()
+        || e.downcast_ref::<analytics::QueryEngineFault>().is_some()
+}
+
 /// Where `nuthatch sql` queries run: the local store (when `dev` is stopped) or the running instance's
 /// HTTP API (when `dev` holds the single-writer redb). Opened once, so a REPL reuses one connection.
 enum SqlBackend {
@@ -1128,7 +1167,7 @@ impl SqlBackend {
                             Some(h) => format!("{raw}\n\nhint: {h}"),
                             None => raw,
                         };
-                        anyhow::bail!("{}", sql_failure_message(&full))
+                        Err(sql_refusal(&full, !query_was_cut_short(&e)))
                     }
                 }
             }
@@ -1152,19 +1191,31 @@ impl SqlBackend {
                             db.display()
                         ),
                         None => format!("querying {url} - is `nuthatch dev` running?"),
+                    })
+                    .map_err(|e| {
+                        // No store, no config and nothing answering: this is not a nest at all.
+                        let no_nest = absent_store.as_ref().is_some_and(|db| {
+                            db.parent().is_some_and(|d| {
+                                !d.join(config::CONFIG_FILE).exists()
+                                    && !d.join(nuthatch::runtime::MOUNTS_FILE).exists()
+                            })
+                        });
+                        let code = if no_nest {
+                            Code::NoNest
+                        } else {
+                            Code::NestNotRunning
+                        };
+                        nuthatch::cli_error::tag(code, e)
                     })?;
                 let status = resp.status();
                 let body: serde_json::Value =
                     resp.json().await.context("reading the API response")?;
                 if !status.is_success() {
-                    anyhow::bail!(
-                        "{}",
-                        sql_failure_message(
-                            body.get("error")
-                                .and_then(|e| e.as_str())
-                                .unwrap_or("query failed")
-                        )
-                    );
+                    let raw = body
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("query failed");
+                    return Err(sql_refusal(raw, status == reqwest::StatusCode::BAD_REQUEST));
                 }
                 let rows = body
                     .get("rows")
