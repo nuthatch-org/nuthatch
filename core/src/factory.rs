@@ -163,6 +163,20 @@ impl FactorySet {
                     f.template
                 );
             }
+            // The registry holds one template per child address, so the second rule's would never
+            // decode a log (#2958).
+            if let Some(other) = entry.iter().find(|r| r.child_param == f.child_param) {
+                bail!(
+                    "factory rules on '{}' event '{}' give child_param '{}' two templates, '{}' and \
+                     '{}': a child takes one template, so the second would index nothing. Declare \
+                     one template whose ABI holds both contracts' events",
+                    f.watch,
+                    f.event,
+                    f.child_param,
+                    other.template,
+                    f.template
+                );
+            }
             entry.push(FactoryRule {
                 child_param: f.child_param.clone(),
                 template: f.template.clone(),

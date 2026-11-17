@@ -462,4 +462,16 @@ template = "switchable_beacon""#,
             "must name the problem: {err}"
         );
     }
+
+    /// #2958: one announced address given two templates kept the first and left the second's tables
+    /// empty, without a word. Refused at load, naming both templates.
+    #[test]
+    fn one_child_param_with_two_templates_is_refused() {
+        let two = MULTI.replace(r#"child_param = "proxy""#, r#"child_param = "beacon""#);
+        let err = FactorySet::build(&cfg(&two)).unwrap_err().to_string();
+        assert!(
+            err.contains("two templates, 'switchable_beacon' and 'module_proxy'"),
+            "{err}"
+        );
+    }
 }
