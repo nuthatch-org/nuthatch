@@ -1,0 +1,4 @@
+# harness output, envio runs 1 and 2 (RPC mode, eth.drpc.org)
+run 1: first query 25.78 s, ready 186.36 s
+run 2: first query 26.90 s, ready 245.69 s
+{"_meta":{"progressBlock":26400999,"isReady":true,"eventsProcessed":49354},"t":33329,"a":2630,"d":5810,"w":7585}  (both runs)

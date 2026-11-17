@@ -1,0 +1,5 @@
+install: 3.96 s, nuthatch 5.22.0, sha256 a4f9d304e21b372fd167f5ac4cca2309e3b4db442c2d6ec1facbc2ef8a28f9a7
+run 1: init 2.25 s, first query 0.97 s, range indexed 15.17 s after dev started; approval=2630 deposit=5810 transfer=33329 withdrawal=7585 total=49354 (ok)
+run 2: init 2.53 s, first query 0.96 s, range indexed 15.97 s after dev started; approval=2630 deposit=5810 transfer=33329 withdrawal=7585 total=49354 (ok)
+run 3: init 2.41 s, first query 1.20 s, range indexed 38.91 s after dev started; approval=2630 deposit=5810 transfer=33329 withdrawal=7585 total=49354 (ok)
+logs: <work dir>

@@ -1,0 +1,15 @@
+--- config.yaml as envio init wrote it
++++ config.yaml as run
+@@ -3,7 +3,11 @@
+ disable_default_cross_chain: true
+ chains:
+ - id: 1
+-  start_block: 0
++  start_block: 26400000
++  end_block: 26400999
++  rpc:
++  - url: https://eth.drpc.org
++    for: sync
+   contracts:
+   - name: WETH
+     address:

@@ -1,0 +1,4 @@
+# harness output, ponder runs 1 and 2
+run 1: first query 2.78 s, ready 228.76 s
+run 2: first query 3.02 s, ready 203.54 s
+{"data":{"t":{"totalCount":33329},"a":{"totalCount":2630},"d":{"totalCount":5810},"w":{"totalCount":7585}}}  (both runs)

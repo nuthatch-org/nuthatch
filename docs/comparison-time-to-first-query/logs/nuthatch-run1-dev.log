@@ -1,0 +1,9 @@
+# nuthatch dev, run 1, untrimmed
+2026-11-17T21:27:56.246098Z  INFO mainnet blocks every 12050ms; polling every 300s (--poll-interval overrides)
+2026-11-17T21:27:56.251856Z  INFO admin token in ./.admin-token; open http://127.0.0.1:8301/_admin/?token=<redacted>
+2026-11-17T21:27:56.293704Z  INFO indexing nest 'run1' on mainnet: 1 contract(s), 4 table(s), 0 anonymous skipped, finality Depth(64), window 20, registry 0b5732a3bd91…
+2026-11-17T21:27:56.305744Z  INFO API live on http://127.0.0.1:8301  (try GET /  and  /metrics)
+2026-11-17T21:27:56.369238Z  INFO cold start: backfilling from block 26400000 (from deployment) (tip 26437453)
+2026-11-17T21:27:56.369267Z  INFO that is 37453 blocks of history; to index only the last 300 instead, stop, remove ./nuthatch.redb and ./segments, and rerun with `--backfill 300`
+2026-11-17T21:27:56.430950Z  INFO following, behind tip block=26399999 tip=26437453 blocks_behind=37454
+2026-11-17T21:28:11.195667Z  INFO shutdown signal received; API stopped

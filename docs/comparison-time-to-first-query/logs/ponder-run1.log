@@ -1,0 +1,294 @@
+# ponder dev, run 1. Filter: ANSI stripped, only Ponder's timestamped log lines kept (the terminal UI
+# and the multi-line error bodies are dropped; each 429 body read 'You reached Public endpoint rate
+# limit'). 117 HTTP 429s in the untrimmed log. The final UI frame is at the end.
+23:30:54.728 INFO  Connected to database type=pglite database=.ponder/pglite (495ms)
+23:30:54.997 INFO  Connected to JSON-RPC chain=mainnet hostnames=["eth.drpc.org"] (267ms)
+23:30:55.595 INFO  Created database tables count=4 tables=["transfer","approval","deposit","withdrawal"] (22ms)
+23:30:55.599 INFO  Started migrating 'ponder_rpc_cache_1' schema statement_count=12
+23:30:55.611 INFO  Migrated 'ponder_rpc_cache_1' schema (12ms)
+23:30:55.625 INFO  Created HTTP server port=42069 (4ms)
+23:30:55.625 INFO  Started returning 200 responses endpoint=/health
+23:30:55.818 INFO  Started backfill indexing chain=mainnet block_range=[26400000,26400999]
+23:30:55.818 INFO  Started fetching backfill JSON-RPC data chain=mainnet cached_block=26399999 cache_rate=0.0%
+23:30:56.384 INFO  Indexed block range chain=mainnet event_count=1113 block_range=[26400000,26400025] (15ms)
+23:30:58.185 INFO  Indexed block range chain=mainnet event_count=1225 block_range=[26400026,26400051] (12ms)
+23:31:00.301 INFO  Indexed block range chain=mainnet event_count=1705 block_range=[26400052,26400090] (26ms)
+23:31:00.818 INFO  Updated backfill indexing progress progress=9.0%
+23:31:01.360 INFO  Indexed block range chain=mainnet event_count=1324 block_range=[26400091,26400116] (12ms)
+23:31:02.447 INFO  Indexed block range chain=mainnet event_count=1174 block_range=[26400117,26400142] (13ms)
+23:31:04.240 INFO  Indexed block range chain=mainnet event_count=1252 block_range=[26400143,26400168] (11ms)
+23:31:05.587 INFO  Indexed block range chain=mainnet event_count=1240 block_range=[26400169,26400194] (14ms)
+23:31:05.817 INFO  Updated backfill indexing progress progress=19.3%
+23:31:07.624 INFO  Indexed block range chain=mainnet event_count=1229 block_range=[26400195,26400220] (11ms)
+23:31:08.912 INFO  Indexed block range chain=mainnet event_count=1262 block_range=[26400221,26400246] (11ms)
+23:31:08.967 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:08.967 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e2624073-8692-4188-bd03-3bc817b71938 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5f7",true]} retry_count=1 retry_delay=125 (69ms)
+23:31:08.969 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=da777bba-6ea4-40cb-beb8-929655b25eb3 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fa",true]} retry_count=1 retry_delay=125 (70ms)
+23:31:08.973 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=cb262ee6-6a67-474c-be82-04493659bad9 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=1 retry_delay=125 (74ms)
+23:31:08.974 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=77aa1d63-299d-4b14-ac87-482b8c5664dd method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fb",true]} retry_count=1 retry_delay=125 (75ms)
+23:31:09.366 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:09.366 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=07de8d09-aa72-405d-b655-286a50346c30 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d608",true]} retry_count=1 retry_delay=125 (283ms)
+23:31:09.366 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c109962b-1db5-484b-8b82-4e88de739aaf method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=1 retry_delay=125 (283ms)
+23:31:09.367 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=48e6342a-9b22-43a0-aa81-e5b8aca28ecc method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fb",true]} retry_count=2 retry_delay=250 (268ms)
+23:31:09.367 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=8836a282-6564-443a-b918-56d862a51325 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=1 retry_delay=125 (283ms)
+23:31:09.373 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=d46d0b6a-0c4b-4696-ac6c-86804544e5a7 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=1 retry_delay=125 (289ms)
+23:31:09.373 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=f4e649ff-706d-4f82-91b9-725fc364ea37 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fa",true]} retry_count=2 retry_delay=250 (278ms)
+23:31:09.375 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=92d9d2f7-3ed9-492d-ae41-6265d4cc7545 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=2 retry_delay=250 (276ms)
+23:31:09.375 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=307c22bb-6065-4e16-a4bc-c3d123cefd81 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5f7",true]} retry_count=2 retry_delay=250 (282ms)
+23:31:09.375 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0f764d83-33a9-4ddb-a403-4502c4762b51 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=1 retry_delay=125 (292ms)
+23:31:09.375 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0355c7d8-f1a7-417e-8838-92ff060c6b2d method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60f",true]} retry_count=1 retry_delay=125 (292ms)
+23:31:09.376 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e3aeccb0-327b-4824-88ff-92a124198053 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=1 retry_delay=125 (292ms)
+23:31:10.063 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:10.063 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2a595bb4-d906-4d50-8925-75e23e4f15e7 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d608",true]} retry_count=2 retry_delay=250 (62ms)
+23:31:10.070 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=79a3d808-0df2-40f4-b3f9-a4c44a2d1eac method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fb",true]} retry_count=3 retry_delay=500 (65ms)
+23:31:10.077 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=236f17a6-4c4c-480d-8563-ce2799f81c6a method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=2 retry_delay=250 (73ms)
+23:31:10.079 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b421150a-71d5-48cb-bc1e-62b9fe935712 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=2 retry_delay=250 (72ms)
+23:31:10.079 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=fe67de53-91de-470b-a547-98743fbd543e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=2 retry_delay=250 (73ms)
+23:31:10.079 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=49d57103-9920-4f8f-8732-14ce3b94679e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=2 retry_delay=250 (75ms)
+23:31:10.080 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b0beb907-7430-407d-9d01-fe1e34b6353f method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60f",true]} retry_count=2 retry_delay=250 (73ms)
+23:31:10.080 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=02a5a398-048a-481c-abc1-aad2a2c9a526 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=2 retry_delay=250 (73ms)
+23:31:10.080 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=79cd3cc5-c180-4267-8554-9b01c7173924 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5f7",true]} retry_count=3 retry_delay=500 (71ms)
+23:31:10.080 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=6c1e16b6-f9d6-4685-a442-f495b7e2cc8b method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fa",true]} retry_count=3 retry_delay=500 (73ms)
+23:31:10.080 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c133ca02-0c2e-41c6-a0e1-6ec63b22238a method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=3 retry_delay=500 (73ms)
+23:31:10.817 INFO  Updated backfill indexing progress progress=24.5% estimate=38s
+23:31:11.081 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:11.081 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0350bb2c-9728-4b56-9e31-2d0184a27be9 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=3 retry_delay=500 (78ms)
+23:31:11.086 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=ba91bdaf-c3f9-47f3-8156-2eafd3790c99 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=3 retry_delay=500 (82ms)
+23:31:11.088 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0b02ed4d-a119-4e0d-8600-d6c0718121d0 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=3 retry_delay=500 (84ms)
+23:31:11.088 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=bb855652-3e33-4b17-bcc2-b429a11eca9e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=3 retry_delay=500 (84ms)
+23:31:12.082 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:12.083 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c52f567b-7525-41a5-a05b-897924a7bf4e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=4 retry_delay=1000 (72ms)
+23:31:12.084 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=37973d5e-05ca-40cd-9ad9-c5cadd598785 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=4 retry_delay=1000 (72ms)
+23:31:12.085 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=49f536c3-7396-4358-8857-9bb69615ec74 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=4 retry_delay=1000 (72ms)
+23:31:12.087 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=abd31344-26a9-4883-8f70-4bd378de5316 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=4 retry_delay=1000 (74ms)
+23:31:13.146 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:13.146 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=8c239125-775a-43fe-ac67-e35ec31328d6 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=5 retry_delay=2000 (64ms)
+23:31:13.149 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e18db2dd-756e-494b-a8aa-c657da3453aa method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=5 retry_delay=2000 (64ms)
+23:31:13.157 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=a77869ed-d9fd-4b48-aab8-f376621351fd method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=5 retry_delay=2000 (71ms)
+23:31:13.159 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=13f961b7-60ec-442c-bea4-378291d2bd61 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=5 retry_delay=2000 (72ms)
+23:31:15.224 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:15.224 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=fe9a1532-602b-484c-90d6-634f386391f9 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=6 retry_delay=4000 (78ms)
+23:31:15.226 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e5de025f-073a-40ea-9dd5-12565fa94aa3 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=6 retry_delay=4000 (77ms)
+23:31:15.229 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=4f4eb436-f7d0-4403-b09f-3a4aa7818dc4 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=6 retry_delay=4000 (71ms)
+23:31:15.229 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=d63e0d0b-535f-42f3-87db-b3a0b14de5cd method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=6 retry_delay=4000 (70ms)
+23:31:15.817 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:17.597 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400247,26400272] (10s)
+23:31:18.888 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400273,26400298] (10s)
+23:31:19.304 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:19.304 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=ca4f529c-f5b6-4b7c-b25e-595fd9b75650 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=7 retry_delay=8000 (78ms)
+23:31:19.306 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c10eb4c1-e96d-414b-ba13-ced9b9d7bae2 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=7 retry_delay=8000 (76ms)
+23:31:19.308 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=856b2e58-5687-4e78-97d5-98e092ae54f7 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=7 retry_delay=8000 (83ms)
+23:31:19.310 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b54cc69a-7509-4a4b-bb7e-89b9c2c9c067 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=7 retry_delay=8000 (80ms)
+23:31:20.817 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:24.236 WARN  All JSON-RPC providers are inactive due to rate limiting chain=mainnet rate_limits=[13.931829057070303]
+23:31:25.314 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[13.931829057070303] is_active=[true] is_warming_up=[true] (15s)
+23:31:25.329 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[13.931829057070303] is_active=[true] is_warming_up=[true] (15s)
+23:31:25.570 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[13.931829057070303] is_active=[true] is_warming_up=[true] (15s)
+23:31:25.580 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[13.931829057070303] is_active=[true] is_warming_up=[true] (15s)
+23:31:25.581 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[13.931829057070303] is_active=[true] is_warming_up=[true] (15s)
+23:31:25.817 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:27.464 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:27.465 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c99ef0c4-c84d-4c73-830d-ed112dd89483 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60d",true]} retry_count=8 retry_delay=16000 (160ms)
+23:31:27.480 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c737f92d-cf30-48ce-a31c-ff9bca9cd460 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=3 retry_delay=500 (167ms)
+23:31:27.481 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=1cc2affd-2ab2-4217-9f45-5d45234e87b3 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60f",true]} retry_count=3 retry_delay=500 (169ms)
+23:31:27.482 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=44100de5-5790-4ac0-aaf6-7678d544221b method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fb",true]} retry_count=4 retry_delay=1000 (169ms)
+23:31:28.702 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:28.702 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=3a2940de-8918-4620-bf82-ddce016004ec method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=4 retry_delay=1000 (97ms)
+23:31:28.706 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=df9823eb-1a88-4ea7-b9c7-9c78ed69b133 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60f",true]} retry_count=4 retry_delay=1000 (100ms)
+23:31:28.708 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=9643a121-e0e8-408c-951e-bae24ba2532e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d608",true]} retry_count=3 retry_delay=500 (100ms)
+23:31:30.499 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:30.500 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e03581c2-2097-447e-8f71-f1fa81c16f64 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5f7",true]} retry_count=4 retry_delay=1000 (87ms)
+23:31:30.502 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b6359536-717a-42a0-9d08-0517292a7f01 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fa",true]} retry_count=4 retry_delay=1000 (89ms)
+23:31:30.504 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=ac2bda6c-3526-4af6-88a7-3c9842a51e43 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=4 retry_delay=1000 (91ms)
+23:31:30.818 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:33.257 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:33.257 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e1724cd1-983c-46f2-9cb6-a8fb5772b778 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=5 retry_delay=2000 (193ms)
+23:31:33.257 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b5ae112f-7259-4d3e-858d-2703e2b1e269 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d610",true]} retry_count=8 retry_delay=16000 (189ms)
+23:31:33.258 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=aec33c1b-2be5-42b9-95ce-d04712cfcf51 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=8 retry_delay=16000 (189ms)
+23:31:35.819 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:37.169 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:37.169 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=15100c2a-5e75-4a03-b88d-a1153966fe03 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d602",true]} retry_count=6 retry_delay=4000 (66ms)
+23:31:40.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:42.105 WARN  All JSON-RPC providers are inactive due to rate limiting chain=mainnet rate_limits=[10.780183748869597]
+23:31:42.305 WARN  JSON-RPC request unexpectedly surpassed timeout action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c99ef0c4-c84d-4c73-830d-ed112dd89483 method=eth_getBlockByNumber (15s)
+23:31:42.313 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.780183748869597] is_active=[true] is_warming_up=[true] (15s)
+23:31:42.321 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:42.321 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e11d5b4a-2879-4262-b5ae-26c6a935e270 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=5 retry_delay=2000 (150ms)
+23:31:43.483 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.241174561426117] is_active=[false] is_warming_up=[false] (15s)
+23:31:44.209 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.241174561426117] is_active=[false] is_warming_up=[false] (15s)
+23:31:44.708 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.241174561426117] is_active=[false] is_warming_up=[false] (15s)
+23:31:45.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:46.501 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.241174561426117] is_active=[false] is_warming_up=[false] (15s)
+23:31:46.503 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[10.241174561426117] is_active=[false] is_warming_up=[false] (15s)
+23:31:47.174 WARN  All JSON-RPC providers are inactive due to rate limiting chain=mainnet rate_limits=[10.241174561426117]
+23:31:47.464 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:47.465 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e16270ce-8de2-40cd-82f2-323f14939960 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d611","toBlock":"0x192d62a"}]} retry_count=6 retry_delay=4000 (140ms)
+23:31:47.476 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0e2cc8e6-c803-495e-9986-bbc1ac7dfda2 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60e",true]} retry_count=8 retry_delay=16000 (136ms)
+23:31:48.069 WARN  JSON-RPC request unexpectedly surpassed timeout action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b5ae112f-7259-4d3e-858d-2703e2b1e269 method=eth_getBlockByNumber (15s)
+23:31:48.070 WARN  JSON-RPC request unexpectedly surpassed timeout action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=aec33c1b-2be5-42b9-95ce-d04712cfcf51 method=eth_getBlockByNumber (15s)
+23:31:50.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:52.341 WARN  All JSON-RPC providers are inactive due to rate limiting chain=mainnet rate_limits=[9.729115833354811]
+23:31:52.619 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:31:52.620 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=90039f98-255e-4c79-9bb6-de0125a58289 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d60c",true]} retry_count=9 retry_delay=32000 (146ms)
+23:31:52.641 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=d58bfbfd-80cb-43b3-983c-aa612300734c method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5f7",true]} retry_count=5 retry_delay=2000 (165ms)
+23:31:52.642 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b504d0fc-a70f-4ce7-a593-91b040f71ce0 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d5fb",true]} retry_count=5 retry_delay=2000 (167ms)
+23:31:55.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:31:56.170 WARN  Unable to find available JSON-RPC provider within expected time action=fetch_block_data chain=mainnet rate_limit=[9.24266004168707] is_active=[false] is_warming_up=[false] (15s)
+23:31:57.476 WARN  All JSON-RPC providers are inactive due to rate limiting chain=mainnet rate_limits=[9.24266004168707]
+23:32:00.819 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:32:02.341 WARN  JSON-RPC request unexpectedly surpassed timeout action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0e2cc8e6-c803-495e-9986-bbc1ac7dfda2 method=eth_getBlockByNumber (15s)
+23:32:05.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:32:07.475 WARN  JSON-RPC request unexpectedly surpassed timeout action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=90039f98-255e-4c79-9bb6-de0125a58289 method=eth_getBlockByNumber (15s)
+23:32:10.819 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:32:15.819 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:32:20.820 INFO  Updated backfill indexing progress progress=24.5% estimate=55s
+23:32:24.873 INFO  Indexed block range chain=mainnet event_count=912 block_range=[26400247,26400272] (10ms)
+23:32:25.819 INFO  Updated backfill indexing progress progress=27.2% estimate=14m 22s
+23:32:26.346 INFO  Indexed block range chain=mainnet event_count=1061 block_range=[26400273,26400298] (15ms)
+23:32:29.347 INFO  Indexed block range chain=mainnet event_count=1062 block_range=[26400299,26400324] (10ms)
+23:32:30.820 INFO  Updated backfill indexing progress progress=32.4% estimate=8m 38s
+23:32:32.364 INFO  Indexed block range chain=mainnet event_count=1274 block_range=[26400325,26400350] (21ms)
+23:32:35.532 INFO  Indexed block range chain=mainnet event_count=1273 block_range=[26400351,26400376] (21ms)
+23:32:35.819 INFO  Updated backfill indexing progress progress=37.5% estimate=5m 48s
+23:32:38.375 INFO  Indexed block range chain=mainnet event_count=1169 block_range=[26400377,26400402] (17ms)
+23:32:40.820 INFO  Updated backfill indexing progress progress=40.1% estimate=3m 56s
+23:32:41.279 INFO  Indexed block range chain=mainnet event_count=1129 block_range=[26400403,26400428] (9ms)
+23:32:44.267 INFO  Indexed block range chain=mainnet event_count=1548 block_range=[26400429,26400454] (14ms)
+23:32:45.820 INFO  Updated backfill indexing progress progress=45.5% estimate=2m 38s
+23:32:46.351 INFO  Indexed block range chain=mainnet event_count=1390 block_range=[26400455,26400480] (10ms)
+23:32:49.328 INFO  Indexed block range chain=mainnet event_count=1069 block_range=[26400481,26400506] (9ms)
+23:32:50.821 INFO  Updated backfill indexing progress progress=50.7% estimate=1m 50s
+23:32:52.121 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:52.121 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0d756605-0ffe-4d3d-8793-843eaf7092e6 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d714",true]} retry_count=1 retry_delay=125 (103ms)
+23:32:52.391 INFO  Indexed block range chain=mainnet event_count=981 block_range=[26400507,26400532] (11ms)
+23:32:52.447 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:52.447 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2b743b79-9f70-4307-8ca6-bc0ab9462c6f method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d715",true]} retry_count=1 retry_delay=125 (71ms)
+23:32:52.450 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2797bb1f-0cbf-43f4-8d3e-829fd3531566 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d716",true]} retry_count=1 retry_delay=125 (73ms)
+23:32:54.119 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:54.119 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=dbc900dd-86d6-4ac9-bffd-f654333042f2 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d723",true]} retry_count=1 retry_delay=125 (102ms)
+23:32:54.119 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0e5cc7cf-1fe3-419f-abd6-f00ede8de3dc method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d724",true]} retry_count=1 retry_delay=125 (101ms)
+23:32:54.121 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=b97a9d86-4163-47d7-857f-3fa0823bfa7d method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d726",true]} retry_count=1 retry_delay=125 (101ms)
+23:32:54.125 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=554237fe-6123-4d31-ba6f-9c78d3af29cc method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d727",true]} retry_count=1 retry_delay=125 (105ms)
+23:32:54.131 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=9a1d42e1-5955-4af8-bdb9-66c442d9567e method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d72b",true]} retry_count=1 retry_delay=125 (110ms)
+23:32:55.076 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:55.076 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=f39f1703-b764-4efb-a374-0f42517a2e03 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d72e",true]} retry_count=1 retry_delay=125 (74ms)
+23:32:55.082 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=831cc6ff-011f-4c05-b365-527b2ec0ba4f method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d72f","toBlock":"0x192d748"}]} retry_count=1 retry_delay=125 (80ms)
+23:32:55.083 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0f0ef0f5-278b-49a2-9b14-cccf9f61852a method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d715",true]} retry_count=2 retry_delay=250 (81ms)
+23:32:55.083 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=db96cfff-9276-4c42-b1d1-321130d2fc97 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d72d",true]} retry_count=1 retry_delay=125 (82ms)
+23:32:55.821 INFO  Updated backfill indexing progress progress=53.3% estimate=1m 40s
+23:32:56.084 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:56.084 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=63964306-9caa-4a7d-a5ab-d1a79f8befe3 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d72d",true]} retry_count=2 retry_delay=250 (68ms)
+23:32:57.082 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:32:57.082 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2ea9dbc8-a9c3-48db-b00d-01f25fcfb6c5 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d723",true]} retry_count=2 retry_delay=250 (80ms)
+23:32:57.087 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=6ccbb236-f0d6-40b8-9a79-088bf8c0ab88 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d724",true]} retry_count=2 retry_delay=250 (84ms)
+23:32:57.088 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=9d388221-7976-480a-a77b-23a064e744f5 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d715",true]} retry_count=3 retry_delay=500 (85ms)
+23:32:57.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=43d4ab08-3d1a-4178-b58d-da313705be36 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d726",true]} retry_count=2 retry_delay=250 (86ms)
+23:32:57.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=f1aceea3-a5d6-48e2-abb1-31bee43a5787 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d727",true]} retry_count=2 retry_delay=250 (86ms)
+23:32:57.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=87bf8045-a0bc-4ef5-9e8a-47e032d56d4d method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d72d",true]} retry_count=3 retry_delay=500 (69ms)
+23:32:58.474 INFO  Indexed block range chain=mainnet event_count=1221 block_range=[26400533,26400558] (11ms)
+23:33:00.821 INFO  Updated backfill indexing progress progress=55.9% estimate=1m 32s
+23:33:02.255 INFO  Indexed block range chain=mainnet event_count=1248 block_range=[26400559,26400584] (10ms)
+23:33:05.821 INFO  Updated backfill indexing progress progress=58.5% estimate=1m 25s
+23:33:06.291 INFO  Indexed block range chain=mainnet event_count=1352 block_range=[26400585,26400610] (12ms)
+23:33:10.174 INFO  Indexed block range chain=mainnet event_count=1270 block_range=[26400611,26400636] (18ms)
+23:33:10.822 INFO  Updated backfill indexing progress progress=63.7% estimate=52s
+23:33:14.256 INFO  Indexed block range chain=mainnet event_count=1522 block_range=[26400637,26400662] (21ms)
+23:33:15.822 INFO  Updated backfill indexing progress progress=66.3% estimate=54s
+23:33:17.609 INFO  Indexed block range chain=mainnet event_count=1798 block_range=[26400663,26400688] (20ms)
+23:33:20.822 INFO  Updated backfill indexing progress progress=68.9% estimate=53s
+23:33:21.343 INFO  Indexed block range chain=mainnet event_count=1310 block_range=[26400689,26400714] (10ms)
+23:33:25.319 INFO  Indexed block range chain=mainnet event_count=1445 block_range=[26400715,26400740] (12ms)
+23:33:25.821 INFO  Updated backfill indexing progress progress=74.1% estimate=46s
+23:33:29.328 INFO  Indexed block range chain=mainnet event_count=1641 block_range=[26400741,26400766] (22ms)
+23:33:30.822 INFO  Updated backfill indexing progress progress=76.7% estimate=35s
+23:33:33.296 INFO  Indexed block range chain=mainnet event_count=1632 block_range=[26400767,26400792] (19ms)
+23:33:35.823 INFO  Updated backfill indexing progress progress=79.3% estimate=34s
+23:33:37.252 INFO  Indexed block range chain=mainnet event_count=1276 block_range=[26400793,26400818] (11ms)
+23:33:39.130 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:39.131 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=45f6fcd0-b770-405b-872f-666881b0c1f8 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=1 retry_delay=125 (114ms)
+23:33:39.136 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=92cb4bd4-7da0-4779-9a28-c509fa79fcb2 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d83f",true]} retry_count=1 retry_delay=125 (120ms)
+23:33:40.087 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:40.087 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=95a0b4fb-b2c3-4152-9790-c69b85e25612 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=1 retry_delay=125 (82ms)
+23:33:40.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=510fe048-c821-48ee-94e4-d14456633479 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d848",true]} retry_count=1 retry_delay=125 (84ms)
+23:33:40.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=83fb8c07-01fd-4e78-98dc-5af3ea2f31f9 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d846",true]} retry_count=1 retry_delay=125 (85ms)
+23:33:40.089 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=88347534-1263-41a1-8a4c-66de9e15df78 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84b",true]} retry_count=1 retry_delay=125 (83ms)
+23:33:40.824 INFO  Updated backfill indexing progress progress=81.9% estimate=32s
+23:33:41.103 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:41.103 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2802315e-ad59-4568-8ad5-f8d8c7624e71 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=2 retry_delay=250 (97ms)
+23:33:41.108 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0821bf1b-4984-4986-817d-321ae6d56b88 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d848",true]} retry_count=2 retry_delay=250 (102ms)
+23:33:41.108 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=db029319-c29c-45bb-94b1-03864e8d7cbf method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d846",true]} retry_count=2 retry_delay=250 (102ms)
+23:33:41.109 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=dd3709ce-ffa6-495d-90e2-0e2a3686b6c2 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84b",true]} retry_count=2 retry_delay=250 (102ms)
+23:33:41.110 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=ea333859-6898-4cfb-b6d1-2b05f75fc717 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d84d","toBlock":"0x192d866"}]} retry_count=1 retry_delay=125 (95ms)
+23:33:41.114 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=82f5fc3b-040b-423a-b6c6-11e7ad4be925 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84c",true]} retry_count=1 retry_delay=125 (99ms)
+23:33:42.108 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:42.108 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=7604d65c-e924-416c-9fb5-b0f4cccbf073 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=3 retry_delay=500 (105ms)
+23:33:42.110 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e376f838-7333-4c7b-a477-c9fbff772f95 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=2 retry_delay=250 (107ms)
+23:33:42.110 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=64a9fab4-c859-4834-b998-b78d4358d19f method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d84d","toBlock":"0x192d866"}]} retry_count=2 retry_delay=250 (106ms)
+23:33:42.111 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=2958a1d4-b7d8-4e07-8b29-91cc102b4a90 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d848",true]} retry_count=3 retry_delay=500 (104ms)
+23:33:43.068 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:43.068 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c506cb10-f376-4a02-9e1d-f159acf07660 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84b",true]} retry_count=3 retry_delay=500 (67ms)
+23:33:43.073 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=0c378652-2c33-4ff7-8f1b-3df950761c68 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=3 retry_delay=500 (67ms)
+23:33:43.075 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=10480073-5f9d-4488-acc5-6526d4a1854d method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84c",true]} retry_count=2 retry_delay=250 (69ms)
+23:33:43.096 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=145b46b3-bc79-4f79-8ee5-18d54ccd4bc9 method=eth_getLogs request={"method":"eth_getLogs","params":[{"address":"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2","topics":[["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef","0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925","0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c","0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"]],"fromBlock":"0x192d84d","toBlock":"0x192d866"}]} retry_count=3 retry_delay=500 (87ms)
+23:33:43.262 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400819,26400844] (9s)
+23:33:44.086 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:44.087 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=6d484761-2c2b-4240-9016-98e98b6e1e65 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d848",true]} retry_count=4 retry_delay=1000 (71ms)
+23:33:44.093 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=24905a07-75b8-4b65-a4c6-166f563ee10a method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=4 retry_delay=1000 (77ms)
+23:33:45.065 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:45.065 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=ebc20c43-2bc9-4e82-a924-a6e856edc19f method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84c",true]} retry_count=3 retry_delay=500 (57ms)
+23:33:45.066 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=107dfbf3-78a5-4361-bcd8-50fabf63f570 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84b",true]} retry_count=4 retry_delay=1000 (57ms)
+23:33:45.824 INFO  Updated backfill indexing progress progress=81.9% estimate=32s
+23:33:46.070 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:46.070 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=331fcad3-f5f6-4bf0-9347-46d257e7d05a method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=4 retry_delay=1000 (67ms)
+23:33:46.077 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=c93a07a9-3535-4a68-b617-e73fed717f18 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=5 retry_delay=2000 (68ms)
+23:33:46.173 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=e826988e-7051-4e52-8a4b-4e8a37f66d7f method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d84b",true]} retry_count=5 retry_delay=2000 (108ms)
+23:33:47.137 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:47.137 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=a4181e70-b8fa-4eda-8f6d-af2be501dc98 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=5 retry_delay=2000 (66ms)
+23:33:47.255 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400845,26400870] (9s)
+23:33:48.150 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:48.151 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=f6b8d416-2e61-457a-b806-07e0f1756d21 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=6 retry_delay=4000 (74ms)
+23:33:49.195 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:49.195 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=9ed3231a-06bf-4745-9c0e-0e06a787cff0 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=6 retry_delay=4000 (58ms)
+23:33:50.824 INFO  Updated backfill indexing progress progress=81.9% estimate=32s
+23:33:52.230 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:52.231 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=656ab009-ebeb-4310-b8bc-ccb471ea460f method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d847",true]} retry_count=7 retry_delay=8000 (80ms)
+23:33:53.287 WARN  All JSON-RPC providers are inactive action=fetch_block_data chain=mainnet
+23:33:53.287 WARN  Received JSON-RPC error action=fetch_block_data chain=mainnet hostname=eth.drpc.org request_id=4ed5d9ef-78e3-4c28-aa8c-a15256838b13 method=eth_getBlockByNumber request={"method":"eth_getBlockByNumber","params":["0x192d842",true]} retry_count=7 retry_delay=8000 (92ms)
+23:33:55.824 INFO  Updated backfill indexing progress progress=81.9% estimate=32s
+23:34:00.825 INFO  Updated backfill indexing progress progress=81.9% estimate=32s
+23:34:01.509 INFO  Indexed block range chain=mainnet event_count=1370 block_range=[26400819,26400844] (19ms)
+23:34:05.824 INFO  Updated backfill indexing progress progress=84.5% estimate=1m 01s
+23:34:07.337 INFO  Indexed block range chain=mainnet event_count=1338 block_range=[26400845,26400870] (19ms)
+23:34:10.825 INFO  Updated backfill indexing progress progress=87.1% estimate=43s
+23:34:11.474 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400871,26400896] (10s)
+23:34:14.219 INFO  Indexed block range chain=mainnet event_count=1337 block_range=[26400871,26400896] (20ms)
+23:34:15.825 INFO  Updated backfill indexing progress progress=89.6% estimate=32s
+23:34:17.340 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400897,26400922] (9s)
+23:34:20.825 INFO  Updated backfill indexing progress progress=89.6% estimate=32s
+23:34:21.263 INFO  Indexed block range chain=mainnet event_count=1286 block_range=[26400897,26400922] (20ms)
+23:34:24.189 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400923,26400948] (10s)
+23:34:25.825 INFO  Updated backfill indexing progress progress=92.3% estimate=22s
+23:34:27.287 INFO  Indexed block range chain=mainnet event_count=1321 block_range=[26400923,26400948] (17ms)
+23:34:30.826 INFO  Updated backfill indexing progress progress=94.9% estimate=14s
+23:34:31.266 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400949,26400974] (9s)
+23:34:34.288 INFO  Indexed block range chain=mainnet event_count=1327 block_range=[26400949,26400974] (13ms)
+23:34:35.826 INFO  Updated backfill indexing progress progress=97.5% estimate=6s
+23:34:38.192 WARN  Fetching backfill JSON-RPC data is taking longer than expected chain=mainnet block_range=[26400975,26400999] (10s)
+23:34:40.826 INFO  Updated backfill indexing progress progress=97.5% estimate=6s
+23:34:41.212 INFO  Finished fetching backfill JSON-RPC data chain=mainnet (3m 45s)
+23:34:41.235 INFO  Indexed block range chain=mainnet event_count=1268 block_range=[26400975,26400999] (12ms)
+23:34:42.309 INFO  Completed backfill indexing across all chains (3m 46s)
+23:34:42.322 INFO  Started returning 200 responses endpoint=/ready
+23:34:42.322 INFO  Skipped live indexing (chain only requires backfill indexing) chain=mainnet end_block=26400999
+23:34:42.322 INFO  Completed indexing across all chains (3m 46s)
+23:34:42.438 WARN  Received SIGTERM
+23:34:42.438 WARN  Started shutdown sequence
+# final frame
+│ WETH:Withdrawal │  7585 │         0.002 │
+│ Chain   │ Status   │ Block    │ RPC (req/s) │
+│ mainnet │ complete │ 26400999 │         3.9 │
+│ Event           │ Count │ Duration (ms) │
+│ WETH:Transfer   │ 33329 │         0.002 │
+│ WETH:Approval   │  2630 │         0.003 │
+│ WETH:Deposit    │  5810 │         0.003 │
+│ WETH:Withdrawal │  7585 │         0.002 │

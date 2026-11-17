@@ -1,0 +1,117 @@
+# graph-node 0.45.0 arm64 build, eth.drpc.org. Filter: per-block lines (Scanning, Scanned, Found,
+# Start/Done processing, Applying) dropped; everything else kept.
+Waiting for IPFS (ipfs:5001)
+Waiting for Postgres (postgres:5432)
+Nov 17 21:59:28.030 INFO Connecting to IPFS server at 'ipfs:5001'
+Nov 17 21:59:28.047 INFO Successfully connected to IPFS RPC API at: 'ipfs:5001'
+Nov 17 21:59:28.048 INFO Graph Node version: 0.45.0 (2026-11-11)
+Nov 17 21:59:28.048 WARN GRAPH_POI_ACCESS_TOKEN not set; might leak POIs to the public via GraphQL
+Nov 17 21:59:28.048 INFO Generating configuration from command line arguments
+Nov 17 21:59:28.048 WARN No fork base URL specified, subgraph forking is disabled
+Nov 17 21:59:28.048 INFO Starting up, node_id: default
+Nov 17 21:59:28.048 INFO No [log_store] section in config, log queries will return empty results
+Nov 17 21:59:28.054 WARN Expensive queries file not set to a valid file: /etc/graph-node/expensive-queries.txt
+Nov 17 21:59:28.079 INFO Connecting to Postgres, weight: 1, conn_pool_size: 10, url: postgresql://graph-node:HIDDEN_PASSWORD@postgres:5432/graph-node?sslmode=prefer, pool: main, shard: primary
+Nov 17 21:59:28.079 INFO Pool successfully connected to Postgres, pool: main, shard: primary, component: Store
+Nov 17 21:59:28.089 INFO Dropping cross-shard views, pool: main, shard: primary, component: ConnectionPool
+Nov 17 21:59:28.104 INFO Setting up fdw, pool: main, shard: primary, component: ConnectionPool
+Nov 17 21:59:28.108 INFO Running migrations, pool: main, shard: primary, component: ConnectionPool
+Nov 17 21:59:28.108 INFO Migrations finished, pool: main, shard: primary, component: ConnectionPool
+Nov 17 21:59:28.109 INFO Creating cross-shard views, pool: main, shard: primary, component: ConnectionPool
+Nov 17 21:59:28.178 INFO Setup finished, shards: 1
+Nov 17 21:59:28.188 WARN Missing graphman server auth token; graphman server will not start
+Nov 17 21:59:28.188 WARN Amp-powered subgraphs disabled
+Nov 17 21:59:28.188 INFO Creating transport, compression: none, capabilities: archive, traces, url: https://eth.drpc.org, provider: mainnet-rpc-0
+Nov 17 21:59:28.191 INFO All network providers have checks enabled. To be considered valid they will have to pass the following checks: [ExtendedBlocksCheck]
+Nov 17 21:59:28.191 INFO All network providers have checks enabled. To be considered valid they will have to pass the following checks: [ExtendedBlocksCheck]
+Nov 17 21:59:28.191 INFO Creating LoadManager in disabled mode, component: LoadManager
+Nov 17 21:59:28.191 INFO Creating block ingestor, network_name: mainnet
+Nov 17 21:59:28.191 INFO Starting block ingestor for network, kind: ethereum, network_name: mainnet
+Nov 17 21:59:28.191 INFO Starting JSON-RPC admin server at: http://localhost:8020, component: JsonRpcServer
+Nov 17 21:59:28.192 INFO Starting job runner with 5 jobs, component: JobRunner
+Nov 17 21:59:28.192 INFO Starting GraphQL HTTP server at: http://localhost:8000, component: GraphQLServer
+Nov 17 21:59:28.192 INFO Starting metrics server at: http://localhost:8040, component: MetricsServer
+Nov 17 21:59:28.192 INFO Starting index node server at: http://localhost:8030, component: IndexNodeServer
+Nov 17 21:59:28.192 INFO Started all assigned subgraphs, node_id: default, count: 1, component: SubgraphRegistrar
+Nov 17 21:59:28.193 INFO Resolve subgraph files using IPFS, n_templates: 0, n_data_sources: 1, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 21:59:28.195 INFO Successfully resolved subgraph files using IPFS, features: ø, n_templates: 0, n_data_sources: 1, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 21:59:28.199 INFO Starting subgraph writer, queue_size: 5, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 21:59:28.202 INFO Data source count at start: 1, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 21:59:30.087 INFO JSON-RPC call, x_forwarded_proto: unset, x_real_ip: unset, x_forwarded_for: unset, remote_addr: 172.19.0.1:48698, params: Some(Object {"name": String("weth")}), method: subgraph_create, component: JsonRpcServer
+Nov 17 21:59:30.265 INFO Syncing 85 blocks from Ethereum, code: BlockIngestionLagging, blocks_needed: 85, blocks_behind: 85, latest_block_head: 26437610, current_block_head: 26437525, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 21:59:30.570 INFO Checking eth_getBlockReceipts support, provider: mainnet-rpc-0, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 21:59:30.779 INFO Provider supports block receipts, provider: mainnet-rpc-0, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 21:59:31.237 INFO JSON-RPC call, x_forwarded_proto: unset, x_real_ip: unset, x_forwarded_for: unset, remote_addr: 172.19.0.1:48710, params: Some(Object {"ipfs_hash": String("QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH"), "name": String("weth"), "version_label": String("v0.0.1")}), method: subgraph_deploy, component: JsonRpcServer
+Nov 17 21:59:31.349 INFO Set subgraph start block, block: Some(#26399999 (8af9b61cb6958e86e46c294acf26259de1a24418cc3cbc155d853cfaf84f5181)), sgd: 0, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphRegistrar
+Nov 17 21:59:31.349 INFO Graft base, block: None, base: None, sgd: 0, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphRegistrar
+Nov 17 22:00:40.619 INFO Syncing 6 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 6, blocks_behind: 6, latest_block_head: 26437616, current_block_head: 26437610, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:00:44.481 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437615, current_block_head: 26437616, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:00:49.846 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437617, current_block_head: 26437616, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:01:03.370 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437618, current_block_head: 26437617, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:01:13.577 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437619, current_block_head: 26437618, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:01:24.928 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437620, current_block_head: 26437619, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:01:39.867 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437621, current_block_head: 26437620, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:01:51.118 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437622, current_block_head: 26437621, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:04.558 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437623, current_block_head: 26437622, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:07.272 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437622, current_block_head: 26437623, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:16.893 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437624, current_block_head: 26437623, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:18.372 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437624, current_block_head: 26437623, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:19.871 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437623, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:20.949 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437623, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:22.023 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437623, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:24.183 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437623, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:24.630 INFO Committed write batch, time_ms: 165, weight: 9999776, entities: 14075, block_count: 305, block_number: 26400304, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:02:26.393 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437625, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:28.074 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437625, current_block_head: 26437624, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:46.171 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437626, current_block_head: 26437625, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:47.680 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437626, current_block_head: 26437625, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:49.114 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437627, current_block_head: 26437626, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:02:50.682 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437627, current_block_head: 26437626, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:01.968 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437628, current_block_head: 26437627, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:03.624 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437627, current_block_head: 26437628, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:04.697 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437627, current_block_head: 26437628, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:06.869 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437627, current_block_head: 26437628, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:13.320 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437629, current_block_head: 26437628, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:25.532 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437630, current_block_head: 26437629, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:03:30.319 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437630, current_block_head: 26437629, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:04:01.499 INFO Syncing 3 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 3, blocks_behind: 3, latest_block_head: 26437633, current_block_head: 26437630, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:04:13.535 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437634, current_block_head: 26437633, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:04:24.768 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437635, current_block_head: 26437634, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:00.559 INFO Syncing 3 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 3, blocks_behind: 3, latest_block_head: 26437638, current_block_head: 26437635, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:03.158 INFO Syncing 3 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 3, blocks_behind: 3, latest_block_head: 26437638, current_block_head: 26437635, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:07.466 INFO Committed write batch, time_ms: 166, weight: 10012232, entities: 13863, block_count: 291, block_number: 26400595, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:05:14.680 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437639, current_block_head: 26437638, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:24.935 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437640, current_block_head: 26437639, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:26.543 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437640, current_block_head: 26437639, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:05:37.550 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437641, current_block_head: 26437640, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:06:07.947 INFO Syncing 2 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 2, blocks_behind: 2, latest_block_head: 26437643, current_block_head: 26437641, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:06:15.255 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437644, current_block_head: 26437643, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:06:26.375 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437645, current_block_head: 26437644, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:06:36.590 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437646, current_block_head: 26437645, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:06:38.000 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437646, current_block_head: 26437645, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:15.090 INFO Syncing 3 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 3, blocks_behind: 3, latest_block_head: 26437649, current_block_head: 26437646, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:18.260 INFO Committed write batch, time_ms: 174, weight: 10040459, entities: 13469, block_count: 231, block_number: 26400826, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:07:18.262 INFO Start pruning historical entities, latest_block: 26400826, earliest_block: 26400326, history_blocks: 500, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager > Prune
+Nov 17 22:07:18.336 INFO Finished pruning entities, analyze_time_s: 0, time_s: 0, rows_copied: 0, rows_deleted: 325, tables: [poi2$], runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager > Prune
+Nov 17 22:07:20.954 INFO Committed write batch, time_ms: 13, weight: 186634, entities: 254, block_count: 4, block_number: 26400830, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:07:26.834 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437650, current_block_head: 26437649, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:28.401 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437649, current_block_head: 26437650, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:38.178 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437651, current_block_head: 26437650, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:49.427 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437652, current_block_head: 26437651, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:07:51.076 INFO Committed write batch, time_ms: 70, weight: 4092687, entities: 5695, block_count: 112, block_number: 26400942, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:07:51.077 INFO Start pruning historical entities, latest_block: 26400942, earliest_block: 26400442, history_blocks: 500, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager > Prune
+Nov 17 22:07:51.156 INFO Finished pruning entities, analyze_time_s: 0, time_s: 0, rows_copied: 0, rows_deleted: 115, tables: [poi2$], runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager > Prune
+Nov 17 22:08:22.162 INFO Syncing 2 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 2, blocks_behind: 2, latest_block_head: 26437654, current_block_head: 26437652, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:29.441 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437655, current_block_head: 26437654, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:32.144 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437654, current_block_head: 26437655, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:33.321 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437654, current_block_head: 26437655, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:35.462 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437654, current_block_head: 26437655, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:38.687 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437656, current_block_head: 26437655, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:41.269 WARN Provider went backwards - ignoring this latest block, latest_block_head: 26437655, current_block_head: 26437656, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:08:41.476 INFO Committed write batch, time_ms: 34, weight: 1968998, entities: 2720, block_count: 51, block_number: 26400993, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:08:42.923 INFO Stopping subgraph as maximum endBlock reached, current_block: 26400999, max_end_block: 26400999, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:08:42.923 INFO Stopping subgraph - max end block reached, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:08:42.930 INFO Committed write batch, time_ms: 6, weight: 199495, entities: 275, block_count: 6, block_number: 26400999, runner_index: 0, sgd: 1, subgraph_id: QmbjqZuTEhEyH1c7nuXCmRhf2W6kH7aMPtm1dACC5tbcVH, component: SubgraphInstanceManager
+Nov 17 22:08:50.472 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437657, current_block_head: 26437656, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:09:00.614 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437658, current_block_head: 26437657, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor
+Nov 17 22:09:01.999 INFO Syncing 1 blocks from Ethereum, code: BlockIngestionStatus, blocks_needed: 1, blocks_behind: 1, latest_block_head: 26437658, current_block_head: 26437657, provider: mainnet-rpc-0, component: EthereumPollingBlockIngestor

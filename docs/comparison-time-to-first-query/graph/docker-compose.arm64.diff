@@ -1,0 +1,11 @@
+--- docker-compose.yml (graph-node v0.45.0, ethereum set to eth.drpc.org)
++++ docker-compose.yml as run on Apple Silicon
+@@ -1,7 +1,7 @@
+ version: '3'
+ services:
+   graph-node:
+-    image: graphprotocol/graph-node
++    image: ghcr.io/nuthatch-org/graph-node:v0.45.0
+     ports:
+       - '8000:8000'
+       - '8001:8001'
