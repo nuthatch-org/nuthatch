@@ -384,6 +384,8 @@ pub struct SqlFacts<'a> {
     pub reproducible_by_snapshot: bool,
     /// The offchain snapshots it read, where it read any.
     pub offchain: Option<Value>,
+    /// The label set it read, where it read `labels` (#2961).
+    pub labels: Option<&'a str>,
 }
 
 /// One maintained relation in `/sql`'s `provenance.entities`: `through` is the watermark captured with
@@ -431,6 +433,9 @@ pub fn sql_envelope(f: &SqlFacts, rows: Value) -> Value {
         }
         if let Some(read) = &f.offchain {
             provenance.insert("offchain".into(), read.clone());
+        }
+        if let Some(labels) = f.labels {
+            provenance.insert("labels_sha256".into(), json!(labels));
         }
     }
     response

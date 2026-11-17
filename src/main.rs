@@ -1213,6 +1213,7 @@ impl SqlBackend {
                     // does not carry the set. `None` says "not known" rather than "none".
                     referenced_tables: None,
                     offchain: None,
+                    labels: None,
                     scan_bound: None,
                     ipc: None,
                 })
@@ -1502,6 +1503,7 @@ mod tests {
             tip_unavailable: false,
             referenced_tables: None,
             offchain: None,
+            labels: None,
             scan_bound: None,
             ipc: None,
         }

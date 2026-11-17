@@ -2076,11 +2076,13 @@ TFR Art 26, 31 CFR 1010.430, FATF R.11), and then for personal data to go.
 - *How an answer is kept.* An evidence bundle (#2944) records one answer with the NID, the
   registry hash and a hash of the rows, and verifying it re-asks any nest of that NID, a
   mirror-seeded one included. A bundle holds whatever its statement selected, so it is yours to
-  retain or delete. The NID does not pin a label set, so a statement that reads `labels` or exposure
-  verifies only against a nest holding the same set; keep chain-only statements in evidence that
-  must outlive a deletion. A bundle made before this release over a nest that held labels names
-  that nest's old NID, which no current nest reports; its rows still reproduce at the same block,
-  so make it again against the upgraded nest and keep both.
+  retain or delete. The NID does not pin a label set, so a bundle whose rows read `labels`, directly
+  or through a view, records the set's `labels_sha256` (#2961), and verifying it against a nest
+  holding another set, or none, fails as `labels:`; keep chain-only statements in evidence that must
+  outlive a deletion. A verifier older than that release refuses such a bundle outright. A bundle
+  made before #2946 over a nest that held labels names that nest's old NID, which no current nest
+  reports; its rows still reproduce at the same block, so make it again against the upgraded nest
+  and keep both.
 - *Label sets are not part of the nest.* `labels/` and `labels.manifest.json` count toward neither
   the NID nor the data identity, no sealed byte is derived from them, bundles do not carry them and
   the mirror does not copy them. Exposure is rebuilt from them in memory at start, maintained views
