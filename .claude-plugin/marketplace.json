@@ -1,0 +1,17 @@
+{
+  "name": "nuthatch",
+  "description": "nuthatch, the self-hosted EVM indexer: skills for building and querying nests, and its MCP server.",
+  "owner": {
+    "name": "nuthatch",
+    "url": "https://www.nuthatch-indexer.com"
+  },
+  "plugins": [
+    {
+      "name": "nuthatch",
+      "source": "./",
+      "description": "Index an EVM contract's events into local SQL: the builder, subgraph-port and evm-indexing skills, and the nuthatch MCP server.",
+      "category": "development",
+      "tags": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph"]
+    }
+  ]
+}

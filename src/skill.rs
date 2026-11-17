@@ -22,8 +22,11 @@ pub const SKILL_DIR: &str = "skills/nuthatch-builder";
 /// Where the subgraph-port skill lives (RFC-0044). Drift-checked alongside the builder skill.
 pub const PORT_SKILL_DIR: &str = "skills/nuthatch-subgraph-port";
 
+/// The discovery skill, whose description names the task rather than the product (#2982).
+pub const DISCOVERY_SKILL_DIR: &str = "skills/evm-indexing";
+
 /// Authored skill packages whose `--flag` mentions CI greps against clap.
-pub const AUTHORED_SKILL_DIRS: &[&str] = &[SKILL_DIR, PORT_SKILL_DIR];
+pub const AUTHORED_SKILL_DIRS: &[&str] = &[SKILL_DIR, PORT_SKILL_DIR, DISCOVERY_SKILL_DIR];
 
 /// Regenerate the skill's machine-generated references into `root/skills/nuthatch-builder/`. Today
 /// that's `cli-reference.md`; the config reference is authored, with its keys drift-checked in CI

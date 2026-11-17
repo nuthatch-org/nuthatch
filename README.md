@@ -471,8 +471,21 @@ nest. (Making that correct on the first try is the [semantic-layer work](docs/rf
 itself - `init`, config, factories, compliance, multi-nest runtimes, troubleshooting - before you even have a nest:
 
 ```sh
-cp -r skills/nuthatch-builder ~/.claude/skills/   # or your repo's .claude/skills/
+npx skills add nuthatch-org/nuthatch              # any agent the skills CLI knows
+cp -r skills/nuthatch-builder ~/.claude/skills/   # or, from a clone, by hand
 ```
+
+In Claude Code, the plugin installs the skills and the MCP server together:
+
+```text
+/plugin marketplace add nuthatch-org/nuthatch
+/plugin install nuthatch@nuthatch
+```
+
+Cursor reads the same repository as a plugin (`.cursor-plugin/`), and `rules/nuthatch.mdc` is
+a rule to copy into a project's `.cursor/rules/`. Besides the builder, `skills/` holds
+`nuthatch-subgraph-port` and `evm-indexing`, a short skill that answers to the task ("index this
+contract's events") rather than to the product's name.
 
 Its CLI/config references are generated from the binary and CI-checked for drift, so the skill never
 lies about a flag ([RFC-0017](docs/rfcs/0017-builder-skill.md)).
