@@ -615,6 +615,127 @@ mod tests {
         );
     }
 
+    /// #2947: the MiCA Art 22 example's own views, over one transfer per RTS deduction, give each
+    /// deduction, (c) and (d) per single currency area exactly.
+    #[test]
+    fn the_mica_art22_example_deducts_each_rts_case_once() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let views = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mica-art22/views");
+        std::fs::create_dir(dir.path().join("views")).unwrap();
+        for e in std::fs::read_dir(&views).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.contains("art22") {
+                std::fs::copy(e.path(), dir.path().join("views").join(name)).unwrap();
+            }
+        }
+        let a = |n: u8| format!("0x{:040x}", n);
+        let (z, issuer, c1, c2, c3, n1, n2) = (a(0), a(1), a(2), a(3), a(4), a(5), a(6));
+        let (k, d, x, p1, p2) = (a(7), a(8), a(9), a(10), a(11));
+        let q3 = 1_782_864_000u64;
+        let q4 = 1_790_812_800u64;
+        let eur = 1_000_000u64;
+        let transfers = [
+            (q3, &z, &issuer, 1000),
+            (q3, &issuer, &c1, 500),
+            (q3, &c1, &c2, 100),
+            (q3, &c1, &n1, 50),
+            (q3, &n1, &n2, 40),
+            (q3, &c1, &c3, 30),
+            (q3, &c2, &k, 20),
+            (q3, &c2, &d, 10),
+            (q3, &c2, &x, 5),
+            (q3, &p1, &p2, 7),
+            (q3 + 86_400, &c1, &c1, 3),
+            (q3 + 86_400, &c2, &z, 2),
+            (q4, &c1, &c2, 1000),
+        ];
+        let rows: Vec<String> = transfers
+            .iter()
+            .enumerate()
+            .map(|(i, (ts, from, to, v))| {
+                serde_json::json!({
+                    "table": "fiat_token_v2_2__transfer", "block_number": i as u64 + 1,
+                    "log_index": 0, "block_timestamp": ts,
+                    "from": from, "to": to, "value": (v * eur).to_string(),
+                })
+                .to_string()
+            })
+            .collect();
+        crate::seal::seal_range(dir.path(), &rows, 1, transfers.len() as u64).unwrap();
+        let set = format!(
+            "address,label\n{issuer},issuer\n{c1},custodial\n{c1},area:EUR\n{c2},custodial\n\
+             {c2},area:EUR\n{c3},custodial\n{c3},area:PLN\n{k},collateral\n{d},derivative\n\
+             {x},not_payment\n{p1},custodial\n{p1},person:alice\n{p2},custodial\n{p2},person:alice\n"
+        );
+        let labels = dir.path().join("set.csv");
+        std::fs::write(&labels, set).unwrap();
+        crate::labels::import(dir.path(), &labels).unwrap();
+        let q = |sql: &str| crate::analytics::query(dir.path(), sql).unwrap();
+        let s = |v: &serde_json::Value| v.as_str().map(String::from).unwrap_or(v.to_string());
+
+        let c: Vec<_> = q("SELECT * FROM art22_quarter_transactions ORDER BY quarter")
+            .iter()
+            .map(|r| {
+                [
+                    &r["quarter"],
+                    &r["days"],
+                    &r["transactions"],
+                    &r["avg_per_day"],
+                ]
+                .map(s)
+            })
+            .collect();
+        assert_eq!(c, [["3", "92", "12", "0.13"], ["4", "92", "1", "0.01"]]);
+        let c3 = &q("SELECT avg_eur_per_day FROM art22_quarter_transactions WHERE quarter = 3")[0];
+        assert_eq!(
+            s(&c3["avg_eur_per_day"]),
+            "19.206521",
+            "1767 EUR over 92 days"
+        );
+
+        let d: Vec<_> =
+            q("SELECT * FROM art22_quarter_means_of_exchange WHERE quarter = 3 ORDER BY area")
+                .iter()
+                .map(|r| {
+                    [
+                        &r["area"],
+                        &r["transactions"],
+                        &r["value_base_units"],
+                        &r["avg_eur_per_day"],
+                    ]
+                    .map(s)
+                })
+                .collect();
+        assert_eq!(
+            d,
+            [
+                ["EUR", "1", "100000000", "1.086956"],
+                ["unassigned", "2", "80000000", "0.869565"]
+            ],
+            "cross-area and an unlabelled party are unassigned"
+        );
+
+        let lines: Vec<_> = q(
+            "SELECT deduction, transactions FROM art22_quarter_deductions WHERE quarter = 3 \
+             ORDER BY deduction",
+        )
+        .iter()
+        .map(|r| [&r["deduction"], &r["transactions"]].map(s))
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                ["collateral", "1"],
+                ["derivative", "1"],
+                ["exchange", "3"],
+                ["non_custodial", "2"],
+                ["not_payment", "1"],
+                ["same_person", "2"]
+            ]
+        );
+    }
+
     /// #2945: EUR 1,000 at each transfer's UTC day rate, to recipients no `vasp` label covers. The
     /// first day's rate is 0.8, so 1,250 tokens is exactly EUR 1,000 and is not above it.
     #[test]
