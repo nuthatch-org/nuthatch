@@ -36,6 +36,9 @@ pub struct Body {
     pub rows: Vec<Value>,
     /// sha256 of the rows in canonical order: each row's JSON (keys sorted), sorted.
     pub rows_sha256: String,
+    /// The label set the rows read, where they read `labels` (#2961): a NID does not pin one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels_sha256: Option<String>,
     pub made_with: String,
 }
 
@@ -57,6 +60,7 @@ struct Identity {
     chain_id: u64,
     nid: String,
     registry_hash: String,
+    labels_sha256: Option<String>,
 }
 
 async fn identity(client: &reqwest::Client, url: &str) -> Result<Identity> {
@@ -73,6 +77,7 @@ async fn identity(client: &reqwest::Client, url: &str) -> Result<Identity> {
             .ok_or_else(|| anyhow!("/nest has no `chain_id`"))?,
         nid: text("nid")?,
         registry_hash: text("registry_hash")?,
+        labels_sha256: v["labels_sha256"].as_str().map(String::from),
     })
 }
 
@@ -86,8 +91,14 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<Value> {
     Ok(v)
 }
 
-/// The statement's rows as of `block`, refused if they are not the whole, sealed answer.
-async fn answer(client: &reqwest::Client, url: &str, q: &str, block: u64) -> Result<Vec<Value>> {
+/// The statement's rows as of `block`, refused if they are not the whole, sealed answer, and the
+/// label set they read.
+async fn answer(
+    client: &reqwest::Client,
+    url: &str,
+    q: &str,
+    block: u64,
+) -> Result<(Vec<Value>, Option<String>)> {
     let resp = client
         .post(format!("{url}/sql"))
         .json(&json!({ "q": q, "at_block": block, "max_rows": MAX_ROWS + 1 }))
@@ -115,7 +126,8 @@ async fn answer(client: &reqwest::Client, url: &str, q: &str, block: u64) -> Res
     if rows.len() > MAX_ROWS {
         bail!("the answer has more than {MAX_ROWS} rows; aggregate it first");
     }
-    Ok(rows)
+    let labels = v["provenance"]["labels_sha256"].as_str().map(String::from);
+    Ok((rows, labels))
 }
 
 /// The block `/at` places `time` at.
@@ -141,7 +153,7 @@ pub async fn make(
         (None, Some(t)) => place(&client, url, t).await?,
         _ => bail!("give --at-block or --at-time"),
     };
-    let rows = answer(&client, url, q, block).await?;
+    let (rows, labels_sha256) = answer(&client, url, q, block).await?;
     let evidence = Body {
         chain: id.chain,
         chain_id: id.chain_id,
@@ -151,6 +163,7 @@ pub async fn make(
         block,
         time,
         rows_sha256: rows_hash(&rows),
+        labels_sha256,
         rows,
         made_with: format!("nuthatch {}", env!("CARGO_PKG_VERSION")),
     };
@@ -184,8 +197,9 @@ impl Report {
     }
 }
 
-/// Check `bundle` against the nest at `url`: the same identity, the same block for its time, the same
-/// rows at that block, and, given a trusted key, a signature by it.
+/// Check `bundle` against the nest at `url`: the same identity, the same label set where the rows read
+/// one, the same block for its time, the same rows at that block, and, given a trusted key, a
+/// signature by it.
 pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) -> Result<Report> {
     let mut report = Report::default();
     let e = &bundle.evidence;
@@ -227,6 +241,13 @@ pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) 
             e.chain_id, id.chain_id
         ));
     }
+    if e.labels_sha256.is_some() && e.labels_sha256 != id.labels_sha256 {
+        report.mismatches.push(format!(
+            "labels: the rows read label set {}, this nest holds {}",
+            e.labels_sha256.as_deref().unwrap_or("none"),
+            id.labels_sha256.as_deref().unwrap_or("none")
+        ));
+    }
     if !report.mismatches.is_empty() {
         return Ok(report);
     }
@@ -239,7 +260,7 @@ pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) 
             ));
         }
     }
-    let rows = answer(&client, url, &e.statement, e.block).await?;
+    let (rows, _) = answer(&client, url, &e.statement, e.block).await?;
     let got = rows_hash(&rows);
     if got != e.rows_sha256 {
         report.mismatches.push(format!(

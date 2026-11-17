@@ -839,6 +839,7 @@ mod tests {
                 tip_unavailable: false,
                 referenced_tables: None,
                 offchain: None,
+                labels: None,
                 scan_bound: None,
                 ipc: None,
             })

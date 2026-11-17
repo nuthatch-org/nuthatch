@@ -401,6 +401,11 @@ async fn route_sql(
             entities,
             reproducible_by_snapshot: false,
             offchain: None,
+            labels: referenced
+                .contains("labels")
+                .then(|| crate::nest::labels_sha256(n.files))
+                .flatten()
+                .as_deref(),
         },
         Value::Array(rows),
     );

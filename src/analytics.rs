@@ -552,6 +552,8 @@ pub struct QueryOutput {
     /// it was defined over, or `None` where that is not known. Such an answer is reproducible by
     /// snapshot, not re-derivable from chain (RFC-0045 §6).
     pub offchain: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// The label set this answer read, by [`crate::labels::set_hash`], where it read `labels` (#2961).
+    pub labels: Option<String>,
     /// The bound a declared query was admitted against; `None` on every other path.
     pub scan_bound: Option<ScanBound>,
     /// The answer as an Arrow IPC stream, in place of `rows`, when [`QueryGuard::arrow`] asked.
@@ -569,6 +571,7 @@ impl QueryOutput {
             tip_unavailable: self.tip_unavailable,
             referenced_tables: self.referenced_tables.clone(),
             offchain: self.offchain.clone(),
+            labels: self.labels.clone(),
             scan_bound: self.scan_bound.clone(),
             ipc: None,
         }
@@ -1225,7 +1228,7 @@ pub fn query_named(
 /// surface with no auth and two concurrency permits. What bounds the sweep is `tables` below: the
 /// tables the failed query actually referenced, which for that query is none.
 enum Attempt {
-    Ok(QueryOutput),
+    Ok(Box<QueryOutput>),
     DiedExecuting {
         error: anyhow::Error,
         /// The base tables the query named, lowercased - the reachability bound on the sweep. `None`
@@ -1486,12 +1489,12 @@ fn run(
             want,
             true,
         )? {
-            Attempt::Ok(out) => Ok(out),
+            Attempt::Ok(out) => Ok(*out),
             Attempt::DiedExecuting { error, .. } => Err(error),
         };
     }
     let (e, tables) = match first? {
-        Attempt::Ok(out) => return Ok(out),
+        Attempt::Ok(out) => return Ok(*out),
         Attempt::DiedExecuting { error, tables, .. } => (error, tables),
     };
     #[cfg(test)]
@@ -1559,7 +1562,7 @@ fn run(
         want,
         true,
     )? {
-        Attempt::Ok(out) => Ok(out),
+        Attempt::Ok(out) => Ok(*out),
         Attempt::DiedExecuting { error, .. } => Err(error),
     }
 }
@@ -1678,7 +1681,16 @@ fn attempt(
         slot: Some(slot),
         restore: cached,
     };
-    let (referenced, offchain, degraded_tables, interrupted, (spilled, held), outcome, cap, scan) = {
+    let (
+        referenced,
+        (offchain, labels),
+        degraded_tables,
+        interrupted,
+        (spilled, held),
+        outcome,
+        cap,
+        scan,
+    ) = {
         let slot = warm.slot.as_mut().expect("session");
         let session: &dyn Session = slot.session.as_ref();
         session.set_deadline(deadline);
@@ -1765,6 +1777,10 @@ fn attempt(
                 .filter(|(view, _)| referenced.contains(&view.to_ascii_lowercase()))
                 .collect(),
         );
+        let labels = referenced
+            .contains("labels")
+            .then(|| crate::labels::set_hash(dir))
+            .flatten();
 
         // Hard wall-clock deadline for the untrusted surface: a watchdog thread interrupts the in-flight
         // query once it outlives `deadline` (a cartesian blow-up can't be stopped by the memory cap
@@ -1887,7 +1903,7 @@ fn attempt(
         }
         (
             (Some(referenced), copies),
-            offchain,
+            (offchain, labels),
             degraded_tables,
             interrupted,
             (spilled, held),
@@ -1911,13 +1927,14 @@ fn attempt(
         None => None,
     };
     let Some(outcome) = outcome else {
-        return Ok(Attempt::Ok(QueryOutput {
+        return Ok(Attempt::Ok(Box::new(QueryOutput {
             degraded_tables,
             referenced_tables: referenced,
             offchain,
+            labels,
             scan_bound: scan,
             ..Default::default()
-        }));
+        })));
     };
     let Collected {
         mut rows,
@@ -1970,7 +1987,7 @@ fn attempt(
         }
         _ => false,
     };
-    Ok(Attempt::Ok(QueryOutput {
+    Ok(Attempt::Ok(Box::new(QueryOutput {
         rows,
         columns,
         truncated,
@@ -1979,8 +1996,9 @@ fn attempt(
         referenced_tables: referenced,
         scan_bound: scan,
         offchain,
+        labels,
         ipc,
-    }))
+    })))
 }
 
 /// Skip leading whitespace and SQL comments (`-- line` and `/* block */`) so the read-only guard
