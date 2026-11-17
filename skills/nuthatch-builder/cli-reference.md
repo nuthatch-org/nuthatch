@@ -211,6 +211,7 @@ Re-ask a nest of the same NID and say whether the bundle's answer reproduces
 - `<BUNDLE>` - The bundle `evidence make` wrote
 - `--url <URL>` - The API of a nest with the same NID, sealed past the bundle's block
 - `--pubkey <PUBKEY>` - The signer's public key, hex or a key file, given to you by the signer out of band
+- `--dir <DIR>` - That nest's directory, when it is on this machine: re-hash the segments the bundle's block can read before asking, since `serve` does not
 
 ## `nuthatch init`
 

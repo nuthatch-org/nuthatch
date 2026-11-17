@@ -554,6 +554,9 @@ pub struct QueryOutput {
     pub offchain: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// The label set this answer read, by [`crate::labels::set_hash`], where it read `labels` (#2961).
     pub labels: Option<String>,
+    /// The segments it read, by [`nuthatch_core::seal::read_set_hash`], where it was asked as of a
+    /// block (#2944). Set by the caller, which knows the block.
+    pub segments: Option<String>,
     /// The bound a declared query was admitted against; `None` on every other path.
     pub scan_bound: Option<ScanBound>,
     /// The answer as an Arrow IPC stream, in place of `rows`, when [`QueryGuard::arrow`] asked.
@@ -572,6 +575,7 @@ impl QueryOutput {
             referenced_tables: self.referenced_tables.clone(),
             offchain: self.offchain.clone(),
             labels: self.labels.clone(),
+            segments: self.segments.clone(),
             scan_bound: self.scan_bound.clone(),
             ipc: None,
         }
@@ -1997,6 +2001,7 @@ fn attempt(
         scan_bound: scan,
         offchain,
         labels,
+        segments: None,
         ipc,
     })))
 }

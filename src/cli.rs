@@ -873,6 +873,10 @@ pub struct EvidenceVerifyArgs {
     /// The signer's public key, hex or a key file, given to you by the signer out of band.
     #[arg(long)]
     pub pubkey: Option<String>,
+    /// That nest's directory, when it is on this machine: re-hash the segments the bundle's block can
+    /// read before asking, since `serve` does not.
+    #[arg(long)]
+    pub dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Args)]

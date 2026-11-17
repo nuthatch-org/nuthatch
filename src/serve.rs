@@ -5789,6 +5789,10 @@ async fn run_sql_query_at(
             None => analytics::query_hot_cold(&dir, &sql, guard, &hot, sealed_through, &tables),
         })?;
         out.tip_unavailable = tip_unavailable;
+        out.segments = historical_block.and_then(|block| {
+            let manifest = crate::seal::shared_manifest(&dir).ok()?;
+            nuthatch_core::seal::read_set_hash(&manifest, out.referenced_tables.as_ref()?, block)
+        });
         // The state after the query, for the memo: an answer is remembered only if nothing it reads
         // moved while it ran, so a remembered answer always describes exactly the state its key names.
         let sealed_after = store.sealed_through();
@@ -6479,6 +6483,7 @@ fn sql_facts_envelope(
             reproducible_by_snapshot: read.is_some() || through_entity,
             offchain: read,
             labels: out.labels.as_deref(),
+            segments: out.segments.as_deref(),
         },
         rows,
     )
@@ -10328,6 +10333,8 @@ mod tests {
     async fn an_evidence_bundle_verifies_only_against_the_same_answer() {
         use crate::evidence;
         let tmp = tempfile::tempdir().unwrap();
+        // Final segments: a provisional tail is not pinned, below.
+        crate::seal::test_set_table_floor(tmp.path(), 0);
         let row = |b: u64| {
             json!({"table":"t","block_number":b,"log_index":0,"block_timestamp":b,"v":"x"})
                 .to_string()
@@ -10360,6 +10367,7 @@ mod tests {
                 url
             }
         };
+        let tables = state.tables.clone();
         let url = serve(state.clone(), "n1").await;
         let other = serve(state, "n2").await;
         let q = "SELECT count(*) AS n FROM t";
@@ -10371,7 +10379,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bundle.evidence.rows, vec![json!({"n": 2})]);
-        let report = evidence::verify(&bundle, &url, Some(&trusted))
+        let report = evidence::verify(&bundle, &url, Some(&trusted), None)
             .await
             .unwrap();
         assert!(report.ok(), "{report:?}");
@@ -10380,11 +10388,13 @@ mod tests {
         let other_key = tmp.path().join("k2.json");
         crate::pack::keygen(&other_key).unwrap();
         let wrong = crate::pack::parse_pubkey(other_key.to_str().unwrap()).unwrap();
-        let report = evidence::verify(&bundle, &url, Some(&wrong)).await.unwrap();
+        let report = evidence::verify(&bundle, &url, Some(&wrong), None)
+            .await
+            .unwrap();
         assert_eq!(report.signature, Some(false));
         assert!(!report.ok());
 
-        let report = evidence::verify(&bundle, &other, None).await.unwrap();
+        let report = evidence::verify(&bundle, &other, None, None).await.unwrap();
         assert!(
             report.mismatches.iter().any(|m| m.starts_with("nid")),
             "{report:?}"
@@ -10393,7 +10403,7 @@ mod tests {
         let mut forged = evidence::make(&url, q, Some(20), None, None).await.unwrap();
         forged.evidence.rows = vec![json!({"n": 3})];
         forged.evidence.rows_sha256 = evidence::rows_hash(&forged.evidence.rows);
-        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        let report = evidence::verify(&forged, &url, None, None).await.unwrap();
         assert!(
             report
                 .mismatches
@@ -10404,7 +10414,7 @@ mod tests {
 
         let mut forged = evidence::make(&url, q, Some(20), None, None).await.unwrap();
         forged.evidence.chain_id = 10;
-        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        let report = evidence::verify(&forged, &url, None, None).await.unwrap();
         assert!(
             report.mismatches.iter().any(|m| m.starts_with("chain_id")),
             "{report:?}"
@@ -10412,10 +10422,13 @@ mod tests {
 
         let timed = evidence::make(&url, q, None, Some(20), None).await.unwrap();
         assert_eq!(timed.evidence.block, 20);
-        assert!(evidence::verify(&timed, &url, None).await.unwrap().ok());
+        assert!(evidence::verify(&timed, &url, None, None)
+            .await
+            .unwrap()
+            .ok());
         let mut forged = timed;
         forged.evidence.time = Some(15);
-        let report = evidence::verify(&forged, &url, None).await.unwrap();
+        let report = evidence::verify(&forged, &url, None, None).await.unwrap();
         assert!(
             report.mismatches.iter().any(|m| m.starts_with("time: 15")),
             "{report:?}"
@@ -10444,7 +10457,10 @@ mod tests {
             read.evidence.labels_sha256,
             crate::labels::set_hash(tmp.path())
         );
-        assert!(evidence::verify(&read, &url, None).await.unwrap().ok());
+        assert!(evidence::verify(&read, &url, None, None)
+            .await
+            .unwrap()
+            .ok());
         std::fs::create_dir_all(tmp.path().join("views")).unwrap();
         std::fs::write(
             tmp.path().join("views/10-l.sql"),
@@ -10459,18 +10475,68 @@ mod tests {
             "a read through a view pins the set too"
         );
         std::fs::remove_dir_all(tmp.path().join(crate::labels::LABELS_DIR)).unwrap();
-        let report = evidence::verify(&read, &url, None).await.unwrap();
+        let report = evidence::verify(&read, &url, None, None).await.unwrap();
         assert_eq!(report.mismatches.len(), 1, "{report:?}");
         assert!(report.mismatches[0].starts_with("labels:"), "{report:?}");
         assert!(
-            evidence::verify(&bundle, &url, None).await.unwrap().ok(),
+            evidence::verify(&bundle, &url, None, None)
+                .await
+                .unwrap()
+                .ok(),
             "rows that read no labels outlive the set"
         );
+
+        // The segments block 20 reads are pinned: another set is named, and with `--dir` a changed
+        // byte is named by its file before the nest is asked anything.
+        assert!(bundle.evidence.segments_sha256.is_some());
+        let mut forged = evidence::make(&url, q, Some(20), None, None).await.unwrap();
+        forged.evidence.segments_sha256 = Some("0".repeat(64));
+        let report = evidence::verify(&forged, &url, None, None).await.unwrap();
+        assert!(
+            report
+                .mismatches
+                .iter()
+                .any(|m| m.starts_with("segments at block 20")),
+            "{report:?}"
+        );
+        let seg = crate::seal::load_manifest(tmp.path()).unwrap().tables["t"][0].clone();
+        let path = crate::seal::segment_path(tmp.path(), &seg.file, &seg.hash);
+        let intact = std::fs::read(&path).unwrap();
+        let mut changed = intact.clone();
+        changed[intact.len() / 2] ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        let report = evidence::verify(&bundle, &url, None, Some(tmp.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.mismatches,
+            vec![format!(
+                "segment {}: its bytes do not hash to its name",
+                seg.file
+            )]
+        );
+        std::fs::write(&path, &intact).unwrap();
+        assert!(evidence::verify(&bundle, &url, None, Some(tmp.path()))
+            .await
+            .unwrap()
+            .ok());
 
         let err = evidence::make(&url, q, Some(40), None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not sealed"), "{err}");
+
+        // A provisional tail is replaced by the next seal under another hash, so it cannot be pinned.
+        let tail = tempfile::tempdir().unwrap();
+        crate::seal::seal_range(tail.path(), &[row(10), row(20)], 1, 30).unwrap();
+        let mut state = test_state(tail.path(), 1);
+        state.store.set_meta("sealed_through", "30").unwrap();
+        state.store.set_meta("last_block", "50").unwrap();
+        state.tables = tables;
+        let err = evidence::make(&serve(state, "n3").await, q, Some(20), None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("provisional tail"), "{err}");
     }
 
     #[tokio::test]
