@@ -406,6 +406,8 @@ async fn route_sql(
                 .then(|| crate::nest::labels_sha256(n.files))
                 .flatten()
                 .as_deref(),
+            // `at_block` is refused above, and the pin is only ever made at a block.
+            segments: None,
         },
         Value::Array(rows),
     );

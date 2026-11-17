@@ -386,6 +386,8 @@ pub struct SqlFacts<'a> {
     pub offchain: Option<Value>,
     /// The label set it read, where it read `labels` (#2961).
     pub labels: Option<&'a str>,
+    /// [`crate::seal::read_set_hash`] of what it read, where it was asked as of a block (#2944).
+    pub segments: Option<&'a str>,
 }
 
 /// One maintained relation in `/sql`'s `provenance.entities`: `through` is the watermark captured with
@@ -436,6 +438,9 @@ pub fn sql_envelope(f: &SqlFacts, rows: Value) -> Value {
         }
         if let Some(labels) = f.labels {
             provenance.insert("labels_sha256".into(), json!(labels));
+        }
+        if let Some(segments) = f.segments {
+            provenance.insert("segments_sha256".into(), json!(segments));
         }
     }
     response

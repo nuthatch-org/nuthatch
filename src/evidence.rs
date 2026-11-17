@@ -39,6 +39,9 @@ pub struct Body {
     /// The label set the rows read, where they read `labels` (#2961): a NID does not pin one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels_sha256: Option<String>,
+    /// The sealed segments the rows were read from, by [`nuthatch_core::seal::read_set_hash`] (#2944).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments_sha256: Option<String>,
     pub made_with: String,
 }
 
@@ -91,14 +94,9 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<Value> {
     Ok(v)
 }
 
-/// The statement's rows as of `block`, refused if they are not the whole, sealed answer, and the
-/// label set they read.
-async fn answer(
-    client: &reqwest::Client,
-    url: &str,
-    q: &str,
-    block: u64,
-) -> Result<(Vec<Value>, Option<String>)> {
+/// The statement's rows as of `block`, refused if they are not the whole, sealed answer, with the
+/// label set and the segments they read.
+async fn answer(client: &reqwest::Client, url: &str, q: &str, block: u64) -> Result<Answer> {
     let resp = client
         .post(format!("{url}/sql"))
         .json(&json!({ "q": q, "at_block": block, "max_rows": MAX_ROWS + 1 }))
@@ -126,8 +124,18 @@ async fn answer(
     if rows.len() > MAX_ROWS {
         bail!("the answer has more than {MAX_ROWS} rows; aggregate it first");
     }
-    let labels = v["provenance"]["labels_sha256"].as_str().map(String::from);
-    Ok((rows, labels))
+    let pinned = |k: &str| v["provenance"][k].as_str().map(String::from);
+    Ok(Answer {
+        rows,
+        labels: pinned("labels_sha256"),
+        segments: pinned("segments_sha256"),
+    })
+}
+
+struct Answer {
+    rows: Vec<Value>,
+    labels: Option<String>,
+    segments: Option<String>,
 }
 
 /// The block `/at` places `time` at.
@@ -153,7 +161,18 @@ pub async fn make(
         (None, Some(t)) => place(&client, url, t).await?,
         _ => bail!("give --at-block or --at-time"),
     };
-    let (rows, labels_sha256) = answer(&client, url, q, block).await?;
+    let Answer {
+        rows,
+        labels: labels_sha256,
+        segments,
+    } = answer(&client, url, q, block).await?;
+    let Some(segments_sha256) = segments else {
+        bail!(
+            "the nest did not pin the segments block {block} reads: one is a provisional tail, which \
+             the next seal replaces, or the nest predates the pin. Ask at an earlier block, or once \
+             the tail is folded"
+        );
+    };
     let evidence = Body {
         chain: id.chain,
         chain_id: id.chain_id,
@@ -164,6 +183,7 @@ pub async fn make(
         time,
         rows_sha256: rows_hash(&rows),
         labels_sha256,
+        segments_sha256: Some(segments_sha256),
         rows,
         made_with: format!("nuthatch {}", env!("CARGO_PKG_VERSION")),
     };
@@ -198,9 +218,15 @@ impl Report {
 }
 
 /// Check `bundle` against the nest at `url`: the same identity, the same label set where the rows read
-/// one, the same block for its time, the same rows at that block, and, given a trusted key, a
-/// signature by it.
-pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) -> Result<Report> {
+/// one, the same block for its time, the same segments and rows at that block, and, given a trusted
+/// key, a signature by it. With `dir`, that nest's directory, first re-hash every segment an answer at
+/// the block can read, since `serve` reads them without checking.
+pub async fn verify(
+    bundle: &Bundle,
+    url: &str,
+    trusted: Option<&VerifyingKey>,
+    dir: Option<&Path>,
+) -> Result<Report> {
     let mut report = Report::default();
     let e = &bundle.evidence;
     if rows_hash(&e.rows) != e.rows_sha256 {
@@ -221,6 +247,18 @@ pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) 
                     })
                 })
         }));
+    }
+    if let Some(dir) = dir {
+        let (dir, block) = (dir.to_path_buf(), e.block);
+        for file in tokio::task::spawn_blocking(move || changed_segments(&dir, block)).await?? {
+            report
+                .mismatches
+                .push(format!("segment {file}: its bytes do not hash to its name"));
+        }
+        // Nothing such a nest answers is evidence, and a corrupt file may not answer at all.
+        if !report.mismatches.is_empty() {
+            return Ok(report);
+        }
     }
     let client = reqwest::Client::new();
     let id = identity(&client, url).await?;
@@ -260,15 +298,36 @@ pub async fn verify(bundle: &Bundle, url: &str, trusted: Option<&VerifyingKey>) 
             ));
         }
     }
-    let (rows, _) = answer(&client, url, &e.statement, e.block).await?;
-    let got = rows_hash(&rows);
-    if got != e.rows_sha256 {
+    let got = answer(&client, url, &e.statement, e.block).await?;
+    if e.segments_sha256.is_some() && e.segments_sha256 != got.segments {
         report.mismatches.push(format!(
-            "rows at block {}: the bundle hashes to {}, this nest answers {got}",
+            "segments at block {}: the bundle read {}, this nest reads {}",
+            e.block,
+            e.segments_sha256.as_deref().unwrap_or("none"),
+            got.segments.as_deref().unwrap_or("none")
+        ));
+    }
+    let rows = rows_hash(&got.rows);
+    if rows != e.rows_sha256 {
+        report.mismatches.push(format!(
+            "rows at block {}: the bundle hashes to {}, this nest answers {rows}",
             e.block, e.rows_sha256
         ));
     }
     Ok(report)
+}
+
+/// The file of each segment in `dir` an answer at `block` can read whose bytes are not its hash.
+fn changed_segments(dir: &Path, block: u64) -> Result<Vec<String>> {
+    let manifest = crate::seal::load_manifest(dir)?;
+    let tables = manifest.tables.keys().cloned().collect();
+    Ok(nuthatch_core::seal::read_set(&manifest, &tables, block)
+        .filter(|(_, s)| {
+            std::fs::read(crate::seal::segment_path(dir, &s.file, &s.hash))
+                .map_or(true, |bytes| hex::encode(Sha256::digest(&bytes)) != s.hash)
+        })
+        .map(|(_, s)| s.file.clone())
+        .collect())
 }
 
 /// `nuthatch evidence make|verify`.
@@ -299,7 +358,7 @@ pub async fn run(args: crate::cli::EvidenceArgs) -> Result<()> {
                 .as_deref()
                 .map(crate::pack::parse_pubkey)
                 .transpose()?;
-            let report = verify(&bundle, &a.url, trusted.as_ref()).await?;
+            let report = verify(&bundle, &a.url, trusted.as_ref(), a.dir.as_deref()).await?;
             for m in &report.mismatches {
                 println!("MISMATCH {m}");
             }
