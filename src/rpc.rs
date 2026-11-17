@@ -743,7 +743,10 @@ mod tests {
     #[test]
     fn the_suggested_range_survives_a_non_2xx() {
         assert_eq!(
-            super::classify_status(400, ALCHEMY_400_BODY),
+            super::classify_status(
+                400,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range and no limit on the response size, or you can request any block range with a cap of 10K logs in the response. Based on your parameters and the response size limit, this block range should work: [0x1000000, 0x1007fff]"}}"#,
+            ),
             super::FailureClass::Narrowable {
                 suggested: Some((0x1000000, 0x1007fff)),
                 escalated_from_rate_limit: false,
@@ -3368,5 +3371,143 @@ mod rfc0036_tests {
             ),
             "a result-cap refusal is the case narrowing exists for"
         );
+    }
+
+    /// The getLogs refusals the site's error pages quote, as the public endpoints answered them on
+    /// 2026-11-17. Each page says nuthatch narrows the range for its error; this is what holds it to that.
+    #[tokio::test]
+    async fn the_refusals_the_error_pages_quote_narrow() {
+        const REFUSALS: &[(u16, &str)] = &[
+            // rpc.mevblocker.io
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query returned more than 10000 results. Try with this block range [0x1934111, 0x1934176].","data":{"from":"0x1934111","limit":10000,"to":"0x1934176"}}}"#,
+            ),
+            // gateway.tenderly.co/public/mainnet
+            (
+                200,
+                r#"{"id":1,"jsonrpc":"2.0","error":{"code":-32602,"message":"invalid params","data":"Query returned more than 20000 results. Try with this block range [0x1934111, 0x193524e]."}}"#,
+            ),
+            // polygon-bor-rpc.publicnode.com
+            (
+                200,
+                r#"{"jsonrpc":"2.0","error":{"code":-32701,"message":"exceed maximum block range: 10000"},"id":1}"#,
+            ),
+            // cloudflare-eth.com
+            (
+                200,
+                r#"{"jsonrpc":"2.0","error":{"code":-32047,"message":"Invalid eth_getLogs request. 'fromBlock'-'toBlock' range too large. Max range: 800"},"id":1}"#,
+            ),
+            // eth.drpc.org
+            (
+                400,
+                r#"{"id":1,"jsonrpc":"2.0","error":{"message":"ranges over 10000 blocks are not supported on free plan","code":35}}"#,
+            ),
+            // 1rpc.io/eth
+            (
+                200,
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"eth_getLogs is limited to 0 - 50 blocks range"},"id":1}"#,
+            ),
+            // rpc.flashbots.net
+            (
+                400,
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"block range greater than 2000 max"},"id":1}"#,
+            ),
+            // mainnet.optimism.io
+            (
+                413,
+                r#"{"jsonrpc":"2.0","error":{"code":-32614,"message":"eth_getLogs is limited to a 10,000 range"},"id":1}"#,
+            ),
+            // api.avax.network
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"block range too large: total block range in this request exceeds the maximum of 100 blocks"}}"#,
+            ),
+            // forno.celo.org
+            (
+                400,
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"query exceeds range, retry smaller (max block range 5000, got 20000)"},"id":1}"#,
+            ),
+            // rpc.linea.build
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"range 20000 exceeds limit of 10000"}}"#,
+            ),
+            // Infura's documented timeout, which shares -32005 with its throttle.
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"query timeout exceeded"}}"#,
+            ),
+            // rpc.mantle.xyz
+            (
+                400,
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"block range greater than 10000 max"},"id":1}"#,
+            ),
+            // mainnet.unichain.org
+            (
+                400,
+                r#"{"jsonrpc":"2.0","error":{"code":-32602,"message":"block range greater than 1000 max"},"id":1}"#,
+            ),
+            // rpc.hyperliquid.xyz/evm
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"query exceeds max block range 1000"}}"#,
+            ),
+            // eth-pokt.nodies.app
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade your subscription at https://nodies.app/pricing for larger ranges."}}"#,
+            ),
+            // Alchemy, as measured for ALCHEMY_400_BODY: the "Log response size exceeded" page.
+            (
+                400,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Log response size exceeded. You can make eth_getLogs requests with up to a 10,000 block range and no limit on the response size, or you can request any block range with a cap of 10K logs in the response. Based on your parameters and the response size limit, this block range should work: [0x1000000, 0x1007fff]"}}"#,
+            ),
+            // eth.blockrazor.xyz
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"log query range must not exceed 25 blocks"}}"#,
+            ),
+            // evm.cronos.org
+            (
+                200,
+                r#"{"id":1,"error":{"code":-32000,"message":"maximum [from, to] blocks distance: 2000","data":null},"jsonrpc":"2.0"}"#,
+            ),
+        ];
+        for &(status, body) in REFUSALS {
+            let (url, server, _) = answering(status, body).await;
+            let err = RpcClient::new(vec![url])
+                .unwrap()
+                .get_logs(&["0xa0b8".into()], &[], 1_000, 30_000)
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(
+                crate::chunker::is_result_too_large(&err) && !escalated_from_rate_limit(&err),
+                "{body}: {err:#}"
+            );
+        }
+    }
+
+    /// BNB Chain's own public endpoints refuse getLogs over any range with `-32005 "limit
+    /// exceeded"`, three blocks included. That is read as a throttle, never as a range to narrow.
+    #[tokio::test]
+    async fn bnb_chains_limit_exceeded_is_waited_on_not_narrowed() {
+        let (url, server, _) = answering(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}"#,
+        )
+        .await;
+        let err = RpcClient::new(vec![url])
+            .unwrap()
+            .get_logs(&["0x55d3".into()], &[], 1_000, 1_002)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(class_of(&err), Some(FailureClass::RateLimited { .. })),
+            "{err:#}"
+        );
+        assert!(!crate::chunker::is_result_too_large(&err), "{err:#}");
     }
 }

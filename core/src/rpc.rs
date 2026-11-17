@@ -597,6 +597,9 @@ pub fn looks_like_cap(body: &str) -> bool {
         "blocks range",
         // GraphOps, 2026-09-29.
         "exceeded max allowed range",
+        // eth.blockrazor.xyz and evm.cronos.org, 2026-11-17.
+        "range must not exceed",
+        "blocks distance",
     ];
     CAP.iter().any(|m| s.contains(m))
 }
@@ -670,6 +673,10 @@ pub fn classify_rpc_error(err: &Value) -> FailureClass {
         "logs matched by query",
         // GraphOps, 2026-09-29: `-32012 "getLogs request exceeded max allowed range"` over 25,000.
         "exceeded max allowed range",
+        // 2026-11-17: eth.blockrazor.xyz `-32000 "log query range must not exceed 25 blocks"`, and
+        // evm.cronos.org `-32000 "maximum [from, to] blocks distance: 2000"`.
+        "range must not exceed",
+        "blocks distance",
     ];
     const TERMINAL: &[&str] = &[
         "must be authenticated",
