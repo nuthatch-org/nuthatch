@@ -1215,9 +1215,10 @@ pub struct McpArgs {
     #[arg(long, value_name = "VAR")]
     pub token_env: Option<String>,
 
-    /// Also offer `init_nest`, `start_indexing` and `index_status`, so a client can create a nest in
-    /// --dir and index it with no shell. The indexer runs `nuthatch dev` at --url, which must then be
-    /// a loopback address, and stops when this server does.
+    /// Also offer `init_nest`, `start_indexing`, `index_status` and `stop_indexing`, so a client can
+    /// create a nest in --dir and index it with no shell. The indexer runs `nuthatch dev` at --url,
+    /// which must then be a loopback address. It stops when this server exits normally; a server
+    /// killed outright leaves it running, for the next server on the same --dir and --url to adopt.
     #[arg(long)]
     pub authoring: bool,
 

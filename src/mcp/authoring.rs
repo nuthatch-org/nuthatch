@@ -13,6 +13,9 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long `start_indexing` waits for the API to answer before reporting that it has not yet.
 const SERVING_WAIT: Duration = Duration::from_secs(30);
 
+/// How long `stop_indexing` gives `dev` to shut down on SIGTERM.
+const STOP_WAIT: Duration = Duration::from_secs(10);
+
 /// The most of a command's output or log a tool answer carries.
 const OUTPUT_TAIL: usize = 8 * 1024;
 
@@ -232,8 +235,7 @@ impl Authoring {
         // stdout is this server's protocol channel, so the indexer must never write to it.
         cmd.stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)
-            .stderr(log)
-            .kill_on_drop(true);
+            .stderr(log);
         let mut child = cmd.spawn().context("starting `nuthatch dev`")?;
         if let Some(pid) = child.id() {
             let _ = std::fs::write(&self.pidfile, format!("{pid}\n{}\n", self.dir.display()));
@@ -307,20 +309,32 @@ impl Authoring {
         let mut indexer = self.indexer.lock().await;
         if let Some(mut child) = indexer.take() {
             if child.try_wait()?.is_none() {
-                child.kill().await.context("stopping `nuthatch dev`")?;
+                // `dev` shuts down cleanly on SIGTERM; SIGKILL only if it will not.
+                if let Some(pid) = child.id() {
+                    // SAFETY: a plain signal to the child this server spawned and still holds.
+                    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                }
+                if tokio::time::timeout(STOP_WAIT, child.wait()).await.is_err() {
+                    child.kill().await.context("stopping `nuthatch dev`")?;
+                }
                 let _ = std::fs::remove_file(&self.pidfile);
                 return Ok(
                     "Stopped the indexer. `start_indexing` resumes where it stopped.".into(),
                 );
             }
         }
-        let Some(pid) = self.left_running() else {
-            let _ = std::fs::remove_file(&self.pidfile);
-            return Ok("No indexer started for this directory is running.".into());
+        // A pid outlives its process: after a crash or a reboot it may name something else, so it
+        // is only signalled while the nest it was recorded for is still being served.
+        let pid = match self.left_running() {
+            Some(pid) if self.serving().await => pid,
+            _ => {
+                let _ = std::fs::remove_file(&self.pidfile);
+                return Ok("No indexer started for this directory is running.".into());
+            }
         };
-        // SAFETY: a plain signal to a pid recorded for this directory and alive a moment ago.
+        // SAFETY: a plain signal to the pid recorded for this directory, whose nest still answers.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + STOP_WAIT;
         while self.serving().await && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -347,6 +361,20 @@ impl Authoring {
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
+    }
+}
+
+/// The indexer stops with a server that exits normally, by SIGTERM so `dev` shuts down cleanly. A
+/// server killed outright runs no drop; the pidfile is what lets the next one find the indexer.
+impl Drop for Authoring {
+    fn drop(&mut self) {
+        if let Some(child) = self.indexer.get_mut().as_mut() {
+            if let (Ok(None), Some(pid)) = (child.try_wait(), child.id()) {
+                // SAFETY: a plain signal to the child this server spawned and still holds.
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                let _ = std::fs::remove_file(&self.pidfile);
+            }
+        }
     }
 }
 
@@ -497,43 +525,84 @@ mod tests {
         assert!(!err.contains("hunter2"), "{err}");
     }
 
-    /// A server that died leaves its indexer running; the next one adopts it, and can stop it.
+    /// A server that died leaves its indexer running; the next one adopts it, and can stop it. A
+    /// recorded pid whose nest no longer answers is never signalled: it may be another process now.
     #[tokio::test]
     async fn an_indexer_an_earlier_server_left_running_is_adopted_and_stopped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("nuthatch.toml"), "").unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let health = axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
-        let server = tokio::spawn(async move { axum::serve(listener, health).await });
-        let mut orphan = std::process::Command::new("sleep")
+        let orphan = std::process::Command::new("sleep")
             .arg("60")
             .spawn()
             .unwrap();
-        let a = Authoring::with_exe(
-            dir.path().to_path_buf(),
-            PathBuf::from("/nonexistent/nuthatch"),
-            &format!("http://127.0.0.1:{port}"),
-            format!("127.0.0.1:{port}"),
-        );
-        std::fs::write(
-            &a.pidfile,
-            format!("{}\n{}\n", orphan.id(), dir.path().display()),
-        )
-        .unwrap();
+        let pid = orphan.id();
+        let gone = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, exited) = std::sync::mpsc::channel();
+        {
+            let gone = gone.clone();
+            let mut orphan = orphan;
+            std::thread::spawn(move || {
+                let status = orphan.wait().unwrap();
+                gone.store(true, Ordering::SeqCst);
+                let _ = tx.send(status);
+            });
+        }
+        let at = |port: u16| {
+            Authoring::with_exe(
+                dir.path().to_path_buf(),
+                PathBuf::from("/nonexistent/nuthatch"),
+                &format!("http://127.0.0.1:{port}"),
+                format!("127.0.0.1:{port}"),
+            )
+        };
+        let record = |a: &Authoring| {
+            std::fs::write(&a.pidfile, format!("{pid}\n{}\n", dir.path().display())).unwrap()
+        };
 
+        // Nothing listens on a port freed at once, so the nest is not served.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stale = at(dead.local_addr().unwrap().port());
+        drop(dead);
+        record(&stale);
+        let said = stale.call("stop_indexing", &json!({})).await.unwrap();
+        assert!(said.contains("No indexer"), "{said}");
+        assert!(
+            !gone.load(Ordering::SeqCst),
+            "a pid whose nest is not served is not signalled"
+        );
+        assert!(!stale.pidfile.exists(), "the stale record is cleared");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = at(listener.local_addr().unwrap().port());
+
+        let health = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let up = !gone.load(Ordering::SeqCst);
+                async move {
+                    if up {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, health).await });
+        record(&a);
         let said = a.call("start_indexing", &json!({})).await.unwrap();
         assert!(said.contains("an earlier server started it"), "{said}");
         let status: Value =
             serde_json::from_str(&a.call("index_status", &json!({})).await.unwrap()).unwrap();
-        assert_eq!(status["indexer"]["pid"], orphan.id(), "{status}");
+        assert_eq!(status["indexer"]["pid"], pid, "{status}");
 
-        server.abort();
         let said = a.call("stop_indexing", &json!({})).await.unwrap();
+        server.abort();
         assert!(said.contains("earlier server left running"), "{said}");
-        let exited = orphan.wait().unwrap();
+        let status = exited.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(
-            !exited.success(),
+            !status.success(),
             "the orphan was signalled, not left to finish"
         );
         assert!(!a.pidfile.exists());

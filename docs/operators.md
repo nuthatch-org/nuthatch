@@ -2372,8 +2372,9 @@ claude mcp add nuthatch -- nuthatch mcp --authoring --dir ~/nests/usdc
 ```
 
 The nest is written to `--dir`, `--url` must be a loopback address because the indexer runs on this
-machine, and the indexer stops when the client closes the server. Its log is in the system's
-temporary directory, named in `start_indexing`'s answer. `init_nest` resolves the ABI from Sourcify
+machine. The indexer stops when the client closes the server; a server killed outright leaves it
+running, and the next server started on the same `--dir` and `--url` adopts it, which `stop_indexing`
+then stops. Its log is in the system's temporary directory, named in `start_indexing`'s answer. `init_nest` resolves the ABI from Sourcify
 or an explorer and `start_indexing` reads the chain from an RPC, exactly as `init` and `dev` do; the
 agent is asking on your behalf, and nothing else leaves the machine.
 
