@@ -704,7 +704,8 @@ the findings we closed as *not ours to fix* and why, is in
 - **Community:** the [Nuthatch Discord](https://discord.gg/p9Xc45txWa). Ask there if you would like a
   nest run for you, on the stock binary and with no billing, or need a chain nuthatch does not support
   yet. Every supported chain is EVM today; a non-EVM chain asked for by a named user is considered
-  case by case, not promised.
+  case by case, not promised. Releases and what was indexed this week go out on X as
+  [@cargo_pete](https://x.com/cargo_pete).
 - **Out of scope:** a metered or billed service, or any deployment story beyond binary + compose.
 
 ## License
