@@ -51,6 +51,14 @@ ignore = [
   "RUSTSEC-2026-0398", # zstd-safe: seekable decompress sets a Vec length past its capacity
   "RUSTSEC-2026-0403", # zstd-safe: uninitialised memory when a legacy frame fails mid-stream
   #
+  # zip 6.0.0 (transitive: dbsp, in every manifest that builds it). The fixes are zip 9.0.0 and 9.0.5,
+  # which dbsp 0.320 pins out. dbsp only writes archives, its profile dump through `ZipWriter`
+  # (dbsp/src/profile.rs); nothing here reads one, and all three are reader bugs. Lift on the next
+  # dbsp bump that moves zip.
+  "RUSTSEC-2026-0545", # zip: AES entries returned without checking their authentication code
+  "RUSTSEC-2026-0547", # zip: legacy Shrink, Reduce and Implode decoders preallocate the declared size
+  "RUSTSEC-2026-0548", # zip: ZipStreamReader extracts under local-header names
+  #
   # h2 0.3.27 (transitive: dbsp → feldera-types → actix-web → actix-http). The 0.4 line is **fixed,
   # not ignored**: h2 0.4.15 → 0.4.16 in the same commit. That is the right action regardless of
   # exposure and needs no justification here; this entry covers only the 0.3 copy, which cannot be
