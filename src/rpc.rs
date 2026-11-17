@@ -3455,6 +3455,16 @@ mod rfc0036_tests {
                 200,
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Block range too large: maximum allowed is 50 blocks on your current plan. Upgrade your subscription at https://nodies.app/pricing for larger ranges."}}"#,
             ),
+            // eth.blockrazor.xyz
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"log query range must not exceed 25 blocks"}}"#,
+            ),
+            // evm.cronos.org
+            (
+                200,
+                r#"{"id":1,"error":{"code":-32000,"message":"maximum [from, to] blocks distance: 2000","data":null},"jsonrpc":"2.0"}"#,
+            ),
         ];
         for &(status, body) in REFUSALS {
             let (url, server, _) = answering(status, body).await;
