@@ -1391,7 +1391,9 @@ Behind a reverse proxy that forwards the public name, as Caddy does by default, 
 decide nothing here, because a rebinding page is same-origin and may set them itself. Off a loopback
 bind, `0.0.0.0` say, every `Host` is answered, as on an address-history nest: the nest is already
 open to whatever can reach its address, and the gateway in front decides who that is. The published
-Docker image binds `0.0.0.0` inside its container, so this check does not apply there.
+Docker image binds `0.0.0.0` inside its container, so this check does not apply there. The
+Flight SQL listener of a `flight` build (`--flight`) is not checked: it speaks gRPC, which a browser
+page cannot send, so a rebinding page has no way to reach it.
 
 > **Upgrading a loopback nest behind a reverse proxy.** A nest bound to `127.0.0.1` and reached
 > through a proxy by a public name now answers that name with `403` and
