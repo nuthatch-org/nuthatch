@@ -48,6 +48,9 @@ nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 - The loop gives up after five minutes. If it does, the log and `curl -s 127.0.0.1:8288/ready` say
   why; `/ready` answers 503 while the nest is stalled.
 - Stop it with `pkill -f 'nuthatch dev'`.
+- `nuthatch dev --backfill 300 --detach` is the one-command form: it returns once `/ready` reports a
+  first poll (not ten blocks behind; the loop above still waits for that), prints where its log is,
+  outside the nest, and `nuthatch stop` stops it. Exit codes and `--json`: `docs/cli-errors.md`.
 
 ## Query
 

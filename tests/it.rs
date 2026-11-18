@@ -57,6 +57,8 @@ mod e2e_cli_output;
 mod e2e_crash_safety;
 #[path = "e2e_cursor_death_isolation.rs"]
 mod e2e_cursor_death_isolation;
+#[path = "e2e_dev_detach.rs"]
+mod e2e_dev_detach;
 #[path = "e2e_early_cutoff.rs"]
 mod e2e_early_cutoff;
 #[path = "e2e_embed_shapes.rs"]

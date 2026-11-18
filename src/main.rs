@@ -142,6 +142,9 @@ async fn run(command: cli::Command) -> Result<()> {
         // they know which they want. A `mounts.toml` means a multi-nest runtime, a `nuthatch.toml`
         // means one nest, and the pre-2.0 `mounts dev` split is gone.
         cli::Command::Dev(args) => {
+            if args.detach {
+                return nuthatch::detach::start(&args.dir, &args.listen, args.json).await;
+            }
             nuthatch::analytics::check_engine_choice(
                 std::env::var(nuthatch::analytics::ENV_ENGINE).ok().as_deref(),
             )?;
@@ -247,6 +250,7 @@ async fn run(command: cli::Command) -> Result<()> {
         #[cfg(feature = "watch")]
         cli::Command::Watch(args) => nuthatch::watch::run(args).await,
         cli::Command::Diff(args) => run_diff(args).await,
+        cli::Command::Stop(a) => nuthatch::detach::stop(&a.dir, a.json).await,
         cli::Command::Offchain(args) => match args.what {
             cli::OffchainWhat::Drop(args) => offchain::drop_file(
                 std::path::Path::new(&args.dir),

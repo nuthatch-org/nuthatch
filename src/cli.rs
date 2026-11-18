@@ -59,6 +59,8 @@ pub enum Command {
     /// endpoints. Read-only; it reads the endpoints the nest already serves (RFC-0069).
     #[cfg(feature = "watch")]
     Watch(crate::watch::WatchArgs),
+    /// Stop a `nuthatch dev --detach` started for this directory, and wait for it to finish.
+    Stop(StopArgs),
     /// Probe an RPC endpoint before trusting a backfill to it: max `eth_getLogs` width, max JSON-RPC
     /// batch size, and archive depth - and print the largest safe `--window`. Each of those limits
     /// otherwise surfaces mid-backfill as a retry loop that looks like slowness.
@@ -1699,6 +1701,17 @@ pub struct DevArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
+    /// Run in the background and return once the API answers `/ready` with a first poll behind it
+    /// (every mount's, for a runtime), or fail with the end of its log. The log and the process
+    /// record live under $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest,
+    /// and `nuthatch stop` stops it.
+    #[arg(long)]
+    pub detach: bool,
+
+    /// With --detach, print one JSON object on stdout: `pid`, `url`, `dir`, `log` and `stop`.
+    #[arg(long, requires = "detach")]
+    pub json: bool,
+
     /// Allow browser front ends on these origins to call this nest directly (repeatable, or `*`).
     ///
     /// Off by default: without it a nest sends no `Access-Control-Allow-Origin`, and a page on
@@ -1896,6 +1909,17 @@ impl DevArgs {
         #[cfg(not(feature = "flight"))]
         None
     }
+}
+
+#[derive(Args)]
+pub struct StopArgs {
+    /// The directory `nuthatch dev --detach` was started for.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+
+    /// Print one JSON object on stdout: `stopped` (the pid), `dir` and `log`.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
