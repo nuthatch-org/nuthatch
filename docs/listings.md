@@ -92,8 +92,9 @@ Most forms ask for the same few things. Use these.
    (`logo` in that manifest) is the one thing the listing would want that the repo does not have.
 
 7. **Anthropic's plugin directory**: https://claude.ai/directory/manage, from a paid claude.ai account.
-   The plugin is the repository root (`.claude-plugin/plugin.json`). The validator asks for a square
-   PNG icon, 512 to 2048 px, at `.claude-plugin/icon.png`; the first one submitted becomes the
+   The plugin is the `plugin/` folder (`plugin/.claude-plugin/plugin.json`), because the directory
+   refuses a repository with a file over 5 MiB (#3013). The validator asks for a square
+   PNG icon, 512 to 2048 px, at `plugin/.claude-plugin/icon.png`; the first one submitted becomes the
    listing's icon for good, so add the real one before submitting.
 
 8. **affpapa.org** and any other copier of the 4.0.0 command: ask them to use the install and MCP
@@ -108,7 +109,7 @@ Most forms ask for the same few things. Use these.
 - **skills.sh** (https://skills.sh): no submission form. It lists a repository once people install
   from it with `npx skills add nuthatch-org/nuthatch`, which finds `evm-indexing`, `nuthatch-builder`
   and `nuthatch-subgraph-port`.
-- **Claude Code marketplace**: published by `.claude-plugin/marketplace.json` being on `main`.
+- **Claude Code marketplace**: published by `.claude-plugin/marketplace.json` being on `main`, with its plugin `source` at `./plugin`.
 - **Glama**: listed (the README badge).
 - **Smithery**: self-publishing closed on 2026-10-31.
 - **awesome-mcp-servers**: punkpeye/awesome-mcp-servers#19822 is open, waiting on its maintainer.

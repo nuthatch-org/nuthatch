@@ -485,6 +485,9 @@ jobs:
         with:
           name: no-count-skill-reference
           path: skills/nuthatch-builder
+      # plugin/skills is a copy of skills/ that skill_refs checks byte for byte; refresh it too.
+      - name: refresh the plugin's copy of the skills
+        run: scripts/sync-plugin-skills.sh
       - uses: ./.github/actions/nextest-shard
         env:
           NUTHATCH_REQUIRE_BENCH_COMMITS: "1"

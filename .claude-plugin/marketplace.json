@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "nuthatch",
-      "source": "./",
+      "source": "./plugin",
       "description": "Index an EVM contract's events into local SQL: the builder, subgraph-port and evm-indexing skills, and the nuthatch MCP server.",
       "category": "development",
       "tags": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph"]

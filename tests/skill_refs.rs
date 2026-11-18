@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// #2982: the plugin manifests (`.claude-plugin/`, `.cursor-plugin/`, and the Agent Plugins
+/// #2982: the plugin manifests (`plugin/.claude-plugin/`, `.claude-plugin/marketplace.json`, `.cursor-plugin/`, and the Agent Plugins
 /// `plugin.json` and `mcp.json` at the root) publish every directory under `skills/`, and
 /// `npx skills add` installs each one by its frontmatter `name`. A skill added there is therefore
 /// shipped, and must also be one whose flags `authored_files_only_mention_real_flags` checks.
@@ -62,11 +62,11 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
         serde_json::from_str(&std::fs::read_to_string(root.join(p)).unwrap())
             .unwrap_or_else(|e| panic!("{p}: {e}"))
     };
-    let claude = json(".claude-plugin/plugin.json");
+    let claude = json("plugin/.claude-plugin/plugin.json");
     let agent = json("mcp.json");
     for (file, server) in [
         (
-            ".claude-plugin/plugin.json",
+            "plugin/.claude-plugin/plugin.json",
             &claude["mcpServers"]["nuthatch"],
         ),
         ("mcp.json", &agent["mcpServers"]["nuthatch"]),
@@ -90,7 +90,7 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
 
     let marketplace = json(".claude-plugin/marketplace.json");
     assert_eq!(marketplace["plugins"][0]["name"], claude["name"]);
-    assert_eq!(marketplace["plugins"][0]["source"], "./");
+    assert_eq!(marketplace["plugins"][0]["source"], "./plugin");
 
     let cursor = json(".cursor-plugin/plugin.json");
     for key in ["rules", "skills", "mcpServers", "logo"] {
@@ -104,11 +104,50 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
     }
 
     // Anthropic's directory takes a square PNG of 512 to 2048 px, and keeps the first one for good.
-    let png = std::fs::read(root.join(".claude-plugin/icon.png")).expect(".claude-plugin/icon.png");
+    let png = std::fs::read(root.join("plugin/.claude-plugin/icon.png"))
+        .expect("plugin/.claude-plugin/icon.png");
     assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "icon.png is not a PNG");
     let side = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
     let (w, h) = (side(16), side(20));
     assert!(w == h && (512..=2048).contains(&w), "icon.png is {w}x{h}");
+}
+
+/// The Claude plugin is one self-contained folder, so `plugin/skills/` is a copy of `skills/`.
+/// Fail on any difference; `scripts/sync-plugin-skills.sh` repairs it.
+#[test]
+fn the_plugin_carries_the_same_skills_as_the_root_and_stays_small() {
+    fn files(dir: &Path, base: &Path, out: &mut BTreeSet<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                files(&p, base, out);
+            } else {
+                out.insert(p.strip_prefix(base).unwrap().to_path_buf());
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (a, b) = (root.join("skills"), root.join("plugin/skills"));
+    let (mut left, mut right) = (BTreeSet::new(), BTreeSet::new());
+    files(&a, &a, &mut left);
+    files(&b, &b, &mut right);
+    assert_eq!(left, right, "run scripts/sync-plugin-skills.sh");
+    for f in &left {
+        assert_eq!(
+            std::fs::read(a.join(f)).unwrap(),
+            std::fs::read(b.join(f)).unwrap(),
+            "plugin/skills/{} differs from skills/: run scripts/sync-plugin-skills.sh",
+            f.display()
+        );
+    }
+    let mut all = BTreeSet::new();
+    files(&root.join("plugin"), &root.join("plugin"), &mut all);
+    for f in all {
+        let len = std::fs::metadata(root.join("plugin").join(&f))
+            .unwrap()
+            .len();
+        assert!(len < 1 << 20, "plugin/{} is {len} bytes", f.display());
+    }
 }
 
 fn skill_dir() -> PathBuf {

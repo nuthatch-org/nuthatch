@@ -499,6 +499,7 @@ In Claude Code, the plugin installs the skills and the MCP server together:
 /plugin install nuthatch@nuthatch
 ```
 
+The plugin itself is the self-contained `plugin/` folder (its `skills/` mirrors `skills/`, checked by a test).
 Cursor reads the same repository as a plugin (`.cursor-plugin/`), and `rules/nuthatch.mdc` is
 a rule to copy into a project's `.cursor/rules/`. Besides the builder, `skills/` holds
 `nuthatch-subgraph-port` and `evm-indexing`, a short skill that answers to the task ("index this
