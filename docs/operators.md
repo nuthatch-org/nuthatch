@@ -2376,8 +2376,11 @@ gate and tenant share, counted in `/metrics`. Only the query tools are offered: 
 `start_indexing`, `index_status` and `stop_indexing` manage processes on the host and stay on
 stdio. It is stateless (no session id) and answers each POST with one JSON object; a GET is 405.
 A request carrying an
-`Origin` is refused with 403 unless that origin is loopback, which is what stops a web page from
-reaching a local nest by DNS rebinding; clients that are not browsers send none.
+`Origin` is refused with 403 unless that origin is loopback, as the MCP transport requires. That
+guards `/mcp` alone, not the nest: an event nest checks no `Host`, so a web page that rebinds a DNS
+name to 127.0.0.1 can still read `/sql` and the other read routes (#3002). Address-history nests
+check `Host` on every route. It also means a browser client served from another origin cannot use `/mcp`
+even through a gateway that authenticates it; clients that are not browsers send no `Origin`.
 
 It is on by default because it serves nothing `/sql` and the other read routes do not already
 serve, and it carries the same posture: nuthatch checks no credential. Off localhost, the gateway in

@@ -1447,10 +1447,10 @@ async fn local_get(routes: &axum::Router, path: &str, q: &[(&str, &str)]) -> Res
         None => url.path().to_string(),
     };
     let req = axum::http::Request::get(uri).body(axum::body::Body::empty())?;
-    let resp = routes
-        .clone()
-        .oneshot(req)
+    // The stdio bridge's reqwest client bounds a hung call; in process there is no client to do it.
+    let resp = tokio::time::timeout(REQUEST_TIMEOUT, routes.clone().oneshot(req))
         .await
+        .map_err(|_| anyhow!("nuthatch did not answer within {REQUEST_TIMEOUT:?}"))?
         .unwrap_or_else(|e: std::convert::Infallible| match e {});
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), MAX_MESSAGE_BYTES)
