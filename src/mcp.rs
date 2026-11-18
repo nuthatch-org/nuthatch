@@ -222,6 +222,113 @@ pub async fn serve(
     Ok(())
 }
 
+/// The `MCP-Protocol-Version` values `/mcp` accepts. A client that sends none is assumed to speak
+/// 2025-03-26, and every one of these is answered as [`PROTOCOL_VERSION`] is.
+const HTTP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", PROTOCOL_VERSION, "2025-11-25"];
+
+/// `/mcp` on a mount: MCP's Streamable HTTP transport, one JSON-RPC message per POST, answered with
+/// one JSON object by the same [`handle`] the stdio server runs. `routes` is the mount's own router,
+/// so every tool call is a request to it. Stateless: no session id, no SSE stream (GET is 405), and
+/// never the authoring tools, which start processes on the host.
+pub(crate) async fn http(
+    routes: axum::Router,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    let refuse = |status: StatusCode, code: i64, message: &str| {
+        (status, axum::Json(err(Value::Null, code, message))).into_response()
+    };
+    if !origin_allowed(&headers) {
+        return refuse(
+            StatusCode::FORBIDDEN,
+            -32600,
+            "/mcp answers no browser page but one served from this machine (Origin)",
+        );
+    }
+    if method != axum::http::Method::POST {
+        return (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response();
+    }
+    if let Some(v) = headers.get("mcp-protocol-version") {
+        if !HTTP_PROTOCOL_VERSIONS
+            .iter()
+            .any(|p| v.as_bytes() == p.as_bytes())
+        {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                -32600,
+                &format!(
+                    "unsupported MCP-Protocol-Version; this server speaks {}",
+                    HTTP_PROTOCOL_VERSIONS.join(", ")
+                ),
+            );
+        }
+    }
+    let is_json = |v: &axum::http::HeaderValue| {
+        v.to_str().is_ok_and(|s| {
+            s.split(',').any(|t| {
+                let t = t.split(';').next().unwrap_or("").trim();
+                t.eq_ignore_ascii_case("application/json")
+                    || t == "*/*"
+                    || t.eq_ignore_ascii_case("application/*")
+            })
+        })
+    };
+    if !headers.get(header::CONTENT_TYPE).is_some_and(is_json) {
+        return refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            -32600,
+            "an MCP message is sent as Content-Type: application/json",
+        );
+    }
+    if headers.get(header::ACCEPT).is_some_and(|v| !is_json(v)) {
+        return refuse(
+            StatusCode::NOT_ACCEPTABLE,
+            -32600,
+            "/mcp answers in application/json, which Accept does not admit",
+        );
+    }
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        return refuse(StatusCode::BAD_REQUEST, -32700, "Parse error");
+    };
+    match handle(&req, &Session::new(&routes, "")).await {
+        None => StatusCode::ACCEPTED.into_response(),
+        Some(resp) if resp["id"].is_null() && resp.get("error").is_some() => {
+            (StatusCode::BAD_REQUEST, axum::Json(resp)).into_response()
+        }
+        Some(resp) => axum::Json(resp).into_response(),
+    }
+}
+
+/// A browser always sends `Origin` on a POST, and a DNS-rebinding page sends its own, so a page is let
+/// in only when it was served from loopback; a client that is not a browser sends none.
+fn origin_allowed(headers: &axum::http::HeaderMap) -> bool {
+    let mut all = headers.get_all(axum::http::header::ORIGIN).iter();
+    let Some(origin) = all.next() else {
+        return true;
+    };
+    if all.next().is_some() {
+        return false;
+    }
+    let Some(rest) = origin.to_str().ok().and_then(|o| {
+        o.strip_prefix("http://")
+            .or_else(|| o.strip_prefix("https://"))
+    }) else {
+        return false;
+    };
+    let host = match rest.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map(|(h, _)| h),
+        None => rest.split(':').next(),
+    };
+    host.is_some_and(|h| {
+        h.eq_ignore_ascii_case("localhost")
+            || h.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
 /// Read when `--token-env` is not given.
 const DEFAULT_TOKEN_ENV: &str = "NUTHATCH_MCP_TOKEN";
 
@@ -262,7 +369,7 @@ fn redact_token(v: &mut Value, token: &str) {
 
 /// Dispatch one JSON-RPC message. Returns None for notifications (no response expected).
 async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
-    let (client, base) = (session.client, session.base);
+    let (client, base) = (session.link, session.base);
     // JSON-RPC 2.0 §5.1: valid JSON that is not a Request object (a number, a string, an array - the
     // batches MCP no longer carries) or an object with no method is an Invalid Request. A response
     // from the client (it has `result` or `error`) answers nothing this bridge asked, so it is dropped.
@@ -379,16 +486,16 @@ async fn explain_bare_404(error: String, session: &Session<'_>) -> String {
 /// One bridge session: the URL it bridges to and, once `/nests` has answered, whether that is a
 /// runtime's root.
 struct Session<'a> {
-    client: &'a reqwest::Client,
+    link: Link<'a>,
     base: &'a str,
     root: std::sync::OnceLock<bool>,
     authoring: Option<&'a authoring::Authoring>,
 }
 
 impl<'a> Session<'a> {
-    fn new(client: &'a reqwest::Client, base: &'a str) -> Self {
+    fn new(link: impl Into<Link<'a>>, base: &'a str) -> Self {
         Session {
-            client,
+            link: link.into(),
             // `http://host:port/` would otherwise request `//schema`.
             base: base.trim_end_matches('/'),
             root: std::sync::OnceLock::new(),
@@ -407,7 +514,7 @@ impl<'a> Session<'a> {
         if self.root.get() == Some(&false) {
             return None;
         }
-        match listed_mounts(self.client, self.base).await {
+        match listed_mounts(self.link, self.base).await {
             Nests::NotRoot => {
                 let _ = self.root.set(false);
                 None
@@ -428,7 +535,7 @@ enum Nests {
     Unknown,
 }
 
-async fn listed_mounts(client: &reqwest::Client, base: &str) -> Nests {
+async fn listed_mounts(client: Link<'_>, base: &str) -> Nests {
     let body = match get(client, &format!("{base}/nests")).await {
         Ok(body) => body,
         Err(e) if e.to_string().starts_with("HTTP 404:") => return Nests::NotRoot,
@@ -493,7 +600,7 @@ fn resource_specs() -> Value {
 }
 
 /// Resolve a `nuthatch://…` resource URI to its HTTP-backed content.
-async fn read_resource(uri: &str, client: &reqwest::Client, base: &str) -> Result<String> {
+async fn read_resource(uri: &str, client: Link<'_>, base: &str) -> Result<String> {
     let path = match uri {
         "nuthatch://schema" => "/schema",
         "nuthatch://tables" => "/tables",
@@ -523,7 +630,7 @@ struct Shape {
 /// default to advertising **everything** - never hide a tool because a probe failed. The safe default
 /// is the current, unconditional behaviour, so a stale nest degrades to exactly today's surface.
 async fn fetch_shape(session: &Session<'_>) -> Shape {
-    let (client, base) = (session.client, session.base);
+    let (client, base) = (session.link, session.base);
     let all = Shape {
         transfers: true,
         compliance: true,
@@ -772,7 +879,7 @@ fn query_tools(shape: &Shape) -> Vec<Value> {
     tools
 }
 
-async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Result<String> {
+async fn call_tool(params: &Value, client: Link<'_>, base: &str) -> Result<String> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -929,7 +1036,7 @@ struct History {
     status_read: bool,
 }
 
-async fn history(client: &reqwest::Client, base: &str) -> History {
+async fn history(client: Link<'_>, base: &str) -> History {
     let status = get(client, &format!("{base}/"))
         .await
         .ok()
@@ -1294,12 +1401,70 @@ fn segment(s: &str) -> Result<String> {
         .collect())
 }
 
-async fn get(client: &reqwest::Client, url: &str) -> Result<String> {
-    fetch(client.get(url), url).await
+/// Where a session's reads go: a running nest over HTTP, or, behind `/mcp`, the mount's own routes
+/// in process, so a tool call meets the same route, limits and tenant seat as a direct request.
+#[derive(Clone, Copy)]
+enum Link<'a> {
+    Http(&'a reqwest::Client),
+    Local(&'a axum::Router),
 }
 
-async fn get_query(client: &reqwest::Client, url: &str, q: &[(&str, &str)]) -> Result<String> {
-    fetch(client.get(url).query(q), url).await
+impl<'a> From<&'a reqwest::Client> for Link<'a> {
+    fn from(client: &'a reqwest::Client) -> Self {
+        Link::Http(client)
+    }
+}
+
+impl<'a> From<&'a axum::Router> for Link<'a> {
+    fn from(routes: &'a axum::Router) -> Self {
+        Link::Local(routes)
+    }
+}
+
+async fn get(link: Link<'_>, url: &str) -> Result<String> {
+    match link {
+        Link::Http(client) => fetch(client.get(url), url).await,
+        Link::Local(routes) => local_get(routes, url, &[]).await,
+    }
+}
+
+async fn get_query(link: Link<'_>, url: &str, q: &[(&str, &str)]) -> Result<String> {
+    match link {
+        Link::Http(client) => fetch(client.get(url).query(q), url).await,
+        Link::Local(routes) => local_get(routes, url, q).await,
+    }
+}
+
+/// `path` (with no origin) and its query, sent through `routes` as one GET.
+async fn local_get(routes: &axum::Router, path: &str, q: &[(&str, &str)]) -> Result<String> {
+    use tower::ServiceExt;
+    let mut url = reqwest::Url::parse("http://mount.invalid")?.join(path)?;
+    if !q.is_empty() {
+        url.query_pairs_mut().extend_pairs(q);
+    }
+    let uri = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let req = axum::http::Request::get(uri).body(axum::body::Body::empty())?;
+    let resp = routes
+        .clone()
+        .oneshot(req)
+        .await
+        .unwrap_or_else(|e: std::convert::Infallible| match e {});
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), MAX_MESSAGE_BYTES)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the response from nuthatch is larger than {MAX_MESSAGE_BYTES} bytes; ask for fewer rows"
+            )
+        })?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if !status.is_success() {
+        bail!("HTTP {}: {body}", status.as_u16());
+    }
+    Ok(body)
 }
 
 async fn fetch(req: reqwest::RequestBuilder, url: &str) -> Result<String> {
@@ -1462,21 +1627,25 @@ mod tests {
         let client = reqwest::Client::new();
         let call = |name: &str| json!({ "name": "table", "arguments": { "name": name } });
 
-        let climbed = call_tool(&call("../_admin/events"), &client, &base).await;
+        let climbed = call_tool(&call("../_admin/events"), (&client).into(), &base).await;
         assert!(!matches!(&climbed, Ok(b) if b == "admin"), "{climbed:?}");
         for refused in ["..", "."] {
-            let err = call_tool(&call(refused), &client, &base).await.unwrap_err();
+            let err = call_tool(&call(refused), (&client).into(), &base)
+                .await
+                .unwrap_err();
             assert!(
                 err.to_string().contains("not a valid path segment"),
                 "{err}"
             );
         }
         assert_eq!(
-            call_tool(&call("a/b?c"), &client, &base).await.unwrap(),
+            call_tool(&call("a/b?c"), (&client).into(), &base)
+                .await
+                .unwrap(),
             "table:a/b?c"
         );
         let flags = json!({ "name": "flags", "arguments": { "kind": "x&limit=1" } });
-        assert!(call_tool(&flags, &client, &base).await.is_err());
+        assert!(call_tool(&flags, (&client).into(), &base).await.is_err());
         server.abort();
     }
 
@@ -1496,7 +1665,7 @@ mod tests {
         let call = json!({ "name": "table", "arguments": { "name": "t" } });
         let answered = tokio::time::timeout(
             REQUEST_TIMEOUT * 5,
-            call_tool(&call, &http_client(None).unwrap(), &base),
+            call_tool(&call, (&http_client(None).unwrap()).into(), &base),
         )
         .await;
         assert!(matches!(answered, Ok(Err(_))), "{answered:?}");

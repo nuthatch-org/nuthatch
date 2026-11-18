@@ -1199,6 +1199,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /at?time=<unix seconds>` | where the nest stood at a time (#2941): `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it, which proves the nest indexed past it. Its state at the time is its state at `block`; `exact` says the two are adjacent, `final` that `next_block` is sealed. Refused (409) for a time not yet indexed past, or before the first stamped block of a nest whose history does not start at deployment; 422 for a timestamp-free nest |
 | `GET /nest` | nest identity and registry hash, and the `undecoded` block `/ready` also carries |
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
+| `POST /mcp` | MCP over Streamable HTTP: the query tools of `nuthatch mcp`, never the authoring ones; see [the AI section](#ai-point-a-coding-agent-at-your-data) |
 | `GET /_admin/`, `/_admin/events`, `/_admin/config`, `/_admin/storage`, `/_admin/requests` | admin UI (eight tabs since 4.2.1), its event stream, the authored files and limits as JSON with every URL cut to scheme and host and every secret withheld, the sealed catalogue per table (`?table=` for one table's segments), and the last 256 requests served (`?since=<seq>` for those after one): route template, the declared query or entity name when the nest knows it, status, milliseconds and bytes, never SQL text, a query string, a path value or a client address, and not the monitoring reads (`/`, `/health`, `/ready`, `/metrics`, `/_admin*`). Token-gated off-localhost; removable with `--no-admin` |
 
 **Answers in Arrow** (RFC-0079). JSON is the default and is unchanged; Arrow is asked for:
@@ -2358,6 +2359,30 @@ claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-e
 
 Every request then carries `Authorization: Bearer <token>`. `--print-config` prints the variable's
 name, never its value, and an error body that echoes the token reaches the agent as `[redacted]`.
+
+### Over HTTP: `/mcp`
+
+A client that wants a URL instead of a subprocess (a hosted agent, a directory listing) can use the
+nest's own `/mcp`, MCP's Streamable HTTP transport, served by `dev` and `serve` with nothing to turn
+on. In a runtime it is per mount, `/<alias>/mcp`, like `/sql`.
+
+```sh
+claude mcp add --transport http nuthatch http://127.0.0.1:8288/mcp
+```
+
+It answers with the same code as `nuthatch mcp`, and each tool call is made to the mount's own
+routes, so a `sql` call is a `/sql` request: read-only, under the same timeout, row cap, concurrency
+gate and tenant share, counted in `/metrics`. Only the query tools are offered: `init_nest`,
+`start_indexing`, `index_status` and `stop_indexing` manage processes on the host and stay on
+stdio. It is stateless (no session id) and answers each POST with one JSON object; a GET is 405.
+A request carrying an
+`Origin` is refused with 403 unless that origin is loopback, which is what stops a web page from
+reaching a local nest by DNS rebinding; clients that are not browsers send none.
+
+It is on by default because it serves nothing `/sql` and the other read routes do not already
+serve, and it carries the same posture: nuthatch checks no credential. Off localhost, the gateway in
+front of the node authenticates and rate-limits `/mcp` as it does `/sql`, and an operator who does
+not want it offered there simply does not route it.
 
 ### Starting from nothing: `--authoring`
 

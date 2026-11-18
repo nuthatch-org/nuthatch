@@ -53,6 +53,11 @@ A runtime hosting several nests serves nothing at its root: point `--url` at one
 
 Stdio server bridging to a running `nuthatch dev`. Works offline against the local instance.
 
+A running nest also answers MCP over Streamable HTTP at `/mcp` (per mount, `/<alias>/mcp`), on by
+default: `claude mcp add --transport http nuthatch http://127.0.0.1:8288/mcp`. It offers the query
+tools only, each call goes through the same routes and limits as `/sql`, and off localhost the
+gateway in front does the authentication. See [docs/operators.md](docs/operators.md).
+
 ## Skill and llms.txt
 
 - Every nest `init` creates holds an `llms.txt` and a `.claude/skills/` scaffold. Read them first

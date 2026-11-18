@@ -585,7 +585,7 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/_admin/storage", get(admin_storage))
             .route("/_admin/requests", get(admin_requests))
     };
-    admin(sync_server(graph_facade(
+    let routes = admin(sync_server(graph_facade(
         Router::new()
             .route("/", get(summary))
             .route("/health", get(|| async { "ok" }))
@@ -633,7 +633,16 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
         let backing = backing.clone();
         move |req, next| pin_request(backing.clone(), req, next)
     }))
-    .with_state(backing)
+    .with_state(backing);
+    // Outside the layers above: `/mcp` is a client of these routes, and each tool call it makes is
+    // counted, priced and pinned as the request it becomes.
+    let target = routes.clone();
+    routes.route(
+        "/mcp",
+        axum::routing::any(move |method, headers, body| {
+            crate::mcp::http(target.clone(), method, headers, body)
+        }),
+    )
 }
 
 /// How a follower answers `GET /<route>/sync` (RFC-0080), put on the request by its own layer so the
@@ -10325,6 +10334,168 @@ mod tests {
             .set_meta(crate::indexer::HISTORY_FROM_DEPLOYMENT_KEY, "true")
             .unwrap();
         assert_eq!(placed(state, ts(5)).await, (None, 10, false, true));
+    }
+
+    /// #2984: `/mcp` over a real socket speaks Streamable HTTP with the stdio server's tools, minus
+    /// the authoring ones, answers `sql` from the nest under `/sql`'s confinement, and refuses a page
+    /// from another origin.
+    #[tokio::test]
+    async fn mcp_over_http_answers_from_the_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::seal::test_set_table_floor(tmp.path(), 0);
+        let row = |b: u64| {
+            json!({"table":"t","block_number":b,"log_index":0,"block_timestamp":b,"v":"x"})
+                .to_string()
+        };
+        crate::seal::seal_range(tmp.path(), &[row(10), row(20), row(21)], 1, 30).unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        state.store.set_meta("sealed_through", "30").unwrap();
+        state.store.set_meta("last_block", "50").unwrap();
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(true),
+        }]);
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, router(SharedNest::new(state))).await });
+        let client = reqwest::Client::new();
+        let post = |body: Value, origin: Option<&'static str>| {
+            let mut req = client
+                .post(&url)
+                .header("accept", "application/json, text/event-stream")
+                .json(&body);
+            if let Some(o) = origin {
+                req = req.header("origin", o);
+            }
+            async move {
+                let resp = req.send().await.unwrap();
+                let status = resp.status().as_u16();
+                (status, resp.text().await.unwrap())
+            }
+        };
+        let rpc = |id: u64, method: &str, params: Value| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+
+        let (status, body) = post(rpc(1, "initialize", json!({})), None).await;
+        assert_eq!(status, 200, "{body}");
+        let init: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "nuthatch", "{init}");
+        let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        assert_eq!(post(note, None).await, (202, String::new()));
+
+        let (_, body) = post(rpc(2, "tools/list", json!({})), None).await;
+        let list: Value = serde_json::from_str(&body).unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"sql"), "{names:?}");
+        for authoring in [
+            "init_nest",
+            "start_indexing",
+            "index_status",
+            "stop_indexing",
+        ] {
+            assert!(!names.contains(&authoring), "{names:?}");
+            let call = json!({"name": authoring, "arguments": {}});
+            let (_, body) = post(rpc(3, "tools/call", call), None).await;
+            let out: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(out["result"]["isError"], true, "{out}");
+        }
+
+        let sql = |q: &str| json!({"name": "sql", "arguments": {"query": q}});
+        let (_, body) = post(
+            rpc(4, "tools/call", sql("SELECT count(*) AS n FROM t")),
+            None,
+        )
+        .await;
+        let out: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        let text = out["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("| 3"), "{text}");
+        let (_, body) = post(rpc(5, "tools/call", sql("DROP TABLE t")), None).await;
+        let out: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(out["result"]["isError"], true, "{out}");
+
+        let (status, _) = post(
+            rpc(6, "tools/list", json!({})),
+            Some("http://localhost:6274"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        for origin in [
+            "http://evil.example",
+            "http://127.0.0.1.evil.example",
+            "null",
+        ] {
+            let (status, _) = post(rpc(7, "tools/list", json!({})), Some(origin)).await;
+            assert_eq!(status, 403, "{origin}");
+        }
+        let resp = client
+            .get(&url)
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 405);
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("mcp-protocol-version", "1999-01-01")
+            .body(rpc(8, "ping", json!({})).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+        let resp = client
+            .post(&url)
+            .header("content-type", "text/plain")
+            .body(rpc(9, "ping", json!({})).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 415);
+    }
+
+    /// #2984: in a runtime each mount answers MCP under its own prefix, from its own data.
+    #[tokio::test]
+    async fn mcp_is_served_per_mount() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "mcp-mount-2984";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let app = compose_runtime(roster, nests, health);
+        let call = |path: String| {
+            let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "status", "arguments": {}}});
+            axum::http::Request::post(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let resp = app
+            .clone()
+            .oneshot(call(format!("/{name}/mcp")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let out: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(out["result"]["isError"], false, "{out}");
+        let resp = app.oneshot(call("/mcp".into())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// #2944: a bundle made from one nest verifies against it over HTTP, and fails by name when its rows,
