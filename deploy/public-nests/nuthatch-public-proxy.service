@@ -1,0 +1,36 @@
+# /etc/systemd/system/nuthatch-public-proxy.service
+# nginx.conf as its own unprivileged instance, on 127.0.0.1:8480 (docs/public-nests.md).
+# It does not use, replace or reload the system nginx, and does not bind 80 or 443: Caddy keeps those.
+[Unit]
+Description=nuthatch public nests: rate limits and route allowlist
+Documentation=https://github.com/nuthatch-org/nuthatch/blob/main/docs/public-nests.md
+After=network.target nuthatch-public-arc-testnet.service
+
+[Service]
+Type=simple
+User=nests-public
+Group=nests-public
+# /run/nuthatch-public is made, owned by the service user, and removed on stop.
+RuntimeDirectory=nuthatch-public
+ExecStartPre=/usr/bin/mkdir -p /run/nuthatch-public/tmp
+ExecStartPre=/usr/sbin/nginx -t -c /etc/nuthatch-public/nginx.conf -e stderr
+ExecStart=/usr/sbin/nginx -c /etc/nuthatch-public/nginx.conf -e stderr
+ExecReload=/usr/sbin/nginx -t -c /etc/nuthatch-public/nginx.conf -e stderr
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target
