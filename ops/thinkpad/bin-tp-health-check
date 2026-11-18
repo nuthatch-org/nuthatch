@@ -1,0 +1,33 @@
+#!/bin/bash
+# Checks tailscaled, disk (>15% free), expected units, graphops auth. Wakes Grok Bot only when the
+# failure set changes. State: ~/.local/state/tp-health/. Test hooks: TP_HEALTH_FAKE_FAIL="tailscaled disk".
+set -u
+[ -f ~/.config/nh/env ] && . ~/.config/nh/env
+export PATH=$HOME/.npm-global/bin:$HOME/.cargo/bin:$PATH
+S=~/.local/state/tp-health; mkdir -p "$S"
+fails=()
+tailscale status >/dev/null 2>&1 || fails+=(tailscaled)
+free=$(df --output=pcent "$HOME" | tail -1 | tr -dc 0-9); free=$((100 - free))
+[ "$free" -gt 15 ] || fails+=("disk(${free}%free)")
+units=${TP_EXPECTED_UNITS:-}
+[ -z "$units" ] && [ -f ~/.config/tp-health/units ] && units=$(grep -v '^#' ~/.config/tp-health/units | tr '\n' ' ')
+[ -z "$units" ] && units="tp-worker@test.service"
+for u in $units; do systemctl --user is-active --quiet "$u" || fails+=("unit:$u"); done
+graphops auth status --check >/dev/null 2>&1 || fails+=(graphops-auth)
+for f in ${TP_HEALTH_FAKE_FAIL:-}; do fails+=("fake:$f"); done
+cur=$(printf '%s\n' "${fails[@]:-}" | sort | tr '\n' ',' | sed 's/,$//')
+status=ok; [ -n "$cur" ] && status=fail
+prev=$(cat "$S/failures" 2>/dev/null || true)
+{ date -Is; echo "status=$status"; echo "failures=$cur"; echo "disk_free_pct=$free"; } > "$S/last"
+if [ "$cur" != "$prev" ]; then
+  printf '%s' "$cur" > "$S/failures"
+  body=$(printf '{"source":"thinkpad","host":"%s","status":"%s","failures":"%s","previous":"%s","at":"%s"}' "$(hostname)" "$status" "$cur" "$prev" "$(date -Is)")
+  if [ -n "${CLAUDE_WAKE_URL:-}" ]; then
+    curl -fsS -m 20 -X POST -H 'Content-Type: application/json' ${CLAUDE_WAKE_KEY:+-H "Authorization: Bearer $CLAUDE_WAKE_KEY"} -d "$body" "$CLAUDE_WAKE_URL" >/dev/null \
+      && echo "wake sent: $status" || echo "wake POST failed" >&2
+  else
+    echo "state change ($status) but CLAUDE_WAKE_URL unset; no wake sent"
+  fi
+  echo "$(date -Is) $status $cur" >> "$S/history"
+fi
+[ "$status" = ok ]

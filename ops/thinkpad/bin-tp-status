@@ -1,0 +1,15 @@
+#!/bin/bash
+# Compact ThinkPad status. Secrets are shown as set/unset only.
+[ -f ~/.config/nh/env ] && . ~/.config/nh/env
+export PATH=$HOME/.npm-global/bin:$HOME/.cargo/bin:$PATH
+echo "== units"
+systemctl --user list-units --no-legend --all 'tp-*' 2>/dev/null | awk '{print "  "$1, $3"/"$4}'
+systemctl --user list-timers --no-legend 'tp-*' 2>/dev/null | awk '{print "  timer next:", $1, $2, $3}'
+echo "linger: $(loginctl show-user "$USER" -p Linger --value 2>/dev/null)"
+echo "== last health check"; sed 's/^/  /' ~/.local/state/tp-health/last 2>/dev/null || echo "  none yet"
+echo "== disk: $(df -h --output=avail,pcent "$HOME" | tail -1 | xargs) (avail, used)"
+echo "== tailscale: $(tailscale status >/dev/null 2>&1 && echo up || echo DOWN)"
+if graphops auth status --check >/dev/null 2>&1; then echo "== graphops auth: ok"; else echo "== graphops auth: FAIL"; fi
+isset() { [ -n "${!1:-}" ] && echo set || echo unset; }
+echo "   GRAPHOPS_TOKEN: $(isset GRAPHOPS_TOKEN)  CLAUDE_WAKE_URL: $(isset CLAUDE_WAKE_URL)  CLAUDE_WAKE_KEY: $(isset CLAUDE_WAKE_KEY)  GH_TOKEN: $(isset GH_TOKEN)"
+echo "== github preflight"; ~/bin/gh-preflight 2>&1 | sed 's/^/  /'

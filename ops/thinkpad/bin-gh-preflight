@@ -1,0 +1,21 @@
+#!/bin/bash
+# Read-only: reports which GH_TOKEN permissions appear to work. Never posts or writes anything.
+# Fine-grained tokens do not expose their permission list, so the repo `permissions` field (what the
+# token's identity can push to) and the token type are the only non-writing signals; a definitive
+# test would need a write. Treat "yes" as "necessary, not sufficient".
+[ -f ~/.config/nh/env ] && . ~/.config/nh/env
+PUB=${PREFLIGHT_PUBLIC_REPO:-nuthatch-org/nuthatch}; GTM=${PREFLIGHT_GTM_REPO:-nuthatch-org/gtm}
+[ -n "${GH_TOKEN:-}" ] || { echo "GH_TOKEN: unset"; exit 2; }
+echo "GH_TOKEN: set ($(case $GH_TOKEN in github_pat_*) echo fine-grained;; ghp_*) echo classic;; *) echo other;; esac))"
+if ! user=$(gh api user -q .login 2>/dev/null); then echo "auth: rejected"; exit 1; fi
+echo "auth: ok as $user"
+rc=0
+chk() { # label repo field
+  local v; v=$(gh api "repos/$2" -q ".permissions.$3" 2>/dev/null)
+  if [ "$v" = true ]; then echo "$1: yes ($2 permissions.$3=true)"
+  else echo "$1: NO or unverifiable ($2 permissions.$3=${v:-unreadable})"; rc=1; fi
+}
+chk "Issues write, public repo" "$PUB" push
+echo "  issues enabled on $PUB: $(gh api "repos/$PUB" -q .has_issues 2>/dev/null)"
+chk "Contents write, gtm" "$GTM" push
+exit $rc
