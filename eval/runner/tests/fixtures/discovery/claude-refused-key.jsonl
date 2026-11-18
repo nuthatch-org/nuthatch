@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Invalid API key · Fix external API key"}]},"error":"authentication_failed"}
+{"type":"result","subtype":"success","is_error":true,"result":"Invalid API key · Fix external API key","terminal_reason":"api_error"}

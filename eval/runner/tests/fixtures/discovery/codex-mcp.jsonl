@@ -1,0 +1,3 @@
+{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"nuthatch","tool":"sql","arguments":{"query":"select 1"},"result":{"content":[{"type":"text","text":"[{\"n\":1}]"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"nuthatch","tool":"fail","arguments":{},"result":{"content":[{"type":"text","text":"no nest"}],"structured_content":null},"error":null,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"nuthatch","tool":"sql","arguments":{"query":"select 1"},"result":null,"error":{"message":"MCP tool call requires approval, but approval policy is never"},"status":"failed"}}

@@ -46,6 +46,13 @@ fn main() {
         let transcript = std::fs::read_to_string(&a.transcript)
             .map_err(|e| format!("{}: {e}", a.transcript.display()))?;
         let events = discovery::parse(format, &transcript);
+        if let Some(error) = discovery::ended_in_error(format, &transcript) {
+            return Err(format!(
+                "not scored: {} ended on an error ({error}), which is not a verdict; see {}",
+                a.agent,
+                a.transcript.display()
+            ));
+        }
         if discovery::never_acted(&events) {
             return Err(format!(
                 "not scored: {} took no turn, so this is a harness or login failure, not a verdict; see {}",

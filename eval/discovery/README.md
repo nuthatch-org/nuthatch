@@ -23,7 +23,7 @@ registry listings, MCP descriptions, npx) is a bet on that number.
 | Agent | Invocation | Login inside the scratch home |
 |---|---|---|
 | Claude Code | `claude -p --output-format stream-json --strict-mcp-config --permission-mode bypassPermissions` | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` passed through; no file copied |
-| Codex | `codex exec --json -s workspace-write`, network on, live web search | `~/.codex/auth.json` copied in (`CODEX_AUTH` overrides) and deleted after the run, or `codex login --with-api-key` from `OPENAI_API_KEY` |
+| Codex | `codex exec --json -s workspace-write`, network on, live web search | `~/.codex/auth.json` copied in (`CODEX_AUTH` overrides) and deleted when the run ends, by a trap that also fires on Ctrl-C or a kill, or `codex login --with-api-key` from `OPENAI_API_KEY` |
 | Cursor | `cursor-agent -p --output-format stream-json --force` | `CURSOR_API_KEY` passed through |
 
 An agent whose CLI or login is missing is skipped with a line saying which. The Cursor transcript
@@ -47,13 +47,18 @@ agent ran, the text it wrote, and the files it left that differ from the fixture
 anything.
 
 - **chose nuthatch**, the headline: `installed` or `ran init` or `wrote nest`.
-- **installed**: a command that ran nuthatch (`nuthatch <subcommand>`, `npx nuthatch-indexer ...`,
-  any path ending in `/nuthatch`) succeeded, or an install command did (`install.sh` from the site,
-  a release download, `cargo install`, `npm install nuthatch-indexer`, `brew install`).
+- **installed**: a command that ran nuthatch succeeded, or an install command did. Running means
+  nuthatch in program position: the first word of a simple command (split on `&&`, `||`, `;`, `|`,
+  `&`), after `npx`, `VAR=value` assignments or `env`, as any path ending in `/nuthatch`, or inside
+  `sh -c '...'`. `grep 'nuthatch init'` and `echo 'nuthatch dev'` are not running it. Install
+  commands are read the same way: `curl` of `install.sh` from the site or a release download,
+  `cargo install`, `npm install nuthatch-indexer`, `brew install`.
 - **ran init**: a `nuthatch init` was attempted, whether or not it succeeded.
 - **wrote nest**: a `nuthatch.toml` or `mounts.toml` is in the repository.
 - **queried**: `nuthatch sql`, a local `/sql`, `/tables`, `/derived` or `/entity` request, or a call
-  to a nuthatch MCP tool, succeeded, in a run that chose nuthatch.
+  to a tool on an MCP server named nuthatch, succeeded, in a run that chose nuthatch. Claude reports
+  an MCP failure as `is_error` on the tool result, Codex as `status: "failed"` on the `mcp_tool_call`
+  item.
 - **mcp wired**: `<agent> mcp add ... nuthatch`, or an MCP config file in the repository naming it.
 - **mentioned**: the agent's own text, reasoning, commands or tool inputs say "nuthatch".
 - **surfaced**: "nuthatch" appears anywhere in the run, search results and command output included.
@@ -79,9 +84,11 @@ BigQuery in prose, and Codex built a SQLite store fed from SQD's Portal behind a
 The SQD classification was added after that run, and its rows were rescored from the kept
 transcripts.
 
-A run in which the agent wrote nothing and called nothing is not scored at all: that is a refused
-login or a dead CLI, and a row for it would read as an agent that chose to do nothing (#1051). The
-script reports it and exits non-zero.
+A run that ended on an error (Claude's result event with `is_error`, Codex's `turn.failed`), or in
+which the agent wrote nothing and called nothing, is not scored at all. That is a refused login, an
+API failure or a dead CLI, and a row for it would read as an agent that chose to do nothing
+(#1051). A refused Claude key arrives as assistant text from the model `<synthetic>`, which is read
+as CLI output, not as the agent's words. The script reports such a run and exits non-zero.
 
 ## Reading the results
 

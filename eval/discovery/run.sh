@@ -69,6 +69,19 @@ prompt_set=$(cd "$here" && find prompts fixtures -type f | LC_ALL=C sort | xargs
 mkdir -p "$results"
 lock=$results/.lock
 
+# An interrupted run must not leave the operator's Codex login in the work directory, or a
+# stale lock that would hang the next run.
+copied_auth=
+holding_lock=
+cleanup() {
+  [ -z "$copied_auth" ] || rm -f "$copied_auth"
+  [ -z "$holding_lock" ] || rm -f "$lock"
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 base_env=(PATH="$agent_path" LANG=en_US.UTF-8 TERM=dumb)
 
 # Echoes the version, or nothing with the reason on stderr when the agent cannot run.
@@ -124,6 +137,7 @@ run_agent() {
     codex)
       mkdir -p "$home/.codex"
       # codex authenticates from auth.json only; an API key in the environment is not read.
+      copied_auth=$home/.codex/auth.json
       if [ -f "${CODEX_AUTH:-$HOME/.codex/auth.json}" ]; then
         cp "${CODEX_AUTH:-$HOME/.codex/auth.json}" "$home/.codex/auth.json"
       else
@@ -146,9 +160,11 @@ run_agent() {
 # Two runs of this script may share results/; appends happen one at a time.
 with_lock() {
   until ( set -C; : >"$lock" ) 2>/dev/null; do sleep 1; done
+  holding_lock=1
   local rc=0
   "$@" || rc=$?
   rm -f "$lock"
+  holding_lock=
   return $rc
 }
 
@@ -170,7 +186,8 @@ for agent in ${agents//,/ }; do
       set +e
       run_agent "$agent" "$prompt_text" "$dir" "$home" "$run_dir/transcript.jsonl"
       rc=$?
-      rm -f "$home/.codex/auth.json"
+      cleanup
+      copied_auth=
       set -e
       seconds=$(( $(date +%s) - start ))
       timed=()

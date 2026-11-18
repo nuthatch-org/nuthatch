@@ -18,7 +18,14 @@ pub enum Event {
     Text(String),
     /// A shell command, and whether it succeeded when the transcript says.
     Command { cmd: String, ok: Option<bool> },
-    /// Any other tool call: a file write, a web search, an MCP call.
+    /// A call to a tool on an MCP server, and whether it succeeded when the transcript says.
+    Mcp {
+        server: String,
+        tool: String,
+        input: String,
+        ok: Option<bool>,
+    },
+    /// Any other tool call: a file write, a web search.
     Tool { name: String, input: String },
     /// What came back from a tool: search results, command output. Not the agent's words.
     Output(String),
@@ -76,6 +83,14 @@ pub fn parse(format: Format, transcript: &str) -> Vec<Event> {
                     .pointer("/message/content")
                     .cloned()
                     .unwrap_or(Value::Null);
+                // A refused login arrives as an assistant message the CLI wrote itself, with the
+                // model `<synthetic>` and an `error` field: not the agent's words.
+                if v.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>")
+                    || v.get("error").is_some_and(|e| !e.is_null())
+                {
+                    events.push(Event::Output(content_text(&content)));
+                    continue;
+                }
                 for block in content.as_array().into_iter().flatten() {
                     match str_at(block, "type") {
                         "text" => events.push(Event::Text(str_at(block, "text").into())),
@@ -87,6 +102,17 @@ pub fn parse(format: Format, transcript: &str) -> Vec<Event> {
                                 pending.insert(str_at(block, "id").into(), events.len());
                                 events.push(Event::Command {
                                     cmd: str_at(&input, "command").into(),
+                                    ok: None,
+                                });
+                            } else if let Some((server, tool)) = name
+                                .strip_prefix("mcp__")
+                                .and_then(|rest| rest.split_once("__"))
+                            {
+                                pending.insert(str_at(block, "id").into(), events.len());
+                                events.push(Event::Mcp {
+                                    server: server.into(),
+                                    tool: tool.into(),
+                                    input: input.to_string(),
                                     ok: None,
                                 });
                             } else {
@@ -114,7 +140,7 @@ pub fn parse(format: Format, transcript: &str) -> Vec<Event> {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     if let Some(&i) = pending.get(str_at(block, "tool_use_id")) {
-                        if let Event::Command { ok, .. } = &mut events[i] {
+                        if let Event::Command { ok, .. } | Event::Mcp { ok, .. } = &mut events[i] {
                             *ok = Some(!error);
                         }
                     }
@@ -149,6 +175,26 @@ pub fn parse(format: Format, transcript: &str) -> Vec<Event> {
                         }
                     }
                     "error" => events.push(Event::Output(str_at(&item, "message").into())),
+                    // A tool error comes back as status "failed" with either `error` set or a
+                    // result the server marked as an error.
+                    "mcp_tool_call" => {
+                        events.push(Event::Mcp {
+                            server: str_at(&item, "server").into(),
+                            tool: str_at(&item, "tool").into(),
+                            input: item
+                                .get("arguments")
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                                .to_string(),
+                            ok: Some(
+                                str_at(&item, "status") == "completed"
+                                    && item.get("error").is_none_or(Value::is_null),
+                            ),
+                        });
+                        if let Some(r) = item.get("result").filter(|r| !r.is_null()) {
+                            events.push(Event::Output(r.to_string()));
+                        }
+                    }
                     "" => {}
                     kind => {
                         let mut input = item.clone();
@@ -203,6 +249,28 @@ pub fn parse(format: Format, transcript: &str) -> Vec<Event> {
 /// dead CLI, not an agent that chose to do nothing, and it must not be scored as one (#1051).
 pub fn never_acted(events: &[Event]) -> bool {
     !events.iter().any(|e| !matches!(e, Event::Output(_)))
+}
+
+/// The error a run ended on, when the CLI says it ended on one: Claude's result event with
+/// `is_error` (a refused key reports `subtype: success` beside it), or Codex's `turn.failed`.
+pub fn ended_in_error(format: Format, transcript: &str) -> Option<String> {
+    transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| match (format, str_at(&v, "type")) {
+            (Format::Claude | Format::Cursor, "result")
+                if v.get("is_error").and_then(Value::as_bool) == Some(true) =>
+            {
+                Some(str_at(&v, "result").to_string())
+            }
+            (Format::Codex, "turn.failed") => Some(
+                v.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .into(),
+            ),
+            _ => None,
+        })
 }
 
 /// The model Claude's transcript names in its init event, and the cost its result event reports.
@@ -262,59 +330,212 @@ const SUBCOMMANDS: &[&str] = &[
     "version",
 ];
 
-fn words(cmd: &str) -> Vec<String> {
-    cmd.split(|c: char| c.is_whitespace() || ";&|()<>'\"`".contains(c))
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect()
+enum Token {
+    Word(String),
+    Sep,
 }
 
-/// The subcommand of each nuthatch invocation in a command: `nuthatch init`, `npx -y
-/// nuthatch-indexer sql`, `~/.nuthatch/bin/nuthatch dev`.
-fn nuthatch_subcommands(cmd: &str) -> Vec<String> {
-    let w = words(cmd);
+/// Shell words with quotes resolved, and a separator for each `;`, `&&`, `||`, `|`, `&`, `(`,
+/// `)` and newline outside quotes. Enough of sh to find program position, not an interpreter.
+fn tokens(cmd: &str) -> Vec<Token> {
     let mut out = Vec::new();
-    for pair in w.windows(2) {
-        let program = pair[0].rsplit('/').next().unwrap_or("");
-        if matches!(program, "nuthatch" | "nuthatch-indexer" | "nuthatch.js")
-            && SUBCOMMANDS.contains(&pair[1].as_str())
-        {
-            out.push(pair[1].clone());
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = cmd.chars().peekable();
+    let flush = |out: &mut Vec<Token>, word: &mut String, in_word: &mut bool| {
+        if *in_word {
+            out.push(Token::Word(std::mem::take(word)));
+            *in_word = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                for d in chars.by_ref() {
+                    if d == '\'' {
+                        break;
+                    }
+                    word.push(d);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(d) = chars.next() {
+                    match d {
+                        '"' => break,
+                        '\\' => match chars.peek() {
+                            Some(&n @ ('"' | '\\' | '$' | '`')) => {
+                                word.push(n);
+                                chars.next();
+                            }
+                            _ => word.push('\\'),
+                        },
+                        _ => word.push(d),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(n) = chars.next() {
+                    if n != '\n' {
+                        word.push(n);
+                    }
+                }
+            }
+            // `2>&1` and `&>` are redirections, not a background separator.
+            '&' if word.ends_with('>') || word.ends_with('<') || chars.peek() == Some(&'>') => {
+                in_word = true;
+                word.push(c);
+            }
+            ';' | '&' | '|' | '(' | ')' | '\n' => {
+                flush(&mut out, &mut word, &mut in_word);
+                out.push(Token::Sep);
+            }
+            c if c.is_whitespace() => flush(&mut out, &mut word, &mut in_word),
+            _ => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    flush(&mut out, &mut word, &mut in_word);
+    out
+}
+
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+/// Every simple command in `cmd` as its argv, lowercased, with the program first: leading
+/// `VAR=value` assignments and `sudo`/`env`/`exec`/`time`/`command` stripped, `npx -y pkg` read
+/// as `pkg`, and `sh -c 'script'` (how Codex wraps every command) read as the script's commands.
+fn simple_commands(cmd: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut argv: Vec<String> = Vec::new();
+    let mut toks = tokens(cmd);
+    toks.push(Token::Sep);
+    for t in toks {
+        match t {
+            Token::Word(w) => argv.push(w),
+            Token::Sep => {
+                let words = std::mem::take(&mut argv);
+                simple(words, &mut out);
+            }
         }
     }
     out
 }
 
-fn is_install(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    if lower.contains("nuthatch-indexer.com/install")
-        || lower.contains("github.com/nuthatch-org/nuthatch/releases")
-    {
-        return true;
+fn simple(words: Vec<String>, out: &mut Vec<Vec<String>>) {
+    let mut i = 0;
+    loop {
+        let Some(w) = words.get(i) else {
+            return;
+        };
+        let assignment = w.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if assignment
+            || matches!(
+                w.as_str(),
+                "sudo" | "env" | "exec" | "time" | "command" | "nohup"
+            )
+        {
+            i += 1;
+        } else {
+            break;
+        }
     }
-    let w = words(cmd);
-    let has = |s: &str| w.iter().any(|x| x == s);
-    let names_it = w.iter().any(|x| x.contains("nuthatch"));
-    (has("cargo") && has("install") && names_it)
-        || (has("brew") && has("install") && names_it)
-        || ((has("npm") || has("pnpm") || has("yarn") || has("bun"))
-            && (has("i") || has("install") || has("add"))
-            && w.iter().any(|x| x.starts_with("nuthatch-indexer")))
-        || (has("npx") && w.iter().any(|x| x.starts_with("nuthatch-indexer")))
+    let program = basename(&words[i]).to_lowercase();
+    if matches!(program.as_str(), "sh" | "bash" | "zsh" | "dash") {
+        let script = words[i + 1..]
+            .iter()
+            .position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
+            .and_then(|p| words.get(i + 2 + p));
+        if let Some(script) = script {
+            out.extend(simple_commands(script));
+        }
+        return;
+    }
+    if matches!(program.as_str(), "npx" | "pnpx" | "bunx") {
+        if let Some(p) = words[i + 1..].iter().position(|a| !a.starts_with('-')) {
+            i += 1 + p;
+        }
+    }
+    let mut argv: Vec<String> = words[i..].iter().map(|w| w.to_lowercase()).collect();
+    // `npx nuthatch-indexer@5.22.0`
+    if let Some((pkg, _)) = argv[0].split_once('@').filter(|(p, _)| !p.is_empty()) {
+        argv[0] = pkg.to_string();
+    }
+    out.push(argv);
+}
+
+fn is_nuthatch_program(argv0: &str) -> bool {
+    matches!(
+        basename(argv0),
+        "nuthatch" | "nuthatch-indexer" | "nuthatch.js"
+    )
+}
+
+/// The subcommand of each nuthatch invocation in a command: `nuthatch init`, `npx -y
+/// nuthatch-indexer sql`, `~/.nuthatch/bin/nuthatch dev`. Only in program position, so
+/// `grep 'nuthatch init'` is not one.
+fn nuthatch_subcommands(cmd: &str) -> Vec<String> {
+    simple_commands(cmd)
+        .into_iter()
+        .filter(|argv| is_nuthatch_program(&argv[0]))
+        .filter_map(|argv| {
+            argv[1..]
+                .iter()
+                .find(|a| SUBCOMMANDS.contains(&a.as_str()))
+                .cloned()
+        })
+        .collect()
+}
+
+fn is_install(cmd: &str) -> bool {
+    simple_commands(cmd).iter().any(|argv| {
+        let program = basename(&argv[0]);
+        let args = &argv[1..];
+        let sub = args.first().map(String::as_str);
+        let names = |p: &str| args.iter().any(|a| a.contains(p));
+        match program {
+            "curl" | "wget" => {
+                names("nuthatch-indexer.com/install")
+                    || names("github.com/nuthatch-org/nuthatch/releases")
+            }
+            "cargo" | "brew" => sub == Some("install") && names("nuthatch"),
+            "npm" | "pnpm" | "yarn" | "bun" => {
+                matches!(sub, Some("i" | "install" | "add"))
+                    && args.iter().any(|a| a.starts_with("nuthatch-indexer"))
+            }
+            // Reached through `npx`, which downloads it.
+            "nuthatch-indexer" => true,
+            _ => false,
+        }
+    })
 }
 
 fn is_mcp_add(cmd: &str) -> bool {
-    let w = words(cmd);
-    w.windows(2).any(|p| p[0] == "mcp" && p[1] == "add") && w.iter().any(|x| x.contains("nuthatch"))
+    simple_commands(cmd).iter().any(|argv| {
+        matches!(basename(&argv[0]), "claude" | "codex" | "cursor-agent")
+            && argv.get(1).map(String::as_str) == Some("mcp")
+            && argv.get(2).map(String::as_str) == Some("add")
+            && argv.iter().any(|a| a.contains("nuthatch"))
+    })
 }
 
 fn is_local_query(cmd: &str) -> bool {
-    let lower = cmd.to_lowercase();
-    (lower.contains("curl") || lower.contains("wget"))
-        && (lower.contains("127.0.0.1:") || lower.contains("localhost:"))
-        && ["/sql", "/tables", "/derived", "/entity"]
-            .iter()
-            .any(|p| lower.contains(p))
+    simple_commands(cmd).iter().any(|argv| {
+        matches!(basename(&argv[0]), "curl" | "wget")
+            && argv.iter().any(|a| {
+                (a.contains("127.0.0.1:") || a.contains("localhost:"))
+                    && ["/sql", "/tables", "/derived", "/entity"]
+                        .iter()
+                        .any(|p| a.contains(p))
+            })
+    })
 }
 
 /// A file the agent created or changed, relative to the workdir.
@@ -446,9 +667,10 @@ pub fn alternatives(changed: &[Changed], commands: &[String]) -> Vec<&'static st
     };
     let ran = |program: &str, subs: &[&str]| {
         commands.iter().any(|c| {
-            let w = words(c);
-            w.windows(2)
-                .any(|p| p[0].rsplit('/').next() == Some(program) && subs.contains(&p[1].as_str()))
+            simple_commands(c).iter().any(|argv| {
+                basename(&argv[0]) == program
+                    && argv.get(1).is_some_and(|s| subs.contains(&s.as_str()))
+            })
         })
     };
     let mut out = Vec::new();
@@ -525,8 +747,15 @@ pub fn score(events: &[Event], changed: &[Changed]) -> Score {
                 if name.to_lowercase().contains("search") {
                     s.web_searches += 1;
                 }
-                // An MCP call into a nuthatch server: Claude names it mcp__nuthatch__sql.
-                if has(name) {
+            }
+            Event::Mcp {
+                server,
+                tool,
+                input,
+                ok,
+            } => {
+                s.mentioned |= has(server) || has(tool) || has(input);
+                if has(server) && *ok == Some(true) {
                     s.queried = true;
                 }
             }
@@ -777,12 +1006,114 @@ mod tests {
 
     #[test]
     fn a_refused_login_is_not_an_agent_that_did_nothing() {
-        let t = r#"{"type":"thread.started","thread_id":"x"}
-{"type":"item.completed","item":{"type":"error","message":"401 Unauthorized"}}
-{"type":"turn.failed","error":{"message":"401 Unauthorized"}}"#;
-        assert!(never_acted(&parse(Format::Codex, t)));
+        // Both trimmed from real refusals on 2026-11-18: Claude with an invalid API key, Codex
+        // with no auth.json.
+        let claude = include_str!("../tests/fixtures/discovery/claude-refused-key.jsonl");
+        let e = parse(Format::Claude, claude);
+        assert!(
+            never_acted(&e),
+            "the CLI's synthetic error text is not the agent's: {e:?}"
+        );
+        assert!(!score(&e, &[]).mentioned);
+        assert_eq!(
+            ended_in_error(Format::Claude, claude).as_deref(),
+            Some("Invalid API key · Fix external API key")
+        );
+        let codex = include_str!("../tests/fixtures/discovery/codex-refused-login.jsonl");
+        assert!(never_acted(&parse(Format::Codex, codex)));
+        assert!(ended_in_error(Format::Codex, codex)
+            .unwrap()
+            .contains("401"));
+
         assert!(never_acted(&parse(Format::Claude, "")));
         assert!(!never_acted(&[Event::Text("ok".into())]));
+        let ok = r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#;
+        assert_eq!(ended_in_error(Format::Claude, ok), None);
+    }
+
+    #[test]
+    fn quoting_the_words_is_not_running_nuthatch() {
+        for c in [
+            "grep -rn 'nuthatch init' .",
+            "echo 'nuthatch dev'",
+            "rg 'nuthatch (init|dev)' docs",
+            "/bin/zsh -lc \"grep -rn 'nuthatch init' .\"",
+            "git commit -m \"nuthatch sql works\"",
+        ] {
+            assert!(nuthatch_subcommands(c).is_empty(), "{c}");
+            let s = score(&[cmd(c, true)], &[]);
+            assert!(!s.chose_nuthatch && !s.installed && !s.ran_init, "{c}");
+        }
+        assert!(!is_install("echo 'npm install nuthatch-indexer'"));
+        assert!(!is_mcp_add("grep 'claude mcp add nuthatch' README.md"));
+    }
+
+    #[test]
+    fn program_position_is_found_through_separators_wrappers_and_assignments() {
+        for (c, sub) in [
+            ("cd nest && nuthatch init 0xabc --chain mainnet", "init"),
+            ("ls || nuthatch dev", "dev"),
+            ("true; nuthatch sql 'select 1' | head", "sql"),
+            ("RUST_LOG=info NUTHATCH_DIR=x nuthatch dev 2>&1 &", "dev"),
+            ("env FOO=1 ./bin/nuthatch init 0xabc", "init"),
+            ("npx -y nuthatch-indexer@5.22.0 init 0xabc", "init"),
+            ("/bin/zsh -lc 'cd nest && nuthatch init 0xabc'", "init"),
+            ("(cd nest; nuthatch dev)", "dev"),
+        ] {
+            assert_eq!(nuthatch_subcommands(c), vec![sub], "{c}");
+        }
+        assert!(is_install(
+            "/bin/zsh -lc 'curl -fsSL https://nuthatch-indexer.com/install.sh | sh'"
+        ));
+    }
+
+    #[test]
+    fn a_nuthatch_mcp_call_counts_as_a_query_only_when_it_succeeded() {
+        // Real shapes, 2026-11-18, against a stub MCP server named nuthatch: a `sql` call that
+        // succeeded and a `fail` call the server marked as an error. Codex's third item is the
+        // same call refused by its approval policy.
+        let claude = parse(
+            Format::Claude,
+            include_str!("../tests/fixtures/discovery/claude-mcp.jsonl"),
+        );
+        let codex = parse(
+            Format::Codex,
+            include_str!("../tests/fixtures/discovery/codex-mcp.jsonl"),
+        );
+        let calls = |e: &[Event]| -> Vec<(String, Option<bool>)> {
+            e.iter()
+                .filter_map(|e| match e {
+                    Event::Mcp {
+                        server, tool, ok, ..
+                    } if server == "nuthatch" => Some((tool.clone(), *ok)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            calls(&claude),
+            vec![("sql".into(), Some(true)), ("fail".into(), Some(false))]
+        );
+        assert_eq!(
+            calls(&codex),
+            vec![
+                ("sql".into(), Some(true)),
+                ("fail".into(), Some(false)),
+                ("sql".into(), Some(false))
+            ]
+        );
+        let init = cmd("nuthatch init 0xabc", true);
+        for events in [&claude, &codex] {
+            let mut with = vec![init.clone()];
+            with.extend(events.iter().cloned());
+            assert!(score(&with, &[]).queried);
+            let failed_only: Vec<Event> = with
+                .iter()
+                .filter(|e| !matches!(e, Event::Mcp { ok: Some(true), .. }))
+                .cloned()
+                .collect();
+            assert!(!score(&failed_only, &[]).queried);
+        }
     }
 
     #[test]

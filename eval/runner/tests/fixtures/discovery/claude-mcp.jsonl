@@ -1,0 +1,6 @@
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01Y59PJytSHwsp4oro2koPLt","name":"ToolSearch","input":{"query":"select:mcp__nuthatch__sql,mcp__nuthatch__fail","max_results":2}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01Y59PJytSHwsp4oro2koPLt","content":[{"type":"tool_reference","tool_name":"mcp__nuthatch__sql"},{"type":"tool_reference","tool_name":"mcp__nuthatch__fail"}]}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01EXRGkjKpUsHTkuUFKqYgfb","name":"mcp__nuthatch__sql","input":{"query":"select 1"}}]}}
+{"type":"user","message":{"content":[{"tool_use_id":"toolu_01EXRGkjKpUsHTkuUFKqYgfb","type":"tool_result","content":[{"type":"text","text":"[{\"n\":1}]"}]}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_012qATBjRayp6sDkPdYDfTTm","name":"mcp__nuthatch__fail","input":{}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"no nest","is_error":true,"tool_use_id":"toolu_012qATBjRayp6sDkPdYDfTTm"}]}}
