@@ -542,3 +542,13 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 - TEE attestation, zk proofs (verifiability = deterministic re-execution of the core
   + content-addressed segments; nothing heavier).
 - Kubernetes manifests, Helm charts, or any deployment story beyond binary + compose.
+
+## Agent worker rules (cloud and headless sessions)
+
+- One task, one branch `agent/<id>`, one PR. Never push to `main` and never merge.
+- The brief you were given is the scope. Don't touch anything listed as out of scope.
+- Before opening or updating the PR, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests for the crates you touched. CI is the merge gate.
+- Never weaken, skip or delete a test to get green.
+- PR body: summary, risks, and exactly how you verified it.
+- Stop and say so in the PR (don't push on) if the change needs a public API or schema change, `unsafe`, a new dependency, or more than about 400 changed lines.
+- `.claude/hooks/wake.sh` notifies the orchestrator when you stop. Leave it alone.
