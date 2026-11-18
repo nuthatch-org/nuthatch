@@ -590,5 +590,6 @@ Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): recon
 - `7` `chain_not_detected`: pass --chain <name>, or --rpc with an endpoint on its chain
 - `8` `rpc_refused`: pass --rpc with an endpoint that answers; `nuthatch doctor --rpc <url>` probes one
 - `9` `rpc_range_too_wide`: `nuthatch doctor --rpc <url>` prints the largest safe --window; pass it to dev
+- `10` `port_in_use`: pass --listen 127.0.0.1:<free port>, or `nuthatch stop` the nest holding this one
 
 With `--json`, an error is one object on stderr: `{"error": {"code", "exit", "message", "next"}}`. 0 is success.
