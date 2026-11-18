@@ -12591,7 +12591,11 @@ mod tests {
             true,
             declared_public(),
         );
-        assert_hosts(&app, &["/sql?q=SELECT%201", "/tables", "/ready", "/nope"]).await;
+        assert_hosts(
+            &app,
+            &["/sql?q=SELECT%201", "/tables", "/ready", "/mcp", "/nope"],
+        )
+        .await;
     }
 
     /// The same in a runtime, at the root and under a mount's prefix.
