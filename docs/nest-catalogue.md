@@ -13,8 +13,8 @@ never as "this has not shipped" - as of 2026-08-04 the index lists Graph Horizon
 Uniswap V4, Livepeer and POA as 🟢 available, and two of those are not ranked in this file at all.
 Keeping a plan and a status board in one document is what let a shipped nest sit in Tier 3 for weeks.
 
-**Showcase nests (#2978, 2026-11-18).** The contracts people ask about most, each public, measured on
-5.22.0 and checked against an explorer or `eth_call` in its own README:
+**Showcase nests (#2978, 2026-11-18).** The contracts people ask about most, each public. The four stablecoin and WETH nests are
+measured on 5.22.0 and checked against an explorer or `eth_call` in their READMEs:
 [USDC](https://github.com/nuthatch-org/usdc-nest),
 [USDC on Base](https://github.com/nuthatch-org/usdc-base-nest),
 [WETH](https://github.com/nuthatch-org/weth-nest),
