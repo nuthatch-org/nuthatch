@@ -74,6 +74,8 @@ mod e2e_flight_clients;
 mod e2e_fold_writer;
 #[path = "e2e_follower.rs"]
 mod e2e_follower;
+#[path = "e2e_init_in_repo.rs"]
+mod e2e_init_in_repo;
 #[path = "e2e_l1_blocks.rs"]
 mod e2e_l1_blocks;
 #[path = "e2e_migrate_parity.rs"]

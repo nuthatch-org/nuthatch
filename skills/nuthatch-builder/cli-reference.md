@@ -229,10 +229,10 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--abi <ABI>` - Use these local ABI file(s) instead of resolving from Sourcify/Etherscan, one per address in order (comma-separated; use an empty entry to resolve that address normally). The escape hatch for a proxy whose implementation ABI the public resolvers don't return - point this at the implementation's ABI and the nest decodes the events the proxy actually emits
 - `--chain <CHAIN>` - Chain to index, e.g. mainnet, arbitrum-one, base. Omit it and nuthatch probes each known chain for the contract's bytecode and picks the one it lives on - you rarely need to say
 - `--rpc <RPC>` - Use only these RPC URL(s) (repeatable). They are written to the nest's `rpc_urls` and used for ABI/deploy-block resolution during init. Point at your own node to avoid public-RPC limits
-- `--dir <DIR>` - Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the nest's own name)
+- `--dir <DIR>` - Directory to scaffold into. Defaults to the current directory; for `--from`, to the nest's own name; and in a git repository that already has an `AGENTS.md` or `.gitignore`, to `./nest` (`init` says so), so the repository's own files are not skipped. `--dir .` scaffolds in place
 - `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Skips the RPC probe for that address. An empty entry still probes
 - `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
-- `--json` - Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias, deployment block, proxy warning), `tables`, `files_written` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there
+- `--json` - Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias, deployment block, proxy warning), `tables`, `files_written`, `files_skipped` (scaffold files that were already there and kept), `files_appended` (existing files given a nuthatch section), `dir_defaulted` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there
 
 ## `nuthatch labels`
 
