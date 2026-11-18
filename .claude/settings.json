@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "Stop":        [{ "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/wake.sh stop" }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/wake.sh failed" }] }],
+    "Notification":[{ "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/wake.sh needs_input" }] }]
+  }
+}
