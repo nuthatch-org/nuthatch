@@ -4,7 +4,11 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 U=~/.config/systemd/user
 if [ "${1:-}" = --uninstall ]; then
-  systemctl --user disable --now tp-health.timer 'tp-worker@test.service' 2>/dev/null || true
+  # every tp-worker@ instance: loaded ones (incl. inactive/failed) and those listed in the units file
+  inst=$( { systemctl --user list-units --all --plain --no-legend 'tp-worker@*' 2>/dev/null | awk '{print $1}'
+           grep -v '^#' ~/.config/tp-health/units 2>/dev/null; } | grep '^tp-worker@.*\.service$' | sort -u || true)
+  # shellcheck disable=SC2086
+  systemctl --user disable --now tp-health.timer $inst 2>/dev/null || true
   rm -f "$U"/tp-worker@.service "$U"/tp-health.service "$U"/tp-health.timer \
         ~/bin/tp-worker-run ~/bin/tp-health-check ~/bin/gh-preflight ~/bin/tp-status
   systemctl --user daemon-reload; echo "removed (state in ~/.local/state/tp-health kept)"; exit 0

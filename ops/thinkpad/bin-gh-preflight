@@ -15,7 +15,7 @@ chk() { # label repo field
   if [ "$v" = true ]; then echo "$1: yes ($2 permissions.$3=true)"
   else echo "$1: NO or unverifiable ($2 permissions.$3=${v:-unreadable})"; rc=1; fi
 }
-chk "Issues write, public repo" "$PUB" push
+chk "push permission (necessary signal only; Issues write not verifiable for fine-grained tokens), $PUB" "$PUB" push
 echo "  issues enabled on $PUB: $(gh api "repos/$PUB" -q .has_issues 2>/dev/null)"
 chk "Contents write, gtm" "$GTM" push
 exit $rc
