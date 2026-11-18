@@ -24,7 +24,9 @@ pub(crate) fn compare_bin() -> PathBuf {
             .parent()
             .unwrap()
             .join("parity-bin/lodestar-parity-compare");
-        if shipped.is_file() {
+        // Only while it is newer than every source it was built from: a binary left by another
+        // checkout would otherwise be the oracle without a word.
+        if shipped.is_file() && (std::env::var_os("CI").is_some() || newer_than_sources(&shipped)) {
             return shipped;
         }
         if std::env::var_os("CI").is_some() {
@@ -45,6 +47,33 @@ pub(crate) fn compare_bin() -> PathBuf {
         target.join("debug/lodestar-parity-compare")
     })
     .clone()
+}
+
+/// Whether `bin` was modified after every file under tools/lodestar-parity (its sources, manifest
+/// and lockfile), so it was built from them or something later.
+fn newer_than_sources(bin: &std::path::Path) -> bool {
+    fn newest(dir: &std::path::Path, acc: &mut std::time::SystemTime) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            if path.is_dir() {
+                newest(&path, acc);
+            } else if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
+                *acc = (*acc).max(t);
+            }
+        }
+    }
+    let Ok(built) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let mut sources = std::time::SystemTime::UNIX_EPOCH;
+    newest(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/lodestar-parity"),
+        &mut sources,
+    );
+    built > sources
 }
 
 fn decode(s: &str) -> String {
