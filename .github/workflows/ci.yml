@@ -60,7 +60,17 @@ env:
 jobs:
   # Two tiers, to fit a 20-job org on a single PR. `full` is false for a change only to docs/ (bar
   # docs/bench/, which point-read reads) or to root *.md: the default leg still runs, since it holds
-  # every test that reads docs. `slow` is the merge queue, a push, or a PR labelled `full-ci`.
+  # every test that reads docs.
+  #
+  # `slow` is computed as `full && (event != pull_request || PR has the full-ci label)`. In words:
+  #   - merge_group (the merge queue): slow = full. A queue entry is slow whenever it changes any
+  #     code; only a docs-only entry skips the slow tier, and it cannot move RSS or latency.
+  #   - push (main, sprint/**): slow = full, so every landed commit runs the slow tier.
+  #   - pull_request: slow only with the `full-ci` label. A plain PR skips the slow tier.
+  # So on a plain PR, build release, footprint, point-read and backfill are skipped, and a skipped
+  # job satisfies its required context. The merge queue is the gate for RAM and latency. Caveat: a
+  # PR based on sprint/** is a pull_request too, so its RAM and latency gates are also skipped
+  # there and run only after the push lands.
   # Gated jobs test `!= 'false'`, so a failed `changes` (empty outputs) runs everything, not nothing.
   changes:
     name: changes (which tiers run)
@@ -1277,9 +1287,11 @@ jobs:
   build-release:
     name: build release
     needs: changes
-    # #3041: the slow tier only (merge queue, main, or a `full-ci` label). On a PR it was the second
-    # longest job and gated nothing but the measurement jobs below, which are slow-tier too. A
-    # skipped job still satisfies its required context, as the other slow-tier jobs do.
+    # #3041: the slow tier only, as set in `changes` (merge queue, push, or a PR labelled `full-ci`).
+    # On a plain PR this job and the three measurements that consume its binary are skipped. That was
+    # chosen for PR wall time: this was the second-longest job on a PR, and its only consumers there
+    # are those measurements. The cost is that a RAM, point-read or backfill regression is caught in
+    # the merge queue rather than on the PR. `full-ci` restores the pre-merge check.
     if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     # 45, not 20 (#584). Warm this job is 3m40s-5m12s; cold - triggered by any `Cargo.lock`
