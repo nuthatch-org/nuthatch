@@ -1355,9 +1355,16 @@ fn resolve_dir(args: &mut InitArgs, cwd: &Path) -> bool {
     if !args.dir.is_empty() {
         return false;
     }
-    let host = args.from.is_none() && in_host_repo(cwd);
-    args.dir = if host { "nest" } else { "." }.to_string();
+    let (dir, host) = default_dir(args, cwd);
+    args.dir = dir.to_string();
     host
+}
+
+/// What an unset `--dir` means, and whether that is the `nest` subdirectory of a host repository.
+/// The one place the default is decided, so a reader that runs before `resolve_dir` agrees with it.
+fn default_dir(args: &InitArgs, cwd: &Path) -> (&'static str, bool) {
+    let host = args.from.is_none() && in_host_repo(cwd);
+    (if host { "nest" } else { "." }, host)
 }
 
 /// Said before anything else, so it is the first thing a person sees.
@@ -1564,9 +1571,14 @@ fn scaffold_views(dir: &Path, schema: &[crate::registry::TableSchema]) -> Result
 /// Where `init` writes the nest: `--dir`, except that `--from` with the default names it after its
 /// source.
 pub(crate) fn target_dir(args: &InitArgs) -> PathBuf {
+    let dir = if args.dir.is_empty() {
+        default_dir(args, Path::new(".")).0
+    } else {
+        args.dir.as_str()
+    };
     match &args.from {
-        Some(source) if args.dir == "." => PathBuf::from(source_basename(source)),
-        _ => PathBuf::from(&args.dir),
+        Some(source) if dir == "." => PathBuf::from(source_basename(source)),
+        _ => PathBuf::from(dir),
     }
 }
 
@@ -2599,6 +2611,22 @@ fn dir_hint(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `target_dir` runs on an unresolved `--dir` too (the head count reads it), and must agree with
+    /// what `resolve_dir` then picks.
+    #[test]
+    fn target_dir_resolves_an_unset_dir_as_init_does() {
+        let parse = |a: &[&str]| match <crate::cli::Cli as clap::Parser>::parse_from(a).command {
+            crate::cli::Command::Init(i) => i,
+            _ => unreachable!(),
+        };
+        let from = parse(&["nuthatch", "init", "--from", "https://github.com/o/mynest.git"]);
+        assert_eq!(target_dir(&from), PathBuf::from("mynest"));
+        let mut a = parse(&["nuthatch", "init", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"]);
+        let before = target_dir(&a);
+        resolve_dir(&mut a, Path::new("."));
+        assert_eq!(target_dir(&a), before);
+    }
 
     #[test]
     fn only_json_walks_the_directory() {

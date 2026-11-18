@@ -567,10 +567,14 @@ mod tests {
         assert_eq!(Pending::of(&from).dir, PathBuf::from("mynest"));
         let given = init_args(&["nuthatch", "init", "--from", "./a", "--dir", "b"]);
         assert_eq!(Pending::of(&given).dir, PathBuf::from("b"));
+        // The unset default depends on the working directory (a host repository gets `nest`), so
+        // the addresses case names `.`; project's tests cover the default itself.
         let addresses = init_args(&[
             "nuthatch",
             "init",
             "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "--dir",
+            ".",
         ]);
         assert_eq!(Pending::of(&addresses).dir, PathBuf::from("."));
     }
