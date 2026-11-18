@@ -93,7 +93,7 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
     assert_eq!(marketplace["plugins"][0]["source"], "./");
 
     let cursor = json(".cursor-plugin/plugin.json");
-    for key in ["rules", "skills", "mcpServers"] {
+    for key in ["rules", "skills", "mcpServers", "logo"] {
         let path = cursor[key]
             .as_str()
             .unwrap_or_else(|| panic!("cursor {key}"));
@@ -102,6 +102,13 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
             ".cursor-plugin/plugin.json {key}: {path} is missing"
         );
     }
+
+    // Anthropic's directory takes a square PNG of 512 to 2048 px, and keeps the first one for good.
+    let png = std::fs::read(root.join(".claude-plugin/icon.png")).expect(".claude-plugin/icon.png");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "icon.png is not a PNG");
+    let side = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
+    let (w, h) = (side(16), side(20));
+    assert!(w == h && (512..=2048).contains(&w), "icon.png is {w}x{h}");
 }
 
 fn skill_dir() -> PathBuf {

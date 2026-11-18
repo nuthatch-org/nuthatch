@@ -8,6 +8,7 @@
   "homepage": "https://www.nuthatch-indexer.com",
   "repository": "https://github.com/nuthatch-org/nuthatch",
   "license": "MIT OR Apache-2.0",
+  "logo": ".claude-plugin/icon.png",
   "keywords": ["cursor-plugin", "evm", "ethereum", "indexer", "sql", "mcp", "subgraph", "nuthatch"],
   "category": "developer-tools",
   "tags": ["evm", "indexer", "sql", "mcp"],
