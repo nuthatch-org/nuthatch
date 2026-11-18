@@ -2297,34 +2297,20 @@ fn served_last_block(s: &AppState) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
-/// Whether the catalogue in `dir` names a sealed segment that holds a row, for `/ready`'s `has_rows`.
-/// A true answer is kept for the life of the process, as sealed rows are never taken back, so a
-/// poll reads the catalogue only while it has found none, which is when it is small or absent.
-fn sealed_segments_hold_rows(dir: &std::path::Path) -> bool {
-    static KNOWN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-    let known = |dir: &std::path::Path| {
-        KNOWN
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|d| d == dir)
-    };
-    if known(dir) {
-        return true;
-    }
-    let holds = crate::seal::load_manifest(dir)
-        .map(|m| m.tables.values().flatten().any(|seg| seg.rows > 0))
-        .unwrap_or(false);
-    if holds {
-        KNOWN
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(dir.to_path_buf());
-    }
-    holds
+/// The `from_block` of the earliest sealed segment in `dir`'s catalogue that holds a row, for
+/// `/ready`'s `has_rows` and `first_block_indexed`. The catalogue records a range, not a first row.
+fn sealed_first_block(dir: &std::path::Path) -> Option<u64> {
+    crate::seal::load_manifest(dir).ok().and_then(|m| {
+        m.tables
+            .values()
+            .flatten()
+            .filter(|seg| seg.rows > 0)
+            .map(|seg| seg.from_block)
+            .min()
+    })
 }
 
+/// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
 pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     use crate::metrics::{now_unix, METRICS};
     let nest = s
@@ -2617,8 +2603,9 @@ fn ready_answer(s: &AppState) -> Answer {
         .sample_entity_keys(1)
         .ok()
         .and_then(|k| k.into_iter().next());
-    let first_block_indexed = hot_first.as_deref().and_then(answer::block_of_entity_key);
-    let has_rows = hot_first.is_some() || sealed_segments_hold_rows(&s.dir);
+    let sealed_first = sealed_first_block(&s.dir);
+    let first_block_indexed = answer::first_block_indexed(hot_first.as_deref(), sealed_first);
+    let has_rows = hot_first.is_some() || sealed_first.is_some();
     #[cfg(feature = "folds")]
     let folds = (!folds.is_null()).then_some(folds);
     #[cfg(not(feature = "folds"))]
