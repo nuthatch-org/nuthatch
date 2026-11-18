@@ -143,7 +143,14 @@ async fn run(command: cli::Command) -> Result<()> {
         // means one nest, and the pre-2.0 `mounts dev` split is gone.
         cli::Command::Dev(args) => {
             if args.detach {
-                return nuthatch::detach::start(&args.dir, &args.listen, args.json).await;
+                return nuthatch::detach::start(
+                    &args.dir,
+                    &args.listen,
+                    args.json,
+                    args.wait_rows
+                        .then(|| std::time::Duration::from_secs(args.wait_timeout)),
+                )
+                .await;
             }
             nuthatch::analytics::check_engine_choice(
                 std::env::var(nuthatch::analytics::ENV_ENGINE).ok().as_deref(),

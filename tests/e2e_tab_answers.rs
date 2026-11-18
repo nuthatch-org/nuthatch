@@ -190,6 +190,23 @@ fn the_node_answers_the_pinned_requests_byte_for_byte() {
         .collect();
     let got = Value::Array(got);
 
+    // Sealed and hot rows both exist here: the first block indexed is not the hot store's first key.
+    let ready = got
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "/ready")
+        .expect("the requests include /ready");
+    let ready: Value = serde_json::from_str(ready["body"].as_str().unwrap()).unwrap();
+    let (first, sealed) = (
+        ready["first_block_indexed"].as_u64().unwrap(),
+        ready["sealed_through"].as_u64().unwrap(),
+    );
+    assert!(
+        first <= sealed,
+        "sealed rows are older than the hot store's first key: first {first}, sealed {sealed}"
+    );
+
     let pinned = format!("{DIR}/s5-expected.json");
     let pin = std::env::var_os("NUTHATCH_PIN_TAB_PARITY").is_some();
     if pin {

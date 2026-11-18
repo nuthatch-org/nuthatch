@@ -302,7 +302,20 @@ impl Authoring {
                 self.base
             )),
         };
-        Ok(json!({ "url": self.base, "ready": ready, "indexer": indexer }).to_string())
+        // Lifted from `/ready` so an agent reads "serving but empty" without digging (#3022).
+        let has_rows = ready.get("has_rows").cloned().unwrap_or(Value::Null);
+        let first_block_indexed = ready
+            .get("first_block_indexed")
+            .cloned()
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "url": self.base,
+            "ready": ready,
+            "has_rows": has_rows,
+            "first_block_indexed": first_block_indexed,
+            "indexer": indexer,
+        })
+        .to_string())
     }
 
     async fn stop_indexing(&self) -> Result<String> {

@@ -1713,6 +1713,21 @@ pub struct DevArgs {
     #[arg(long)]
     pub detach: bool,
 
+    /// With --detach, also wait until at least one row is indexed (`/ready` reports `has_rows`),
+    /// so `nuthatch sql` straight after it sees data. On timeout the nest keeps running and the
+    /// command exits 11 (`rows_timeout`).
+    #[arg(long, requires = "detach")]
+    pub wait_rows: bool,
+
+    /// With --wait-rows, how many seconds to wait for the first row.
+    #[arg(
+        long,
+        requires = "wait_rows",
+        default_value_t = 300,
+        value_name = "SECS"
+    )]
+    pub wait_timeout: u64,
+
     /// With --detach, print one JSON object on stdout: `pid`, `url`, `dir`, `log` and `stop`.
     #[arg(long, requires = "detach")]
     pub json: bool,

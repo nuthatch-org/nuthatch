@@ -2297,6 +2297,19 @@ fn served_last_block(s: &AppState) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
+/// The `from_block` of the earliest sealed segment in `dir`'s catalogue that holds a row, for
+/// `/ready`'s `has_rows` and `first_block_indexed`. The catalogue records a range, not a first row.
+fn sealed_first_block(dir: &std::path::Path) -> Option<u64> {
+    crate::seal::load_manifest(dir).ok().and_then(|m| {
+        m.tables
+            .values()
+            .flatten()
+            .filter(|seg| seg.rows > 0)
+            .map(|seg| seg.from_block)
+            .min()
+    })
+}
+
 /// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
 pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     use crate::metrics::{now_unix, METRICS};
@@ -2584,6 +2597,15 @@ fn ready_answer(s: &AppState) -> Answer {
         #[cfg(feature = "folds")]
             folds_stalled: _,
     } = nest_readiness(s);
+    // One key read: the hot store iterates in key order, so the first key is the oldest row's.
+    let hot_first = s
+        .store
+        .sample_entity_keys(1)
+        .ok()
+        .and_then(|k| k.into_iter().next());
+    let sealed_first = sealed_first_block(&s.dir);
+    let first_block_indexed = answer::first_block_indexed(hot_first.as_deref(), sealed_first);
+    let has_rows = hot_first.is_some() || sealed_first.is_some();
     #[cfg(feature = "folds")]
     let folds = (!folds.is_null()).then_some(folds);
     #[cfg(not(feature = "folds"))]
@@ -2598,6 +2620,8 @@ fn ready_answer(s: &AppState) -> Answer {
         last,
         lag,
         sealed,
+        has_rows,
+        first_block_indexed,
         freshness: answer::Freshness {
             mode: s.freshness.mode(),
             poll_interval_secs: s.freshness.poll_interval.as_secs(),

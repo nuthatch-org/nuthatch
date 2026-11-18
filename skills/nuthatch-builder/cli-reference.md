@@ -134,6 +134,8 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving
 - `--listen <LISTEN>` - Address to bind the HTTP API to
 - `--detach` - Run in the background and return once the API answers `/ready` with a first poll behind it (every mount's, for a runtime), or fail with the end of its log. The log and the process record live under $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest, and `nuthatch stop` stops it
+- `--wait-rows` - With --detach, also wait until at least one row is indexed (`/ready` reports `has_rows`), so `nuthatch sql` straight after it sees data. On timeout the nest keeps running and the command exits 11 (`rows_timeout`)
+- `--wait-timeout <WAIT_TIMEOUT>` - With --wait-rows, how many seconds to wait for the first row
 - `--json` - With --detach, print one JSON object on stdout: `pid`, `url`, `dir`, `log` and `stop`
 - `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--ipfs <IPFS>` - IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable)
@@ -591,5 +593,6 @@ Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): recon
 - `8` `rpc_refused`: pass --rpc with an endpoint that answers; `nuthatch doctor --rpc <url>` probes one
 - `9` `rpc_range_too_wide`: `nuthatch doctor --rpc <url>` prints the largest safe --window; pass it to dev
 - `10` `port_in_use`: pass --listen 127.0.0.1:<free port>, or `nuthatch stop` the nest holding this one
+- `11` `rows_timeout`: the nest is still running; read /ready for `has_rows`, or raise --wait-timeout
 
 With `--json`, an error is one object on stderr: `{"error": {"code", "exit", "message", "next"}}`. 0 is success.

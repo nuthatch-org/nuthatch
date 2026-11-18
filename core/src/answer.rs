@@ -493,6 +493,26 @@ pub struct Freshness {
     pub poll_interval_source: &'static str,
 }
 
+/// [`Ready::first_block_indexed`]: the smaller of the hot store's first key's block and the earliest
+/// sealed row-holding segment's `from_block`. Sealing moves old rows out of the hot store, so the hot
+/// key alone is not the oldest once anything is sealed.
+pub fn first_block_indexed(hot_first_key: Option<&str>, sealed_from: Option<u64>) -> Option<u64> {
+    let hot = hot_first_key.and_then(block_of_entity_key);
+    match (hot, sealed_from) {
+        (Some(h), Some(s)) => Some(h.min(s)),
+        (h, s) => h.or(s),
+    }
+}
+
+/// The block an entity key names: keys are `{block:012}-{log_index:06}` (`store::entity_key`), so the
+/// smallest key in the hot store is the oldest row's. `None` for a key not in that shape.
+pub fn block_of_entity_key(key: &str) -> Option<u64> {
+    let (block, _) = key.split_once('-')?;
+    (block.len() == 12 && block.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| block.parse().ok())
+        .flatten()
+}
+
 /// Everything `/ready` reports, gathered by whoever holds the cursor.
 pub struct Ready {
     pub version: String,
@@ -504,6 +524,16 @@ pub struct Ready {
     pub last: u64,
     pub lag: u64,
     pub sealed: u64,
+    /// Whether a row exists that a query can read: at least one row in the hot store, or a sealed
+    /// segment whose catalogue entry counts more than zero rows. It is not `sealed > 0`: a seal can
+    /// advance past blocks that held no event. It is a statement about stored rows, so it stays true
+    /// once true, and a nest that already held data reports true on its first poll.
+    pub has_rows: bool,
+    /// The first block indexed: the smaller of the oldest hot row's block (the smallest entity key,
+    /// `{block:012}-{log_index:06}`) and the `from_block` of the earliest sealed segment that holds a
+    /// row. The catalogue records a segment's range, not its first row, so with sealed rows this is
+    /// the start of the range the first row falls in; null before any row.
+    pub first_block_indexed: Option<u64>,
     pub freshness: Freshness,
     pub last_poll: u64,
     pub age: Option<u64>,
@@ -547,6 +577,8 @@ pub fn ready(r: &Ready) -> Answer {
         "initial_poll_failed": r.initial_failure,
         "tip": if unpolled { Value::Null } else { r.tip.into() },
         "last_block": r.last,
+        "has_rows": r.has_rows,
+        "first_block_indexed": r.first_block_indexed,
         "lag_blocks": if unpolled { Value::Null } else { r.lag.into() },
         "cursorless": r.cursorless,
         "freshness": {
@@ -728,6 +760,34 @@ pub fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn first_block_indexed_is_the_older_of_sealed_and_hot() {
+        use super::first_block_indexed as first;
+        let hot = Some("000000000200-000001");
+        // Sealed rows are older than the hot store's first key once anything is sealed.
+        assert_eq!(first(hot, Some(100)), Some(100));
+        assert_eq!(first(hot, None), Some(200));
+        assert_eq!(first(None, Some(100)), Some(100));
+        assert_eq!(first(None, None), None);
+        assert_eq!(first(Some("000000000050-000001"), Some(100)), Some(50));
+    }
+
+    #[test]
+    fn an_entity_key_names_its_block_and_anything_else_names_none() {
+        use super::block_of_entity_key as block;
+        assert_eq!(block("000000000007-000003"), Some(7));
+        assert_eq!(block("000041000000-000000"), Some(41_000_000));
+        for bad in [
+            "",
+            "7-3",
+            "00000000000x-000001",
+            "000000000007",
+            "balances:0xab",
+        ] {
+            assert_eq!(block(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn timestamps_render_at_every_unit_and_before_the_epoch() {
         use super::rfc3339;
