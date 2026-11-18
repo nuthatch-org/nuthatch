@@ -48,7 +48,9 @@ fn prose_on_stderr(json: bool) {
 #[derive(Debug, Default)]
 struct Scaffolded {
     next: Vec<String>,
-    proxy_warnings: std::collections::BTreeMap<String, String>,
+    /// The proxy history check per alias this run made: `Some` warning, or `None` for clean. An alias
+    /// absent here was not checked, and the nest records nothing that would say.
+    proxy_checks: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl Scaffolded {
@@ -62,14 +64,15 @@ impl Scaffolded {
     /// The `--json` object, read back from the nest as written.
     fn report(&self, dir: &Path, before: &Files) -> Result<serde_json::Value> {
         let config = Config::load(dir)?;
-        let schema: serde_json::Value = std::fs::read_to_string(dir.join("schema.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let path = dir.join("schema.json");
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {} back", path.display()))?;
+        let schema: serde_json::Value = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not JSON", path.display()))?;
         let tables: Vec<&str> = schema["tables"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .with_context(|| format!("{} has no tables array", path.display()))?
+            .iter()
             .filter_map(|t| t["table"].as_str())
             .collect();
         let contracts: Vec<serde_json::Value> = config
@@ -80,7 +83,8 @@ impl Scaffolded {
                     "address": c.address,
                     "alias": c.alias,
                     "deployment_block": c.start_block,
-                    "proxy_warning": self.proxy_warnings.get(&c.alias),
+                    "proxy_checked": self.proxy_checks.contains_key(&c.alias),
+                    "proxy_warning": self.proxy_checks.get(&c.alias).cloned().flatten(),
                 })
             })
             .collect();
@@ -102,6 +106,11 @@ impl Scaffolded {
 struct Files(std::collections::BTreeMap<String, (u64, Option<std::time::SystemTime>)>);
 
 impl Files {
+    /// Only `--json` reports what was written, so only `--json` pays for the walk.
+    fn when(json: bool, dir: &Path) -> Option<Self> {
+        json.then(|| Files::under(dir))
+    }
+
     fn under(dir: &Path) -> Self {
         fn walk(
             root: &Path,
@@ -152,13 +161,13 @@ impl Files {
 pub async fn init(args: InitArgs) -> Result<()> {
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
     prose_on_stderr(args.json);
-    let (json, dir) = (args.json, target_dir(&args));
-    let before = Files::under(&dir);
+    let dir = target_dir(&args);
+    let before = Files::when(args.json, &dir);
     let done = scaffold(args).await?;
     say!("help:  {DISCORD}   (stuck, or something missing? say so here)");
-    count.ask().await; // RFC-0054 hook
-    if json {
-        println!("{}", done.report(&dir, &before)?);
+    count.ask(before.is_some()).await; // RFC-0054 hook
+    if let Some(before) = &before {
+        println!("{}", done.report(&dir, before)?);
     }
     Ok(())
 }
@@ -259,10 +268,14 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        if let Some(w) =
-            report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await
-        {
-            done.proxy_warnings.insert(alias.clone(), w);
+        // A local ABI skips the implementation lookup, so there is nothing to compare.
+        if overrides[i].is_none() {
+            if let Some(check) =
+                report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
+                    .await
+            {
+                done.proxy_checks.insert(alias.clone(), check);
+            }
         }
 
         // Does the ABI we just vendored actually decode what this address emits? Best-effort and
@@ -361,7 +374,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
 pub async fn add(args: AddArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     prose_on_stderr(args.json);
-    let before = Files::under(&dir);
+    let before = Files::when(args.json, &dir);
     let mut done = Scaffolded::default();
     let mut config = Config::load(&dir).with_context(|| {
         format!(
@@ -448,10 +461,14 @@ pub async fn add(args: AddArgs) -> Result<()> {
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        if let Some(w) =
-            report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await
-        {
-            done.proxy_warnings.insert(alias.clone(), w);
+        // A local ABI skips the implementation lookup, so there is nothing to compare.
+        if overrides[i].is_none() {
+            if let Some(check) =
+                report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
+                    .await
+            {
+                done.proxy_checks.insert(alias.clone(), check);
+            }
         }
 
         report_abi_fit(
@@ -484,9 +501,9 @@ pub async fn add(args: AddArgs) -> Result<()> {
         dir_hint(&args.dir)
     );
     print_undetected_start_blocks(&undetected);
-    if args.json {
+    if let Some(before) = &before {
         done.next = vec![format!("nuthatch dev{}", dir_hint(&args.dir))];
-        println!("{}", done.report(&dir, &before)?);
+        println!("{}", done.report(&dir, before)?);
     }
     Ok(())
 }
@@ -521,14 +538,14 @@ fn refuse_an_indexed_nest(dir: &Path, config: &Config, addresses: &[String]) -> 
 pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     prose_on_stderr(args.json);
-    let before = Files::under(&dir);
+    let before = Files::when(args.json, &dir);
     let config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
     let n = write_nest_artifacts(&dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
     say!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
-    if args.json {
+    if let Some(before) = &before {
         let done = Scaffolded::next(format!("nuthatch dev{}", dir_hint(&args.dir)));
-        println!("{}", done.report(&dir, &before)?);
+        println!("{}", done.report(&dir, before)?);
     }
     Ok(())
 }
@@ -2042,22 +2059,25 @@ fn proxy_history_may_be_missing(proxy_start: u64, implementation_start: u64) -> 
 /// Warn about the current-implementation trap from #773. Resolving the current ABI correctly is not
 /// enough when the nest starts before that implementation existed: the old event names are absent
 /// from the registry, so their logs would be skipped while the cursor appears healthy.
+/// `Some` warning or `Some(None)` once checked; `None` when a block it needs could not be read.
 async fn report_proxy_history_gap(
     rpc: &RpcClient,
     implementation: Option<&str>,
     proxy_start: Option<u64>,
     tip: Option<u64>,
     alias: &str,
-) -> Option<String> {
-    let (Some(implementation), Some(proxy_start), Some(tip)) = (implementation, proxy_start, tip)
-    else {
+) -> Option<Option<String>> {
+    let Some(implementation) = implementation else {
+        return Some(None);
+    };
+    let (Some(proxy_start), Some(tip)) = (proxy_start, tip) else {
         return None;
     };
     let Ok(implementation_start) = detect_deploy_block(rpc, implementation, tip).await else {
         return None;
     };
     if !proxy_history_may_be_missing(proxy_start, implementation_start) {
-        return None;
+        return Some(None);
     }
     let warning = format!(
         "the proxy starts at block {proxy_start}, but its current implementation was deployed at \
@@ -2074,7 +2094,7 @@ async fn report_proxy_history_gap(
          same address, with an `events` allowlist of the events the current ABI lacks."
     );
     eprintln!();
-    Some(warning)
+    Some(Some(warning))
 }
 
 fn is_empty_code(code: &str) -> bool {
@@ -2326,6 +2346,38 @@ fn dir_hint(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_json_walks_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        assert!(Files::when(false, dir.path()).is_none());
+        assert_eq!(Files::when(true, dir.path()).unwrap().0.len(), 1);
+    }
+
+    /// The object says what the nest holds, so a schema.json that cannot be read is not "no tables".
+    #[test]
+    fn the_report_refuses_a_schema_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+        )
+        .unwrap();
+        let before = Files::under(dir.path());
+        let done = Scaffolded::default();
+        let missing = done.report(dir.path(), &before).unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("schema.json"),
+            "{missing:#}"
+        );
+        std::fs::write(dir.path().join("schema.json"), "{not json").unwrap();
+        assert!(done.report(dir.path(), &before).is_err());
+        std::fs::write(dir.path().join("schema.json"), "{}").unwrap();
+        assert!(done.report(dir.path(), &before).is_err());
+        std::fs::write(dir.path().join("schema.json"), r#"{"tables": []}"#).unwrap();
+        assert!(done.report(dir.path(), &before).is_ok());
+    }
 
     /// A link in a nest directory is refused, not copied as the file it points at (#2692).
     #[cfg(unix)]

@@ -76,6 +76,8 @@ fn init_json_is_one_object_with_the_tables_and_what_to_run_next() {
     assert_eq!(c["alias"], "weth");
     assert_eq!(c["deployment_block"], 100);
     assert!(c["proxy_warning"].is_null(), "{v}");
+    // A local ABI skips the implementation lookup, so null here must not read as clean.
+    assert_eq!(c["proxy_checked"], false, "{v}");
     let files: Vec<&str> = v["files_written"]
         .as_array()
         .unwrap()
@@ -213,4 +215,87 @@ async fn watch_once_json_is_the_nests_own_answers() {
     assert_eq!(v["ready"]["last_block"], 42, "{v}");
     assert_eq!(v["summary"]["tables"], 3, "{v}");
     assert!(v["nests"].is_null(), "{v}");
+}
+
+/// A JSON-RPC stand-in on mainnet: code from block 50, no logs.
+fn serve_rpc() -> String {
+    fn answer(req: &Value) -> Value {
+        let block = |v: &Value| {
+            u64::from_str_radix(v.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16)
+                .unwrap_or(1_000)
+        };
+        let result = match req["method"].as_str().unwrap_or_default() {
+            "eth_chainId" => serde_json::json!("0x1"),
+            "eth_blockNumber" => serde_json::json!("0x3e8"),
+            "eth_getCode" => {
+                if block(&req["params"][1]) >= 50 {
+                    serde_json::json!("0x6080")
+                } else {
+                    serde_json::json!("0x")
+                }
+            }
+            "eth_getLogs" => serde_json::json!([]),
+            "eth_getBlockByNumber" => serde_json::json!({
+                "number": "0x3e8", "hash": format!("0x{:064x}", 1000),
+                "parentHash": format!("0x{:064x}", 999), "timestamp": "0x1", "transactions": [],
+            }),
+            _ => Value::Null,
+        };
+        serde_json::json!({"jsonrpc": "2.0", "id": req["id"].clone(), "result": result})
+    }
+    async fn handler(axum::Json(req): axum::Json<Value>) -> axum::Json<Value> {
+        axum::Json(match req.as_array() {
+            Some(batch) => Value::Array(batch.iter().map(answer).collect()),
+            None => answer(&req),
+        })
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(listener, axum::Router::new().fallback(handler))
+                    .await
+                    .unwrap();
+            })
+    });
+    url
+}
+
+/// With an RPC that answers, `init` finds the deployment block and samples logs for the ABI fit,
+/// and every line those steps print stays off stdout.
+#[test]
+fn init_json_over_a_live_rpc_keeps_stdout_to_the_object() {
+    let rpc = serve_rpc();
+    let dir = tempfile::tempdir().unwrap();
+    let abi = dir.path().join("erc20.json");
+    std::fs::write(&abi, ERC20).unwrap();
+    let nest = dir.path().join("nest");
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &[
+            "init",
+            WETH,
+            "--chain",
+            "mainnet",
+            "--rpc",
+            &rpc,
+            "--abi",
+            abi.to_str().unwrap(),
+            "--alias",
+            "weth",
+            "--dir",
+            nest.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = object(&stdout);
+    assert_eq!(v["contracts"][0]["deployment_block"], 50, "{v}\n{stderr}");
+    assert!(stderr.contains("deployed at block 50"), "{stderr}");
 }
