@@ -110,6 +110,32 @@ fn init_without_json_prints_as_it_did() {
     assert!(!stdout.trim_start().starts_with('{'), "{stdout}");
 }
 
+/// A published nest need not carry schema.json, and `init --from` must not write one into the copy,
+/// since it is in the NID. The tables still come back.
+#[test]
+fn init_from_json_reports_a_nest_published_without_schema_json() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(init_weth(dir.path(), false).0, 0);
+    let published = dir.path().join("nest");
+    std::fs::remove_file(published.join("schema.json")).unwrap();
+    let copy = dir.path().join("copy");
+    let (code, stdout, stderr) = run(
+        dir.path(),
+        &[
+            "init",
+            "--from",
+            published.to_str().unwrap(),
+            "--dir",
+            copy.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let v = object(&stdout);
+    assert_eq!(v["tables"], serde_json::json!(["weth__transfer"]), "{v}");
+    assert!(!copy.join("schema.json").exists());
+}
+
 #[test]
 fn init_json_over_an_existing_nest_fails_with_one_error_object() {
     let dir = tempfile::tempdir().unwrap();

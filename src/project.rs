@@ -64,17 +64,11 @@ impl Scaffolded {
     /// The `--json` object, read back from the nest as written.
     fn report(&self, dir: &Path, before: &Files) -> Result<serde_json::Value> {
         let config = Config::load(dir)?;
-        let path = dir.join("schema.json");
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {} back", path.display()))?;
-        let schema: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("{} is not JSON", path.display()))?;
-        let tables: Vec<&str> = schema["tables"]
-            .as_array()
-            .with_context(|| format!("{} has no tables array", path.display()))?
-            .iter()
-            .filter_map(|t| t["table"].as_str())
-            .collect();
+        // From the config and ABIs, as schema.json is written: a nest from `init --from` need not
+        // carry one, and writing it there would move the NID of the nest just copied.
+        let (_, schema) = nest_tables(dir, &config)?;
+        let mut tables: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
+        tables.sort_unstable();
         let contracts: Vec<serde_json::Value> = config
             .contracts
             .iter()
@@ -239,11 +233,11 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     let used: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut done = Scaffolded::default();
     for (i, address) in addresses.iter().enumerate() {
-        let (abi_json, implementation, contract_name) = match &overrides[i] {
+        let (abi_json, implementation, contract_name, proxy_known) = match &overrides[i] {
             Some(path) => {
                 say!("→ using local ABI {path} for {address}");
                 let (abi, name) = read_local_abi(path)?;
-                (abi, None, name)
+                (abi, None, name, false)
             }
             None => {
                 say!("→ resolving ABI for {address} on {}…", chain.name);
@@ -253,6 +247,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
                     resolved.abi,
                     resolved.implementation,
                     resolved.contract_name,
+                    resolved.proxy_known,
                 )
             }
         };
@@ -268,8 +263,8 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        // A local ABI skips the implementation lookup, so there is nothing to compare.
-        if overrides[i].is_none() {
+        // A local ABI, a failed slot read or an unresolved implementation ABI leave nothing to compare.
+        if proxy_known {
             if let Some(check) =
                 report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
                     .await
@@ -424,11 +419,11 @@ pub async fn add(args: AddArgs) -> Result<()> {
     let mut new_aliases: Vec<String> = Vec::with_capacity(new_addresses.len());
     let mut undetected: Vec<String> = Vec::new();
     for (i, address) in new_addresses.iter().enumerate() {
-        let (abi_json, implementation, contract_name) = match &overrides[i] {
+        let (abi_json, implementation, contract_name, proxy_known) = match &overrides[i] {
             Some(path) => {
                 say!("→ using local ABI {path} for {address}");
                 let (abi, name) = read_local_abi(path)?;
-                (abi, None, name)
+                (abi, None, name, false)
             }
             None => {
                 say!("→ resolving ABI for {address} on {}…", chain.name);
@@ -438,6 +433,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
                     resolved.abi,
                     resolved.implementation,
                     resolved.contract_name,
+                    resolved.proxy_known,
                 )
             }
         };
@@ -461,8 +457,8 @@ pub async fn add(args: AddArgs) -> Result<()> {
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        // A local ABI skips the implementation lookup, so there is nothing to compare.
-        if overrides[i].is_none() {
+        // A local ABI, a failed slot read or an unresolved implementation ABI leave nothing to compare.
+        if proxy_known {
             if let Some(check) =
                 report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
                     .await
@@ -1256,12 +1252,14 @@ enum AgentDocs {
     KeepExisting,
 }
 
-fn write_nest_artifacts(
+/// Every table the nest's config and ABIs produce: what schema.json is written from.
+fn nest_tables(
     dir: &Path,
-    chain_name: &str,
     config: &Config,
-    docs: AgentDocs,
-) -> Result<usize> {
+) -> Result<(
+    crate::registry::DecodeRegistry,
+    Vec<crate::registry::TableSchema>,
+)> {
     let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
     if config.extract.decodes_calls() {
@@ -1275,6 +1273,16 @@ fn write_nest_artifacts(
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
     }
     crate::indexer::refuse_duplicate_tables(&schema)?;
+    Ok((registry, schema))
+}
+
+fn write_nest_artifacts(
+    dir: &Path,
+    chain_name: &str,
+    config: &Config,
+    docs: AgentDocs,
+) -> Result<usize> {
+    let (registry, schema) = nest_tables(dir, config)?;
     let hash = decode_identity(dir, config, &registry)?;
     let schema_path = dir.join("schema.json");
     if !write_if_changed(&schema_path, nuthatch_scaffold::schema_json(hash, &schema)?)
@@ -1562,6 +1570,9 @@ struct ResolvedAbi {
     implementation: Option<String>,
     /// Sourcify (or a wrapped ABI) sometimes names the contract. Used as the default alias (#774).
     contract_name: Option<String>,
+    /// Whether the proxy lookup reached a verdict the history check can rest on: not a proxy, or a
+    /// proxy whose implementation ABI is the one vendored.
+    proxy_known: bool,
 }
 
 async fn resolve_abi(
@@ -1571,7 +1582,9 @@ async fn resolve_abi(
     explorer: Option<&str>,
 ) -> Result<ResolvedAbi> {
     require_contract_code(rpc, chain_id, address).await?;
-    if let Some(implementation) = resolve_implementation(rpc, address).await {
+    let lookup = resolve_implementation(rpc, address).await;
+    if let ProxyLookup::Implementation(implementation) = &lookup {
+        let implementation = implementation.clone();
         say!("  · proxy → implementation {implementation}");
         if let Ok(resolved) = abi::resolve(chain_id, &implementation, explorer).await {
             print_abi_resolved(&resolved);
@@ -1579,6 +1592,7 @@ async fn resolve_abi(
                 abi: resolved.abi,
                 implementation: Some(implementation),
                 contract_name: resolved.contract_name,
+                proxy_known: true,
             });
         }
         say!("  · implementation ABI unresolved; using the proxy's own ABI");
@@ -1591,6 +1605,7 @@ async fn resolve_abi(
         abi: resolved.abi,
         implementation: None,
         contract_name: resolved.contract_name,
+        proxy_known: matches!(lookup, ProxyLookup::NotProxy),
     })
 }
 
@@ -1636,16 +1651,31 @@ fn print_abi_resolved(resolved: &abi::Resolved) {
     }
 }
 
-/// Follow the well-known proxy patterns to an implementation address, or `None` if `address` is not a
-/// recognised proxy. Direct-slot proxies (EIP-1967 / EIP-1822 / legacy zeppelinos) hold the impl
+/// What following the proxy patterns found at an address.
+#[derive(Debug, PartialEq)]
+enum ProxyLookup {
+    NotProxy,
+    Implementation(String),
+    /// A slot read failed, so "not a proxy" was never established.
+    Unread,
+}
+
+/// Follow the well-known proxy patterns to an implementation address, or `NotProxy` if `address` is
+/// not a recognised proxy. Direct-slot proxies (EIP-1967 / EIP-1822 / legacy zeppelinos) hold the impl
 /// address in a storage slot; an EIP-897 proxy exposes `implementation()` directly; a beacon proxy
 /// holds a beacon whose `implementation()` we then call.
-async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String> {
+async fn resolve_implementation(rpc: &RpcClient, address: &str) -> ProxyLookup {
+    // A call to `implementation()` reverts on most contracts, so only a failed storage read leaves
+    // the answer unknown.
+    let mut unread = false;
     for slot in PROXY_IMPL_SLOTS {
-        if let Ok(word) = rpc.get_storage_at(address, slot).await {
-            if let Some(implementation) = impl_from_slot(&word) {
-                return Some(implementation);
+        match rpc.get_storage_at(address, slot).await {
+            Ok(word) => {
+                if let Some(implementation) = impl_from_slot(&word) {
+                    return ProxyLookup::Implementation(implementation);
+                }
             }
+            Err(_) => unread = true,
         }
     }
     // EIP-897 / Aragon AppProxyUpgradeable: unlike a beacon, the proxy itself exposes the logic
@@ -1654,22 +1684,33 @@ async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String
     // standard storage slot was needlessly treated as a bespoke, unresolvable proxy.
     if let Ok(ret) = rpc.eth_call(address, IMPLEMENTATION_SELECTOR).await {
         if let Some(implementation) = impl_from_slot(&ret) {
-            return Some(implementation);
+            return ProxyLookup::Implementation(implementation);
         }
     }
     // Beacon proxy: the implementation is one hop further - the proxy points at a beacon, and the
     // beacon answers `implementation()`. Both the stored word and the call return are 32-byte,
     // left-padded addresses, so `impl_from_slot` decodes either.
-    if let Ok(word) = rpc.get_storage_at(address, PROXY_BEACON_SLOT).await {
-        if let Some(beacon) = impl_from_slot(&word) {
-            if let Ok(ret) = rpc.eth_call(&beacon, IMPLEMENTATION_SELECTOR).await {
-                if let Some(implementation) = impl_from_slot(&ret) {
-                    return Some(implementation);
+    match rpc.get_storage_at(address, PROXY_BEACON_SLOT).await {
+        Ok(word) => {
+            if let Some(beacon) = impl_from_slot(&word) {
+                match rpc.eth_call(&beacon, IMPLEMENTATION_SELECTOR).await {
+                    Ok(ret) => {
+                        if let Some(implementation) = impl_from_slot(&ret) {
+                            return ProxyLookup::Implementation(implementation);
+                        }
+                    }
+                    // A beacon is there, so its silence is not a verdict.
+                    Err(_) => unread = true,
                 }
             }
         }
+        Err(_) => unread = true,
     }
-    None
+    if unread {
+        ProxyLookup::Unread
+    } else {
+        ProxyLookup::NotProxy
+    }
 }
 
 /// What a sample of the contract's real logs says about the ABI we resolved for it.
@@ -2355,28 +2396,28 @@ mod tests {
         assert_eq!(Files::when(true, dir.path()).unwrap().0.len(), 1);
     }
 
-    /// The object says what the nest holds, so a schema.json that cannot be read is not "no tables".
+    /// The tables come from the config and ABIs, so a nest with no schema.json (a published one,
+    /// through `init --from`) still lists them, and an ABI that cannot be read is an error, not "no
+    /// tables".
     #[test]
-    fn the_report_refuses_a_schema_it_cannot_read() {
+    fn the_report_lists_tables_from_the_config_and_refuses_a_broken_abi() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("abis")).unwrap();
+        std::fs::write(dir.path().join("abis/pool.json"), POOL_ABI).unwrap();
         std::fs::write(
             dir.path().join("nuthatch.toml"),
-            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n",
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"pool\"\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+             abi = \"abis/pool.json\"\n",
         )
         .unwrap();
         let before = Files::under(dir.path());
         let done = Scaffolded::default();
-        let missing = done.report(dir.path(), &before).unwrap_err();
-        assert!(
-            format!("{missing:#}").contains("schema.json"),
-            "{missing:#}"
-        );
-        std::fs::write(dir.path().join("schema.json"), "{not json").unwrap();
+        let v = done.report(dir.path(), &before).unwrap();
+        assert_eq!(v["tables"], serde_json::json!(["pool__transfer"]), "{v}");
+        assert!(!dir.path().join("schema.json").exists());
+        std::fs::write(dir.path().join("abis/pool.json"), "{not json").unwrap();
         assert!(done.report(dir.path(), &before).is_err());
-        std::fs::write(dir.path().join("schema.json"), "{}").unwrap();
-        assert!(done.report(dir.path(), &before).is_err());
-        std::fs::write(dir.path().join("schema.json"), r#"{"tables": []}"#).unwrap();
-        assert!(done.report(dir.path(), &before).is_ok());
     }
 
     /// A link in a nest directory is refused, not copied as the file it points at (#2692).
@@ -3695,6 +3736,58 @@ abi = "abis/tok.json"
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Answers `eth_getStorageAt` with `slot` (an error when `None`) and reverts every `eth_call`.
+    async fn fake_proxy_rpc(slot: Option<&'static str>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(
+            State(slot): State<Option<&'static str>>,
+            Json(req): Json<Value>,
+        ) -> Json<Value> {
+            let id = req["id"].clone();
+            Json(match (req["method"].as_str(), slot) {
+                (Some("eth_getStorageAt"), Some(word)) => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": word})
+                }
+                (Some("eth_getStorageAt"), None) => json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32602, "message": "invalid argument 1: hex string has odd length"}}),
+                _ => json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": 3, "message": "execution reverted"}}),
+            })
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(slot);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A failed slot read is not "not a proxy": the history check must not call it clean.
+    #[tokio::test]
+    async fn a_failed_slot_read_leaves_the_proxy_question_open() {
+        let address = "0x00000000000000000000000000000000000000aa";
+        let zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let pointer = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let lookup = |url: String| async move {
+            let rpc =
+                RpcClient::with_timeout(vec![url], std::time::Duration::from_secs(2)).unwrap();
+            resolve_implementation(&rpc, address).await
+        };
+        let (failing, _a) = fake_proxy_rpc(None).await;
+        assert_eq!(lookup(failing).await, ProxyLookup::Unread);
+        let (plain, _b) = fake_proxy_rpc(Some(zero)).await;
+        assert_eq!(lookup(plain).await, ProxyLookup::NotProxy);
+        let (proxy, _c) = fake_proxy_rpc(Some(pointer)).await;
+        assert!(matches!(
+            lookup(proxy).await,
+            ProxyLookup::Implementation(_)
+        ));
     }
 
     /// Mainnet at block 0x10, answering `eth_getCode` with `code`.

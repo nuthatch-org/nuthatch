@@ -51,8 +51,10 @@ stderr:
   `chain_id`, `contracts` (each with `address`, `alias`, `deployment_block`, `proxy_checked` and
   `proxy_warning`), `tables`, `files_written` and `next`, the commands to run next.
   `proxy_checked` is true only for a contract this run resolved and compared against its proxy
-  history: a contract given `--abi`, one added earlier, or one whose blocks could not be read is
-  false, and its `proxy_warning` null says nothing. The nest keeps no record of the check.
+  history: a contract given `--abi`, one added earlier, or one whose proxy slots or blocks could
+  not be read is false, and its `proxy_warning` null says nothing. The nest keeps no record of the
+  check. `tables` is computed from the config and ABIs, as schema.json is, so a nest from
+  `init --from` that carries no schema.json still lists them and is not given one.
 - `nuthatch schema --json`: the same object, after the artifacts are regenerated.
 - `nuthatch watch --once --json`: the running nest's own `/ready`, `/` and `/nests` answers, as
   `ready`, `summary` and `nests`, with each mount's `/ready` under `mounts`. Nothing answering is
