@@ -35,6 +35,11 @@ eval/discovery/run.sh --agents claude --prompts usdc-dashboard,getlogs-range --r
 eval/discovery/run.sh --condition skill                    # with skills/ installed for the agent
 ```
 
+`--condition plugin` (Claude Code only) adds a copy of this repository's marketplace and `plugin/` to a
+scratch config and runs `claude plugin marketplace add` then `claude plugin install nuthatch@nuthatch`,
+as a user would. The plugin ships an MCP server (run through npx), so this condition drops
+`--strict-mcp-config`; nuthatch itself stays off the agent's `PATH`.
+
 `--condition bare` is the agent as installed. `--condition skill` copies this repository's `skills/`
 into the agent's skills directory, the closest a script gets to "the plugin is installed". Transcripts
 and workdirs stay in the work directory the script prints, outside the repository; nothing but the
@@ -97,3 +102,21 @@ model, the prompt-set hash, seconds, exit code and, for Claude, cost) and one li
 [`results/table.md`](results/table.md), which is the history to read across dates. Compare rows only
 with the same `prompt_set_sha256`: a changed prompt or fixture is a different eval. One run per cell
 is an anecdote; `--runs 3` or more before reading a change into it.
+
+## 5.23.0 run (#3023): not run, blocked on credentials
+
+Planned: Claude Code only, `claude-sonnet-5-5` (the baseline used `claude-opus-5-5`, so the two are
+not like for like), bare, skill and plugin, all 5 prompts, 3 runs, 600 s: 45 runs, one condition at a
+time, checking `npx -y ccusage@latest blocks --active --json` (stop above a projected 25 USD) before each batch.
+
+**No runs were made.** Claude Code on the box is not logged in (`claude auth status`: `loggedIn: false`)
+and neither `ANTHROPIC_API_KEY` nor `CLAUDE_CODE_OAUTH_TOKEN` is set, so `run.sh` skips it. Obtaining
+credentials was out of scope. What landed is the `plugin` condition in `run.sh`, whose install steps were
+checked by hand in a scratch home (`marketplace add` and `install` both succeed). So there is no delta
+against the baseline to report: chose-nuthatch and reached-rows (`queried` in the results) are unmeasured
+for bare, skill and plugin on 5.23.0. Not run either: Codex and Cursor (not installed or authed), plugin
+plus MCP wired as its own condition (the plugin condition already carries the plugin's MCP server), and the
+"use an indexer" prompt. The post-Priority-1 rerun remains.
+
+To run: `ANTHROPIC_API_KEY=... eval/discovery/run.sh --agents claude --condition bare --runs 3`, then `skill`, then `plugin`.
+The scorer's `queried` field is the closest to "reached rows" (a succeeded `nuthatch sql`, `/sql` or MCP query in a run that chose nuthatch).

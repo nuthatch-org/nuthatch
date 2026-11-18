@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The agent discovery eval (#2988). See README.md beside this file.
 #
-#   run.sh [--agents claude,codex,cursor] [--prompts id,...] [--condition bare|skill]
+#   run.sh [--agents claude,codex,cursor] [--prompts id,...] [--condition bare|skill|plugin]
 #          [--runs N] [--timeout SECONDS] [--work DIR] [--results DIR]
 #
 # Each run gets a fresh workdir and a fresh HOME, so the agent sees none of the operator's
@@ -35,8 +35,8 @@ while [ $# -gt 0 ]; do
 done
 
 case $condition in
-  bare|skill) ;;
-  *) echo "--condition is bare or skill, not $condition" >&2; exit 2 ;;
+  bare|skill|plugin) ;;
+  *) echo "--condition is bare, skill or plugin, not $condition" >&2; exit 2 ;;
 esac
 
 timeout_bin=$(command -v timeout || command -v gtimeout || true)
@@ -128,11 +128,29 @@ run_agent() {
     claude)
       mkdir -p "$home/.claude"
       [ "$condition" = skill ] && cp -R "$root/skills" "$home/.claude/skills"
+      # The plugin condition installs this repository's plugin/ as a user would: add a marketplace,
+      # then install from it, into the scratch config. The marketplace is a copy under a neutral
+      # path, because the agent can read where its marketplaces came from. Unlike the other
+      # conditions it drops --strict-mcp-config, since the plugin ships an MCP server (npx) and a
+      # user who installs the plugin gets it.
+      if [ "$condition" = plugin ]; then
+        mkdir -p "$home/mkt/.claude-plugin"
+        cp -R "$root/plugin" "$home/mkt/plugin"
+        cp "$root/.claude-plugin/marketplace.json" "$home/mkt/.claude-plugin/marketplace.json"
+        local -a pe=("${base_env[@]}" HOME="$home" TMPDIR="$home/tmp" CLAUDE_CONFIG_DIR="$home/.claude" DISABLE_AUTOUPDATER=1)
+        local mname
+        mname=$(sed -n 's/^  "name": "\(.*\)",/\1/p' "$home/mkt/.claude-plugin/marketplace.json" | head -1)
+        env -i "${pe[@]}" "$(command -v claude)" plugin marketplace add "$home/mkt" >"$home/plugin-install.log" 2>&1 \
+          && env -i "${pe[@]}" "$(command -v claude)" plugin install "nuthatch@$mname" >>"$home/plugin-install.log" 2>&1 \
+          || { echo "plugin install failed, see $home/plugin-install.log" >&2; return 1; }
+      fi
+      local -a strict=(--strict-mcp-config)
+      [ "$condition" = plugin ] && strict=()
       env_vars+=(CLAUDE_CONFIG_DIR="$home/.claude" ENABLE_CLAUDEAI_MCP_SERVERS=false DISABLE_AUTOUPDATER=1)
       [ -n "${ANTHROPIC_API_KEY:-}" ] && env_vars+=(ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY")
       [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && env_vars+=(CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN")
       (cd "$dir" && env -i "${env_vars[@]}" "$timeout_bin" "$timeout_s" "$(command -v claude)" -p "$prompt_text" \
-        --output-format stream-json --verbose --strict-mcp-config --permission-mode bypassPermissions \
+        --output-format stream-json --verbose ${strict[@]+"${strict[@]}"} --permission-mode bypassPermissions \
         >"$transcript" 2>"$transcript.err" </dev/null) ;;
     codex)
       mkdir -p "$home/.codex"
