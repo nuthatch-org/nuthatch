@@ -60,9 +60,9 @@
           "value": "mcp"
         },
         {
-          "type": "positional",
-          "valueHint": "authoring",
-          "value": "--authoring"
+          "type": "named",
+          "name": "--authoring",
+          "description": "Also offer the tools that create a nest in --dir and index it, so the client needs no shell"
         },
         {
           "type": "named",

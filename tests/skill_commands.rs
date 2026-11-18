@@ -160,7 +160,10 @@ fn the_shipped_mcp_configs_run_npx_and_parse() {
     for a in npm["packageArguments"].as_array().unwrap() {
         if a["type"] == "named" {
             args.push(a["name"].as_str().unwrap().to_string());
-            args.push(a["default"].as_str().unwrap().to_string());
+            // A bare flag such as `--authoring` has no value or default (#3021).
+            if let Some(v) = a["value"].as_str().or(a["default"].as_str()) {
+                args.push(v.to_string());
+            }
         } else {
             args.push(a["value"].as_str().unwrap().to_string());
         }
