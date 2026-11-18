@@ -2254,6 +2254,15 @@ impl NestReadiness {
     }
 }
 
+/// The last block of the store this request reads, which is what `/sql` cites as `as_of`.
+fn served_last_block(s: &AppState) -> Option<u64> {
+    s.store
+        .get_meta("last_block")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
 /// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
 pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     use crate::metrics::{now_unix, METRICS};
@@ -2432,6 +2441,13 @@ pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
         || cursor_stalled;
     #[cfg(feature = "folds")]
     let stalled = stalled || folds_stalled;
+    // The verdicts above judge the cursor; the block reported is the one `/sql` answers through and
+    // cites as `as_of`. Catching up, requests read a snapshot published about once a second, and
+    // the cursor's count runs ahead of it (#2997).
+    let (last, lag) = match served_last_block(s) {
+        Some(served) => (served, tip.saturating_sub(served)),
+        None => (last, lag),
+    };
     NestReadiness {
         stalled,
         wedged,

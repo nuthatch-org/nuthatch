@@ -1801,3 +1801,105 @@ async fn a_hot_scan_failure_and_a_cold_corruption_are_told_apart_on_the_healthy_
 
     server.abort();
 }
+
+/// #2997: a cold-start backfill publishes the snapshot requests read about once a second, so the
+/// cursor commits many windows between two of them. Whatever block `/ready` reports, a `/sql`
+/// asked straight after must already answer through it. One transfer a block, so a count short of
+/// the reported block is the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_reports_no_block_sql_cannot_answer_while_backfilling() {
+    const LAST: u64 = 240;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scaffold_nest(dir.path(), "usdc", USDC);
+    let tape = Arc::new(TapeSource::new());
+    let (a1, a2) = (account(1), account(2));
+    for b in 1..=LAST {
+        tape.insert_block(
+            b,
+            transfers_block(
+                b,
+                0,
+                1_700_000_000 + b,
+                USDC,
+                &[(a1.as_str(), a2.as_str(), b as u128)],
+            ),
+        );
+    }
+    tape.advance_tip_to(LAST);
+    // Two blocks a window and 10 ms a commit: seconds of catching up, so many windows commit
+    // between two published snapshots.
+    indexer::slow_writer_commit(dir.path(), Duration::from_millis(10));
+    let rt = indexer::spawn_nest(
+        tape.clone(),
+        dir.path().to_path_buf(),
+        cfg,
+        None,
+        false,
+        1,
+        Some(2),
+        false,
+        None,
+    )
+    .await
+    .expect("spawn_nest");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = serve::router(serve::SharedNest::new(rt.state));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let q = format!("SELECT count(*) AS n FROM \"{}\"", transfer_table("usdc"));
+
+    let as_u64 = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_str()?.parse().ok());
+    let (mut samples, mut short) = (Vec::new(), Vec::new());
+    let deadline = std::time::Instant::now() + POLL_TIMEOUT;
+    loop {
+        let ready: serde_json::Value = client
+            .get(format!("{base}/ready"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let reported = as_u64(&ready["last_block"]).unwrap_or(0);
+        let answer: serde_json::Value = client
+            .get(format!("{base}/sql"))
+            .query(&[("q", q.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let n = answer["rows"]
+            .get(0)
+            .and_then(|r| as_u64(&r["n"]))
+            .unwrap_or(0);
+        let as_of = as_u64(&answer["provenance"]["as_of"]).unwrap_or(0);
+        samples.push((reported, n, as_of));
+        if n < reported || as_of < reported {
+            short.push((reported, n, as_of));
+        }
+        if n == LAST || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    server.abort();
+    rt.ingest.abort();
+
+    let during: BTreeSet<u64> = samples
+        .iter()
+        .map(|s| s.0)
+        .filter(|&r| r > 0 && r < LAST)
+        .collect();
+    assert!(
+        during.len() >= 3,
+        "the poll never watched the backfill move: {samples:?}"
+    );
+    assert!(
+        short.is_empty(),
+        "/ready reported blocks /sql could not yet answer, as (reported, count, as_of): {short:?}"
+    );
+    assert_eq!(samples.last().map(|s| s.1), Some(LAST), "{samples:?}");
+}
