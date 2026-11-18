@@ -94,6 +94,7 @@ pub mod graph_schema;
 pub mod graph_validate;
 pub mod health;
 pub mod help;
+pub mod host_names;
 pub mod indexer;
 pub mod inspect;
 pub mod ipfs;

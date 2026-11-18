@@ -66,6 +66,8 @@ async fn serve_without_hot_store_refuses_a_nest_with_no_store_rather_than_creati
 
     let args = ServeArgs {
         cors: Vec::new(),
+        public_host: Vec::new(),
+        local_host: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
@@ -111,6 +113,8 @@ async fn serve_without_hot_store_refuses_a_store_a_live_handle_holds() {
 
     let args = ServeArgs {
         cors: Vec::new(),
+        public_host: Vec::new(),
+        local_host: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: format!("127.0.0.1:{}", free_port().await),
         hot_store: None,
@@ -151,6 +155,8 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
     let listen = format!("127.0.0.1:{port}");
     let args = ServeArgs {
         cors: Vec::new(),
+        public_host: vec!["nest.example.com".into()],
+        local_host: Vec::new(),
         dir: dir.path().to_string_lossy().into_owned(),
         listen: listen.clone(),
         hot_store: None,
@@ -184,6 +190,24 @@ async fn serve_without_hot_store_serves_a_store_the_writer_left_behind() {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    task.abort();
     assert!(up, "serve must come up against a store already on disk");
+    // #3002: `--public-host` reaches the bind, and a rebound name is refused.
+    for (host, refused) in [
+        ("nest.example.com", false),
+        ("rebound.attacker.example", true),
+    ] {
+        let resp = client
+            .get(format!("{base}/tables"))
+            .header("host", host)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16() == 403,
+            refused,
+            "Host {host}: {}",
+            resp.status()
+        );
+    }
+    task.abort();
 }

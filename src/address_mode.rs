@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use crate::address_history::{AddressHistory, AddressHistoryConfig};
 use crate::config::Config;
+use crate::host_names::HostNames;
 use crate::rpc::RpcClient;
 
 /// Where the cursor reads the chain head. A trait so tests drive the loop without a network.
@@ -3223,14 +3224,11 @@ fn api_params(
     Ok(q)
 }
 
-/// Host names the operator declared for a loopback bind (`--local-host`, `--public-host`).
+/// Host names the operator declared for a loopback bind (`--local-host`, `--public-host`): a public
+/// name reads watched data, but nothing is changed or lent for it.
 #[derive(Clone, Debug, Default)]
 pub struct Hosts {
-    /// Answered as this machine, as `localhost` is: a Docker host alias, say.
-    pub local: Vec<String>,
-    /// Answered as the public, behind the operator's proxy: watched data is read, nothing is changed
-    /// or lent.
-    pub public: Vec<String>,
+    pub names: HostNames,
     /// Required besides locality for what only this machine may do, when `--write-token-env` is given.
     pub write_token: Option<WriteToken>,
 }
@@ -3267,44 +3265,10 @@ impl WriteToken {
 }
 
 impl Hosts {
-    /// The names given to `--local-host` and `--public-host`, refused when one could not do what it
-    /// says: a loopback name is always this machine, so it cannot be limited to reads.
+    /// The names given to `--local-host` and `--public-host`.
     pub fn declared(local: &[String], public: &[String]) -> Result<Self> {
-        let name = |flag: &str, raw: &String| -> Result<String> {
-            match authority_host(raw) {
-                Some(n)
-                    if raw
-                        .trim_start_matches('[')
-                        .trim_end_matches(']')
-                        .eq_ignore_ascii_case(&n) =>
-                {
-                    Ok(n)
-                }
-                _ => bail!("{flag} {raw:?} is not a host name; give the name alone, with no port"),
-            }
-        };
-        let local = local
-            .iter()
-            .map(|h| name("--local-host", h))
-            .collect::<Result<Vec<_>>>()?;
-        let public = public
-            .iter()
-            .map(|h| name("--public-host", h))
-            .collect::<Result<Vec<_>>>()?;
-        for p in &public {
-            if is_loopback_name(p) {
-                bail!(
-                    "--public-host {p} would do nothing: a loopback name is always answered as this \
-                     machine. Point the proxy at a name of its own, or have it add X-Forwarded-For"
-                );
-            }
-            if local.contains(p) {
-                bail!("{p} is given to both --local-host and --public-host; a name is one or the other");
-            }
-        }
         Ok(Self {
-            local,
-            public,
+            names: HostNames::declared(local, public)?,
             write_token: None,
         })
     }
@@ -3365,36 +3329,6 @@ const PROXY_HEADERS: &[&str] = &[
     "x-azure-clientip",
 ];
 
-/// The host of an authority that is `host[:digits]` and nothing else, lowercased.
-fn authority_host(authority: &str) -> Option<String> {
-    let (name, rest) = match authority.strip_prefix('[') {
-        Some(v6) => {
-            let (v6, rest) = v6.split_once(']')?;
-            v6.parse::<std::net::Ipv6Addr>().ok()?;
-            (v6, rest)
-        }
-        None => authority
-            .find(':')
-            .map_or((authority, ""), |i| (&authority[..i], &authority[i..])),
-    };
-    let port_ok = rest.is_empty()
-        || rest
-            .strip_prefix(':')
-            .is_some_and(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
-    let name_ok = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'));
-    (port_ok && name_ok).then(|| name.to_ascii_lowercase())
-}
-
-fn is_loopback_name(name: &str) -> bool {
-    name == "localhost"
-        || name
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
-}
-
 /// A loopback bind cannot tell a local caller from a reverse proxy or a DNS-rebinding page by the
 /// socket, so the `Host` decides: a loopback or declared local name is this machine unless a proxy
 /// or another site shows, a declared public name is anyone, and any other name is refused.
@@ -3402,32 +3336,11 @@ fn classify(loopback: bool, hosts: &Hosts, headers: &HeaderMap) -> Result<Caller
     if !loopback {
         return Ok(Caller::remote("this nest is not bound to loopback"));
     }
-    let declared = |list: &[String], name: &str| list.iter().any(|h| h.eq_ignore_ascii_case(name));
-    let local_name = |name: &str| is_loopback_name(name) || declared(&hosts.local, name);
-    let mut all = headers.get_all(axum::http::header::HOST).iter();
-    let host = all.next();
-    if all.next().is_some() {
-        return Err("this request carries two Host headers, and is refused".into());
-    }
-    if let Some(raw) = host {
-        let raw = String::from_utf8_lossy(raw.as_bytes()).into_owned();
-        let Some(name) = authority_host(&raw) else {
-            return Err(format!(
-                "Host {raw:?} is not a host name and port, and is refused"
-            ));
-        };
-        if !local_name(&name) {
-            if declared(&hosts.public, &name) {
-                return Ok(Caller::remote(format!(
-                    "it was sent to Host {name}, a --public-host"
-                )));
-            }
-            return Err(format!(
-                "this nest is bound to loopback and does not answer Host {name}: start it with \
-                 --public-host {name} to serve reads to callers behind a proxy, or --local-host \
-                 {name} if that name is this machine"
-            ));
-        }
+    let names = &hosts.names;
+    if let crate::host_names::Seen::Public(name) = names.check(headers)? {
+        return Ok(Caller::remote(format!(
+            "it was sent to Host {name}, a --public-host"
+        )));
     }
     if let Some(h) = PROXY_HEADERS.iter().find(|h| headers.contains_key(**h)) {
         return Ok(Caller::remote(format!(
@@ -3441,11 +3354,7 @@ fn classify(loopback: bool, hosts: &Hosts, headers: &HeaderMap) -> Result<Caller
     };
     match header("origin") {
         Some(origin) => {
-            let local = origin
-                .split_once("://")
-                .and_then(|(_, rest)| authority_host(rest))
-                .is_some_and(|name| local_name(&name));
-            if !local {
+            if !names.is_local_origin(&origin) {
                 return Ok(Caller::remote(format!(
                     "it comes from a page at Origin {origin}"
                 )));
@@ -8241,8 +8150,10 @@ mod tests {
             ModeState::new(history, 1, Duration::from_secs(300), true).with_forward(forward),
         );
         let hosts = Hosts {
-            local: vec!["host.docker.internal".into()],
-            public: vec!["wallet.example.com".into()],
+            names: HostNames {
+                local: vec!["host.docker.internal".into()],
+                public: vec!["wallet.example.com".into()],
+            },
             ..Default::default()
         };
         let addr = listen(router_for(s.clone(), hosts)).await;
@@ -8383,7 +8294,10 @@ mod tests {
                 .with_deadline(Duration::from_millis(200)),
         );
         let hosts = Hosts {
-            public: vec!["wallet.example.com".into()],
+            names: HostNames {
+                public: vec!["wallet.example.com".into()],
+                ..Default::default()
+            },
             ..Default::default()
         };
         let addr = listen(router_for(s, hosts)).await;
@@ -8429,9 +8343,11 @@ mod tests {
                 .with_deadline(Duration::from_millis(200)),
         );
         let hosts = Hosts {
-            public: vec!["wallet.example.com".into()],
+            names: HostNames {
+                public: vec!["wallet.example.com".into()],
+                ..Default::default()
+            },
             write_token: Some(WriteToken(TOKEN.into())),
-            ..Default::default()
         };
         let addr = listen(router_for(s.clone(), hosts)).await;
         let host = format!("Host: 127.0.0.1:{}", addr.port());
@@ -8583,8 +8499,8 @@ mod tests {
         }
         let hosts =
             Hosts::declared(&s(&["host.docker.internal"]), &s(&["Wallet.Example.com"])).unwrap();
-        assert_eq!(hosts.local, ["host.docker.internal"]);
-        assert_eq!(hosts.public, ["wallet.example.com"]);
+        assert_eq!(hosts.names.local, ["host.docker.internal"]);
+        assert_eq!(hosts.names.public, ["wallet.example.com"]);
     }
 
     /// A refusal says what it saw and what to do about it.
