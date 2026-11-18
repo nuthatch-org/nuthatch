@@ -1,9 +1,11 @@
-//! The RFC-0016 Tier-B runner and the RFC-0017 authoring runner, and what they share.
+//! The RFC-0016 Tier-B runner, the RFC-0017 authoring runner, the discovery scorer (#2988), and what
+//! they share.
 //!
 //! A standalone crate, outside the root package, so nothing here reaches the shipped binary or the
 //! default build. Reports are written byte-for-byte as the Python runners they replace wrote them.
 
 pub mod authoring;
+pub mod discovery;
 pub mod proc;
 pub mod pyjson;
 pub mod tier_b;

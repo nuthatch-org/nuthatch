@@ -1,0 +1,15 @@
+type Transfer @entity(immutable: true) {
+  id: Bytes!
+  from: Bytes!
+  to: Bytes!
+  value: BigInt!
+  blockNumber: BigInt!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type Account @entity {
+  id: Bytes!
+  balance: BigInt!
+  transferCount: Int!
+}

@@ -1,0 +1,1 @@
+Give my agent SQL access to Uniswap V3 swaps on Ethereum.

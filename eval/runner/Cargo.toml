@@ -3,7 +3,7 @@ name = "nuthatch-eval-runner"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
-description = "The RFC-0016 Tier-B and RFC-0017 authoring eval runners. Dev tooling, never in the binary."
+description = "The RFC-0016 Tier-B and RFC-0017 authoring eval runners, and the discovery scorer. Dev tooling, never in the binary."
 license = "MIT OR Apache-2.0"
 publish = false
 
@@ -24,3 +24,7 @@ path = "src/bin/run-tier-b.rs"
 [[bin]]
 name = "run-authoring"
 path = "src/bin/run-authoring.rs"
+
+[[bin]]
+name = "score-discovery"
+path = "src/bin/score-discovery.rs"
