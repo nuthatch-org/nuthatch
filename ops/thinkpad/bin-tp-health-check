@@ -1,0 +1,43 @@
+#!/bin/bash
+# Checks tailscaled, disk (>15% free), expected units, graphops auth. Wakes Grok Bot only when the
+# failure set changes. State: ~/.local/state/tp-health/.
+#   failures: the failure set last ANNOUNCED. Advanced only after a successful wake POST, so a failed
+#             POST (or an unset CLAUDE_WAKE_URL) is retried on the next run.
+#   last:     snapshot of the most recent run, for tp-status. Nothing reads it for dedupe.
+#   history:  one line per successful wake.
+# Failure tokens are stable (disk-low, not disk(14%)); numbers go only in the POST body.
+# Test hooks: TP_HEALTH_FAKE_FAIL="tailscaled disk-low".
+set -u
+[ -f ~/.config/nh/env ] && . ~/.config/nh/env
+export PATH=$HOME/.npm-global/bin:$HOME/.cargo/bin:$PATH
+S=~/.local/state/tp-health; mkdir -p "$S"
+fails=()
+tailscale status >/dev/null 2>&1 || fails+=(tailscaled)
+free=$(df --output=pcent "$HOME" | tail -1 | tr -dc 0-9); free=$((100 - free))
+[ "$free" -gt 15 ] || fails+=(disk-low)
+units=${TP_EXPECTED_UNITS:-}
+[ -z "$units" ] && [ -f ~/.config/tp-health/units ] && units=$(grep -v '^#' ~/.config/tp-health/units | tr '\n' ' ')
+[ -z "$units" ] && units="tp-worker@test.service"
+for u in $units; do systemctl --user is-active --quiet "$u" || fails+=("unit:$u"); done
+graphops auth status --check >/dev/null 2>&1 || fails+=(graphops-auth)
+for f in ${TP_HEALTH_FAKE_FAIL:-}; do fails+=("fake:$f"); done
+cur=$(printf '%s\n' "${fails[@]:-}" | sort | tr '\n' ',' | sed 's/,$//')
+status=ok; [ -n "$cur" ] && status=fail
+prev=$(cat "$S/failures" 2>/dev/null || true)
+{ date -Is; echo "status=$status"; echo "failures=$cur"; echo "disk_free_pct=$free"; } > "$S/last"
+if [ "$cur" = "$prev" ]; then
+  :
+elif [ -z "${CLAUDE_WAKE_URL:-}" ]; then
+  echo "state change ($status) but CLAUDE_WAKE_URL unset; no wake sent, state not advanced (will send on first run after the URL is set)"
+else
+  body=$(printf '{"source":"thinkpad","host":"%s","status":"%s","failures":"%s","previous":"%s","disk_free_pct":%s,"at":"%s"}' \
+    "$(hostname)" "$status" "$cur" "$prev" "$free" "$(date -Is)")
+  if curl -fsS -m 20 -X POST -H 'Content-Type: application/json' ${CLAUDE_WAKE_KEY:+-H "Authorization: Bearer $CLAUDE_WAKE_KEY"} -d "$body" "$CLAUDE_WAKE_URL" >/dev/null; then
+    printf '%s' "$cur" > "$S/failures"
+    echo "$(date -Is) $status $cur" >> "$S/history"
+    echo "wake sent: $status"
+  else
+    echo "wake POST failed; state not advanced, will retry on the next run" >&2
+  fi
+fi
+[ "$status" = ok ]

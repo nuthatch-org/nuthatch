@@ -1,0 +1,17 @@
+[Unit]
+Description=ThinkPad supervised worker %i
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/nh/env
+Environment=PATH=%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+WorkingDirectory=%h
+ExecStart=%h/bin/tp-worker-run %i
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Install]
+WantedBy=default.target

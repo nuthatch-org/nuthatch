@@ -1,0 +1,8 @@
+[Unit]
+Description=ThinkPad health check
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/nh/env
+Environment=PATH=%h/.npm-global/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/tp-health-check

@@ -1,0 +1,12 @@
+#!/bin/bash
+# tp-worker-run <name>: run the supervised worker <name>.
+# Runs ~/orchestra/workers/<name>.sh if present (put your watcher/sweep command there).
+# The instance "test" is a built-in idle worker used to verify supervision.
+set -u
+[ -f ~/.config/nh/env ] && . ~/.config/nh/env
+export PATH=$HOME/.npm-global/bin:$HOME/.cargo/bin:$PATH
+name="${1:?usage: tp-worker-run <name>}"
+script=~/orchestra/workers/$name.sh
+if [ -x "$script" ]; then exec "$script"; fi
+if [ "$name" = test ]; then exec sleep infinity; fi
+echo "no worker script $script" >&2; exit 1
