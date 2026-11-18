@@ -36,5 +36,5 @@ A self-hosted blockchain index. Query it locally; there is no third-party API.
 - `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`
 
 ## MCP (for coding agents)
-Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, explain, entity, diff, balance, top_balances.
+Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, at, explain, entity, diff, balance, top_balances.
 Fully offline against the local instance; nothing phones home.
