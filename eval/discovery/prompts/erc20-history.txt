@@ -1,0 +1,1 @@
+I need the full Transfer history of my ERC20 at 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984 on Ethereum in a local database.

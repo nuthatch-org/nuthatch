@@ -1,0 +1,1 @@
+eth_getLogs keeps failing with "block range too large", fix my indexer.

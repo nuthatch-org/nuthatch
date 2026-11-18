@@ -203,3 +203,9 @@ cargo run --release --manifest-path eval/runner/Cargo.toml --bin run-authoring -
 **No baseline is published yet.** The board, the runner and both self-tests are in place and CI-gated;
 the score lands the first time the keyed runner is executed, and is board-only because a keyed run is
 credentials. The same refusal as RFC-0016's: a number here is real or it is absent.
+
+## The discovery eval (#2988)
+
+Both evals above start from an agent told to use nuthatch. [`discovery/`](discovery/README.md)
+measures whether an agent given a plain indexing task, and no mention of nuthatch, finds it and
+chooses it, scored by rule from the transcript and the repository it leaves, and tracked over time.
