@@ -6,7 +6,8 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "nuthatch",
     version,
-    about = "Be your own indexer - one binary, one command."
+    about = "Be your own indexer - one binary, one command.",
+    after_help = crate::cli_error::EXIT_STATUS_HELP
 )]
 pub struct Cli {
     /// Log output format. `text` (default) is the human-readable line format; `json` emits one

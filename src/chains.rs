@@ -86,15 +86,19 @@ pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<Resolved
     }
     if rpc_urls.is_empty() {
         let known = all().iter().map(|c| c.name).collect::<Vec<_>>().join(", ");
-        anyhow::bail!(
-            "unknown chain '{name}' (try: {known}) - or pass --rpc <url> to point nuthatch at a \
-             chain it doesn't ship built-in"
-        );
+        return Err(crate::cli_error::tag(
+            crate::cli_error::Code::ChainNotDetected,
+            anyhow::anyhow!(
+                "unknown chain '{name}' (try: {known}) - or pass --rpc <url> to point nuthatch at a \
+                 chain it doesn't ship built-in"
+            ),
+        ));
     }
     let chain_id = crate::rpc::RpcClient::new(rpc_urls.to_vec())?
         .chain_id()
         .await
-        .with_context(|| format!("could not read the chain id for '{name}' from --rpc"))?;
+        .with_context(|| format!("could not read the chain id for '{name}' from --rpc"))
+        .map_err(|e| crate::cli_error::tag(crate::cli_error::Code::RpcRefused, e))?;
     // A provider's own name for a registered chain keeps the registry's policy, on the caller's RPC (#2686).
     if let Some(c) = lookup_by_id(chain_id) {
         println!(

@@ -41,6 +41,7 @@ pub mod check;
 pub mod chunker;
 pub mod cid;
 pub mod cli;
+pub mod cli_error;
 pub mod config;
 /// The control-plane HTTP API (RFC-0022 §3): declare what the fleet should run.
 #[cfg(feature = "postgres-store")]

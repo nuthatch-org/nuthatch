@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::abi;
 use crate::chains;
 use crate::cli::{AddArgs, InitArgs};
+use crate::cli_error::{Code, CodeExt as _};
 use crate::config::{Config, Contract, Extract, Nest};
 use crate::rpc::RpcClient;
 #[cfg(test)]
@@ -1384,7 +1385,9 @@ async fn resolve_abi(
         }
         println!("  · implementation ABI unresolved; using the proxy's own ABI");
     }
-    let resolved = abi::resolve(chain_id, address, explorer).await?;
+    let resolved = abi::resolve(chain_id, address, explorer)
+        .await
+        .code(Code::AbiNotFound)?;
     print_abi_resolved(&resolved);
     Ok(ResolvedAbi {
         abi: resolved.abi,
@@ -1406,9 +1409,12 @@ async fn require_contract_code(rpc: &RpcClient, chain_id: u64, address: &str) ->
 }
 
 fn no_contract_code(address: &str, chain_id: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "no contract code at {address} on chain {chain_id}; check the address and --chain. If the \
-         contract self-destructed, pass --abi path/to.json to index its history anyway"
+    crate::cli_error::tag(
+        Code::ChainNotDetected,
+        anyhow::anyhow!(
+            "no contract code at {address} on chain {chain_id}; check the address and --chain. If \
+             the contract self-destructed, pass --abi path/to.json to index its history anyway"
+        ),
     )
 }
 
@@ -1948,11 +1954,14 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
 
 fn found_nowhere(probe: &str, probed: &[(&'static chains::Chain, Option<bool>)]) -> anyhow::Error {
     let names: Vec<&str> = probed.iter().map(|(c, _)| c.name).collect();
-    anyhow::anyhow!(
-        "couldn't find bytecode for {probe} on any known chain ({}).\n\
-         Pass --chain explicitly, or --rpc <url> for a custom endpoint. If the address is mistyped, \
-         or is not a contract, no chain will have code there.",
-        names.join(", ")
+    crate::cli_error::tag(
+        Code::ChainNotDetected,
+        anyhow::anyhow!(
+            "couldn't find bytecode for {probe} on any known chain ({}).\n\
+             Pass --chain explicitly, or --rpc <url> for a custom endpoint. If the address is \
+             mistyped, or is not a contract, no chain will have code there.",
+            names.join(", ")
+        ),
     )
 }
 
@@ -1992,7 +2001,8 @@ async fn detect_chain_on_rpc(
     let chain_id = rpc
         .chain_id()
         .await
-        .context("could not read chain id from --rpc")?;
+        .context("could not read chain id from --rpc")
+        .code(Code::RpcRefused)?;
     let chain = chains::all()
         .iter()
         .find(|chain| chain.chain_id == chain_id)
@@ -2001,21 +2011,28 @@ async fn detect_chain_on_rpc(
             format!(
                 "--rpc reports unregistered chain id {chain_id}; pass --chain <name> to name it"
             )
-        })?;
+        })
+        .code(Code::ChainNotDetected)?;
     let tip = rpc
         .block_number()
         .await
-        .context("could not read tip from --rpc")?;
+        .context("could not read tip from --rpc")
+        .code(Code::RpcRefused)?;
     let code = rpc
         .get_code(&probe, tip)
         .await
-        .context("could not read contract bytecode from --rpc")?;
+        .context("could not read contract bytecode from --rpc")
+        .code(Code::RpcRefused)?;
     if is_empty_code(&code) {
-        bail!(
-            "no bytecode for {probe} on {} via the supplied RPC endpoint(s); the address may be \
-             mistyped, or the contract self-destructed (then pass --chain and --abi path/to.json)",
-            chain.name
-        );
+        return Err(crate::cli_error::tag(
+            Code::ChainNotDetected,
+            anyhow::anyhow!(
+                "no bytecode for {probe} on {} via the supplied RPC endpoint(s); the address may \
+                 be mistyped, or the contract self-destructed (then pass --chain and --abi \
+                 path/to.json)",
+                chain.name
+            ),
+        ));
     }
     println!("  ✓ found on {}", chain.name);
     Ok(chains::ResolvedChain {
