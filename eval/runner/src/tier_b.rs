@@ -177,7 +177,7 @@ fn py_type(v: &Value) -> &'static str {
 )]
 pub struct Args {
     /// nuthatch serve URL
-    #[arg(long, required_unless_present = "self_test")]
+    #[arg(long, required_unless_present_any = ["self_test", "decoy_mcp"])]
     pub url: Option<String>,
     #[arg(long, default_value_os_t = root().join("target/debug/nuthatch"))]
     pub nuthatch: PathBuf,
@@ -203,6 +203,93 @@ pub struct Args {
     /// prove the scorer's honesty with no key, no nest and no model
     #[arg(long)]
     pub self_test: bool,
+    /// load a generic SQL server beside nuthatch and name neither in the prompt (#2983): a pass
+    /// needs the subject to pick nuthatch's `sql` by its description alone
+    #[arg(long)]
+    pub crowded: bool,
+    /// serve the decoy SQL server over stdio; how the runner launches it for --crowded
+    #[arg(long, hide = true)]
+    pub decoy_mcp: bool,
+}
+
+/// The second server a --crowded subject sees: a plausible warehouse with a SQL tool of its own, that
+/// answers nothing. Its name is the one a generic database server would have.
+pub const DECOY: &str = "warehouse";
+
+pub fn subject_config(args: &Args) -> Result<Value, String> {
+    let mut servers = Map::new();
+    servers.insert(
+        "nuthatch".into(),
+        json!({
+            "command": args.nuthatch.to_string_lossy(),
+            "args": ["mcp", "--url", args.url.as_deref().unwrap_or_default()],
+        }),
+    );
+    if args.crowded {
+        let me = std::env::current_exe().map_err(|e| e.to_string())?;
+        servers.insert(
+            DECOY.into(),
+            json!({ "command": me.to_string_lossy(), "args": ["--decoy-mcp"] }),
+        );
+    }
+    Ok(json!({ "mcpServers": servers }))
+}
+
+pub fn subject_prompt(question: &str, crowded: bool) -> String {
+    if crowded {
+        format!(
+            "Answer this question about the indexed smart contract's onchain history. Obtain the \
+             data with the tools available, and give the result only after you have queried it.\
+             \n\n{question}"
+        )
+    } else {
+        format!(
+            "Use the nuthatch MCP tools to answer this question. Use the sql tool to obtain the data. \
+             Give the result only after you have queried it.\n\n{question}"
+        )
+    }
+}
+
+/// The decoy's reply to one message, or `None` for a notification.
+pub fn decoy_answer(req: &Value) -> Option<Value> {
+    let id = req.get("id")?.clone();
+    let result = match req["method"].as_str().unwrap_or("") {
+        "initialize" => json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": { "tools": {} },
+            "serverInfo": { "name": DECOY, "version": "0.0.0" },
+        }),
+        "tools/list" => json!({ "tools": [
+            { "name": "list_tables", "description": "List the tables in the connected database.",
+              "inputSchema": { "type": "object", "properties": {} } },
+            { "name": "query", "description": "Run a read-only SQL query against the connected database and return the rows.",
+              "inputSchema": { "type": "object", "properties": { "sql": { "type": "string" } }, "required": ["sql"] } },
+        ] }),
+        "tools/call" => json!({
+            "content": [{ "type": "text", "text": "the database is empty: it holds no tables" }],
+            "isError": false,
+        }),
+        _ => {
+            return Some(json!({ "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": "method not found" } }))
+        }
+    };
+    Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+pub fn serve_decoy() {
+    use std::io::{BufRead, Write};
+    let stdout = std::io::stdout();
+    for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(resp) = decoy_answer(&req) {
+            let mut out = stdout.lock();
+            let _ = writeln!(out, "{resp}");
+            let _ = out.flush();
+        }
+    }
 }
 
 pub struct SubjectRun {
@@ -212,17 +299,13 @@ pub struct SubjectRun {
 }
 
 pub fn subject_run(question: &str, args: &Args) -> Result<SubjectRun, String> {
-    let config = pyjson::dumps(
-        &json!({"mcpServers": {"nuthatch": {
-            "command": args.nuthatch.to_string_lossy(),
-            "args": ["mcp", "--url", args.url.as_deref().unwrap_or_default()],
-        }}}),
-        Style::Default,
-    );
-    let prompt = format!(
-        "Use the nuthatch MCP tools to answer this question. Use the sql tool to obtain the data. \
-         Give the result only after you have queried it.\n\n{question}"
-    );
+    let config = pyjson::dumps(&subject_config(args)?, Style::Default);
+    let prompt = subject_prompt(question, args.crowded);
+    let allowed = if args.crowded {
+        format!("mcp__nuthatch__*,mcp__{DECOY}__*")
+    } else {
+        "mcp__nuthatch__*".to_string()
+    };
     // This directory is intentionally neither the repository nor the fixture. --restricted removes
     // built-in code/command tools; --tools '' keeps it so.
     let cwd = tempfile::Builder::new()
@@ -239,7 +322,7 @@ pub fn subject_run(question: &str, args: &Args) -> Result<SubjectRun, String> {
         "--tools",
         "",
         "--allowed-tools",
-        "mcp__nuthatch__*",
+        &allowed,
         "--no-session-persistence",
         "--output-format",
         "stream-json",
@@ -777,6 +860,44 @@ pub fn self_test() -> Checks {
         Ok(()) => c.check("report with final_query is accepted", true, ""),
         Err(e) => c.check("report with final_query is accepted", false, &e),
     }
+
+    // #2983: a crowded subject has a second SQL server, and nothing in its prompt says which to use.
+    let crowded = Args::parse_from(["run-tier-b", "--url", "http://127.0.0.1:9", "--crowded"]);
+    let servers = subject_config(&crowded).unwrap_or_default();
+    let names: Vec<&String> = servers["mcpServers"]
+        .as_object()
+        .map(|m| m.keys().collect())
+        .unwrap_or_default();
+    c.check(
+        "a crowded subject is given the decoy beside nuthatch",
+        names == ["nuthatch", DECOY],
+        &format!("{names:?}"),
+    );
+    let prompt = subject_prompt("how many transfers?", true).to_lowercase();
+    c.check(
+        "a crowded prompt names neither server nor tool",
+        !prompt.contains("nuthatch") && !prompt.contains("sql") && !prompt.contains(DECOY),
+        &prompt,
+    );
+    let decoy_call = json!({ "type": "assistant", "message": { "content": [
+        { "type": "tool_use", "name": format!("mcp__{DECOY}__query"),
+          "input": { "sql": "SELECT COUNT(*) FROM transfers", "query": "SELECT 1" } }
+    ] } });
+    let run = parse_stream(&decoy_call.to_string());
+    c.check(
+        "a query sent to the decoy is not scored as nuthatch's",
+        run.tool_calls == 1 && run.queries.is_empty(),
+        &format!("{} tools, {:?}", run.tool_calls, run.queries),
+    );
+    let listed = decoy_answer(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .unwrap_or_default();
+    c.check(
+        "the decoy offers a SQL tool of its own",
+        listed["result"]["tools"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|t| t["name"] == "query")),
+        &listed.to_string(),
+    );
 
     c.finish();
     c

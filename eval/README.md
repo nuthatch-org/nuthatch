@@ -80,6 +80,13 @@ cargo run --release --manifest-path eval/runner/Cargo.toml --bin run-tier-b -- \
   --url http://127.0.0.1:8288 --nuthatch target/release/nuthatch --runs 3
 ```
 
+**With other servers loaded (#2983).** `--crowded` gives the subject a second MCP server beside
+nuthatch, a generic `warehouse` with `list_tables` and a SQL `query` tool of its own that holds
+nothing, and a prompt that names neither server nor tool. A pass then needs the subject to pick
+nuthatch's `sql` from the tool descriptions alone; a query sent to the decoy is counted as a tool call
+and never scored. Publish it beside the plain baseline with `--report eval/eval-report-crowded.json`.
+No crowded baseline has been run yet.
+
 **Every failing result records its query (#1051).** `final_query`, plus `final_rows` on a failure.
 Without them a zero cannot say whether the agent invented a table name, tripped the
 `value`/`value_dec` big-int footgun this fixture exists to probe, or fell over the `"from"`/`"to"`

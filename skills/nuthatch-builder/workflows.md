@@ -182,6 +182,8 @@ nuthatch mcp --print-config           # copy-paste MCP client config (Claude Cod
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 # a remote nest behind a gateway: name the variable holding its bearer token
 claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-env NEST_TOKEN
+# no nest yet: the agent creates and indexes one with init_nest, start_indexing, index_status
+claude mcp add nuthatch -- nuthatch mcp --authoring --dir ~/nests/usdc
 ```
 
 A runtime hosting several nests serves nothing at its root: point `--url` at one mount, `http://127.0.0.1:8288/<alias>` (or `/<tenant>/<alias>`). `GET /nests` lists them.

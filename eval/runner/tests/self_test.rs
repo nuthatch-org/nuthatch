@@ -40,6 +40,10 @@ fn the_tier_b_runner_passes_its_own_self_test() {
             "a reachable scorer still yields a verdict",
             "report without final_query is refused",
             "report with final_query is accepted",
+            "a crowded subject is given the decoy beside nuthatch",
+            "a crowded prompt names neither server nor tool",
+            "a query sent to the decoy is not scored as nuthatch's",
+            "the decoy offers a SQL tool of its own",
         ],
     );
 }

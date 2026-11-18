@@ -274,11 +274,20 @@ async fn main() -> Result<()> {
         cli::Command::Seed(a) => nuthatch::seed::run(std::path::Path::new(&a.dir), &a.from).await,
         cli::Command::Partitions(a) => nuthatch::address_partitions::run(&a).await,
         cli::Command::Mcp(args) => {
+            // A client launches the server from a directory of its choosing, so the nest's is fixed now.
+            let authoring = args
+                .authoring
+                .then(|| std::path::absolute(&args.dir))
+                .transpose()?;
             if args.print_config {
-                mcp::print_client_config(&args.url, args.token_env.as_deref());
+                mcp::print_client_config(
+                    &args.url,
+                    args.token_env.as_deref(),
+                    authoring.as_deref(),
+                );
                 Ok(())
             } else {
-                mcp::serve(args.url, args.token_env).await
+                mcp::serve(args.url, args.token_env, authoring).await
             }
         }
         cli::Command::Settle(args) => {

@@ -275,6 +275,8 @@ Serve the Model Context Protocol over stdio (bridges to a running `nuthatch dev`
 - `--url <URL>` - Base URL of the running `nuthatch dev` HTTP API to bridge to
 - `--print-config` - Print a copy-paste MCP client config (Claude Code `.mcp.json` + the `claude mcp add` one-liner) and exit, instead of running the stdio server. This is the "wire it up in one step" helper
 - `--token-env <TOKEN_ENV>` - Name of an environment variable holding a bearer token, sent as `Authorization: Bearer` on every request to --url. Defaults to `NUTHATCH_MCP_TOKEN` when that is set. The token itself never goes on the command line
+- `--authoring` - Also offer `init_nest`, `start_indexing`, `index_status` and `stop_indexing`, so a client can create a nest in --dir and index it with no shell. The indexer runs `nuthatch dev` at --url, which must then be a loopback address. It stops when this server exits normally; a server killed outright leaves it running, for the next server on the same --dir and --url to adopt
+- `--dir <DIR>` - With --authoring: the directory the nest is created in and indexed from
 
 ## `nuthatch metadata`
 

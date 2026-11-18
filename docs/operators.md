@@ -2359,6 +2359,29 @@ claude mcp add nuthatch -- nuthatch mcp --url https://nest.example.com --token-e
 Every request then carries `Authorization: Bearer <token>`. `--print-config` prints the variable's
 name, never its value, and an error body that echoes the token reaches the agent as `[redacted]`.
 
+### Starting from nothing: `--authoring`
+
+With `--authoring`, a client that has no nest yet can make one. The server also offers `init_nest`
+(an address, and optionally a chain, alias, RPC, local ABI or start block), `start_indexing` (runs
+`nuthatch dev` on that nest at `--url`, optionally with `backfill`, `rpc` and `poll_interval`) and
+`index_status` (the nest's `/ready` answer and the indexer's state). They run this binary's own
+`init` and `dev`, so what an agent sends is only ever their arguments.
+
+```sh
+claude mcp add nuthatch -- nuthatch mcp --authoring --dir ~/nests/usdc
+```
+
+The nest is written to `--dir`, `--url` must be a loopback address because the indexer runs on this
+machine. The indexer stops when the client closes the server; a server killed outright leaves it
+running, and the next server started on the same `--dir` and `--url` adopts it, which `stop_indexing`
+then stops. Its log is in the system's temporary directory, named in `start_indexing`'s answer. `init_nest` resolves the ABI from Sourcify
+or an explorer and `start_indexing` reads the chain from an RPC, exactly as `init` and `dev` do; the
+agent is asking on your behalf, and nothing else leaves the machine.
+
+Every tool carries MCP annotations: the query tools are `readOnlyHint: true` and
+`openWorldHint: false`, and those that answer one JSON object (`status`, `tables`, `at`, `diff`,
+`balance`, `top_balances`) declare an `outputSchema` and send `structuredContent`.
+
 ---
 
 ## Stability contract

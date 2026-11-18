@@ -468,6 +468,9 @@ A runtime hosting several nests serves nothing at its root: point `--url` at one
 A nest behind a gateway that wants a bearer token: `--token-env NEST_TOKEN` names the variable that
 holds it (`NUTHATCH_MCP_TOKEN` is read by default), so the token never goes on the command line.
 
+No nest yet? `nuthatch mcp --authoring --dir <dir>` also offers `init_nest`, `start_indexing` and
+`index_status`, so the agent can create the nest and index it without a shell.
+
 Then just ask: *"what are the top USDC holders?"* - the agent writes the SQL and runs it against your
 nest. (Making that correct on the first try is the [semantic-layer work](docs/rfcs/0016-governed-semantic-layer-and-agent-grade-mcp.md).)
 

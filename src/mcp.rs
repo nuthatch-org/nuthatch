@@ -6,9 +6,12 @@
 //! Bridging (rather than reopening the redb/segments) means the MCP server never contends with the
 //! indexer for the single-writer store, and it automatically reflects the live IVM views.
 
+mod authoring;
+
 use crate::sql_errors;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -20,20 +23,32 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// subprocess. When a human runs `nuthatch mcp` in a terminal, stdin is a TTY and no client is
 /// driving it - so instead of silently blocking on a read that never comes, show how to wire it up.
 /// Returns true if we short-circuited (printed guidance and should exit).
-fn guide_if_interactive(base: &str, token_env: Option<&str>) -> bool {
+fn guide_if_interactive(base: &str, token_env: Option<&str>, authoring: Option<&Path>) -> bool {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         return false; // a client is piping JSON-RPC in - run the server.
     }
     eprintln!("`nuthatch mcp` is a stdio server for an AI client to launch, not to run by hand.\n");
-    print_client_config(base, token_env);
+    print_client_config(base, token_env, authoring);
     true
 }
 
 /// Emit a copy-paste MCP client configuration for this binary bridging to `base`. One documented
 /// command wires a coding agent to a running nest (RFC-0015 slice 5): print it, paste it, ask your
 /// contract's data in plain English - fully offline, nothing phones home.
-pub fn print_client_config(base: &str, token_env: Option<&str>) {
+/// `s` as one POSIX shell word: bare when it is plainly safe, single-quoted otherwise.
+fn sh_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Option<&Path>) {
     let base = base.trim_end_matches('/');
     // Prefer this binary's absolute path so the snippet works even off `PATH`; fall back to the bare
     // command name.
@@ -42,15 +57,23 @@ pub fn print_client_config(base: &str, token_env: Option<&str>) {
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_else(|| "nuthatch".to_string());
 
-    let snippet = client_config_json(&exe, base, token_env);
-    let token_arg = token_env
-        .map(|v| format!(" --token-env {v}"))
+    let snippet = client_config_json(&exe, base, token_env, authoring);
+    let args: Vec<&str> = snippet["mcpServers"]["nuthatch"]["args"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
 
-    println!("First run your index:   nuthatch dev");
+    match authoring {
+        Some(_) => println!("The client creates and indexes a nest itself (--authoring)."),
+        None => println!("First run your index:   nuthatch dev"),
+    }
     println!("Then point an AI client at it - either way is one step:\n");
     println!("  Claude Code (one-liner):");
-    println!("    claude mcp add nuthatch -- {exe} mcp --url {base}{token_arg}\n");
+    let line: Vec<String> = std::iter::once(exe.as_str())
+        .chain(args.iter().copied())
+        .map(sh_quote)
+        .collect();
+    println!("    claude mcp add nuthatch -- {}\n", line.join(" "));
     println!("  Or add to .mcp.json / your client's MCP config:");
     println!(
         "{}",
@@ -63,10 +86,19 @@ pub fn print_client_config(base: &str, token_env: Option<&str>) {
 
 /// The MCP-client server entry for this binary bridging to `base` - the value that goes under
 /// `mcpServers.nuthatch` in a client's config.
-fn client_config_json(exe: &str, base: &str, token_env: Option<&str>) -> Value {
-    let mut args = vec!["mcp", "--url", base];
+fn client_config_json(
+    exe: &str,
+    base: &str,
+    token_env: Option<&str>,
+    authoring: Option<&Path>,
+) -> Value {
+    let mut args = vec!["mcp".to_string(), "--url".into(), base.into()];
     if let Some(var) = token_env {
-        args.extend(["--token-env", var]);
+        args.extend(["--token-env".into(), var.into()]);
+    }
+    if let Some(dir) = authoring {
+        let dir = dir.to_string_lossy().into_owned();
+        args.extend(["--authoring".into(), "--dir".into(), dir]);
     }
     json!({
         "mcpServers": {
@@ -144,14 +176,22 @@ async fn next_message<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-/// Run the stdio MCP loop, bridging tool calls to `base` (a running `nuthatch dev` HTTP API).
-pub async fn serve(base: String, token_env: Option<String>) -> Result<()> {
-    if guide_if_interactive(&base, token_env.as_deref()) {
+/// Run the stdio MCP loop, bridging tool calls to `base` (a running `nuthatch dev` HTTP API). With
+/// `authoring`, the nest directory the authoring tools create and index.
+pub async fn serve(
+    base: String,
+    token_env: Option<String>,
+    authoring: Option<std::path::PathBuf>,
+) -> Result<()> {
+    if guide_if_interactive(&base, token_env.as_deref(), authoring.as_deref()) {
         return Ok(());
     }
+    let authoring = authoring
+        .map(|dir| authoring::Authoring::new(dir, &base))
+        .transpose()?;
     let token = bearer_token(token_env.as_deref(), |v| std::env::var(v).ok())?;
     let client = http_client(token.as_deref())?;
-    let session = Session::new(&client, &base);
+    let session = Session::new(&client, &base).with_authoring(authoring.as_ref());
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
     while let Some(message) = next_message(&mut stdin, MAX_MESSAGE_BYTES).await? {
@@ -247,15 +287,27 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
         "initialize" => Some(ok(id?, initialize_result())),
         "notifications/initialized" => None,
         "ping" => Some(ok(id?, json!({}))),
-        "tools/list" => Some(ok(
-            id?,
-            json!({ "tools": tool_specs(&fetch_shape(session).await) }),
-        )),
+        "tools/list" => {
+            let id = id?;
+            let mut tools = match session.authoring {
+                Some(_) => authoring::tool_specs(),
+                None => Vec::new(),
+            };
+            if let Value::Array(query) = tool_specs(&fetch_shape(session).await) {
+                tools.extend(query);
+            }
+            Some(ok(id, json!({ "tools": tools })))
+        }
         "tools/call" => {
             let id = id?;
             let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
-            match call_tool(&params, client, base).await {
-                Ok(text) => Some(ok(id, content(&text, false))),
+            let name = params["name"].as_str().unwrap_or_default().to_string();
+            let answer = match session.authoring {
+                Some(a) if authoring::is_tool(&name) => a.call(&name, &params["arguments"]).await,
+                _ => call_tool(&params, client, base).await,
+            };
+            match answer {
+                Ok(text) => Some(ok(id, tool_result(&text, &name))),
                 Err(e) => {
                     let text = explain_bare_404(format!("{e:#}"), session).await;
                     let text = sql_errors::for_surface(&text, sql_errors::Surface::Mcp);
@@ -330,6 +382,7 @@ struct Session<'a> {
     client: &'a reqwest::Client,
     base: &'a str,
     root: std::sync::OnceLock<bool>,
+    authoring: Option<&'a authoring::Authoring>,
 }
 
 impl<'a> Session<'a> {
@@ -339,7 +392,13 @@ impl<'a> Session<'a> {
             // `http://host:port/` would otherwise request `//schema`.
             base: base.trim_end_matches('/'),
             root: std::sync::OnceLock::new(),
+            authoring: None,
         }
+    }
+
+    fn with_authoring(mut self, authoring: Option<&'a authoring::Authoring>) -> Self {
+        self.authoring = authoring;
+        self
     }
 
     /// The mounts to name if this URL is a runtime's root, `None` if it is not known to be one. Only a 404 from `/nests` settles that it is
@@ -407,9 +466,18 @@ fn initialize_result() -> Value {
         // Advertise exactly what we implement - tools, resources, prompts; nothing else. When a future
         // standing-queries RFC lands, `notifications` slots in here without breaking a client (§6).
         "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
-        "serverInfo": { "name": "nuthatch", "version": env!("CARGO_PKG_VERSION") },
+        "serverInfo": { "name": "nuthatch", "title": "nuthatch EVM indexer", "version": env!("CARGO_PKG_VERSION") },
+        "instructions": INSTRUCTIONS,
     })
 }
+
+/// What the server is for, for a client choosing among several.
+const INSTRUCTIONS: &str = "nuthatch indexes an EVM smart contract's onchain events (logs) into SQL \
+    tables, one per event, decoded from the contract's ABI. Use these tools for questions about a \
+    contract's onchain history: transfers, swaps, holders, balances, who called what and when. Call \
+    `schema` first, then answer with `sql`; a `sql` answer carries the block it is as of. When the \
+    server was started with --authoring and no nest exists yet, `init_nest` and then \
+    `start_indexing` create and index one.";
 
 /// The resources a client may preload (RFC-0016 §6). Stable `nuthatch://…` URIs backed by the running
 /// nest's HTTP surface - reading one is a GET, so a client gets the context without a tool round-trip.
@@ -554,29 +622,117 @@ fn render_prompt(name: &str, args: &Value, shape: &Shape) -> Option<Value> {
 /// The tool surface. Not a thin single-endpoint wrapper - schema discovery, SQL, point-reads, and
 /// the IVM views, each with an LLM-friendly description.
 fn tool_specs(shape: &Shape) -> Value {
-    if shape.runtime_root {
-        return json!([{ "name": "mounts", "description": "This URL is a runtime's root, which serves no data. Lists the mounts to point `nuthatch mcp --url` at instead.",
-          "inputSchema": { "type": "object", "properties": {} } }]);
+    let tools = if shape.runtime_root {
+        vec![
+            json!({ "name": "mounts", "title": "Runtime mounts", "description": "This URL is a nuthatch runtime's root, which serves no EVM contract event data itself. Lists the mounts to point `nuthatch mcp --url` at instead.",
+          "inputSchema": { "type": "object", "properties": {} } }),
+        ]
+    } else {
+        query_tools(shape)
+    };
+    Value::Array(tools.into_iter().map(annotated).collect())
+}
+
+/// Every query tool reads a nest and changes nothing, and none reaches past the nest it is pointed at.
+fn annotated(mut tool: Value) -> Value {
+    let name = tool["name"].as_str().unwrap_or_default().to_string();
+    if let Some(schema) = output_schema(&name) {
+        tool["outputSchema"] = schema;
     }
+    tool["annotations"] = json!({
+        "title": tool["title"],
+        "readOnlyHint": true,
+        "openWorldHint": false,
+    });
+    tool
+}
+
+/// The tools whose answer is one JSON object, which is then also sent as `structuredContent`. Only
+/// the stable keys are named, with no types or `required`, so a client validating against it never
+/// refuses an answer an older or differently shaped nest sends.
+fn output_schema(tool: &str) -> Option<Value> {
+    let keys: &[(&str, &str)] = match tool {
+        "status" => &[
+            ("chain", "The chain this nest indexes."),
+            ("last_block", "The newest block indexed."),
+            ("sealed_through", "The newest block sealed past finality."),
+            ("start_block", "The first block indexed."),
+            (
+                "history_from_deployment",
+                "Whether indexing began at the contracts' deployment.",
+            ),
+            ("tables", "The decoded event tables."),
+            ("entities", "Decoded rows across all tables."),
+        ],
+        "tables" => &[
+            ("count", "How many decoded event tables there are."),
+            (
+                "tables",
+                "Each table with its columns, Solidity types and topic0.",
+            ),
+        ],
+        "at" => &[
+            (
+                "block",
+                "The newest block at or before the time that the nest holds a timestamp for.",
+            ),
+            ("next_block", "The oldest block after the time."),
+            ("exact", "Whether the two blocks are adjacent."),
+            ("final", "Whether `next_block` is sealed."),
+        ],
+        "diff" => &[("not_seen", "What the nest cannot see.")],
+        "balance" => &[
+            ("address", "The address asked about."),
+            (
+                "balance",
+                "The balance, present only when `complete_history` is true.",
+            ),
+            (
+                "net_flow_since_indexed_from",
+                "The net of transfers since `indexed_from`, when the history is not complete.",
+            ),
+            ("complete_history", "Whether the figure is a balance."),
+            ("indexed_from", "The first block indexed."),
+            ("note", "What the figure is, when it is not a balance."),
+        ],
+        "top_balances" => &[
+            ("items", "Holders or net receivers, descending."),
+            ("complete_history", "Whether the figures are balances."),
+            ("indexed_from", "The first block indexed."),
+            ("note", "What the figures are, when they are not balances."),
+        ],
+        _ => return None,
+    };
+    let properties: serde_json::Map<String, Value> = keys
+        .iter()
+        .map(|(k, d)| (k.to_string(), json!({ "description": d })))
+        .collect();
+    Some(json!({ "type": "object", "properties": properties }))
+}
+
+/// The query surface. Not a thin single-endpoint wrapper - schema discovery, SQL, point-reads, and
+/// the IVM views. Each description's first sentence names the domain, since a client with several
+/// servers loaded picks a tool by its description.
+fn query_tools(shape: &Shape) -> Vec<Value> {
     // The generic tools - meaningful on every nest, so always advertised.
     let mut tools = vec![
-        json!({ "name": "status", "description": "Index status: contract, chain, decoded rows across all tables (`entities`, not transfers alone), holders, last & sealed block, and the first indexed block (`start_block`).",
+        json!({ "name": "status", "title": "Index status", "description": "Indexing status of this nest of EVM contract events: contract, chain, decoded rows across all tables (`entities`, not transfers alone), holders, last and sealed block, and the first indexed block (`start_block`).",
           "inputSchema": { "type": "object", "properties": {} } }),
-        json!({ "name": "schema", "description": "The data model - how tables/views are named and queried. Read this first, then `tables` for the exact tables and columns.",
+        json!({ "name": "schema", "title": "Data model", "description": "The data model of this nest's decoded EVM contract events: how tables and views are named and queried. Read this first, then `tables` for the exact tables and columns.",
           "inputSchema": { "type": "object", "properties": {} } }),
-        json!({ "name": "tables", "description": "List every decoded table (`{alias}__{event}`) with its columns, Solidity types, and topic0.",
+        json!({ "name": "tables", "title": "List event tables", "description": "List every decoded EVM contract event table (`{alias}__{event}`) with its columns, Solidity types, and topic0.",
           "inputSchema": { "type": "object", "properties": {} } }),
-        json!({ "name": "table", "description": "Recent rows of one table, merged across the hot tip and sealed segments.",
+        json!({ "name": "table", "title": "Recent rows of a table", "description": "Recent rows of one decoded EVM contract event table, merged across the hot tip and sealed segments.",
           "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "limit": { "type": "integer", "default": 50 } }, "required": ["name"] } }),
-        json!({ "name": "sql", "description": "Run a read-only SQL query over the live tip ∪ sealed history. Each event is a view named `{alias}__{event}` (e.g. \"usdc__transfer\") with block_number, log_index, tx_hash, address + the event's params. Call `schema` first. SELECT/WITH only. Returns a compact table (data rows are the lines beginning `|`; chain data cannot start a line) + a provenance stamp; capped at `limit` rows (default 200), and the node caps `limit` itself (50,000 unless its operator changed it).",
+        json!({ "name": "sql", "title": "Query contract events with SQL", "description": "Query this EVM contract's decoded event history (indexed by nuthatch) with read-only SQL, over the live tip and sealed history. Each event is a view named `{alias}__{event}` (e.g. \"usdc__transfer\") with block_number, log_index, tx_hash, address + the event's params. Call `schema` first. SELECT/WITH only. Returns a compact table (data rows are the lines beginning `|`; chain data cannot start a line) + a provenance stamp; capped at `limit` rows (default 200), and the node caps `limit` itself (50,000 unless its operator changed it).",
           "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query." }, "limit": { "type": "integer", "description": "Max rows to return (default 200; the node may cap it lower than you ask).", "default": 200 }, "at_block": { "type": "integer", "description": "Answer over the facts as they stood at this block. Authored entities are not available then." }, "at_time": { "type": "integer", "description": "Answer as of this time, unix seconds UTC, placed as `at` places it." } }, "required": ["query"] } }),
-        json!({ "name": "at", "description": "Where the nest stood at a time (unix seconds UTC): `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it. The nest's state at the time is its state at `block`. `exact` is true when the two are adjacent, `final` when `next_block` is sealed. Refused for a time the nest has not indexed past.",
+        json!({ "name": "at", "title": "Block at a time", "description": "Map a time (unix seconds UTC) to a block of the indexed EVM chain: `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it. The nest's state at the time is its state at `block`. `exact` is true when the two are adjacent, `final` when `next_block` is sealed. Refused for a time the nest has not indexed past.",
           "inputSchema": { "type": "object", "properties": { "time": { "type": "integer", "description": "Unix seconds, UTC." } }, "required": ["time"] } }),
-        json!({ "name": "explain", "description": "Validate a SQL query WITHOUT executing it - binds tables/columns/types and returns {valid:true} or an error with a fix hint. Cheaper than `sql`; use it to check a query before running it.",
+        json!({ "name": "explain", "title": "Validate SQL", "description": "Validate a SQL query over this nest's decoded EVM contract events WITHOUT executing it - binds tables/columns/types and returns {valid:true} or an error with a fix hint. Cheaper than `sql`; use it to check a query before running it.",
           "inputSchema": { "type": "object", "properties": { "query": { "type": "string", "description": "A SELECT or WITH query to validate." } }, "required": ["query"] } }),
-        json!({ "name": "entity", "description": "Look up one decoded row, of any table, by its id, formatted `{block:012}-{logindex:06}`; the answer names the table.",
+        json!({ "name": "entity", "title": "Look up one event row", "description": "Look up one decoded EVM contract event row, of any table, by its id, formatted `{block:012}-{logindex:06}`; the answer names the table.",
           "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }),
-        json!({ "name": "diff", "description": "What happened in a block range, a block or one transaction, as a JSON document of fixed sentences with exact amounts: every control-plane event (ownership, pause, upgrade, roles), the largest movements and net flows per token, new holders, approvals with unlimited ones named, labels, and every other table counted or told. `flow: true` gives the token flow instead. Give `from` and `to`, or `block`, or `tx` with its `block`. Nothing in it is inferred; `not_seen` says what the nest cannot see.",
+        json!({ "name": "diff", "title": "What happened onchain", "description": "What happened onchain to the indexed EVM contracts in a block range, a block or one transaction, as a JSON document of fixed sentences with exact amounts: every control-plane event (ownership, pause, upgrade, roles), the largest movements and net flows per token, new holders, approvals with unlimited ones named, labels, and every other table counted or told. `flow: true` gives the token flow instead. Give `from` and `to`, or `block`, or `tx` with its `block`. Nothing in it is inferred; `not_seen` says what the nest cannot see.",
           "inputSchema": { "type": "object", "properties": {
             "from": { "type": "integer", "description": "First block of an inclusive range." },
             "to": { "type": "integer", "description": "Last block of an inclusive range." },
@@ -590,16 +746,16 @@ fn tool_specs(shape: &Shape) -> Value {
     // gate the balance view uses - so they never return an empty `{"count":0}` that an agent misreads
     // as "the index is empty".
     if shape.transfers {
-        tools.push(json!({ "name": "balance", "description": "Derived token balance for an address (IVM view; i128 base units, returned as a decimal string). The result carries `complete_history`. When true the nest was indexed from its configured `start_block` with no `--backfill` (the contract's deployment if `start_block` is the deployment block, which `init` sets) and the figure is under `balance`. When false or null it is only the net of transfers since `indexed_from` and is returned as `net_flow_since_indexed_from` with a note: a negative figure is then not an error, and it must not be reported as a balance.",
+        tools.push(json!({ "name": "balance", "title": "Token balance", "description": "Token balance of an address, derived from the indexed EVM token contract's Transfer events (IVM view; i128 base units, returned as a decimal string). The result carries `complete_history`. When true the nest was indexed from its configured `start_block` with no `--backfill` (the contract's deployment if `start_block` is the deployment block, which `init` sets) and the figure is under `balance`. When false or null it is only the net of transfers since `indexed_from` and is returned as `net_flow_since_indexed_from` with a note: a negative figure is then not an error, and it must not be reported as a balance.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
-        tools.push(json!({ "name": "top_balances", "description": "Top holder balances, descending (IVM view; i128 base units as decimal strings). The result carries `complete_history`. When true these are holders (`holders`, `balance`). When false or null they are only net flows since `indexed_from` (`net_receivers`, `net_flow_since_indexed_from`, with a note) and must not be reported as holders or balances.",
+        tools.push(json!({ "name": "top_balances", "title": "Top token holders", "description": "Top holders of the indexed EVM token contract, descending, derived from its Transfer events (IVM view; i128 base units as decimal strings). The result carries `complete_history`. When true these are holders (`holders`, `balance`). When false or null they are only net flows since `indexed_from` (`net_receivers`, `net_flow_since_indexed_from`, with a note) and must not be reported as holders or balances.",
           "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "default": 20 } } } }));
     }
     // Compliance tools (RFC-0008): advertised only where compliance is configured (RFC-0025).
     if shape.compliance {
-        tools.push(json!({ "name": "flags", "description": "Compliance flags (RFC-0008 C3): `kind=threshold` (single transfers over the configured amount) or `kind=velocity` (addresses over the windowed-volume threshold). Amounts are i128 base units as decimal strings.",
+        tools.push(json!({ "name": "flags", "title": "Compliance flags", "description": "Compliance flags over the indexed EVM token transfers (RFC-0008 C3): `kind=threshold` (single transfers over the configured amount) or `kind=velocity` (addresses over the windowed-volume threshold). Amounts are i128 base units as decimal strings.",
           "inputSchema": { "type": "object", "properties": { "kind": { "type": "string", "enum": ["threshold", "velocity"] }, "limit": { "type": "integer", "default": 50 } } } }));
-        tools.push(json!({ "name": "exposure", "description": "Direct counterparty-exposure of an address to the labeled set (RFC-0008 C1): inbound/outbound count + summed amount per label.",
+        tools.push(json!({ "name": "exposure", "title": "Labeled exposure", "description": "Direct counterparty exposure of an address to the labeled set, from the indexed EVM token transfers (RFC-0008 C1): inbound/outbound count + summed amount per label.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string" } }, "required": ["address"] } }));
     }
     // A mount that answers only declared queries (RFC-0034) refuses `sql` and `explain` outright, so
@@ -608,12 +764,12 @@ fn tool_specs(shape: &Shape) -> Value {
         tools.retain(|t| !matches!(t["name"].as_str(), Some("sql" | "explain")));
     }
     if shape.queries {
-        tools.push(json!({ "name": "queries", "description": "The queries this mount declares, each with its parameters; run one with `query`. A mount that does not answer arbitrary SQL refuses `sql` and `explain` and answers these, plus the typed tools (`table`, `entity`, `diff`, and the balance tools where they are offered).",
+        tools.push(json!({ "name": "queries", "title": "Declared queries", "description": "The named queries this mount declares over its decoded EVM contract events, each with its parameters; run one with `query`. A mount that does not answer arbitrary SQL refuses `sql` and `explain` and answers these, plus the typed tools (`table`, `entity`, `diff`, and the balance tools where they are offered).",
           "inputSchema": { "type": "object", "properties": {} } }));
-        tools.push(json!({ "name": "query", "description": "Run one declared query by name with its parameters (see `queries`). Returns the JSON the node sends, with its provenance.",
+        tools.push(json!({ "name": "query", "title": "Run a declared query", "description": "Run one declared query over this mount's decoded EVM contract events, by name with its parameters (see `queries`). Returns the JSON the node sends, with its provenance.",
           "inputSchema": { "type": "object", "properties": { "name": { "type": "string" }, "params": { "type": "object", "description": "Parameter name to value.", "additionalProperties": { "type": ["string", "number", "boolean"] } } }, "required": ["name"] } }));
     }
-    Value::Array(tools)
+    tools
 }
 
 async fn call_tool(params: &Value, client: &reqwest::Client, base: &str) -> Result<String> {
@@ -1188,9 +1344,34 @@ fn content(text: &str, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
+/// A successful answer, carrying it as `structuredContent` too where the tool declares an
+/// `outputSchema`, as MCP requires.
+fn tool_result(text: &str, tool: &str) -> Value {
+    let mut result = content(text, false);
+    if output_schema(tool).is_some() {
+        if let Ok(object @ Value::Object(_)) = serde_json::from_str::<Value>(text) {
+            result["structuredContent"] = object;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The printed `claude mcp add` line survives a directory with a space or a quote in it.
+    #[test]
+    fn a_printed_argument_is_one_shell_word() {
+        assert_eq!(sh_quote("--url"), "--url");
+        assert_eq!(sh_quote("http://127.0.0.1:8288"), "http://127.0.0.1:8288");
+        assert_eq!(
+            sh_quote("--dir=/Users/me/My Nests/usdc"),
+            "'--dir=/Users/me/My Nests/usdc'"
+        );
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+        assert_eq!(sh_quote(""), "''");
+    }
 
     /// #1661: an oversized line is reported without retaining it, and the next message arrives.
     #[tokio::test]
@@ -1389,7 +1570,12 @@ mod tests {
 
     #[test]
     fn client_config_launches_this_binary_and_bridges_to_base() {
-        let cfg = client_config_json("/usr/local/bin/nuthatch", "http://127.0.0.1:8288", None);
+        let cfg = client_config_json(
+            "/usr/local/bin/nuthatch",
+            "http://127.0.0.1:8288",
+            None,
+            None,
+        );
         let srv = &cfg["mcpServers"]["nuthatch"];
         assert_eq!(srv["command"], "/usr/local/bin/nuthatch");
         // The client launches `nuthatch mcp --url <base>` as a stdio subprocess.
@@ -1402,7 +1588,7 @@ mod tests {
     /// RFC-0073 FR13: the variable is named, the token never, and a named variable must be set.
     #[test]
     fn the_token_comes_from_a_named_variable_or_the_default() {
-        let cfg = client_config_json("nuthatch", "https://n.example", Some("MY_TOKEN"));
+        let cfg = client_config_json("nuthatch", "https://n.example", Some("MY_TOKEN"), None);
         assert_eq!(
             cfg["mcpServers"]["nuthatch"]["args"],
             json!([
@@ -2229,6 +2415,113 @@ mod tests {
         assert!(capped.contains("row cap"), "{capped}");
         let asked = format_sql_result(&raw(200), 200);
         assert!(asked.contains("raise `limit`"), "{asked}");
+    }
+
+    fn every_tool(authoring: bool) -> Vec<Value> {
+        let all = Shape {
+            transfers: true,
+            compliance: true,
+            free_form: true,
+            queries: true,
+            runtime_root: false,
+        };
+        let root = Shape {
+            runtime_root: true,
+            ..all
+        };
+        let mut tools = if authoring {
+            authoring::tool_specs()
+        } else {
+            Vec::new()
+        };
+        for shape in [all, root] {
+            tools.extend(tool_specs(&shape).as_array().unwrap().iter().cloned());
+        }
+        tools
+    }
+
+    /// #2983: with several servers loaded a client picks by description, so the domain comes first.
+    #[test]
+    fn every_tool_says_first_that_it_is_about_evm_contract_events() {
+        for tool in every_tool(true) {
+            let d = tool["description"].as_str().unwrap();
+            let first = d.split(". ").next().unwrap();
+            assert!(
+                first.contains("EVM") || first.contains("onchain"),
+                "{}: {first}",
+                tool["name"]
+            );
+        }
+    }
+
+    /// #2983: a client can tell a query tool is safe to call without asking.
+    #[test]
+    fn every_tool_carries_a_title_and_annotations() {
+        let writes = ["init_nest", "start_indexing", "stop_indexing"];
+        for tool in every_tool(true) {
+            let name = tool["name"].as_str().unwrap();
+            assert!(tool["title"].is_string(), "{name}");
+            let a = &tool["annotations"];
+            assert_eq!(a["title"], tool["title"], "{name}");
+            assert_eq!(a["readOnlyHint"], !writes.contains(&name), "{name}");
+            assert!(a["openWorldHint"].is_boolean(), "{name}");
+        }
+        let with_schema: Vec<String> = every_tool(false)
+            .iter()
+            .filter(|t| t["outputSchema"]["type"] == "object")
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            with_schema,
+            ["status", "tables", "at", "diff", "balance", "top_balances"]
+        );
+    }
+
+    /// A tool that declares an `outputSchema` must send `structuredContent`, and one that does not
+    /// must not.
+    #[tokio::test]
+    async fn a_json_answer_is_also_structured_content() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_serving_nest().await;
+        let status = call_named(&client, &base, "status", json!({})).await;
+        assert_eq!(
+            status["result"]["structuredContent"]["last_block"], 42,
+            "{status}"
+        );
+        let schema = call_named(&client, &base, "schema", json!({})).await;
+        assert!(
+            schema["result"].get("structuredContent").is_none(),
+            "{schema}"
+        );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn the_authoring_tools_are_listed_only_when_asked_for() {
+        let client = reqwest::Client::new();
+        let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let names = |resp: Value| -> Vec<String> {
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let plain = names(
+            handle(&list, &Session::new(&client, "http://127.0.0.1:1"))
+                .await
+                .unwrap(),
+        );
+        assert!(!plain.iter().any(|n| authoring::is_tool(n)), "{plain:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = authoring::Authoring::new(dir.path().to_path_buf(), "http://127.0.0.1:1").unwrap();
+        let session = Session::new(&client, "http://127.0.0.1:1").with_authoring(Some(&a));
+        let authored = names(handle(&list, &session).await.unwrap());
+        for tool in ["init_nest", "start_indexing", "index_status", "sql"] {
+            assert!(authored.iter().any(|n| n == tool), "{tool}: {authored:?}");
+        }
     }
 
     /// The MCP Registry entry names the release it was cut for. A release that leaves it behind would
