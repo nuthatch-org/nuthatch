@@ -16,6 +16,7 @@ SQL" without reading the message.
 | 7 | `chain_not_detected` | The contract has no code on any chain probed or on the chain named, or that chain is unknown. |
 | 8 | `rpc_refused` | An RPC endpoint could not be reached, or refused the request. |
 | 9 | `rpc_range_too_wide` | An RPC endpoint refused an `eth_getLogs` range that could not be narrowed further. |
+| 10 | `port_in_use` | Something already listens on the `--listen` address, so `dev --detach` would have reported another process's nest as its own. |
 
 The codes and statuses are stable: new ones may be added, and none is renumbered or renamed.
 

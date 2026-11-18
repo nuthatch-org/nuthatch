@@ -268,6 +268,38 @@ fn a_dev_that_fails_to_start_fails_the_detach_with_its_log() {
 }
 
 #[test]
+fn a_taken_port_is_port_in_use_not_a_false_success() {
+    let rpc = serve_rpc(42_161);
+    let nest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = holder.local_addr().unwrap().to_string();
+    let dir = nest.path().to_str().unwrap();
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "dev",
+            "--detach",
+            "--json",
+            "--dir",
+            dir,
+            "--rpc",
+            &rpc,
+            "--listen",
+            &listen,
+            "--no-admin",
+        ],
+    );
+    assert_eq!(code, 10, "{stdout}{stderr}");
+    let v: Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["error"]["code"], "port_in_use");
+    // Nothing was recorded, so `stop` has no nest to report.
+    let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir, "--json"]);
+    assert_eq!(code, 4, "{stderr}");
+}
+
+#[test]
 fn detach_without_a_nest_is_no_nest() {
     let empty = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();

@@ -18,6 +18,7 @@ pub enum Code {
     ChainNotDetected,
     RpcRefused,
     RpcRangeTooWide,
+    PortInUse,
 }
 
 /// The table in `nuthatch --help`.
@@ -33,10 +34,11 @@ Exit status:
   7  chain_not_detected
   8  rpc_refused
   9  rpc_range_too_wide
+  10  port_in_use
 With --json, an error is one JSON object on stderr with its code and a next step (docs/cli-errors.md).";
 
 impl Code {
-    pub const ALL: [Code; 9] = [
+    pub const ALL: [Code; 10] = [
         Code::Error,
         Code::Usage,
         Code::NoNest,
@@ -46,6 +48,7 @@ impl Code {
         Code::ChainNotDetected,
         Code::RpcRefused,
         Code::RpcRangeTooWide,
+        Code::PortInUse,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -59,6 +62,7 @@ impl Code {
             Code::ChainNotDetected => "chain_not_detected",
             Code::RpcRefused => "rpc_refused",
             Code::RpcRangeTooWide => "rpc_range_too_wide",
+            Code::PortInUse => "port_in_use",
         }
     }
 
@@ -74,6 +78,7 @@ impl Code {
             Code::ChainNotDetected => 7,
             Code::RpcRefused => 8,
             Code::RpcRangeTooWide => 9,
+            Code::PortInUse => 10,
         }
     }
 
@@ -100,6 +105,9 @@ impl Code {
             }
             Code::RpcRangeTooWide => {
                 "`nuthatch doctor --rpc <url>` prints the largest safe --window; pass it to dev"
+            }
+            Code::PortInUse => {
+                "pass --listen 127.0.0.1:<free port>, or `nuthatch stop` the nest holding this one"
             }
         }
     }
@@ -312,6 +320,7 @@ mod tests {
                 ("chain_not_detected", 7),
                 ("rpc_refused", 8),
                 ("rpc_range_too_wide", 9),
+                ("port_in_use", 10),
             ]
         );
         let doc = std::fs::read_to_string(
