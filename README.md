@@ -7,6 +7,9 @@
 [![nuthatch-org/nuthatch MCP server](https://glama.ai/mcp/servers/nuthatch-org/nuthatch/badges/score.svg)](https://glama.ai/mcp/servers/nuthatch-org/nuthatch)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
+**For AI coding agents:** [AGENTS.md](AGENTS.md) is install, init, a headless `dev`, query and MCP
+setup for every common client, as commands to paste.
+
 **Also:** self-hosted Etherscan-compatible history for the chains that lost their free tier.
 Base and BNB Chain, plus Gnosis, on your own RPC (Base and BNB Chain need an archive node with tracing): [examples/paywalled-chains](examples/paywalled-chains/).
 
@@ -446,16 +449,23 @@ RPC ingestion  →  deterministic decode  →  redb hot store (the unsealed tip)
 ## Point an AI at it
 
 nuthatch has a Model Context Protocol server compiled in, so a coding agent can query your contract's
-data in plain English - offline, no phone-home. Wiring it is one step:
+data in plain English - offline, no phone-home.
+
+An agent with one shell cannot run `nuthatch dev` in the foreground, which never returns. Run it in
+the background, wait until `/ready` puts it fewer than ten blocks behind the tip, then query:
 
 ```sh
-nuthatch dev &                  # the index the agent will query
-nuthatch mcp --print-config     # prints a copy-paste config for Claude Code / any MCP client
+nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
+for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
+nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 ```
 
-Or add it to Claude Code directly:
+Then wire the client. `nuthatch mcp --print-config` prints a config for Claude Code, and
+`--client` prints the file for one client: `claude`, `cursor`, `codex`, `vscode`, `windsurf` or
+`gemini`. [AGENTS.md](AGENTS.md#mcp) has each one written out.
 
 ```sh
+nuthatch mcp --print-config --client cursor
 claude mcp add nuthatch -- nuthatch mcp --url http://127.0.0.1:8288
 ```
 

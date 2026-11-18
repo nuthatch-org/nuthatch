@@ -634,7 +634,7 @@ alias's `estimated_rss_mb` is `0` because the footprint was charged once to the 
 Sharing is by *identity*: edit either nest's inputs and the NID changes, the mounts stop matching,
 and the edited one gets its own dataset. That dataset does not always start from nothing. When the
 edit touched only inputs that cannot change stored data (`views/`, `entities.toml`, `queries.toml`,
-`maintained.toml`, `semantic.toml`, `llms.txt`, `README.md`, `.claude/`), the new NID adopts an
+`maintained.toml`, `semantic.toml`, `llms.txt`, `README.md`, `AGENTS.md`, `.claude/`), the new NID adopts an
 existing dataset with the same data identity and the same recorded decode identity, and nothing is
 re-indexed; entities are rebuilt from the adopted facts. Any other edit, or a candidate that fails
 either check, means a re-index from the start block.

@@ -8,6 +8,7 @@
 
 mod authoring;
 
+use crate::cli::McpClient;
 use crate::sql_errors;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -82,6 +83,84 @@ pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Optio
     println!(
         "\nThen ask your agent: \"what are the top USDC holders?\" - it queries the nest over MCP."
     );
+    println!(
+        "Other clients: --client cursor|codex|vscode|windsurf|gemini prints that client's file."
+    );
+}
+
+/// `--print-config --client`: the file alone on stdout, so it can be redirected into place, and
+/// where it goes on stderr.
+pub fn print_one_client_config(
+    client: McpClient,
+    base: &str,
+    token_env: Option<&str>,
+    authoring: Option<&Path>,
+) {
+    let base = base.trim_end_matches('/');
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "nuthatch".to_string());
+    let (path, text) = client_config_file(client, &exe, base, token_env, authoring);
+    eprintln!("# {path}");
+    print!("{text}");
+}
+
+/// Where `client` reads its MCP servers from, and that file's content for this bridge.
+fn client_config_file(
+    client: McpClient,
+    exe: &str,
+    base: &str,
+    token_env: Option<&str>,
+    authoring: Option<&Path>,
+) -> (&'static str, String) {
+    let entry = &client_config_json(exe, base, token_env, authoring)["mcpServers"]["nuthatch"];
+    let json = |v: Value| serde_json::to_string_pretty(&v).unwrap_or_default() + "\n";
+    match client {
+        McpClient::Claude => (
+            ".mcp.json (project), or run `claude mcp add`",
+            json(json!({ "mcpServers": { "nuthatch": entry } })),
+        ),
+        McpClient::Cursor => (
+            ".cursor/mcp.json (project) or ~/.cursor/mcp.json",
+            json(json!({ "mcpServers": { "nuthatch": entry } })),
+        ),
+        McpClient::Windsurf => (
+            "~/.codeium/windsurf/mcp_config.json",
+            json(json!({ "mcpServers": { "nuthatch": entry } })),
+        ),
+        McpClient::Gemini => (
+            "~/.gemini/settings.json, or .gemini/settings.json in the project",
+            json(json!({ "mcpServers": { "nuthatch": entry } })),
+        ),
+        McpClient::Vscode => (
+            ".vscode/mcp.json",
+            json(json!({
+                "servers": {
+                    "nuthatch": { "type": "stdio", "command": entry["command"], "args": entry["args"] }
+                }
+            })),
+        ),
+        McpClient::Codex => {
+            let args: Vec<toml::Value> = entry["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(|s| toml::Value::String(s.to_string())))
+                .collect();
+            let mut server = toml::map::Map::new();
+            server.insert("command".into(), toml::Value::String(exe.to_string()));
+            server.insert("args".into(), toml::Value::Array(args));
+            let mut servers = toml::map::Map::new();
+            servers.insert("nuthatch".into(), toml::Value::Table(server));
+            let mut root = toml::map::Map::new();
+            root.insert("mcp_servers".into(), toml::Value::Table(servers));
+            (
+                "~/.codex/config.toml (append, or replace an existing [mcp_servers.nuthatch] table: TOML allows one), or run `codex mcp add nuthatch -- <command>`",
+                toml::to_string(&toml::Value::Table(root)).unwrap_or_default(),
+            )
+        }
+    }
 }
 
 /// The MCP-client server entry for this binary bridging to `base` - the value that goes under
@@ -1752,6 +1831,46 @@ mod tests {
             srv["args"],
             json!(["mcp", "--url", "http://127.0.0.1:8288"])
         );
+    }
+
+    /// #2981: each client's file parses as its own format and launches this binary as the bridge.
+    #[test]
+    fn each_client_gets_a_file_in_its_own_shape() {
+        let want = json!(["mcp", "--url", "http://h:1", "--token-env", "T"]);
+        for client in [
+            McpClient::Claude,
+            McpClient::Cursor,
+            McpClient::Windsurf,
+            McpClient::Gemini,
+        ] {
+            let (_, text) = client_config_file(client, "/bin/nh", "http://h:1", Some("T"), None);
+            let v: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                v["mcpServers"]["nuthatch"]["command"], "/bin/nh",
+                "{client:?}"
+            );
+            assert_eq!(v["mcpServers"]["nuthatch"]["args"], want, "{client:?}");
+        }
+
+        let (_, text) =
+            client_config_file(McpClient::Vscode, "/bin/nh", "http://h:1", Some("T"), None);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["servers"]["nuthatch"]["type"], "stdio");
+        assert_eq!(v["servers"]["nuthatch"]["command"], "/bin/nh");
+        assert_eq!(v["servers"]["nuthatch"]["args"], want);
+
+        let (_, text) =
+            client_config_file(McpClient::Codex, "/bin/nh", "http://h:1", Some("T"), None);
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        let server = &v["mcp_servers"]["nuthatch"];
+        assert_eq!(server["command"].as_str(), Some("/bin/nh"));
+        let args: Vec<&str> = server["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(args, ["mcp", "--url", "http://h:1", "--token-env", "T"]);
     }
 
     /// RFC-0073 FR13: the variable is named, the token never, and a named variable must be set.

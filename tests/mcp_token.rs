@@ -31,6 +31,33 @@ fn print_config_names_the_variable_and_never_the_token() {
     assert!(all.contains("--token-env NEST_TOKEN"), "{all}");
 }
 
+/// #2981: `--client` puts only the file on stdout, so `> .cursor/mcp.json` writes a valid one.
+#[test]
+fn print_config_for_one_client_is_the_file_alone() {
+    for client in ["claude", "cursor", "codex", "vscode", "windsurf", "gemini"] {
+        let out = nuthatch()
+            .args(["mcp", "--print-config", "--client", client])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{client}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let parsed = if client == "codex" {
+            toml::from_str::<toml::Value>(&stdout).is_ok()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&stdout).is_ok()
+        };
+        assert!(parsed, "{client}: stdout is not a config file:\n{stdout}");
+        assert!(
+            stdout.contains("http://127.0.0.1:8288"),
+            "{client}: {stdout}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).starts_with("# "),
+            "{client}: the path goes on stderr"
+        );
+    }
+}
+
 #[test]
 fn a_named_variable_that_is_unset_refuses_to_start() {
     let out = nuthatch()

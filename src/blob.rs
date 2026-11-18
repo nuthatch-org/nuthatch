@@ -1355,8 +1355,8 @@ abi = "abis/c.json"
     /// The committed fixture nests keep the NID and data identity they had before the 2026-10-23
     /// identity fixes (#2355, #2362, #2363, #2368, #2369). A change that moves one re-indexes every
     /// operator holding that nest.
-    /// The `scaffold/*` NIDs have since moved with the scaffolded `llms.txt` and `SKILL.md`, which are
-    /// part of the package; their data identities have not.
+    /// The `scaffold/*` NIDs have since moved with the scaffolded `llms.txt`, `SKILL.md` and
+    /// `AGENTS.md`, which are part of the package; their data identities have not.
     /// `diff/control` moved once, deliberately, when its label set left the identity (#2946), and its
     /// goldens, which sit inside it, were reblessed for the new data identity.
     #[test]
@@ -1364,8 +1364,8 @@ abi = "abis/c.json"
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut moved = Vec::new();
         for (nest, nid, data) in [
-            ("scaffold/pair", "c68d2b35b8ffe781450f040349b212dd0e568a7fc0d93078b671e6bc801ea2b3", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
-            ("scaffold/two", "3a88fafe7f48340c898e28587221f849ef0df4379e4c11ecc011c0711074cd03", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
+            ("scaffold/pair", "27c8bfd8039c4744ad4831554476c3bb1490ed33d192cd7311dc9b5a14593ff7", "b28a5043b11263e8adb9e24f5c02535b2c34d7e561e010348db3907941199c57"),
+            ("scaffold/two", "d97a51c2731fa19618094e9891b1a1b9cc3cec4757795ae989172c1c0458c401", "1f7906dd2421d89b7b03fa2a6e9f3e6c7a964200e4dced7b4fc9f40c0c9dfe49"),
             ("diff/control", "deb96b155fb20346b00750e08a8aab5f7cd1770d5bdfc52ba7d1b5a2799fc9f3", "7466bae56f2e552de298263e1676c35ea49e029a147e8b80650373cbef6f2b60"),
             ("diff/euler", "acca6893a2ed1511c04d2253504997e5da27002ffd1b97a31744e964e592913d", "e6162f0e1ee5162c714412d942cc107de22a51fb84055a0b369b899834b11a0e"),
             ("diff/history", "2cc9884d9e3422ad8b311e737046318fe220099ab2be184700aa4b9541911fbf", "2f76fe63740f1b7b618bf0aca425d86629ad59acae19da85e0124f2d821a3e7c"),
@@ -1455,6 +1455,7 @@ abi = "abis/c.json"
 
         for (file, contents, what) in [
             ("llms.txt", "completely different docs\n", "documentation"),
+            ("AGENTS.md", "different agent docs\n", "documentation"),
             (
                 "views/10-v.sql",
                 "CREATE VIEW renamed AS SELECT 1 -- and a comment",
@@ -1577,6 +1578,7 @@ abi = "abis/c.json"
             "semantic.toml",
             "llms.txt",
             "README.md",
+            "AGENTS.md",
             ".claude/skills/x.md",
             "maintained.toml",
         ] {

@@ -294,11 +294,19 @@ async fn run(command: cli::Command) -> Result<()> {
                 .then(|| std::path::absolute(&args.dir))
                 .transpose()?;
             if args.print_config {
-                mcp::print_client_config(
-                    &args.url,
-                    args.token_env.as_deref(),
-                    authoring.as_deref(),
-                );
+                match args.client {
+                    Some(client) => mcp::print_one_client_config(
+                        client,
+                        &args.url,
+                        args.token_env.as_deref(),
+                        authoring.as_deref(),
+                    ),
+                    None => mcp::print_client_config(
+                        &args.url,
+                        args.token_env.as_deref(),
+                        authoring.as_deref(),
+                    ),
+                }
                 Ok(())
             } else {
                 mcp::serve(args.url, args.token_env, authoring).await
