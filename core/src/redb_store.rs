@@ -2170,6 +2170,22 @@ async fn off_the_workers<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     type Store = super::Store<crate::tap::NoFeed>;
+
+    /// `/ready`'s `first_block_indexed` reads the first sampled key as the oldest row's: put rows in
+    /// scrambled order and the sample is still the smallest key, which names its block.
+    #[test]
+    fn the_first_sampled_key_is_the_oldest_rows_whatever_the_insert_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("hot.redb")).unwrap();
+        for block in [900u64, 7, 41_000_000, 300] {
+            store
+                .put_entity(&Store::entity_key(block, 3), "{}")
+                .unwrap();
+        }
+        let first = store.sample_entity_keys(1).unwrap();
+        assert_eq!(first, vec![Store::entity_key(7, 3)]);
+        assert_eq!(crate::answer::block_of_entity_key(&first[0]), Some(7));
+    }
     use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
     use std::sync::Arc;
 

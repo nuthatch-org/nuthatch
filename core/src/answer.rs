@@ -493,6 +493,15 @@ pub struct Freshness {
     pub poll_interval_source: &'static str,
 }
 
+/// The block an entity key names: keys are `{block:012}-{log_index:06}` (`store::entity_key`), so the
+/// smallest key in the hot store is the oldest row's. `None` for a key not in that shape.
+pub fn block_of_entity_key(key: &str) -> Option<u64> {
+    let (block, _) = key.split_once('-')?;
+    (block.len() == 12 && block.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| block.parse().ok())
+        .flatten()
+}
+
 /// Everything `/ready` reports, gathered by whoever holds the cursor.
 pub struct Ready {
     pub version: String,
@@ -504,9 +513,13 @@ pub struct Ready {
     pub last: u64,
     pub lag: u64,
     pub sealed: u64,
-    /// Whether any row has been indexed: in the hot store or past it in a sealed segment.
+    /// Whether a row exists that a query can read: at least one row in the hot store, or a sealed
+    /// segment whose catalogue entry counts more than zero rows. It is not `sealed > 0`: a seal can
+    /// advance past blocks that held no event. It is a statement about stored rows, so it stays true
+    /// once true, and a nest that already held data reports true on its first poll.
     pub has_rows: bool,
-    /// The block of the oldest row still in the hot store; null once rows are sealed away or before any.
+    /// The block of the oldest row still in the hot store (the smallest entity key, which is
+    /// `{block:012}-{log_index:06}`); null before any row and once every row is sealed away.
     pub first_block_indexed: Option<u64>,
     pub freshness: Freshness,
     pub last_poll: u64,
@@ -734,6 +747,16 @@ pub fn civil_from_days(days: i64) -> (i32, u32, u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_entity_key_names_its_block_and_anything_else_names_none() {
+        use super::block_of_entity_key as block;
+        assert_eq!(block("000000000007-000003"), Some(7));
+        assert_eq!(block("000041000000-000000"), Some(41_000_000));
+        for bad in ["", "7-3", "00000000000x-000001", "000000000007", "balances:0xab"] {
+            assert_eq!(block(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn timestamps_render_at_every_unit_and_before_the_epoch() {
         use super::rfc3339;

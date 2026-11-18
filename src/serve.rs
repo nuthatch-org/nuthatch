@@ -2298,6 +2298,33 @@ fn served_last_block(s: &AppState) -> Option<u64> {
 }
 
 /// Compute [`NestReadiness`] for one nest. See that type for why it is not inline in [`ready`].
+/// Whether the catalogue in `dir` names a sealed segment that holds a row, for `/ready`'s `has_rows`.
+/// A true answer is kept for the life of the process, as sealed rows are never taken back, so a
+/// poll reads the catalogue only while it has found none, which is when it is small or absent.
+fn sealed_segments_hold_rows(dir: &std::path::Path) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let known = |dir: &std::path::Path| {
+        KNOWN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|d| d == dir)
+    };
+    if known(dir) {
+        return true;
+    }
+    let holds = crate::seal::load_manifest(dir)
+        .map(|m| m.tables.values().flatten().any(|seg| seg.rows > 0))
+        .unwrap_or(false);
+    if holds {
+        KNOWN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(dir.to_path_buf());
+    }
+    holds
+}
+
 pub(crate) fn nest_readiness(s: &AppState) -> NestReadiness {
     use crate::metrics::{now_unix, METRICS};
     let nest = s
@@ -2584,12 +2611,14 @@ fn ready_answer(s: &AppState) -> Answer {
         #[cfg(feature = "folds")]
             folds_stalled: _,
     } = nest_readiness(s);
-    let first_block_indexed = s
+    // One key read: the hot store iterates in key order, so the first key is the oldest row's.
+    let hot_first = s
         .store
         .sample_entity_keys(1)
         .ok()
-        .and_then(|k| k.first()?.get(..12)?.parse::<u64>().ok());
-    let has_rows = first_block_indexed.is_some() || sealed > 0;
+        .and_then(|k| k.into_iter().next());
+    let first_block_indexed = hot_first.as_deref().and_then(answer::block_of_entity_key);
+    let has_rows = hot_first.is_some() || sealed_segments_hold_rows(&s.dir);
     #[cfg(feature = "folds")]
     let folds = (!folds.is_null()).then_some(folds);
     #[cfg(not(feature = "folds"))]

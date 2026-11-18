@@ -346,6 +346,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     if let Some(note) = step.note {
         say!("       {note}");
     }
+    say!("       (--wait-rows waits up to 300s for the first row, then exits 11 with the nest still running)");
     say!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
     if let Some(note) = chains::keyless_caveat(

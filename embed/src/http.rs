@@ -539,6 +539,17 @@ fn ready(n: &Nest) -> Answer {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .summary();
+    let hot_first = store
+        .sample_entity_keys(1)
+        .ok()
+        .and_then(|k| k.into_iter().next());
+    let has_rows = hot_first.is_some()
+        || n.cellar
+            .manifest()
+            .tables
+            .values()
+            .flatten()
+            .any(|seg| seg.rows > 0);
     answer::ready(&answer::Ready {
         version: n.version.to_string(),
         stalled: entities_stalled,
@@ -549,8 +560,8 @@ fn ready(n: &Nest) -> Answer {
         last,
         lag: tip.saturating_sub(last),
         sealed: sealed_through(n),
-        has_rows: sealed_through(n) > 0,
-        first_block_indexed: None,
+        has_rows,
+        first_block_indexed: hot_first.as_deref().and_then(answer::block_of_entity_key),
         freshness: answer::Freshness {
             mode: "tip",
             poll_interval_secs,

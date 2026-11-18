@@ -74,14 +74,20 @@ answers `/ready` with a first poll of the chain behind it; for a `mounts.toml` r
 mount listed at `/nests` has polled. If `dev` exits first, or is not serving
 within two minutes, `--detach` fails with the end of its log, and with `dev`'s own exit status where
 it had one. With `--json` it prints `pid`, `url`, `dir`, `log`, `stop`, `has_rows` and
-`first_block_indexed`.
+`first_block_indexed`, read from `/ready` once when `--wait-rows` did not already wait on it (so a
+restart over an existing store reports the rows it holds).
 
 Serving is not the same as holding data: a nest that has polled once can still have no row, and
 `nuthatch sql "SELECT count(*) ..."` straight after `--detach` then returns 0. Add `--wait-rows` to
 also block until a row is indexed (any mount's, for a runtime), for at most `--wait-timeout` seconds
 (default 300). On timeout it exits 11 (`rows_timeout`) and leaves the nest running. `/ready` and the
-MCP `index_status` report `has_rows` (a row in the hot store or a sealed segment) and
-`first_block_indexed` (the oldest row still in the hot store; null once rows are sealed away).
+MCP `index_status` report `has_rows` and `first_block_indexed`. `has_rows` is true when the hot
+store holds at least one entity row, or the segment catalogue names a sealed segment with more than
+zero rows; it is not `sealed_through > 0`, since a seal can pass blocks that held no event. It is
+read from the store and catalogue (one key read, plus a catalogue read only while none has been
+found), so it stays cheap on a poll. `first_block_indexed` is the block of the smallest hot-store
+key (`{block:012}-{log_index:06}`), the oldest row still hot; null before any row and once every row
+is sealed away.
 
 The log and the record of the process are kept in `$XDG_STATE_HOME/nuthatch/dev/` (else
 `~/.local/state/nuthatch/dev/`), one directory per nest, and never in the nest itself: every file in

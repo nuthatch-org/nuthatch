@@ -21,7 +21,7 @@ fn parse(v: &Value) -> u64 {
 }
 
 /// One Transfer per block, on Arbitrum One unless `chain_id` says otherwise.
-fn answer(req: &Value, chain_id: u64) -> Value {
+fn answer(req: &Value, chain_id: u64, with_logs: bool) -> Value {
     let header = |n: u64| {
         json!({
             "number": hex(n),
@@ -40,6 +40,7 @@ fn answer(req: &Value, chain_id: u64) -> Value {
             Some(_) => header(parse(&req["params"][0])),
             None => Value::Null,
         },
+        "eth_getLogs" if !with_logs => json!([]),
         "eth_getLogs" => {
             let f = &req["params"][0];
             let (from, to) = (parse(&f["fromBlock"]), parse(&f["toBlock"]).min(TIP));
@@ -67,13 +68,27 @@ fn answer(req: &Value, chain_id: u64) -> Value {
 }
 
 fn serve_rpc(chain_id: u64) -> String {
+    serve_rpc_with(chain_id, true)
+}
+
+/// A chain that answers every call but holds no log, so a nest over it never indexes a row.
+fn serve_empty_rpc(chain_id: u64) -> String {
+    serve_rpc_with(chain_id, false)
+}
+
+fn serve_rpc_with(chain_id: u64, with_logs: bool) -> String {
     async fn handler(
-        axum::extract::State(chain_id): axum::extract::State<u64>,
+        axum::extract::State((chain_id, with_logs)): axum::extract::State<(u64, bool)>,
         axum::Json(req): axum::Json<Value>,
     ) -> axum::Json<Value> {
         axum::Json(match req.as_array() {
-            Some(batch) => Value::Array(batch.iter().map(|r| answer(r, chain_id)).collect()),
-            None => answer(&req, chain_id),
+            Some(batch) => Value::Array(
+                batch
+                    .iter()
+                    .map(|r| answer(r, chain_id, with_logs))
+                    .collect(),
+            ),
+            None => answer(&req, chain_id, with_logs),
         })
     }
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -86,11 +101,26 @@ fn serve_rpc(chain_id: u64) -> String {
             .unwrap()
             .block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
-                let app = axum::Router::new().fallback(handler).with_state(chain_id);
+                let app = axum::Router::new()
+                    .fallback(handler)
+                    .with_state((chain_id, with_logs));
                 axum::serve(listener, app).await.unwrap();
             })
     });
     url
+}
+
+fn get_ready(listen: &str) -> Value {
+    use std::io::{Read, Write};
+    let mut conn = std::net::TcpStream::connect(listen).unwrap();
+    write!(
+        conn,
+        "GET /ready HTTP/1.0\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    conn.read_to_string(&mut raw).unwrap();
+    serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
 }
 
 fn free_port() -> u16 {
@@ -412,18 +442,7 @@ fn wait_rows_returns_once_a_row_is_indexed() {
         .expect("a count");
     assert!(n > 0, "{row}");
 
-    let ready: Value = {
-        use std::io::{Read, Write};
-        let mut conn = std::net::TcpStream::connect(&listen).unwrap();
-        write!(
-            conn,
-            "GET /ready HTTP/1.0\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut raw = String::new();
-        conn.read_to_string(&mut raw).unwrap();
-        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
-    };
+    let ready = get_ready(&listen);
     assert_eq!(ready["has_rows"], true, "{ready}");
     assert!(
         ready["first_block_indexed"].is_u64() || ready["sealed_through"].as_u64() > Some(0),
@@ -432,13 +451,38 @@ fn wait_rows_returns_once_a_row_is_indexed() {
 
     let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir]);
     assert_eq!(code, 0, "{stderr}");
+
+    // A start with no --wait-rows over the store that now holds rows reads `/ready` once and reports
+    // what it found, rather than a state nobody checked.
+    let listen = format!("127.0.0.1:{}", free_port());
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "dev",
+            "--detach",
+            "--json",
+            "--dir",
+            dir,
+            "--rpc",
+            &rpc,
+            "--listen",
+            &listen,
+            "--no-admin",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let again: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let _reap = Reap(again["pid"].as_u64().unwrap());
+    assert_eq!(again["has_rows"], true, "{again}");
+    let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir]);
+    assert_eq!(code, 0, "{stderr}");
 }
 
 /// A nest that never indexes a row ends the wait with `rows_timeout`, and keeps running.
 #[test]
 fn wait_rows_times_out_with_its_own_code_and_leaves_the_nest_running() {
-    // The stand-in answers the chain, but its tip is below the nest's start, so nothing indexes.
-    let rpc = serve_rpc(42_161);
+    // The stand-in answers the chain but holds no log, so nothing can ever index.
+    let rpc = serve_empty_rpc(42_161);
     let nest = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     scaffold_nest(nest.path(), "usdc", USDC);
@@ -464,16 +508,12 @@ fn wait_rows_times_out_with_its_own_code_and_leaves_the_nest_running() {
             "300",
         ],
     );
-    // A zero wait may race a fast first row; only the timeout path is asserted when it loses.
-    if code == 0 {
-        let started: Value = serde_json::from_str(stdout.trim()).unwrap();
-        let _ = nuthatch(state.path(), &["stop", "--dir", dir]);
-        let _ = started;
-        return;
-    }
     assert_eq!(code, 11, "{stdout}{stderr}");
     let v: Value = serde_json::from_str(stderr.trim()).unwrap();
     assert_eq!(v["error"]["code"], "rows_timeout");
+    let ready = get_ready(&listen);
+    assert_eq!(ready["has_rows"], false, "{ready}");
+    assert!(ready["first_block_indexed"].is_null(), "{ready}");
     let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir]);
     assert_eq!(code, 0, "the nest was left running: {stderr}");
 }

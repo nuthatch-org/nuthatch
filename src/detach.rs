@@ -525,6 +525,11 @@ pub async fn start(dir: &str, listen: &str, json: bool, wait_rows: Option<Durati
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+    // Without --wait-rows nothing has asked yet, so read `/ready` once rather than print a state nobody
+    // checked: a restart over an existing store has rows on the first poll.
+    if wait_rows.is_none() {
+        rows = first_rows(&client, &url).await;
+    }
     let stop = format!("nuthatch stop --dir {}", nest.display());
     if json {
         println!(
