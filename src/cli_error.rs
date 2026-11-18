@@ -86,7 +86,7 @@ impl Code {
                 "run `nuthatch init 0xADDRESS` here, or pass --dir with the nest's directory"
             }
             Code::NestNotRunning => {
-                "run `nuthatch dev` in the nest's directory, or pass --url to a running one"
+                "run `nuthatch dev --detach` in the nest's directory, or pass --url to a running one"
             }
             Code::SqlInvalid => {
                 "fix the query: `SELECT table_name FROM information_schema.tables` lists the tables"
@@ -220,7 +220,8 @@ pub fn for_command(cmd: &crate::cli::Command) -> (Reaches, bool) {
         C::Init(a) => (rpc, a.json),
         C::Add(a) => (rpc, a.json),
         C::Schema(a) => (Reaches::default(), a.json),
-        C::Dev(_) => (rpc, false),
+        C::Dev(a) => (rpc, a.json),
+        C::Stop(a) => (Reaches::default(), a.json),
         C::Doctor(a) => (Reaches::default(), a.json),
         _ => (Reaches::default(), false),
     }

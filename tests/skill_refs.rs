@@ -537,6 +537,7 @@ const CONFIG_SOURCES: &[(&str, Option<&[&str]>)] = &[
 /// config file lands on this list by accident.
 const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/count.rs", "the per-machine head-count answer, not nest config"), // RFC-0054 hook
+    ("src/detach.rs", "the record of a detached dev, kept outside the nest, not nest config"),
     ("src/address_mode.rs", "the /api/watch request body, not nest config"),
     (
         "src/address_partitions.rs",

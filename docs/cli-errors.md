@@ -25,7 +25,7 @@ A command run with `--json` writes its error to stderr as one JSON object, in pl
 `Error:` text, and exits with the same status:
 
 ```json
-{"error": {"code": "nest_not_running", "exit": 4, "message": "querying http://127.0.0.1:8288 - is `nuthatch dev` running?: ...", "next": "run `nuthatch dev` in the nest's directory, or pass --url to a running one"}}
+{"error": {"code": "nest_not_running", "exit": 4, "message": "querying http://127.0.0.1:8288 - is `nuthatch dev` running?: ...", "next": "run `nuthatch dev --detach` in the nest's directory, or pass --url to a running one"}}
 ```
 
 `message` is the whole error on one line. `next` is the step to take: for `sql_invalid` it is the
@@ -63,4 +63,21 @@ stderr:
 
 ```sh
 nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --json | jq .tables
+```
+
+## Running a nest in the background
+
+`nuthatch dev --detach` starts `dev` with the same flags in the background and returns once its API
+answers `/ready` with a first poll of the chain behind it. If `dev` exits first, or is not serving
+within two minutes, `--detach` fails with the end of its log, and with `dev`'s own exit status where
+it had one. With `--json` it prints `pid`, `url`, `dir`, `log` and `stop`.
+
+The log and the record of the process are kept in `$XDG_STATE_HOME/nuthatch/dev/` (else
+`~/.local/state/nuthatch/dev/`), one directory per nest, and never in the nest itself: every file in
+a nest counts toward its NID. `nuthatch stop` sends the process SIGTERM and waits for it to finish;
+with no detached `dev` running for the directory it fails with `nest_not_running`.
+
+```sh
+nuthatch dev --backfill 300 --detach && nuthatch sql "SELECT count(*) FROM weth__transfer" --json
+nuthatch stop
 ```

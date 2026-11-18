@@ -56,6 +56,7 @@ pub mod count; // RFC-0054 hook
 #[cfg(feature = "counter")]
 pub mod counter;
 pub mod crash;
+pub mod detach;
 /// `nuthatch diff --flow` (RFC-0071): the token flow of a transaction, block or range.
 pub mod diff;
 /// The address-history source of `nuthatch diff` (RFC-0071 §15 step 4).
