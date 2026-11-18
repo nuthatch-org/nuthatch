@@ -18,7 +18,9 @@ async fn serving() -> (String, tokio::task::JoinHandle<anyhow::Result<()>>) {
     let app = Router::new().route("/health", get(|| async { "ok" }));
     let task = {
         let addr = addr.clone();
-        tokio::spawn(async move { nuthatch::serve::bind_and_serve(&addr, app, None).await })
+        tokio::spawn(async move {
+            nuthatch::serve::bind_and_serve(&addr, app, None, Default::default()).await
+        })
     };
     let started = std::time::Instant::now();
     while reqwest::get(format!("http://{addr}/health")).await.is_err() {

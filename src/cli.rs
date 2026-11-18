@@ -1578,6 +1578,17 @@ pub struct ServeArgs {
     #[arg(long = "cors", value_name = "ORIGIN")]
     pub cors: Vec<String>,
 
+    /// A `Host` name this process on a loopback bind answers as the public behind your proxy
+    /// (repeatable). On a loopback bind any other name but loopback is refused, which keeps a page
+    /// that rebinds its DNS name to 127.0.0.1 out.
+    #[arg(long = "public-host")]
+    pub public_host: Vec<String>,
+
+    /// A `Host` name this process on a loopback bind answers as this machine (repeatable), such as
+    /// `host.docker.internal` for a client in a container.
+    #[arg(long = "local-host")]
+    pub local_host: Vec<String>,
+
     /// Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node
     /// owns no cursor, so the lifecycle routes it would expose have nothing to act on.
     #[arg(long)]
@@ -1712,15 +1723,16 @@ pub struct DevArgs {
     )]
     pub trace_rpc: Vec<String>,
 
-    /// A `Host` name an address-history nest on a loopback bind answers as the public behind your
-    /// proxy (repeatable): watched data is read, nothing is changed and the RPC is not lent. Any
-    /// other name but loopback is refused.
+    /// A `Host` name a nest on a loopback bind answers as the public behind your proxy
+    /// (repeatable). On a loopback bind any other name but loopback is refused, which keeps a page
+    /// that rebinds its DNS name to 127.0.0.1 out. An address-history nest reads watched data for
+    /// it, changes nothing and lends no RPC.
     #[arg(long = "public-host")]
     pub public_host: Vec<String>,
 
-    /// A `Host` name an address-history nest on a loopback bind answers as this machine
-    /// (repeatable), such as `host.docker.internal` for a client in a container. A browser page
-    /// cannot choose its `Host`, so a name declared here does not let one in.
+    /// A `Host` name a nest on a loopback bind answers as this machine (repeatable), such as
+    /// `host.docker.internal` for a client in a container. A browser page cannot choose its `Host`,
+    /// so a name declared here does not let one in.
     #[arg(long = "local-host")]
     pub local_host: Vec<String>,
 

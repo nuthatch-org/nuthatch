@@ -2791,7 +2791,9 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
     };
     let serving = {
         let addr = addr.clone();
-        tokio::spawn(async move { serve::bind_and_serve(&addr, service, cors).await })
+        tokio::spawn(async move {
+            serve::bind_and_serve(&addr, service, cors, Default::default()).await
+        })
     };
     let client = reqwest::Client::new();
     let started = std::time::Instant::now();
@@ -2843,6 +2845,63 @@ async fn a_cross_site_page_cannot_suspend_a_mount_through_the_real_bind() {
         axum::http::StatusCode::OK,
         "a form POST suspended the mount"
     );
+    serving.abort();
+}
+
+/// #3002: over the real loopback bind a runtime refuses a `Host` it was not given, as a page that
+/// rebinds its DNS name to 127.0.0.1 would send, and answers loopback and a declared `--public-host`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebound_host_is_refused_through_the_real_bind() {
+    let roost = tempfile::tempdir().unwrap();
+    let nid = "6c".repeat(32);
+    let (handles, _tape) = one_live_mount(roost.path(), &nid).await;
+    let service = handles.live.service();
+    let hosts =
+        nuthatch::host_names::HostNames::declared(&[], &["nest.example.com".into()]).unwrap();
+    let addr = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let serving = {
+        let addr = addr.clone();
+        tokio::spawn(async move { serve::bind_and_serve(&addr, service, None, hosts).await })
+    };
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+    while client
+        .get(format!("http://{addr}/usdc/health"))
+        .send()
+        .await
+        .is_err()
+    {
+        assert!(started.elapsed() < POLL_TIMEOUT, "never came up on {addr}");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for path in [
+        "/usdc/sql?q=SELECT%201",
+        "/usdc/tables",
+        "/usdc/ready",
+        "/ready",
+    ] {
+        let url = format!("http://{addr}{path}");
+        for host in [addr.as_str(), "localhost", "nest.example.com"] {
+            let resp = client.get(&url).header("host", host).send().await.unwrap();
+            assert_ne!(resp.status().as_u16(), 403, "{path} refused Host {host}");
+        }
+        let resp = client
+            .get(&url)
+            .header("host", "rebound.attacker.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "{path} answered a rebound Host"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("Host rebound.attacker.example"), "{body}");
+    }
     serving.abort();
 }
 

@@ -31,7 +31,9 @@ async fn headers_through_the_bind(origins: &[&str]) -> axum::http::HeaderMap {
 
     let serving = {
         let addr = addr.clone();
-        tokio::spawn(async move { nuthatch::serve::bind_and_serve(&addr, app, cors).await })
+        tokio::spawn(async move {
+            nuthatch::serve::bind_and_serve(&addr, app, cors, Default::default()).await
+        })
     };
 
     // Bounded polling rather than a fixed sleep: the bind races this task's first request.

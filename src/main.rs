@@ -163,8 +163,6 @@ async fn run(command: cli::Command) -> Result<()> {
                 }
                 for (flag, set) in [
                     ("--trace-rpc", !args.trace_rpc.is_empty()),
-                    ("--public-host", !args.public_host.is_empty()),
-                    ("--local-host", !args.local_host.is_empty()),
                     ("--write-token-env", args.write_token_env.is_some()),
                 ] {
                     if set {
@@ -172,6 +170,10 @@ async fn run(command: cli::Command) -> Result<()> {
                     }
                 }
                 let flight = args.flight();
+                let hosts = nuthatch::host_names::HostNames::declared(
+                    &args.local_host,
+                    &args.public_host,
+                )?;
                 runtime::dev(
                     dir,
                     args.listen,
@@ -194,6 +196,7 @@ async fn run(command: cli::Command) -> Result<()> {
                     args.registry,
                     args.max_bundle_mb,
                     flight,
+                    hosts,
                 )
                 .await
             } else {

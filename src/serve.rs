@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::analytics;
 use crate::exposure::ExposureView;
+use crate::host_names::HostNames;
 use crate::registry::TableSchema;
 use crate::velocity::VelocityView;
 use crate::views::BalanceView;
@@ -758,8 +759,9 @@ pub async fn run(
     listen: &str,
     state: AppState,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: HostNames,
 ) -> Result<()> {
-    run_shared(listen, SharedNest::new(state), cors).await
+    run_shared(listen, SharedNest::new(state), cors, hosts).await
 }
 
 /// Serve Arrow Flight SQL over `app` on `listen` (RFC-0079 S2), beside the HTTP API; with no address,
@@ -783,8 +785,9 @@ pub async fn run_shared(
     listen: &str,
     shared: SharedNest,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: HostNames,
 ) -> Result<()> {
-    bind_and_serve(listen, router(shared), cors).await
+    bind_and_serve(listen, router(shared), cors, hosts).await
 }
 
 /// Serve **two versions** of a nest on distinct endpoints behind one listener (RFC-0020 slice 3, the
@@ -799,8 +802,15 @@ pub async fn run_two_versions(
     new_prefix: &str,
     new: SharedNest,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: HostNames,
 ) -> Result<()> {
-    bind_and_serve(listen, two_version_router(old, new_prefix, new), cors).await
+    bind_and_serve(
+        listen,
+        two_version_router(old, new_prefix, new),
+        cors,
+        hosts,
+    )
+    .await
 }
 
 /// The two-version app (RFC-0020 slice 3): old at the root, wrapped in a `Deprecation`/`Link` layer;
@@ -838,9 +848,10 @@ pub async fn run_runtime(
     nests: Vec<(String, AppState)>,
     health: Arc<crate::health::RuntimeHealth>,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: HostNames,
 ) -> Result<()> {
     let live = LiveRuntime::new(compose_runtime(roster, nests, health));
-    bind_and_serve(listen, live.service(), cors).await
+    bind_and_serve(listen, live.service(), cors, hosts).await
 }
 
 /// The first path segments [`compose_runtime`] serves at the root. A mount named one of these would
@@ -1287,6 +1298,21 @@ fn cors_outside_admin(app: Router, layer: tower_http::cors::CorsLayer) -> Router
     }))
 }
 
+/// The app a listener serves: `app` behind the `Host` rule of a loopback bind (#3002), then `cors`, so
+/// a refusal still carries the CORS headers a cross-origin page needs to read it.
+pub fn compose_listener(
+    app: Router,
+    cors: Option<tower_http::cors::CorsLayer>,
+    loopback: bool,
+    hosts: HostNames,
+) -> Router {
+    let app = crate::host_names::guard(app, loopback, hosts);
+    match cors {
+        Some(layer) => cors_outside_admin(app, layer),
+        None => app,
+    }
+}
+
 /// Bind `listen` and serve `app` until a shutdown signal - the shared tail of [`run`]/[`run_runtime`].
 ///
 /// `cors` is [`cors_layer`]'s result: `None` leaves the app exactly as it was composed, which is
@@ -1295,14 +1321,13 @@ pub async fn bind_and_serve(
     listen: &str,
     app: Router,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: HostNames,
 ) -> Result<()> {
-    let app = match cors {
-        Some(layer) => cors_outside_admin(app, layer),
-        None => app,
-    };
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("cannot bind {listen}"))?;
+    let loopback = listener.local_addr()?.ip().is_loopback();
+    let app = compose_listener(app, cors, loopback, hosts);
     tracing::info!(
         "API live on http://{}  (try GET /  and  /metrics)",
         listener.local_addr()?
@@ -12507,6 +12532,133 @@ mod tests {
             "refused after {took:?}: a full queue must not also serve out the wait"
         );
         drop(held);
+    }
+
+    /// One GET with `host` through [`compose_listener`], the app `bind_and_serve` serves.
+    async fn host_get(app: &Router, path: &str, host: &str) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let req = axum::http::Request::get(path)
+            .header("host", host)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn declared_public() -> HostNames {
+        HostNames::declared(&[], &["nest.example.com".into()]).unwrap()
+    }
+
+    /// Refused or answered by `Host` alone, on every route given: a 403 names the `Host`, anything
+    /// else is whatever the route itself says.
+    async fn assert_hosts(app: &Router, paths: &[&str]) {
+        for path in paths {
+            for host in [
+                "127.0.0.1:8288",
+                "localhost:8288",
+                "[::1]:8288",
+                "nest.example.com",
+            ] {
+                let (status, body) = host_get(app, path, host).await;
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{path} refused {host}: {body}"
+                );
+            }
+            let (status, body) = host_get(app, path, "rebound.attacker.example:8288").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path} answered {body}");
+            assert!(
+                body.contains("Host rebound.attacker.example")
+                    && body.contains("--public-host rebound.attacker.example"),
+                "{path}: {body}"
+            );
+        }
+    }
+
+    /// #3002: a page that rebinds its DNS name to 127.0.0.1 sends that name as `Host`, and a single
+    /// nest on a loopback bind refuses it on every route, while a declared public name is answered.
+    #[tokio::test]
+    async fn a_loopback_nest_refuses_an_undeclared_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = compose_listener(
+            router(SharedNest::new(test_state(tmp.path(), 2))),
+            None,
+            true,
+            declared_public(),
+        );
+        assert_hosts(&app, &["/sql?q=SELECT%201", "/tables", "/ready", "/nope"]).await;
+    }
+
+    /// The same in a runtime, at the root and under a mount's prefix.
+    #[tokio::test]
+    async fn a_loopback_runtime_refuses_an_undeclared_host_on_every_mount() {
+        let tmp = tempfile::tempdir().unwrap();
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let runtime = compose_runtime(
+            json!({}),
+            vec![("usdc".into(), test_state(tmp.path(), 2))],
+            health,
+        );
+        let app = compose_listener(
+            LiveRuntime::new(runtime).service(),
+            None,
+            true,
+            declared_public(),
+        );
+        assert_hosts(
+            &app,
+            &[
+                "/usdc/sql?q=SELECT%201",
+                "/usdc/tables",
+                "/usdc/ready",
+                "/nests",
+                "/ready",
+            ],
+        )
+        .await;
+    }
+
+    /// Off loopback the operator chose who may reach the address, and every `Host` is answered.
+    #[tokio::test]
+    async fn off_loopback_every_host_is_answered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = compose_listener(
+            router(SharedNest::new(test_state(tmp.path(), 2))),
+            None,
+            false,
+            HostNames::default(),
+        );
+        let (status, body) = host_get(&app, "/tables", "rebound.attacker.example").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// A refusal reaches a cross-origin page as a readable 403, not as a CORS failure.
+    #[tokio::test]
+    async fn a_host_refusal_carries_the_cors_headers() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let app = compose_listener(
+            router(SharedNest::new(test_state(tmp.path(), 2))),
+            cors_layer(&["*".to_string()]).unwrap(),
+            true,
+            HostNames::default(),
+        );
+        let req = axum::http::Request::get("/tables")
+            .header("host", "nest.example.com")
+            .header("origin", "https://app.example.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

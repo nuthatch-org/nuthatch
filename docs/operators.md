@@ -1380,6 +1380,25 @@ bind cannot tell a local caller from a reverse proxy or tunnel ending on the sam
 authenticated** - the guards below bound *how much*, never *who*. Off-localhost binds log a loud
 warning at startup. Put TLS and authentication in front, always.
 
+**Host names on a loopback bind (#3002).** On a loopback bind every route answers only a loopback
+`Host` (`localhost`, `127.0.0.1`, `[::1]`) or a name you declare, and refuses any other with `403`
+naming the `Host` it saw. That covers `/sql`, `/tables`, `/ready`, `/_admin` and every mount's routes
+in a runtime, on `dev` and `serve` alike. It keeps out a web page that rebinds its DNS name to
+127.0.0.1: the visitor's browser sends the page's own name as `Host` and cannot send another.
+Behind a reverse proxy that forwards the public name, as Caddy does by default, start the nest with
+`--public-host <name>` (repeatable). `--local-host <name>` answers a name as this machine, such as
+`host.docker.internal` for a client in a container. Forwarding headers such as `X-Forwarded-For`
+decide nothing here, because a rebinding page is same-origin and may set them itself. Off a loopback
+bind, `0.0.0.0` say, every `Host` is answered, as on an address-history nest: the nest is already
+open to whatever can reach its address, and the gateway in front decides who that is. The published
+Docker image binds `0.0.0.0` inside its container, so this check does not apply there.
+
+> **Upgrading a loopback nest behind a reverse proxy.** A nest bound to `127.0.0.1` and reached
+> through a proxy by a public name now answers that name with `403` and
+> `does not answer Host <name>`. Add `--public-host <name>` to its `dev` or `serve` command, once
+> per name the proxy forwards, and it answers as before. Nothing else changes: a client on the same
+> machine, a nest bound off loopback and the published Docker image need no flag.
+
 **A public nest without an allowlist is an open query engine.** Said plainly because it is the single
 decision that matters here: `sql = "open"` is the default and it is the right default for a local
 `nuthatch dev`, where exploration is the point - but on an endpoint strangers can reach, it means

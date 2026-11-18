@@ -77,8 +77,6 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     }
     for (flag, set) in [
         ("--trace-rpc", !args.trace_rpc.is_empty()),
-        ("--public-host", !args.public_host.is_empty()),
-        ("--local-host", !args.local_host.is_empty()),
         ("--write-token-env", args.write_token_env.is_some()),
     ] {
         if set {
@@ -87,6 +85,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
             );
         }
     }
+    let hosts = crate::host_names::HostNames::declared(&args.local_host, &args.public_host)?;
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
@@ -146,6 +145,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         args.no_admin,
         publish,
         cors,
+        hosts,
         flight,
     )
     .await;
@@ -309,7 +309,15 @@ pub async fn upgrade(
             tokio::spawn(async move {
                 // `upgrade` has its own flags and #1318 asks only for `dev` and `serve`, so a
                 // hot upgrade serves without CORS rather than inventing a value nobody passed.
-                serve::run_two_versions(&listen, old_shared, &new_prefix, new_shared, None).await
+                serve::run_two_versions(
+                    &listen,
+                    old_shared,
+                    &new_prefix,
+                    new_shared,
+                    None,
+                    Default::default(),
+                )
+                .await
             })
         };
         let r = tokio::select! {
@@ -323,7 +331,9 @@ pub async fn upgrade(
         // Slice 2b - serve old, index new, atomically flip once caught up, retire old.
         let mut serve_task = {
             let shared = old_shared.clone();
-            tokio::spawn(async move { serve::run_shared(&listen, shared, None).await })
+            tokio::spawn(async move {
+                serve::run_shared(&listen, shared, None, Default::default()).await
+            })
         };
         let mut catchup_task = {
             let old_store = old_store.clone();
@@ -774,6 +784,7 @@ pub async fn run(
     no_admin: bool,
     publish: Option<crate::publish::Settings>,
     cors: Option<tower_http::cors::CorsLayer>,
+    hosts: crate::host_names::HostNames,
     flight: Option<String>,
 ) -> Result<()> {
     // Admin UI (RFC-0010 Part A): on by default on localhost. Off-localhost it needs an explicit token
@@ -808,7 +819,7 @@ pub async fn run(
         .is_some()
         .then(|| serve::router(serve::SharedNest::new(state.clone())));
     let result = tokio::select! {
-        r = serve::run(&listen, state, cors) => r,
+        r = serve::run(&listen, state, cors, hosts) => r,
         r = serve::flight_beside(flight, flight_app.unwrap_or_default()) => r,
         joined = &mut ingest => match joined {
             Ok(inner) => inner,
@@ -3976,6 +3987,7 @@ async fn build_nest(
 pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     // As in `dev`: refused before anything is opened, so the error is about the flag and nothing else.
     let cors = crate::serve::cors_layer(&args.cors)?;
+    let hosts = crate::host_names::HostNames::declared(&args.local_host, &args.public_host)?;
     let dir = PathBuf::from(&args.dir);
     let mut config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
@@ -4081,7 +4093,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
             )
         })
         .transpose()?;
-    serve::run(&args.listen, state, cors).await
+    serve::run(&args.listen, state, cors, hosts).await
 }
 
 /// Open the shared hot store an FE serves from.

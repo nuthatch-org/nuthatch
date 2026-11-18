@@ -136,6 +136,7 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
         .clone()
         .context("a follower needs --follow <writer-url>")?;
     let cors = crate::serve::cors_layer(&args.cors)?;
+    let hosts = crate::host_names::HostNames::declared(&args.local_host, &args.public_host)?;
     let options = Options {
         feed: args.feed_version,
         paused: false,
@@ -182,7 +183,7 @@ pub async fn serve(args: crate::cli::ServeArgs) -> Result<()> {
         writer = %follower.writer,
         "serving read-only, following the writer's hot-state feed (RFC-0073 FR1)"
     );
-    crate::serve::bind_and_serve(&args.listen, follower.service(), cors).await
+    crate::serve::bind_and_serve(&args.listen, follower.service(), cors, hosts).await
 }
 
 /// What the writer serves a route under, as its `mount` line says.
