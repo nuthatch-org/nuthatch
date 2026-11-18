@@ -102,7 +102,11 @@ fn free_port() -> u16 {
 }
 
 fn nuthatch(state: &Path, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+    run_bin(Path::new(env!("CARGO_BIN_EXE_nuthatch")), state, args)
+}
+
+fn run_bin(bin: &Path, state: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(bin)
         .args(args)
         .env("XDG_STATE_HOME", state)
         .stdin(Stdio::null())
@@ -278,4 +282,44 @@ fn detach_without_a_nest_is_no_nest() {
         ],
     );
     assert_eq!(code, 3, "{stderr}");
+}
+
+/// A binary installed under another name is still recognised as the running `dev`: a second start
+/// is refused rather than truncating the live log, and `stop` stops it.
+#[test]
+fn a_renamed_binary_is_still_known_by_its_executable() {
+    let rpc = serve_rpc(42_161);
+    let nest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let bins = tempfile::tempdir().unwrap();
+    let renamed = bins.path().join("nh-renamed");
+    std::fs::copy(env!("CARGO_BIN_EXE_nuthatch"), &renamed).unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+    let listen = format!("127.0.0.1:{}", free_port());
+    let dir = nest.path().to_str().unwrap();
+    let args = [
+        "dev",
+        "--detach",
+        "--json",
+        "--dir",
+        dir,
+        "--rpc",
+        &rpc,
+        "--listen",
+        &listen,
+        "--no-admin",
+    ];
+
+    let (code, stdout, stderr) = run_bin(&renamed, state.path(), &args);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let started: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let reap = Reap(started["pid"].as_u64().unwrap());
+
+    let (code, _, stderr) = run_bin(&renamed, state.path(), &args);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("already running"), "{stderr}");
+
+    let (code, _, stderr) = run_bin(&renamed, state.path(), &["stop", "--dir", dir]);
+    assert_eq!(code, 0, "{stderr}");
+    std::mem::forget(reap);
 }

@@ -133,7 +133,7 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--dir <DIR>` - The directory to run. A `nuthatch.toml` runs that one nest; a `mounts.toml` runs every nest it mounts, one isolated cursor per chain (RFC-0032). One command either way
 - `--fail-fast` - Exit on the first fault instead of quarantining it (RFC-0026 §6). Only meaningful with more than one nest: by default a failed nest or cursor is quarantined and its healthy siblings keep indexing and serving
 - `--listen <LISTEN>` - Address to bind the HTTP API to
-- `--detach` - Run in the background and return once the API answers `/ready` with a first poll behind it, or fail with the end of its log. The log and the process record live under $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest, and `nuthatch stop` stops it
+- `--detach` - Run in the background and return once the API answers `/ready` with a first poll behind it (every mount's, for a runtime), or fail with the end of its log. The log and the process record live under $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest, and `nuthatch stop` stops it
 - `--json` - With --detach, print one JSON object on stdout: `pid`, `url`, `dir`, `log` and `stop`
 - `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--ipfs <IPFS>` - IPFS gateway(s) or a local node for resolving declared `[[ipfs]]` documents (repeatable)

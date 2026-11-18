@@ -23,6 +23,8 @@ struct Record {
     dir: PathBuf,
     url: String,
     log: PathBuf,
+    /// The executable spawned, which is what identifies the process later, whatever it is named.
+    exe: PathBuf,
 }
 
 /// `$XDG_STATE_HOME/nuthatch/dev/<hash of the nest's path>/`, else under `~/.local/state`.
@@ -93,27 +95,87 @@ fn read_record(state: &Path) -> Option<Record> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Whether `pid` is a running `nuthatch`. A recycled pid owned by something else is not ours to stop.
-fn is_running_nuthatch(pid: u32) -> bool {
+/// What the pid in a record is now. A recycled pid running something else is not ours to stop.
+#[derive(Debug, PartialEq)]
+enum Identity {
+    Gone,
+    /// Running the executable the record names.
+    Ours,
+    Other(PathBuf),
+    /// Alive, and what it runs could not be read: never signalled on a guess.
+    Unconfirmed(String),
+}
+
+fn identify(pid: u32, exe: &Path) -> Identity {
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
-        return false;
+        return Identity::Gone;
     };
     // SAFETY: signal 0 checks for the process without sending anything.
     if unsafe { libc::kill(pid_t, 0) } != 0 {
-        return false;
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM) => Identity::Unconfirmed("it belongs to another user".into()),
+            _ => Identity::Gone,
+        };
     }
-    match std::process::Command::new("ps")
-        .args(["-o", "stat=,comm=", "-p", &pid.to_string()])
-        .output()
-    {
-        // A zombie has exited and only waits for its new parent to reap it.
-        Ok(out) if out.status.success() => {
-            let line = String::from_utf8_lossy(&out.stdout);
-            let line = line.trim();
-            !line.starts_with('Z') && line.ends_with("nuthatch")
-        }
-        // A process that exists, and no `ps` to say what it is.
-        _ => true,
+    match executable_of(pid_t) {
+        Ok(path) if same_executable(&path, exe) => Identity::Ours,
+        Ok(path) => Identity::Other(path),
+        Err(why) => Identity::Unconfirmed(why),
+    }
+}
+
+fn same_executable(running: &Path, recorded: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    running == recorded || canon(running) == canon(recorded)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_of(pid: libc::pid_t) -> std::result::Result<PathBuf, String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map_err(|e| format!("/proc/{pid}/exe could not be read: {e}"))?;
+    // A binary replaced on disk since it started still names its old path.
+    let shown = link.to_string_lossy();
+    Ok(PathBuf::from(
+        shown.strip_suffix(" (deleted)").unwrap_or(&shown),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn executable_of(pid: libc::pid_t) -> std::result::Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is as long as the size passed.
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return Err(format!(
+            "proc_pidpath failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    buf.truncate(n as usize);
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn executable_of(_: libc::pid_t) -> std::result::Result<PathBuf, String> {
+    Err("this platform gives no way to read a process's executable".into())
+}
+
+/// The record's process, if it is still ours. One that cannot be identified stops the command:
+/// neither a second start nor a signal is safe on a guess.
+fn still_ours(record: &Record, record_path: &Path) -> Result<bool> {
+    match identify(record.pid, &record.exe) {
+        Identity::Ours => Ok(true),
+        Identity::Gone | Identity::Other(_) => Ok(false),
+        Identity::Unconfirmed(why) => bail!(
+            "pid {} from {} is alive, and whether it is the nuthatch dev recorded there cannot \
+             be confirmed ({why}), so it is not signalled. Check it with `ps -p {}`; once it is \
+             not running, remove {}",
+            record.pid,
+            record_path.display(),
+            record.pid,
+            record_path.display()
+        ),
     }
 }
 
@@ -132,20 +194,59 @@ fn is_ready(status: u16, body: &serde_json::Value) -> bool {
             .is_none_or(|t| t > 0)
 }
 
+async fn get_json(client: &reqwest::Client, url: &str) -> Option<(u16, serde_json::Value)> {
+    let resp = client.get(url).send().await.ok()?;
+    let status = resp.status().as_u16();
+    Some((status, resp.json().await.unwrap_or_default()))
+}
+
+/// Whether the instance at `url` serves with a first poll behind it. A runtime's root `/ready`
+/// carries no poll time of its own, so each mount it lists at `/nests` must report one.
+async fn serving(client: &reqwest::Client, url: &str) -> bool {
+    let Some((status, body)) = get_json(client, &format!("{url}/ready")).await else {
+        return false;
+    };
+    if !is_ready(status, &body) {
+        return false;
+    }
+    let mounts = match get_json(client, &format!("{url}/nests")).await {
+        Some((200, nests)) => nests["nests"].as_array().cloned().unwrap_or_default(),
+        // A solo nest has no roster, and its own `/ready` was the answer.
+        _ => return true,
+    };
+    for mount in &mounts {
+        let base = match (mount["base_path"].as_str(), mount["name"].as_str()) {
+            (Some(path), _) => path.to_string(),
+            (None, Some(name)) => format!("/{name}"),
+            (None, None) => continue,
+        };
+        match get_json(client, &format!("{url}{base}/ready")).await {
+            Some((status, body))
+                if status == 200 && body["last_poll_unixtime"].as_u64().is_some_and(|t| t > 0) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Start `nuthatch dev` with the same arguments, less `--detach` and `--json`, in its own session,
 /// and return once it serves.
 pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
     let nest = nest_path(dir)?;
     let state = state_dir(&nest)?;
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
-    if let Some(r) = read_record(&state).filter(|r| is_running_nuthatch(r.pid)) {
-        bail!(
-            "nuthatch dev is already running for {} (pid {}, {}); `nuthatch stop --dir {}` stops it",
-            nest.display(),
-            r.pid,
-            r.url,
-            nest.display()
-        );
+    let record_path = state.join(RECORD);
+    if let Some(r) = read_record(&state) {
+        if still_ours(&r, &record_path)? {
+            bail!(
+                "nuthatch dev is already running for {} (pid {}, {}); `nuthatch stop --dir {}` \
+                 stops it",
+                nest.display(),
+                r.pid,
+                r.url,
+                nest.display()
+            );
+        }
     }
     let log_path = state.join(LOG);
     let log = std::fs::File::create(&log_path)
@@ -154,7 +255,9 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
         .skip(1)
         .filter(|a| a != "--detach" && a != "--json")
         .collect();
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    let exe = std::env::current_exe().context("finding this executable")?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
@@ -178,6 +281,7 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
         dir: nest.clone(),
         url: url.clone(),
         log: log_path.clone(),
+        exe,
     };
     std::fs::write(state.join(RECORD), serde_json::to_vec(&record)?)?;
 
@@ -200,12 +304,8 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
                 .unwrap_or(Code::Error);
             return Err(tag(code, err));
         }
-        if let Ok(resp) = client.get(format!("{url}/ready")).send().await {
-            let status = resp.status().as_u16();
-            let body = resp.json().await.unwrap_or_default();
-            if is_ready(status, &body) {
-                break;
-            }
+        if serving(&client, &url).await {
+            break;
         }
         if started.elapsed() > READY_WITHIN {
             let _ = child.kill();
@@ -246,8 +346,13 @@ pub async fn stop(dir: &str, json: bool) -> Result<()> {
         .with_context(|| format!("no directory at {dir}"))
         .map_err(|e| tag(Code::NoNest, e))?;
     let state = state_dir(&nest)?;
-    let Some(record) = read_record(&state).filter(|r| is_running_nuthatch(r.pid)) else {
-        let _ = std::fs::remove_file(state.join(RECORD));
+    let record_path = state.join(RECORD);
+    let record = match read_record(&state) {
+        Some(r) if still_ours(&r, &record_path)? => Some(r),
+        _ => None,
+    };
+    let Some(record) = record else {
+        let _ = std::fs::remove_file(&record_path);
         return Err(tag(
             Code::NestNotRunning,
             anyhow::anyhow!(
@@ -257,12 +362,12 @@ pub async fn stop(dir: &str, json: bool) -> Result<()> {
         ));
     };
     let pid = libc::pid_t::try_from(record.pid).context("pid out of range")?;
-    // SAFETY: a plain signal to a pid just checked to be a running nuthatch.
+    // SAFETY: a plain signal to a pid just identified as the recorded executable.
     if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
         bail!("could not signal pid {}", record.pid);
     }
     let started = Instant::now();
-    while is_running_nuthatch(record.pid) {
+    while identify(record.pid, &record.exe) == Identity::Ours {
         if started.elapsed() > STOP_WITHIN {
             bail!(
                 "pid {} is still running {}s after SIGTERM; its log is {}",
@@ -310,6 +415,83 @@ mod tests {
         assert_eq!(local_url("0.0.0.0:9000"), "http://127.0.0.1:9000");
         assert_eq!(local_url("127.0.0.1:8288"), "http://127.0.0.1:8288");
         assert_eq!(local_url("[::]:8288"), "http://[::1]:8288");
+    }
+
+    /// A runtime's root answers 200 before its mounts have polled; `--detach` must not.
+    #[tokio::test]
+    async fn a_runtime_serves_once_every_mount_has_polled() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        let polled = Arc::new(AtomicU64::new(0));
+        let p = polled.clone();
+        let app = axum::Router::new()
+            .route(
+                "/ready",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"ready": true})) }),
+            )
+            .route(
+                "/nests",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"nests": [
+                        {"name": "a", "base_path": "/a"}, {"name": "b"}
+                    ]}))
+                }),
+            )
+            .route(
+                "/a/ready",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"ready": true, "last_poll_unixtime": 7}))
+                }),
+            )
+            .route(
+                "/b/ready",
+                axum::routing::get(move || {
+                    let t = p.load(Ordering::SeqCst);
+                    async move {
+                        axum::Json(serde_json::json!({"ready": true, "last_poll_unixtime": t}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        assert!(!serving(&client, &url).await, "mount b has not polled");
+        polled.store(9, Ordering::SeqCst);
+        assert!(serving(&client, &url).await);
+    }
+
+    #[test]
+    fn this_process_is_identified_by_its_executable_not_its_name() {
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(identify(std::process::id(), &exe), Identity::Ours);
+        let other = identify(std::process::id(), Path::new("/usr/bin/true"));
+        assert!(matches!(other, Identity::Other(_)), "{other:?}");
+    }
+
+    /// A pid that is alive and cannot be read is refused, not signalled on a guess.
+    #[test]
+    fn an_unconfirmed_pid_is_never_treated_as_gone_or_ours() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root may read pid 1, which then is merely another program
+        }
+        let record = Record {
+            pid: 1,
+            dir: "/n".into(),
+            url: "http://127.0.0.1:1".into(),
+            log: "/l".into(),
+            exe: std::env::current_exe().unwrap(),
+        };
+        match identify(1, &record.exe) {
+            Identity::Unconfirmed(_) => {
+                let err = still_ours(&record, Path::new("/s/dev.json")).unwrap_err();
+                assert!(format!("{err:#}").contains("not signalled"), "{err:#}");
+            }
+            // Some systems let any user read pid 1's executable; that is a refusal of its own.
+            Identity::Other(_) => assert!(!still_ours(&record, Path::new("/s")).unwrap()),
+            seen => panic!("pid 1 read as {seen:?}"),
+        }
     }
 
     #[test]

@@ -1690,10 +1690,10 @@ pub struct DevArgs {
     #[arg(long, default_value = "127.0.0.1:8288")]
     pub listen: String,
 
-    /// Run in the background and return once the API answers `/ready` with a first poll behind it,
-    /// or fail with the end of its log. The log and the process record live under
-    /// $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest, and `nuthatch stop`
-    /// stops it.
+    /// Run in the background and return once the API answers `/ready` with a first poll behind it
+    /// (every mount's, for a runtime), or fail with the end of its log. The log and the process
+    /// record live under $XDG_STATE_HOME/nuthatch/dev/ (else ~/.local/state), never in the nest,
+    /// and `nuthatch stop` stops it.
     #[arg(long)]
     pub detach: bool,
 
