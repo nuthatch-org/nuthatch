@@ -7,6 +7,27 @@
 [![nuthatch-org/nuthatch MCP server](https://glama.ai/mcp/servers/nuthatch-org/nuthatch/badges/score.svg)](https://glama.ai/mcp/servers/nuthatch-org/nuthatch)
 · Website: [www.nuthatch-indexer.com](https://www.nuthatch-indexer.com)
 
+**Measured** on one contract and range, each tool from an empty directory along its own quickstart
+(WETH, 1,000 blocks, 49,354 logs, one keyless RPC; method and caveats in the
+[comparison](docs/comparison-time-to-first-query.md), 17 November 2026, nuthatch 5.22.0):
+
+| | nuthatch | Ponder 0.18.9 | Envio 3.15.0 | graph-node 0.45.0 |
+|---|---|---|---|---|
+| Range indexed | **16.0 s** | 216 s | 216 s | 567 s |
+| Code or config typed | none | about 110 lines | 5 lines | 2 lines |
+| Time to first query | 1.0 s | 2.9 s | 26 s | 189 s |
+
+**No install?** `npx -y nuthatch-indexer` downloads the release for your platform and runs it.
+**Headless:** `nuthatch dev --backfill 300 --detach` returns once `/ready` reports a first poll, and
+`nuthatch stop` stops it. Exit codes: [docs/cli-errors.md](docs/cli-errors.md).
+
+Got here from an `eth_getLogs` error? Each has a page: [`query returned more than 10000 results`](https://nuthatch-indexer.com/docs/errors/query-returned-more-than-10000-results/),
+[`Log response size exceeded`](https://nuthatch-indexer.com/docs/errors/log-response-size-exceeded/),
+[`exceed maximum block range`](https://nuthatch-indexer.com/docs/errors/exceed-maximum-block-range/),
+[`query timeout exceeded`](https://nuthatch-indexer.com/docs/errors/query-timeout-exceeded/),
+[`limit exceeded` on BNB Chain](https://nuthatch-indexer.com/docs/errors/bnb-chain-limit-exceeded/) and
+Etherscan's [`Free API access is not supported for this chain`](https://nuthatch-indexer.com/docs/errors/free-api-access-is-not-supported-for-this-chain/).
+
 **For AI coding agents:** [AGENTS.md](AGENTS.md) is install, init, a headless `dev`, query and MCP
 setup for every common client, as commands to paste.
 
@@ -44,10 +65,8 @@ are rows to query within seconds on the bundled public endpoints. Without it, `d
 contract's deployment block: for WETH that is 21 million blocks, a long backfill on free public endpoints
 and a job for your own RPC (`--rpc`).
 
-That quickstart, run as written on the 4.10.1 release on 2026-10-05, took 13 s from the `curl` to a
-non-zero count in a clean macOS shell on an M5 Pro, and 21 s in a fresh `ubuntu:24.04` container
-([docs/readme-check-2026-10-05.md](https://github.com/nuthatch-org/nuthatch/blob/ede03ca7/docs/readme-check-2026-10-05.md), which records every command in
-this file). The `mkdir` line is newer than that timing.
+How fast that is, measured against Ponder, Envio and a subgraph, is in the
+[time-to-first-query comparison](docs/comparison-time-to-first-query.md), with the scripts that rerun it.
 
 ### Bring your own RPC for real backfills
 
@@ -326,7 +345,6 @@ for zero `eth_call` round trips.
 | RPC requests | **136** |
 | peak RSS | **325 MB** |
 | measured | commit `5a81a37`, 2026-08-07, Alchemy, 11-core laptop: [`docs/bench/obib-case2.json`](docs/bench/obib-case2.json) |
-| on 4.10.1 | **73.4 s** (median of 3), 174 requests, 403 MB, the release binary against Tenderly's keyless gateway, which throttled it, 2026-10-05: [`docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json`](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json) and [the note beside it](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.md) |
 
 Reference times for the same case, from OBIB's README: Sentio 7.78 min, Envio 8.54 min, Subsquid
 46.85 min.
@@ -366,11 +384,9 @@ serve this from their own pre-indexed networks, where nuthatch runs against plai
 
 Cases 1 and 2 were measured in July and August 2026 against the same Alchemy account case 6's old
 figure is withdrawn for, so nobody can rerun those two as they were; they stay because their
-artifacts carry commit, provider and hardware, and case 2 has been rerun on the current release
-without an account, in the row above. The artifacts are
+artifacts carry commit, provider and hardware. The artifacts are
 [`docs/bench/obib-case1.json`](docs/bench/obib-case1.json),
 [`docs/bench/obib-case2.json`](docs/bench/obib-case2.json),
-[`docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json`](docs/bench/obib-case2-4.10.1-tenderly-2026-10-05.json) and
 [`docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json`](docs/bench/obib-case6-4.7.0-tenderly-2026-10-05.json);
 `nuthatch bench backfill` re-runs any of them.
 The case-2 nest is committed at [`obib-case2/`](obib-case2/) - keyless, so the endpoint arrives via
