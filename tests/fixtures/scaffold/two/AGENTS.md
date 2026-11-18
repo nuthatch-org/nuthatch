@@ -40,7 +40,7 @@ blocks behind the tip:
 
 ```sh
 nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks":[0-9],' && break; sleep 2; done
+for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
 ```
 
 `--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's

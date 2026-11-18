@@ -2094,6 +2094,10 @@ fn scaffold_ai_surface_with(
         nuthatch_scaffold::skill_md(chain, &contracts, schema),
     )
     .context("failed to write SKILL.md")?;
+    // A nest scaffolded before AGENTS.md existed has none, and creating one would move its NID.
+    if docs == AgentDocs::KeepExisting {
+        return Ok(());
+    }
     let agents = dir.join(nuthatch_scaffold::AGENTS_MD);
     let authored = std::fs::read(&agents)
         .is_ok_and(|b| !b.starts_with(nuthatch_scaffold::AGENTS_MD_MARK.as_bytes()));
@@ -3241,6 +3245,16 @@ mod tests {
         // Idempotent: a second call finds nothing to do, so `dev` does not rewrite artifacts on every
         // restart and churn anyone's git status.
         assert_eq!(refresh_stale_artifacts(dir.path(), &cfg).unwrap(), None);
+    }
+
+    /// A nest from before AGENTS.md has none; `dev`'s refresh must not add one, or the NID moves.
+    #[test]
+    fn a_refresh_does_not_give_an_older_nest_an_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hand_authored_nest(dir.path());
+        let cfg = Config::load(dir.path()).unwrap();
+        refresh_stale_artifacts(dir.path(), &cfg).unwrap();
+        assert!(!dir.path().join(nuthatch_scaffold::AGENTS_MD).exists());
     }
 
     /// A schema older than the config is the subtler half: `add` a contract by hand, and the file

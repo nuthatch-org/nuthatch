@@ -456,7 +456,7 @@ the background, wait until `/ready` puts it fewer than ten blocks behind the tip
 
 ```sh
 nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks":[0-9],' && break; sleep 2; done
+for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
 nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 ```
 

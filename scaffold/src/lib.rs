@@ -391,7 +391,7 @@ pub fn agents_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]
          \n\
          ```sh\n\
          nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &\n\
-         for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '\"lag_blocks\":[0-9],' && break; sleep 2; done\n\
+         for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '\"lag_blocks\": ?[0-9][,}}]' && break; sleep 2; done\n\
          ```\n\
          \n\
          `--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's\n\

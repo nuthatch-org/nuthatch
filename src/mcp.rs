@@ -156,7 +156,7 @@ fn client_config_file(
             let mut root = toml::map::Map::new();
             root.insert("mcp_servers".into(), toml::Value::Table(servers));
             (
-                "~/.codex/config.toml (append), or run `codex mcp add nuthatch -- <command>`",
+                "~/.codex/config.toml (append, or replace an existing [mcp_servers.nuthatch] table: TOML allows one), or run `codex mcp add nuthatch -- <command>`",
                 toml::to_string(&toml::Value::Table(root)).unwrap_or_default(),
             )
         }

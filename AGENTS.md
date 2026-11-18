@@ -38,7 +38,7 @@ tip, then query. The log goes outside the nest: its identity counts every file i
 
 ```sh
 nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks":[0-9],' && break; sleep 2; done
+for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
 nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 ```
 
@@ -94,7 +94,8 @@ VS Code and Copilot (`.vscode/mcp.json`):
 }
 ```
 
-Codex's `~/.codex/config.toml`, if you would rather edit it than run `codex mcp add`:
+Codex's `~/.codex/config.toml`, if you would rather edit it than run `codex mcp add`. Replace an
+existing `[mcp_servers.nuthatch]` table rather than adding a second: TOML allows one.
 
 ```toml
 [mcp_servers.nuthatch]
