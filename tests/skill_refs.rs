@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// #2982: the plugin manifests (`.claude-plugin/`, `.cursor-plugin/`, and the Agent Plugins
+/// #2982: the plugin manifests (`plugins/nuthatch/`, `.cursor-plugin/`, and the Agent Plugins
 /// `plugin.json` and `mcp.json` at the root) publish every directory under `skills/`, and
 /// `npx skills add` installs each one by its frontmatter `name`. A skill added there is therefore
 /// shipped, and must also be one whose flags `authored_files_only_mention_real_flags` checks.
@@ -62,13 +62,10 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
         serde_json::from_str(&std::fs::read_to_string(root.join(p)).unwrap())
             .unwrap_or_else(|e| panic!("{p}: {e}"))
     };
-    let claude = json(".claude-plugin/plugin.json");
+    let claude = json(PLUGIN_MANIFEST);
     let agent = json("mcp.json");
     for (file, server) in [
-        (
-            ".claude-plugin/plugin.json",
-            &claude["mcpServers"]["nuthatch"],
-        ),
+        (PLUGIN_MANIFEST, &claude["mcpServers"]["nuthatch"]),
         ("mcp.json", &agent["mcpServers"]["nuthatch"]),
     ] {
         assert_eq!(server["command"], "nuthatch", "{file}");
@@ -90,7 +87,10 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
 
     let marketplace = json(".claude-plugin/marketplace.json");
     assert_eq!(marketplace["plugins"][0]["name"], claude["name"]);
-    assert_eq!(marketplace["plugins"][0]["source"], "./");
+    assert_eq!(
+        marketplace["plugins"][0]["source"],
+        format!("./{PLUGIN_DIR}")
+    );
 
     let cursor = json(".cursor-plugin/plugin.json");
     for key in ["rules", "skills", "mcpServers", "logo"] {
@@ -109,6 +109,95 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
     let side = |at: usize| u32::from_be_bytes(png[at..at + 4].try_into().unwrap());
     let (w, h) = (side(16), side(20));
     assert!(w == h && (512..=2048).contains(&w), "icon.png is {w}x{h}");
+}
+
+/// #3013: the Claude plugin lives in its own folder, because Anthropic's directory scans the folder it
+/// is given and refuses any file over 5 MiB (the repo root holds bench tapes larger than that).
+const PLUGIN_DIR: &str = "plugins/nuthatch";
+const PLUGIN_MANIFEST: &str = "plugins/nuthatch/.claude-plugin/plugin.json";
+
+fn files_under(dir: &Path, rel: &Path, out: &mut BTreeSet<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "{} is a symlink",
+            path.display()
+        );
+        let name = rel.join(entry.file_name());
+        if meta.is_dir() {
+            files_under(&path, &name, out);
+        } else {
+            out.insert(name);
+        }
+    }
+}
+
+/// The root `skills/` is authoritative (`npx skills add` and the Cursor plugin read it); the plugin
+/// folder's copy is written by `yatr run plugin-sync` and must match it byte for byte.
+#[test]
+fn the_claude_plugin_folder_is_a_faithful_self_contained_copy() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let plugin = root.join(PLUGIN_DIR);
+
+    let mut skills = BTreeSet::new();
+    files_under(&root.join("skills"), Path::new(""), &mut skills);
+    let mut expected: BTreeSet<PathBuf> =
+        skills.iter().map(|f| Path::new("skills").join(f)).collect();
+    expected.insert(".claude-plugin/plugin.json".into());
+    expected.insert(".claude-plugin/icon.png".into());
+
+    let mut actual = BTreeSet::new();
+    files_under(&plugin, Path::new(""), &mut actual);
+    assert_eq!(
+        actual, expected,
+        "{PLUGIN_DIR} has drifted from skills/ - run `yatr run plugin-sync`"
+    );
+
+    let mut copies: Vec<(PathBuf, PathBuf)> = skills
+        .iter()
+        .map(|f| (root.join("skills").join(f), plugin.join("skills").join(f)))
+        .collect();
+    copies.push((
+        root.join(".claude-plugin/icon.png"),
+        plugin.join(".claude-plugin/icon.png"),
+    ));
+    for (src, copy) in copies {
+        assert!(
+            std::fs::read(&src).unwrap() == std::fs::read(&copy).unwrap(),
+            "{} differs from {} - run `yatr run plugin-sync`",
+            copy.display(),
+            src.display()
+        );
+    }
+    for file in &actual {
+        let len = std::fs::metadata(plugin.join(file)).unwrap().len();
+        assert!(
+            len <= 5 << 20,
+            "{PLUGIN_DIR}/{} is {len} bytes",
+            file.display()
+        );
+    }
+
+    let json = |p: &Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
+    };
+    let manifest = json(&root.join(PLUGIN_MANIFEST));
+    let agent = json(&root.join("plugin.json"));
+    for key in ["name", "version", "description"] {
+        assert_eq!(manifest[key], agent[key], "{PLUGIN_MANIFEST} {key}");
+    }
+    let mcp = json(&root.join("mcp.json"));
+    for key in ["command", "args"] {
+        assert_eq!(
+            manifest["mcpServers"]["nuthatch"][key], mcp["mcpServers"]["nuthatch"][key],
+            "{PLUGIN_MANIFEST} mcpServers {key}"
+        );
+    }
+    let icon = manifest["icon"].as_str().expect("icon");
+    assert!(icon.starts_with("./") && !icon.contains(".."), "{icon}");
+    assert!(plugin.join(icon).is_file(), "{icon}");
 }
 
 fn skill_dir() -> PathBuf {

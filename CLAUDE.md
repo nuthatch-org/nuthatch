@@ -467,11 +467,12 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `plain` | fmt, clippy and test for the plain module and the wasmtime host, and the host's release build |  | cached on its inputs |
 | `plain-hosts` | The plain module in Node, wasmtime, Chrome and Firefox (needs CHROME, FIREFOX, GECKODRIVER) | `plain-module`, `fixture-rpc` | always runs |
 | `plain-module` | The plain module, checked for its imports, size and abi (needs wasm-opt and the wasm32 C toolchain) | `plain` | cached on its inputs |
+| `plugin-sync` | Copy skills/ and the icon into plugins/nuthatch, the Claude plugin folder |  | always runs |
 | `point-read` | Entity point-read p50/p99 against MAX_P50_US |  | always runs |
 | `rolling-upgrade` | Replace followers, then the writer, with a query answered at every step (binary in NUTHATCH_BIN) |  | always runs |
 | `rss-spread` | RUNS (default 7) sequential runs of the dense multi-nest scenario, and their spread | `build` | always runs |
 | `s3-suites` | Publish, registry, seed and remote follower suites against a real S3 server (needs NUTHATCH_MINIO_*) |  | always runs |
-| `skill-refs` | Regenerate the skill's CLI reference from the binary |  | always runs |
+| `skill-refs` | Regenerate the skill's CLI reference from the binary, then run plugin-sync |  | always runs |
 | `tab-answers` | RFC-0075 S5: the query routes in Node, byte for byte against the node's pin | `tab-module`, `fixture-rpc` | always runs |
 | `tab-budget` | RFC-0075 S6: the 600 MiB and 2 GiB ceilings in Node | `tab-module`, `fixture-rpc` | always runs |
 | `tab-entities` | RFC-0075 S4: entities and views in Node through the fixture's reorg | `tab-module`, `fixture-rpc` | always runs |

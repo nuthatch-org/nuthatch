@@ -10,6 +10,7 @@
   "repository": "https://github.com/nuthatch-org/nuthatch",
   "license": "MIT OR Apache-2.0",
   "keywords": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph", "nuthatch"],
+  "icon": "./.claude-plugin/icon.png",
   "mcpServers": {
     "nuthatch": {
       "command": "nuthatch",

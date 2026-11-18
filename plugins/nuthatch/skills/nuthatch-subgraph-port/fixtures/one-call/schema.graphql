@@ -1,0 +1,5 @@
+"""RFC-0044 S2: one eth_call, one exact field. Dropping the call must drop the [[calls]] stanza."""
+type Token @entity {
+  id: ID!
+  symbol: String!
+}

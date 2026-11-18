@@ -106,8 +106,13 @@ run = ['cargo nextest archive --locked --features graph,counter,crash-points,fli
 no_cache = true
 
 [tasks.skill-refs]
-desc = "Regenerate the skill's CLI reference from the binary"
-run = ["cargo run --locked -- skill-refs"]
+desc = "Regenerate the skill's CLI reference from the binary, then run plugin-sync"
+run = ["cargo run --locked -- skill-refs", "scripts/plugin-sync.sh"]
+no_cache = true
+
+[tasks.plugin-sync]
+desc = "Copy skills/ and the icon into plugins/nuthatch, the Claude plugin folder"
+run = ["scripts/plugin-sync.sh"]
 no_cache = true
 
 [tasks.decode]

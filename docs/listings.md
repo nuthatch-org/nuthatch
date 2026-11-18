@@ -92,9 +92,11 @@ Most forms ask for the same few things. Use these.
    (`logo` in that manifest) is the one thing the listing would want that the repo does not have.
 
 7. **Anthropic's plugin directory**: https://claude.ai/directory/manage, from a paid claude.ai account.
-   The plugin is the repository root (`.claude-plugin/plugin.json`). The validator asks for a square
-   PNG icon, 512 to 2048 px, at `.claude-plugin/icon.png`; the first one submitted becomes the
-   listing's icon for good, so add the real one before submitting.
+   Submit it as a plugin in a subfolder, with the path `plugins/nuthatch`: the repository root holds
+   bench tapes over the form's 5 MiB per-file limit, and the subfolder holds only the plugin
+   (#3013). Its skills are copies of the root `skills/`, written by `yatr run plugin-sync` and
+   checked in CI. The icon is `plugins/nuthatch/.claude-plugin/icon.png`, a square PNG of 512 to
+   2048 px; the first one submitted becomes the listing's icon for good.
 
 8. **affpapa.org** and any other copier of the 4.0.0 command: ask them to use the install and MCP
    lines above. The page was reported in #2986; a web search on 2026-11-17 did not find its URL, so
