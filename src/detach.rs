@@ -353,6 +353,15 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
             );
         }
     }
+    // Whatever answers `/ready` on a taken port is not this nest, so the bind is checked first.
+    if let Err(e) = std::net::TcpListener::bind(listen) {
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            return Err(tag(
+                Code::PortInUse,
+                anyhow::anyhow!("{listen} is already in use: another process listens there"),
+            ));
+        }
+    }
     let log_path = state.join(LOG);
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
@@ -411,10 +420,15 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
                 log_tail(&log_path, 20)
             );
             // The child's own status already names its failure class.
-            let code = Code::ALL
-                .into_iter()
-                .find(|c| Some(c.exit_code()) == status.code())
-                .unwrap_or(Code::Error);
+            // A bind that lost a race after the pre-check is the same failure.
+            let code = if log_tail(&log_path, 20).contains("Address already in use") {
+                Code::PortInUse
+            } else {
+                Code::ALL
+                    .into_iter()
+                    .find(|c| Some(c.exit_code()) == status.code())
+                    .unwrap_or(Code::Error)
+            };
             return Err(tag(code, err));
         }
         if serving(&client, &url).await {
