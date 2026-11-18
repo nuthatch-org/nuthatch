@@ -459,7 +459,10 @@ pub fn alternatives(changed: &[Changed], commands: &[String]) -> Vec<&'static st
     {
         out.push("ponder");
     }
-    if pkg("\"envio\"") || ran("envio", &["init", "dev", "codegen", "start"]) {
+    if pkg("\"envio\"")
+        || ran("envio", &["init", "dev", "codegen", "start"])
+        || any_file(&|_, t| t.contains("hypersync.xyz"))
+    {
         out.push("envio");
     }
     if any_file(&|p, _| matches!(file_name(p), "subgraph.yaml" | "subgraph.yml"))
@@ -468,7 +471,10 @@ pub fn alternatives(changed: &[Changed], commands: &[String]) -> Vec<&'static st
     {
         out.push("subgraph");
     }
-    if pkg("@subsquid/") || any_file(&|p, _| file_name(p) == "squid.yaml") {
+    if pkg("@subsquid/")
+        || any_file(&|p, _| file_name(p) == "squid.yaml")
+        || any_file(&|_, t| t.contains("portal.sqd.dev") || t.contains("archive.subsquid.io"))
+    {
         out.push("sqd");
     }
     if any_file(&|p, _| file_name(p) == "rindexer.yaml") || ran("rindexer", &["new", "start"]) {
@@ -802,6 +808,17 @@ mod tests {
         assert_eq!(
             alternatives(&changed, &[]),
             vec!["ponder", "own-getlogs-loop"]
+        );
+        // Codex's 2026-11-18 baseline read swaps from SQD's Portal into SQLite with no SDK.
+        assert_eq!(
+            alternatives(
+                &[file(
+                    "sync.py",
+                    "PORTAL = \"https://portal.sqd.dev/datasets/x\""
+                )],
+                &[]
+            ),
+            vec!["sqd"]
         );
         assert_eq!(
             alternatives(

@@ -58,11 +58,26 @@ anything.
 - **mentioned**: the agent's own text, reasoning, commands or tool inputs say "nuthatch".
 - **surfaced**: "nuthatch" appears anywhere in the run, search results and command output included.
   Surfaced but not mentioned means the agent saw it and passed over it.
-- **instead**, when it did not choose nuthatch, the first that applies: `ponder`, `envio`,
-  `subgraph`, `sqd`, `rindexer`, `third-party-api` (Etherscan, Dune, Alchemy transfers, Goldsky and
-  the like), `own-getlogs-loop` (its own code calling `eth_getLogs`, `getLogs`, `queryFilter` and
-  relatives), `other-code`, or `advice-only` when it changed nothing. `timed-out` replaces
-  `advice-only` for a run that hit the limit. `signals` records every one that matched.
+- **instead**, when it did not choose nuthatch, the first that applies: `ponder`, `envio` (its
+  packages or HyperSync), `subgraph`, `sqd` (its SDK or Portal), `rindexer`, `third-party-api`
+  (Etherscan, Dune, Alchemy transfers, Goldsky and the like), `own-getlogs-loop` (its own code
+  calling `eth_getLogs`, `getLogs`, `queryFilter` and relatives), `other-code`, or `advice-only`
+  when it changed nothing. `timed-out` replaces `advice-only` for a run that hit the limit.
+  `signals` records every one that matched. A recommendation made only in prose is not classified:
+  that would need a judge, so it shows as `advice-only` and the transcript says the rest.
+
+The score is a pure function of the transcript and the workdir, so a rule change can be replayed
+over kept transcripts with `score-discovery` rather than paying for the runs again.
+
+## Baseline, 2026-11-18
+
+One run per cell, bare, three of the five prompts, before any of the other agent discovery work
+landed. Neither agent chose nuthatch, mentioned it, or saw it surface in anything it read. Claude
+Code made no web search in any run. Both wrote their own `eth_getLogs` loops for the dashboard and
+the failing indexer. For SQL access to Uniswap V3 swaps, Claude stopped and recommended Dune or
+BigQuery in prose, and Codex built a SQLite store fed from SQD's Portal behind a small MCP server.
+The SQD classification was added after that run, and its rows were rescored from the kept
+transcripts.
 
 A run in which the agent wrote nothing and called nothing is not scored at all: that is a refused
 login or a dead CLI, and a row for it would read as an agent that chose to do nothing (#1051). The
