@@ -1431,7 +1431,13 @@ fn append_section(path: &Path, html: bool, body: &str) -> Result<bool> {
 fn ignore_body(prefix: &str) -> String {
     nuthatch_scaffold::GITIGNORE
         .lines()
-        .map(|l| format!("{prefix}{l}\n"))
+        // A blank line prefixed would be the bare pattern `nest/`, ignoring the whole nest; a
+        // comment or negation prefixed would change meaning.
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(|l| match (prefix.is_empty(), l.strip_prefix('!')) {
+            (false, Some(rest)) => format!("!{prefix}{rest}\n"),
+            _ => format!("{prefix}{l}\n"),
+        })
         .collect()
 }
 
@@ -2620,9 +2626,18 @@ mod tests {
             crate::cli::Command::Init(i) => i,
             _ => unreachable!(),
         };
-        let from = parse(&["nuthatch", "init", "--from", "https://github.com/o/mynest.git"]);
+        let from = parse(&[
+            "nuthatch",
+            "init",
+            "--from",
+            "https://github.com/o/mynest.git",
+        ]);
         assert_eq!(target_dir(&from), PathBuf::from("mynest"));
-        let mut a = parse(&["nuthatch", "init", "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"]);
+        let mut a = parse(&[
+            "nuthatch",
+            "init",
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        ]);
         let before = target_dir(&a);
         resolve_dir(&mut a, Path::new("."));
         assert_eq!(target_dir(&a), before);
