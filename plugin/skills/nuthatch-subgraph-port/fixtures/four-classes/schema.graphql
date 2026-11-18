@@ -1,0 +1,46 @@
+"""Reduced Uniswap V3 pricing shape for RFC-0044 S1. Four classes, one of each family."""
+type _Schema_
+  @fulltext(
+    name: "tokenSearch"
+    language: en
+    algorithm: rank
+    include: [{ entity: "Token", fields: [{ name: "symbol" }] }]
+  )
+
+type Bundle @entity {
+  id: ID!
+  ethPriceUSD: BigDecimal!
+}
+
+type Pool @entity {
+  id: ID!
+  token0: Token!
+  token1: Token!
+  sqrtPrice: BigInt!
+  token0Price: BigDecimal!
+  token1Price: BigDecimal!
+  liquidity: BigInt!
+  totalValueLockedToken0: BigDecimal!
+  swaps: [Swap!]! @derivedFrom(field: "pool")
+}
+
+type Token @entity {
+  id: ID!
+  symbol: String!
+  decimals: BigInt!
+  derivedETH: BigDecimal!
+  whitelistPools: [Pool!]!
+  name: String!
+}
+
+type Swap @entity {
+  id: ID!
+  pool: Pool!
+  amount0: BigDecimal!
+  timestamp: BigInt!
+}
+
+type BlockStat @entity {
+  id: ID!
+  blockNumber: BigInt!
+}

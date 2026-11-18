@@ -128,7 +128,9 @@ gateway in front does the authentication. See [docs/operators.md](docs/operators
 - The builder skill, for driving the CLI and config: `skills/nuthatch-builder/`. The binary does not
   carry it. Install it, with `nuthatch-subgraph-port` and `evm-indexing`, in one command:
   `npx skills add nuthatch-org/nuthatch`. In Claude Code, `/plugin marketplace add nuthatch-org/nuthatch`
-  then `/plugin install nuthatch@nuthatch` adds the skills and the MCP server. From a clone:
+  then `/plugin install nuthatch@nuthatch` adds the skills and the MCP server; the plugin is the
+  self-contained `plugin/` folder, whose `skills/` is a copy of `skills/` kept equal by
+  `scripts/sync-plugin-skills.sh` and a test. From a clone:
   `cp -r skills/nuthatch-builder ~/.claude/skills/`.
 - Cursor: the repository is a Cursor plugin (`.cursor-plugin/plugin.json`), and
   `rules/nuthatch.mdc` is a rule to copy into a project's `.cursor/rules/`.
