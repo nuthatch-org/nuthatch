@@ -64,11 +64,22 @@ pub struct WatchArgs {
     /// Stop after this many seconds.
     #[arg(long, value_name = "SECS")]
     pub exit_after: Option<u64>,
+
+    /// Read once, print one line per nest, and exit: the status of a running nest for a script.
+    /// Fails with `nest_not_running` when nothing answers.
+    #[arg(long, conflicts_with_all = ["replay", "record", "exit_after"])]
+    pub once: bool,
+
+    /// With --once, print one JSON object instead: `url`, and the bodies of `/ready`, `/` and
+    /// `/nests`, with each mount's `/ready` under `mounts`.
+    #[arg(long, requires = "once")]
+    pub json: bool,
 }
 
 pub async fn run(args: WatchArgs) -> Result<()> {
     let on_screen =
         std::io::stdout().is_terminal() && std::env::var("TERM").map_or(true, |t| t != "dumb");
+    let on_screen = on_screen && !args.once;
     if let Some(path) = &args.replay {
         if !on_screen {
             bail!("--replay draws the screen and needs a terminal");
@@ -109,6 +120,9 @@ pub async fn run(args: WatchArgs) -> Result<()> {
                 .then(|| crate::admin_token::read(&args.dir))
                 .flatten()
         });
+    if args.once {
+        return run_once(&base, args.json).await;
+    }
     if on_screen {
         let described = match &target.ssh {
             Some(host) => format!("{url} via {host}"),
@@ -235,6 +249,53 @@ fn finish(ever_answered: bool, base: &str) -> Result<()> {
     } else {
         bail!("nothing answered at {base}")
     }
+}
+
+/// `--once`: one pass over the routes the line reads, printed as lines or as one object.
+async fn run_once(base: &str, as_json: bool) -> Result<()> {
+    let client = client()?;
+    let reads = read_cycle(&client, base, 1).await;
+    if reads.iter().all(|r| r.status == 0) {
+        return Err(crate::cli_error::tag(
+            crate::cli_error::Code::NestNotRunning,
+            anyhow::anyhow!("{}", unreachable_note(base)),
+        ));
+    }
+    if as_json {
+        let body = |r: &Read| -> serde_json::Value {
+            if r.status == 0 {
+                return serde_json::Value::Null;
+            }
+            serde_json::from_str(&r.body).unwrap_or(serde_json::Value::Null)
+        };
+        let route = |name: &str| reads.iter().find(|r| r.route == name).map(body);
+        let mounts: serde_json::Map<String, serde_json::Value> = reads
+            .iter()
+            .filter_map(|r| {
+                let name = r.route.strip_prefix('/')?.strip_suffix("/ready")?;
+                Some((name.to_string(), body(r)))
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "url": base,
+                "ready": route("/ready"),
+                "summary": route("/"),
+                "nests": route("/nests"),
+                "mounts": mounts,
+            })
+        );
+        return Ok(());
+    }
+    let mut app = App::default();
+    for read in &reads {
+        app.apply(read);
+    }
+    for l in line::lines(&app) {
+        println!("{l}");
+    }
+    Ok(())
 }
 
 async fn run_lines(

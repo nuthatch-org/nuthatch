@@ -216,8 +216,11 @@ pub fn for_command(cmd: &crate::cli::Command) -> (Reaches, bool) {
         C::Diff(_) => (api, false),
         C::Mcp(_) => (api, false),
         #[cfg(feature = "watch")]
-        C::Watch(_) => (api, false),
-        C::Init(_) | C::Add(_) | C::Dev(_) => (rpc, false),
+        C::Watch(a) => (api, a.json),
+        C::Init(a) => (rpc, a.json),
+        C::Add(a) => (rpc, a.json),
+        C::Schema(a) => (Reaches::default(), a.json),
+        C::Dev(_) => (rpc, false),
         C::Doctor(a) => (Reaches::default(), a.json),
         _ => (Reaches::default(), false),
     }

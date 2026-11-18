@@ -86,6 +86,7 @@ async fn a_checked_entity_file_starts_and_indexes() {
     declare_entity(dir.path());
     nuthatch::project::regen(nuthatch::cli::SchemaArgs {
         dir: dir.path().to_str().unwrap().into(),
+        json: false,
     })
     .unwrap();
     nuthatch::check::check(nuthatch::cli::CheckArgs {

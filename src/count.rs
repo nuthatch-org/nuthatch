@@ -322,13 +322,16 @@ impl Pending {
         }
     }
 
-    pub async fn ask(self) {
+    /// `json`: stdout is `init --json`'s object, so nothing is asked there.
+    pub async fn ask(self, json: bool) {
         let Some(path) = config_path() else { return };
         // Input already waiting is the next line of a paste, not an answer to a question not yet
         // printed (#2235): leave it to the shell and ask at a later init.
-        let interactive = std::io::stdin().is_terminal()
-            && std::io::stdout().is_terminal()
-            && !typed_ahead(&std::io::stdin());
+        let interactive = may_ask(
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+            json,
+        ) && !typed_ahead(&std::io::stdin());
         let (ci, opted_out) = silenced();
         let decision = decide(Answer::load(&path).as_ref(), interactive, ci, opted_out);
         let nest = Nest::new(chain_in(&self.dir), self.source);
@@ -343,6 +346,11 @@ impl Pending {
             }
         }
     }
+}
+
+/// The question goes to stdout, so it is asked only on a terminal that is not carrying `--json`.
+fn may_ask(stdin_tty: bool, stdout_tty: bool, json: bool) -> bool {
+    stdin_tty && stdout_tty && !json
 }
 
 /// Whether `input` has bytes ready to read right now.
@@ -500,6 +508,13 @@ fn cwd_nest() -> Nest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_json_on_a_terminal_is_not_asked_the_question() {
+        assert!(may_ask(true, true, false));
+        assert!(!may_ask(true, true, true));
+        assert!(!may_ask(true, false, false));
+    }
     use std::collections::BTreeSet;
 
     fn keys(json: &str) -> BTreeSet<String> {

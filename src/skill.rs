@@ -74,6 +74,19 @@ pub fn generate_cli_reference() -> String {
         }
         render_command(sub, "nuthatch", &mut out);
     }
+    out.push_str("\n## Exit status\n\n");
+    for code in crate::cli_error::Code::ALL {
+        out.push_str(&format!(
+            "- `{}` `{}`: {}\n",
+            code.exit_code(),
+            code.as_str(),
+            code.next()
+        ));
+    }
+    out.push_str(
+        "\nWith `--json`, an error is one object on stderr: \
+         `{\"error\": {\"code\", \"exit\", \"message\", \"next\"}}`. 0 is success.\n",
+    );
     out
 }
 

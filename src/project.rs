@@ -19,23 +19,171 @@ use nuthatch_scaffold::resolve::{
 
 const DISCORD: &str = "https://discord.gg/p9Xc45txWa";
 
+/// Set by `--json`, whose object is then the only thing on stdout.
+static PROSE_ON_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A line of `init`/`add`/`schema` prose: stdout, or stderr under `--json`.
+pub(crate) fn say(line: std::fmt::Arguments) {
+    if PROSE_ON_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+macro_rules! say {
+    () => {
+        say(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        say(format_args!($($arg)*))
+    };
+}
+
+fn prose_on_stderr(json: bool) {
+    PROSE_ON_STDERR.store(json, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What `init` or `add` learned that the files it wrote do not record.
+#[derive(Debug, Default)]
+struct Scaffolded {
+    next: Vec<String>,
+    /// The proxy history check per alias this run made: `Some` warning, or `None` for clean. An alias
+    /// absent here was not checked, and the nest records nothing that would say.
+    proxy_checks: std::collections::BTreeMap<String, Option<String>>,
+}
+
+impl Scaffolded {
+    fn next(command: String) -> Self {
+        Scaffolded {
+            next: vec![command],
+            ..Default::default()
+        }
+    }
+
+    /// The `--json` object, read back from the nest as written.
+    fn report(&self, dir: &Path, before: &Files) -> Result<serde_json::Value> {
+        let config = Config::load(dir)?;
+        // From the config and ABIs, as schema.json is written: a nest from `init --from` need not
+        // carry one, and writing it there would move the NID of the nest just copied.
+        let (_, schema) = nest_tables(dir, &config)?;
+        let mut tables: Vec<&str> = schema.iter().map(|t| t.table.as_str()).collect();
+        tables.sort_unstable();
+        let contracts: Vec<serde_json::Value> = config
+            .contracts
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "address": c.address,
+                    "alias": c.alias,
+                    "deployment_block": c.start_block,
+                    "proxy_checked": self.proxy_checks.contains_key(&c.alias),
+                    "proxy_warning": self.proxy_checks.get(&c.alias).cloned().flatten(),
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({
+            "nest_dir": std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()),
+            "name": config.nest.name,
+            "chain": config.nest.chain,
+            "chain_id": config.nest.chain_id,
+            "contracts": contracts,
+            "tables": tables,
+            "files_written": before.written_since(dir),
+            "next": self.next,
+        }))
+    }
+}
+
+/// Each file under a nest directory with its length and modification time, so a later look can say
+/// which were written. The store and sealed data are not the scaffold's.
+struct Files(std::collections::BTreeMap<String, (u64, Option<std::time::SystemTime>)>);
+
+impl Files {
+    /// Only `--json` reports what was written, so only `--json` pays for the walk.
+    fn when(json: bool, dir: &Path) -> Option<Self> {
+        json.then(|| Files::under(dir))
+    }
+
+    fn under(dir: &Path) -> Self {
+        fn walk(
+            root: &Path,
+            at: &Path,
+            out: &mut std::collections::BTreeMap<String, (u64, Option<std::time::SystemTime>)>,
+        ) {
+            let Ok(entries) = std::fs::read_dir(at) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else {
+                    continue;
+                };
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if matches!(
+                    rel.as_str(),
+                    "segments" | "data" | ".git" | crate::config::DB_FILE
+                ) {
+                    continue;
+                }
+                if meta.is_dir() {
+                    walk(root, &path, out);
+                } else {
+                    out.insert(rel, (meta.len(), meta.modified().ok()));
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        walk(dir, dir, &mut files);
+        Files(files)
+    }
+
+    fn written_since(&self, dir: &Path) -> Vec<String> {
+        Files::under(dir)
+            .0
+            .into_iter()
+            .filter(|(path, seen)| self.0.get(path) != Some(seen))
+            .map(|(path, _)| path)
+            .collect()
+    }
+}
+
 pub async fn init(args: InitArgs) -> Result<()> {
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
-    scaffold(args).await?;
-    println!("help:  {DISCORD}   (stuck, or something missing? say so here)");
-    count.ask().await; // RFC-0054 hook
+    prose_on_stderr(args.json);
+    let dir = target_dir(&args);
+    let before = Files::when(args.json, &dir);
+    let done = scaffold(args).await?;
+    say!("help:  {DISCORD}   (stuck, or something missing? say so here)");
+    count.ask(before.is_some()).await; // RFC-0054 hook
+    if let Some(before) = &before {
+        println!("{}", done.report(&dir, before)?);
+    }
     Ok(())
 }
 
-async fn scaffold(args: InitArgs) -> Result<()> {
+async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     refuse_inapplicable(&args)?;
     // Three ways to start a nest: clone/copy a published one (`--from`), port a subgraph
     // (`--from-subgraph`), or resolve from addresses.
     if let Some(source) = args.from.clone() {
-        return init_from(&source, &target_dir(&args));
+        let target = target_dir(&args);
+        init_from(&source, &target)?;
+        return Ok(Scaffolded::next(format!(
+            "nuthatch dev --dir {}",
+            target.display()
+        )));
     }
     if let Some(source) = args.from_subgraph.clone() {
-        return init_from_subgraph(&source, &args).await;
+        init_from_subgraph(&source, &args).await?;
+        return Ok(Scaffolded::next(format!(
+            "nuthatch dev{}",
+            dir_hint(&args.dir)
+        )));
     }
     if args.addresses.is_empty() {
         bail!("provide one or more contract addresses, --from <git-url|dir>, or --from-subgraph <cid>");
@@ -83,21 +231,23 @@ async fn scaffold(args: InitArgs) -> Result<()> {
     let mut aliases: Vec<String> = Vec::with_capacity(addresses.len());
     let mut undetected: Vec<String> = Vec::new();
     let used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut done = Scaffolded::default();
     for (i, address) in addresses.iter().enumerate() {
-        let (abi_json, implementation, contract_name) = match &overrides[i] {
+        let (abi_json, implementation, contract_name, proxy_known) = match &overrides[i] {
             Some(path) => {
-                println!("→ using local ABI {path} for {address}");
+                say!("→ using local ABI {path} for {address}");
                 let (abi, name) = read_local_abi(path)?;
-                (abi, None, name)
+                (abi, None, name, false)
             }
             None => {
-                println!("→ resolving ABI for {address} on {}…", chain.name);
+                say!("→ resolving ABI for {address} on {}…", chain.name);
                 let resolved =
                     resolve_abi(&rpc, chain.chain_id, address, args.explorer.as_deref()).await?;
                 (
                     resolved.abi,
                     resolved.implementation,
                     resolved.contract_name,
+                    resolved.proxy_known,
                 )
             }
         };
@@ -106,14 +256,22 @@ async fn scaffold(args: InitArgs) -> Result<()> {
             .as_deref()
             .or_else(|| contract_name_from_abi(&abi_json));
         let alias = pick_alias(provided, name, &used, &aliases)?;
-        println!("  · alias {alias}");
+        say!("  · alias {alias}");
         aliases.push(alias);
         let alias = aliases.last().unwrap();
 
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
+        // A local ABI, a failed slot read or an unresolved implementation ABI leave nothing to compare.
+        if proxy_known {
+            if let Some(check) =
+                report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
+                    .await
+            {
+                done.proxy_checks.insert(alias.clone(), check);
+            }
+        }
 
         // Does the ABI we just vendored actually decode what this address emits? Best-effort and
         // never fatal - but loud when the answer is no, because the alternative is a nest that
@@ -157,7 +315,7 @@ async fn scaffold(args: InitArgs) -> Result<()> {
         .map(|r| r.skipped_anonymous())
         .unwrap_or(0);
 
-    println!(
+    say!(
         "{}",
         scaffold_summary(
             &config.nest.name,
@@ -167,17 +325,15 @@ async fn scaffold(args: InitArgs) -> Result<()> {
             &dir.display().to_string(),
         )
     );
-    println!("    nuthatch.toml              config");
-    println!("    abis/                      resolved ABIs");
-    println!("    schema.json                decoded tables + columns");
-    println!("    semantic.toml              what the data means (edit freely)");
-    println!("    views/                     authored SQL derivations (a commented starter to uncomment)");
-    println!("    llms.txt                   how an AI agent queries this index");
-    println!(
-        "    AGENTS.md                  how a coding agent runs, queries and wires up this nest"
-    );
-    println!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
-    println!();
+    say!("    nuthatch.toml              config");
+    say!("    abis/                      resolved ABIs");
+    say!("    schema.json                decoded tables + columns");
+    say!("    semantic.toml              what the data means (edit freely)");
+    say!("    views/                     authored SQL derivations (a commented starter to uncomment)");
+    say!("    llms.txt                   how an AI agent queries this index");
+    say!("    AGENTS.md                  how a coding agent runs, queries and wires up this nest");
+    say!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
+    say!();
     // The line a person copies. On a long history (#1607) it is the last fifteen windows, which
     // the bundled public RPCs can serve.
     let step = next_step(
@@ -186,21 +342,22 @@ async fn scaffold(args: InitArgs) -> Result<()> {
         tip,
         chain.log_window,
     );
-    println!("next:  {}", step.command);
+    say!("next:  {}", step.command);
     if let Some(note) = step.note {
-        println!("       {note}");
+        say!("       {note}");
     }
-    println!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
+    say!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
     if let Some(note) = chains::keyless_caveat(
         &chain.name,
         &config.nest.rpc_urls,
         config.nest.block_timestamps,
     ) {
-        println!();
-        println!("note:  {note}");
+        say!();
+        say!("note:  {note}");
     }
-    Ok(())
+    done.next = vec![step.command, "nuthatch mcp".to_string()];
+    Ok(done)
 }
 
 /// `nuthatch add 0xAnother` - grow an existing nest with more contracts without re-`init`. This is
@@ -211,6 +368,9 @@ async fn scaffold(args: InitArgs) -> Result<()> {
 /// indexed rather than leave `dev` to refuse its data (#2685).
 pub async fn add(args: AddArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
+    prose_on_stderr(args.json);
+    let before = Files::when(args.json, &dir);
+    let mut done = Scaffolded::default();
     let mut config = Config::load(&dir).with_context(|| {
         format!(
             "no nest at '{}' (run `nuthatch init` first, or pass --dir)",
@@ -259,20 +419,21 @@ pub async fn add(args: AddArgs) -> Result<()> {
     let mut new_aliases: Vec<String> = Vec::with_capacity(new_addresses.len());
     let mut undetected: Vec<String> = Vec::new();
     for (i, address) in new_addresses.iter().enumerate() {
-        let (abi_json, implementation, contract_name) = match &overrides[i] {
+        let (abi_json, implementation, contract_name, proxy_known) = match &overrides[i] {
             Some(path) => {
-                println!("→ using local ABI {path} for {address}");
+                say!("→ using local ABI {path} for {address}");
                 let (abi, name) = read_local_abi(path)?;
-                (abi, None, name)
+                (abi, None, name, false)
             }
             None => {
-                println!("→ resolving ABI for {address} on {}…", chain.name);
+                say!("→ resolving ABI for {address} on {}…", chain.name);
                 let resolved =
                     resolve_abi(&rpc, chain.chain_id, address, args.explorer.as_deref()).await?;
                 (
                     resolved.abi,
                     resolved.implementation,
                     resolved.contract_name,
+                    resolved.proxy_known,
                 )
             }
         };
@@ -283,7 +444,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
             .as_deref()
             .or_else(|| contract_name_from_abi(&abi_json));
         let alias = pick_alias(provided, name, &used, &new_aliases)?;
-        println!("  · alias {alias}");
+        say!("  · alias {alias}");
         new_aliases.push(alias);
         let alias = new_aliases.last().unwrap();
         let abi_path = format!("abis/{alias}.json");
@@ -296,7 +457,15 @@ pub async fn add(args: AddArgs) -> Result<()> {
         let start_block =
             resolve_contract_start(&rpc, address, tip, start_blocks[i], &mut undetected).await;
 
-        report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias).await;
+        // A local ABI, a failed slot read or an unresolved implementation ABI leave nothing to compare.
+        if proxy_known {
+            if let Some(check) =
+                report_proxy_history_gap(&rpc, implementation.as_deref(), start_block, tip, alias)
+                    .await
+            {
+                done.proxy_checks.insert(alias.clone(), check);
+            }
+        }
 
         report_abi_fit(
             check_abi_fits(&rpc, address, &abi_json, tip, start_block, chain.log_window).await,
@@ -316,18 +485,22 @@ pub async fn add(args: AddArgs) -> Result<()> {
     config.save(&dir)?;
     let table_count = write_nest_artifacts(&dir, &chain.name, &config, AgentDocs::Rewrite)?;
 
-    println!(
+    say!(
         "✓ added {} contract(s); nest '{}' now has {} contract(s), {} table(s)",
         new_addresses.len(),
         config.nest.name,
         config.contracts.len(),
         table_count,
     );
-    println!(
+    say!(
         "next:  nuthatch dev{}   (backfills every contract from deployment)",
         dir_hint(&args.dir)
     );
     print_undetected_start_blocks(&undetected);
+    if let Some(before) = &before {
+        done.next = vec![format!("nuthatch dev{}", dir_hint(&args.dir))];
+        println!("{}", done.report(&dir, before)?);
+    }
     Ok(())
 }
 
@@ -360,10 +533,16 @@ fn refuse_an_indexed_nest(dir: &Path, config: &Config, addresses: &[String]) -> 
 /// the auto path never saw. Idempotent: authored views and semantic descriptions are preserved.
 pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
+    prose_on_stderr(args.json);
+    let before = Files::when(args.json, &dir);
     let config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
     let n = write_nest_artifacts(&dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
-    println!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
+    say!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
+    if let Some(before) = &before {
+        let done = Scaffolded::next(format!("nuthatch dev{}", dir_hint(&args.dir)));
+        println!("{}", done.report(&dir, before)?);
+    }
     Ok(())
 }
 
@@ -413,7 +592,7 @@ pub fn rename_alias(dir: &Path, old: &str, new: &str) -> Result<()> {
         crate::semantic::save(dir, &sem)?;
     }
     write_nest_artifacts(dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
-    println!("✓ renamed alias {old} → {new}");
+    say!("✓ renamed alias {old} → {new}");
     Ok(())
 }
 
@@ -494,12 +673,12 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let (raw, home) = sg::read_manifest(source, &gateways).await?;
     match &home {
         sg::ManifestHome::Local(dir) => {
-            println!(
+            say!(
                 "→ reading subgraph manifest {source} (local, ABIs resolve under {})…",
                 dir.display()
             )
         }
-        sg::ManifestHome::Remote => println!("→ fetching subgraph manifest {source}…"),
+        sg::ManifestHome::Remote => say!("→ fetching subgraph manifest {source}…"),
     }
     let manifest = sg::parse_manifest(&raw)?;
 
@@ -629,7 +808,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ));
         }
 
-        println!(
+        say!(
             "  ✓ {alias:<28} {address}  start={}  {} event(s)",
             ds.start_block
                 .map(|b| b.to_string())
@@ -818,11 +997,11 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
     let table_count = write_nest_artifacts(&dir, &chain.name, &config, AgentDocs::Rewrite)?;
 
     // ── the honest report ────────────────────────────────────────────────
-    println!(
+    say!(
         "\n✓ scaffolded nest '{}' from subgraph {source}",
         config.nest.name
     );
-    println!(
+    say!(
         "    {} contract(s), {} template(s), {} table(s) on {}",
         config.contracts.len(),
         config.templates.len(),
@@ -830,20 +1009,24 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         chain.name
     );
     for f in &inferred {
-        println!(
+        say!(
             "  ✓ factory: {}.{} → {} via `{}` ({})",
-            f.watch, f.event, f.template, f.child_param, f.because
+            f.watch,
+            f.event,
+            f.template,
+            f.child_param,
+            f.because
         );
     }
     for u in &unresolved {
         if u.candidates.is_empty() {
-            println!(
+            say!(
                 "  ⚠ template `{}` has no creating event in this manifest - it will index \
                  nothing until you add a [[factories]] rule",
                 u.template
             );
         } else {
-            println!(
+            say!(
                 "  ⚠ template `{}` needs a creating event; candidates:\n      {}",
                 u.template,
                 u.candidates.join("\n      ")
@@ -851,10 +1034,10 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         }
     }
     for n in &notes {
-        println!("  ⚠ {n}");
+        say!("  ⚠ {n}");
     }
     if !unresolved.is_empty() || !notes.is_empty() {
-        println!(
+        say!(
             "\n  The warnings above are work the manifest cannot do for us: which template a \
              factory creates lives in the mapping WASM, not in the manifest. Resolve them by \
              adding [[factories]] rules to nuthatch.toml."
@@ -864,7 +1047,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
         // Deliberately *not* filed with the warnings above, and deliberately not called "skipped":
         // the remedy is a different config block, and telling someone to write `[[factories]]` for a
         // file template sends them to a rule that cannot express it.
-        println!(
+        say!(
             "\n  {} `file/ipfs` template(s) - {} - index the *content* behind a CID. nuthatch \
              resolves those (RFC-0037), but which column carries the CID lives in the mapping WASM \
              rather than the manifest, so it needs one line each:\n\n    \
@@ -878,7 +1061,7 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ipfs_templates.join(", ")
         );
     }
-    println!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
+    say!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
     Ok(())
 }
 
@@ -1069,12 +1252,14 @@ enum AgentDocs {
     KeepExisting,
 }
 
-fn write_nest_artifacts(
+/// Every table the nest's config and ABIs produce: what schema.json is written from.
+fn nest_tables(
     dir: &Path,
-    chain_name: &str,
     config: &Config,
-    docs: AgentDocs,
-) -> Result<usize> {
+) -> Result<(
+    crate::registry::DecodeRegistry,
+    Vec<crate::registry::TableSchema>,
+)> {
     let registry = crate::registry::from_nest(dir, config)?;
     let mut schema = registry.schema();
     if config.extract.decodes_calls() {
@@ -1088,6 +1273,16 @@ fn write_nest_artifacts(
         schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
     }
     crate::indexer::refuse_duplicate_tables(&schema)?;
+    Ok((registry, schema))
+}
+
+fn write_nest_artifacts(
+    dir: &Path,
+    chain_name: &str,
+    config: &Config,
+    docs: AgentDocs,
+) -> Result<usize> {
+    let (registry, schema) = nest_tables(dir, config)?;
     let hash = decode_identity(dir, config, &registry)?;
     let schema_path = dir.join("schema.json");
     if !write_if_changed(&schema_path, nuthatch_scaffold::schema_json(hash, &schema)?)
@@ -1233,7 +1428,7 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
     }
 
     if is_git_source(source) {
-        println!("→ cloning nest from {source} …");
+        say!("→ cloning nest from {source} …");
         clone_repo(source, target)?;
         // Drop the clone's history: a consumed nest is a plain working copy, not a live checkout.
         let _ = std::fs::remove_dir_all(target.join(".git"));
@@ -1242,7 +1437,7 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         if !src.is_dir() {
             bail!("--from '{source}' is neither a git URL nor an existing local directory");
         }
-        println!("→ copying nest from {} …", src.display());
+        say!("→ copying nest from {} …", src.display());
         copy_dir_except(&src, target, &crate::blob::is_excluded)?;
     }
     // A clone keeps a committed symlink, which `dev` would refuse (#2355): say so now.
@@ -1258,7 +1453,7 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
     let factories = crate::factory::FactorySet::resolved(&config, &registry)
         .context("nest declares invalid factory/template rules")?;
 
-    println!(
+    say!(
         "✓ nest '{}' ready - {} on {}, {} contract(s), {} table(s), {} anonymous event(s) skipped",
         config.nest.name,
         source_basename(source),
@@ -1268,13 +1463,13 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         registry.skipped_anonymous(),
     );
     if !factories.is_empty() {
-        println!(
+        say!(
             "  factories: {} template(s), {} rule(s) - children discovered at runtime (RFC-0009)",
             config.templates.len(),
             config.factories.len(),
         );
     }
-    println!("next:  nuthatch dev --dir {}", target.display());
+    say!("next:  nuthatch dev --dir {}", target.display());
     Ok(())
 }
 
@@ -1375,6 +1570,9 @@ struct ResolvedAbi {
     implementation: Option<String>,
     /// Sourcify (or a wrapped ABI) sometimes names the contract. Used as the default alias (#774).
     contract_name: Option<String>,
+    /// Whether the proxy lookup reached a verdict the history check can rest on: not a proxy, or a
+    /// proxy whose implementation ABI is the one vendored.
+    proxy_known: bool,
 }
 
 async fn resolve_abi(
@@ -1384,17 +1582,20 @@ async fn resolve_abi(
     explorer: Option<&str>,
 ) -> Result<ResolvedAbi> {
     require_contract_code(rpc, chain_id, address).await?;
-    if let Some(implementation) = resolve_implementation(rpc, address).await {
-        println!("  · proxy → implementation {implementation}");
+    let lookup = resolve_implementation(rpc, address).await;
+    if let ProxyLookup::Implementation(implementation) = &lookup {
+        let implementation = implementation.clone();
+        say!("  · proxy → implementation {implementation}");
         if let Ok(resolved) = abi::resolve(chain_id, &implementation, explorer).await {
             print_abi_resolved(&resolved);
             return Ok(ResolvedAbi {
                 abi: resolved.abi,
                 implementation: Some(implementation),
                 contract_name: resolved.contract_name,
+                proxy_known: true,
             });
         }
-        println!("  · implementation ABI unresolved; using the proxy's own ABI");
+        say!("  · implementation ABI unresolved; using the proxy's own ABI");
     }
     let resolved = abi::resolve(chain_id, address, explorer)
         .await
@@ -1404,6 +1605,7 @@ async fn resolve_abi(
         abi: resolved.abi,
         implementation: None,
         contract_name: resolved.contract_name,
+        proxy_known: matches!(lookup, ProxyLookup::NotProxy),
     })
 }
 
@@ -1445,20 +1647,35 @@ fn abi_resolved_lines(resolved: &abi::Resolved) -> Vec<String> {
 
 fn print_abi_resolved(resolved: &abi::Resolved) {
     for line in abi_resolved_lines(resolved) {
-        println!("{line}");
+        say!("{line}");
     }
 }
 
-/// Follow the well-known proxy patterns to an implementation address, or `None` if `address` is not a
-/// recognised proxy. Direct-slot proxies (EIP-1967 / EIP-1822 / legacy zeppelinos) hold the impl
+/// What following the proxy patterns found at an address.
+#[derive(Debug, PartialEq)]
+enum ProxyLookup {
+    NotProxy,
+    Implementation(String),
+    /// A slot read failed, so "not a proxy" was never established.
+    Unread,
+}
+
+/// Follow the well-known proxy patterns to an implementation address, or `NotProxy` if `address` is
+/// not a recognised proxy. Direct-slot proxies (EIP-1967 / EIP-1822 / legacy zeppelinos) hold the impl
 /// address in a storage slot; an EIP-897 proxy exposes `implementation()` directly; a beacon proxy
 /// holds a beacon whose `implementation()` we then call.
-async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String> {
+async fn resolve_implementation(rpc: &RpcClient, address: &str) -> ProxyLookup {
+    // A call to `implementation()` reverts on most contracts, so only a failed storage read leaves
+    // the answer unknown.
+    let mut unread = false;
     for slot in PROXY_IMPL_SLOTS {
-        if let Ok(word) = rpc.get_storage_at(address, slot).await {
-            if let Some(implementation) = impl_from_slot(&word) {
-                return Some(implementation);
+        match rpc.get_storage_at(address, slot).await {
+            Ok(word) => {
+                if let Some(implementation) = impl_from_slot(&word) {
+                    return ProxyLookup::Implementation(implementation);
+                }
             }
+            Err(_) => unread = true,
         }
     }
     // EIP-897 / Aragon AppProxyUpgradeable: unlike a beacon, the proxy itself exposes the logic
@@ -1467,22 +1684,33 @@ async fn resolve_implementation(rpc: &RpcClient, address: &str) -> Option<String
     // standard storage slot was needlessly treated as a bespoke, unresolvable proxy.
     if let Ok(ret) = rpc.eth_call(address, IMPLEMENTATION_SELECTOR).await {
         if let Some(implementation) = impl_from_slot(&ret) {
-            return Some(implementation);
+            return ProxyLookup::Implementation(implementation);
         }
     }
     // Beacon proxy: the implementation is one hop further - the proxy points at a beacon, and the
     // beacon answers `implementation()`. Both the stored word and the call return are 32-byte,
     // left-padded addresses, so `impl_from_slot` decodes either.
-    if let Ok(word) = rpc.get_storage_at(address, PROXY_BEACON_SLOT).await {
-        if let Some(beacon) = impl_from_slot(&word) {
-            if let Ok(ret) = rpc.eth_call(&beacon, IMPLEMENTATION_SELECTOR).await {
-                if let Some(implementation) = impl_from_slot(&ret) {
-                    return Some(implementation);
+    match rpc.get_storage_at(address, PROXY_BEACON_SLOT).await {
+        Ok(word) => {
+            if let Some(beacon) = impl_from_slot(&word) {
+                match rpc.eth_call(&beacon, IMPLEMENTATION_SELECTOR).await {
+                    Ok(ret) => {
+                        if let Some(implementation) = impl_from_slot(&ret) {
+                            return ProxyLookup::Implementation(implementation);
+                        }
+                    }
+                    // A beacon is there, so its silence is not a verdict.
+                    Err(_) => unread = true,
                 }
             }
         }
+        Err(_) => unread = true,
     }
-    None
+    if unread {
+        ProxyLookup::Unread
+    } else {
+        ProxyLookup::NotProxy
+    }
 }
 
 /// What a sample of the contract's real logs says about the ABI we resolved for it.
@@ -1742,17 +1970,17 @@ async fn resolve_contract_start(
     undetected: &mut Vec<String>,
 ) -> Option<u64> {
     if let Some(b) = provided {
-        println!("  ✓ start block {b} (--start-block)");
+        say!("  ✓ start block {b} (--start-block)");
         return Some(b);
     }
     let tip = tip?;
     match detect_deploy_block(rpc, address, tip).await {
         Ok(b) => {
-            println!("  ✓ deployed at block {b}");
+            say!("  ✓ deployed at block {b}");
             Some(b)
         }
         Err(e) => {
-            println!("  · deployment block undetected ({e:#})");
+            say!("  · deployment block undetected ({e:#})");
             undetected.push(address.to_string());
             None
         }
@@ -1763,16 +1991,16 @@ fn print_undetected_start_blocks(undetected: &[String]) {
     if undetected.is_empty() {
         return;
     }
-    println!();
-    println!(
+    say!();
+    say!(
         "⚠ deployment block undetected for {} contract(s):",
         undetected.len()
     );
     for a in undetected {
-        println!("    {a}");
+        say!("    {a}");
     }
-    println!("  this nest will backfill a recent window, not those contracts' history.");
-    println!(
+    say!("  this nest will backfill a recent window, not those contracts' history.");
+    say!(
         "  re-run with --start-block <n,...> in the same order as the addresses, then `nuthatch dev`."
     );
 }
@@ -1872,36 +2100,42 @@ fn proxy_history_may_be_missing(proxy_start: u64, implementation_start: u64) -> 
 /// Warn about the current-implementation trap from #773. Resolving the current ABI correctly is not
 /// enough when the nest starts before that implementation existed: the old event names are absent
 /// from the registry, so their logs would be skipped while the cursor appears healthy.
+/// `Some` warning or `Some(None)` once checked; `None` when a block it needs could not be read.
 async fn report_proxy_history_gap(
     rpc: &RpcClient,
     implementation: Option<&str>,
     proxy_start: Option<u64>,
     tip: Option<u64>,
     alias: &str,
-) {
-    let (Some(implementation), Some(proxy_start), Some(tip)) = (implementation, proxy_start, tip)
-    else {
-        return;
+) -> Option<Option<String>> {
+    let Some(implementation) = implementation else {
+        return Some(None);
+    };
+    let (Some(proxy_start), Some(tip)) = (proxy_start, tip) else {
+        return None;
     };
     let Ok(implementation_start) = detect_deploy_block(rpc, implementation, tip).await else {
-        return;
+        return None;
     };
-    if proxy_history_may_be_missing(proxy_start, implementation_start) {
-        eprintln!();
-        eprintln!(
-            "  ⚠ {alias}: the proxy starts at block {proxy_start}, but its current implementation \
-             was deployed at block {implementation_start}."
-        );
-        eprintln!(
-            "    Events before block {implementation_start} may use earlier implementation ABIs and \
-             will not be decoded by this scaffold."
-        );
-        eprintln!(
-            "    Before trusting historical totals, add the earlier ABI as a second contract entry at the \
-             same address, with an `events` allowlist of the events the current ABI lacks."
-        );
-        eprintln!();
+    if !proxy_history_may_be_missing(proxy_start, implementation_start) {
+        return Some(None);
     }
+    let warning = format!(
+        "the proxy starts at block {proxy_start}, but its current implementation was deployed at \
+         block {implementation_start}"
+    );
+    eprintln!();
+    eprintln!("  ⚠ {alias}: {warning}.");
+    eprintln!(
+        "    Events before block {implementation_start} may use earlier implementation ABIs and \
+         will not be decoded by this scaffold."
+    );
+    eprintln!(
+        "    Before trusting historical totals, add the earlier ABI as a second contract entry at the \
+         same address, with an `events` allowlist of the events the current ABI lacks."
+    );
+    eprintln!();
+    Some(Some(warning))
 }
 
 fn is_empty_code(code: &str) -> bool {
@@ -1915,7 +2149,7 @@ fn is_empty_code(code: &str) -> bool {
 /// here", never a hard failure, so one flaky RPC can't veto detection.
 async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
     let probe = normalise_address(&addresses[0])?;
-    println!("→ no --chain given; probing known chains for {probe}…");
+    say!("→ no --chain given; probing known chains for {probe}…");
 
     let candidates = chains::all()
         .iter()
@@ -1938,7 +2172,7 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
         .map(|(c, _)| c.name)
         .collect();
     if !unreachable.is_empty() {
-        println!(
+        say!(
             "  ⚠ no answer from {} within {}s; pass --chain if the contract lives there",
             unreachable.join(", "),
             CHAIN_PROBE_TIMEOUT.as_secs()
@@ -1948,12 +2182,12 @@ async fn detect_chain(addresses: &[String]) -> Result<&'static chains::Chain> {
     match found.as_slice() {
         [] => Err(found_nowhere(&probe, &probed)),
         [only] => {
-            println!("  ✓ found on {}", only.name);
+            say!("  ✓ found on {}", only.name);
             Ok(only)
         }
         [first, rest @ ..] => {
             let others: Vec<&str> = rest.iter().map(|c| c.name).collect();
-            println!(
+            say!(
                 "  ✓ found on {} (also deployed on {} - pass --chain to pick another)",
                 first.name,
                 others.join(", ")
@@ -2007,7 +2241,7 @@ async fn detect_chain_on_rpc(
     rpc_urls: &[String],
 ) -> Result<chains::ResolvedChain> {
     let probe = normalise_address(&addresses[0])?;
-    println!("→ no --chain given; checking {probe} through the supplied RPC endpoint(s)…");
+    say!("→ no --chain given; checking {probe} through the supplied RPC endpoint(s)…");
     let rpc = RpcClient::new(rpc_urls.to_vec())?;
     let chain_id = rpc
         .chain_id()
@@ -2045,7 +2279,7 @@ async fn detect_chain_on_rpc(
             ),
         ));
     }
-    println!("  ✓ found on {}", chain.name);
+    say!("  ✓ found on {}", chain.name);
     Ok(chains::ResolvedChain {
         name: chain.name.to_string(),
         chain_id: chain.chain_id,
@@ -2153,6 +2387,38 @@ fn dir_hint(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_json_walks_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        assert!(Files::when(false, dir.path()).is_none());
+        assert_eq!(Files::when(true, dir.path()).unwrap().0.len(), 1);
+    }
+
+    /// The tables come from the config and ABIs, so a nest with no schema.json (a published one,
+    /// through `init --from`) still lists them, and an ABI that cannot be read is an error, not "no
+    /// tables".
+    #[test]
+    fn the_report_lists_tables_from_the_config_and_refuses_a_broken_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("abis")).unwrap();
+        std::fs::write(dir.path().join("abis/pool.json"), POOL_ABI).unwrap();
+        std::fs::write(
+            dir.path().join("nuthatch.toml"),
+            "[nest]\nname = \"t\"\nchain = \"mainnet\"\nchain_id = 1\nrpc_urls = []\n\n\
+             [[contracts]]\nalias = \"pool\"\naddress = \"0x00000000000000000000000000000000000000aa\"\n\
+             abi = \"abis/pool.json\"\n",
+        )
+        .unwrap();
+        let before = Files::under(dir.path());
+        let done = Scaffolded::default();
+        let v = done.report(dir.path(), &before).unwrap();
+        assert_eq!(v["tables"], serde_json::json!(["pool__transfer"]), "{v}");
+        assert!(!dir.path().join("schema.json").exists());
+        std::fs::write(dir.path().join("abis/pool.json"), "{not json").unwrap();
+        assert!(done.report(dir.path(), &before).is_err());
+    }
 
     /// A link in a nest directory is refused, not copied as the file it points at (#2692).
     #[cfg(unix)]
@@ -2525,6 +2791,7 @@ mod tests {
             start_block: Vec::new(),
             dir: dir.path().display().to_string(),
             rpc: vec!["http://127.0.0.1:1".into()],
+            json: false,
         })
         .await
         .unwrap_err();
@@ -3471,6 +3738,58 @@ abi = "abis/tok.json"
         (format!("http://{addr}"), handle)
     }
 
+    /// Answers `eth_getStorageAt` with `slot` (an error when `None`) and reverts every `eth_call`.
+    async fn fake_proxy_rpc(slot: Option<&'static str>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::State, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler(
+            State(slot): State<Option<&'static str>>,
+            Json(req): Json<Value>,
+        ) -> Json<Value> {
+            let id = req["id"].clone();
+            Json(match (req["method"].as_str(), slot) {
+                (Some("eth_getStorageAt"), Some(word)) => {
+                    json!({"jsonrpc": "2.0", "id": id, "result": word})
+                }
+                (Some("eth_getStorageAt"), None) => json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": -32602, "message": "invalid argument 1: hex string has odd length"}}),
+                _ => json!({"jsonrpc": "2.0", "id": id,
+                    "error": {"code": 3, "message": "execution reverted"}}),
+            })
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(slot);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// A failed slot read is not "not a proxy": the history check must not call it clean.
+    #[tokio::test]
+    async fn a_failed_slot_read_leaves_the_proxy_question_open() {
+        let address = "0x00000000000000000000000000000000000000aa";
+        let zero = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let pointer = "0x000000000000000000000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let lookup = |url: String| async move {
+            let rpc =
+                RpcClient::with_timeout(vec![url], std::time::Duration::from_secs(2)).unwrap();
+            resolve_implementation(&rpc, address).await
+        };
+        let (failing, _a) = fake_proxy_rpc(None).await;
+        assert_eq!(lookup(failing).await, ProxyLookup::Unread);
+        let (plain, _b) = fake_proxy_rpc(Some(zero)).await;
+        assert_eq!(lookup(plain).await, ProxyLookup::NotProxy);
+        let (proxy, _c) = fake_proxy_rpc(Some(pointer)).await;
+        assert!(matches!(
+            lookup(proxy).await,
+            ProxyLookup::Implementation(_)
+        ));
+    }
+
     /// Mainnet at block 0x10, answering `eth_getCode` with `code`.
     async fn fake_code_rpc(code: &'static str) -> (String, tokio::task::JoinHandle<()>) {
         use axum::{extract::State, routing::post, Json, Router};
@@ -3575,6 +3894,7 @@ abi = "abis/tok.json"
             rpc: vec![silent, good],
             dir: dir.path().join("nest").to_string_lossy().into_owned(),
             no_timestamps: false,
+            json: false,
         };
 
         let started = std::time::Instant::now();
@@ -3671,6 +3991,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            json: false,
         };
 
         init_from_subgraph(&source, &args)
@@ -3729,6 +4050,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            json: false,
         };
         let r = init_from_subgraph(&source, &args).await;
         (dir, r)
@@ -3922,6 +4244,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            json: false,
         };
 
         // Step 1: blind, this is the error the user actually hits - and the remedy it names.
