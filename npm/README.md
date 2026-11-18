@@ -3,6 +3,7 @@
 Runs [nuthatch](https://github.com/nuthatch-org/nuthatch), the self-hosted EVM indexer, from npm:
 
 ```sh
+mkdir usdc-nest && cd usdc-nest
 npx -y nuthatch-indexer init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc
 npx -y nuthatch-indexer dev --backfill 300
 claude mcp add nuthatch -- npx -y nuthatch-indexer mcp --url http://127.0.0.1:8288

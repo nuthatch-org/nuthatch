@@ -51,6 +51,14 @@ struct Scaffolded {
     /// The proxy history check per alias this run made: `Some` warning, or `None` for clean. An alias
     /// absent here was not checked, and the nest records nothing that would say.
     proxy_checks: std::collections::BTreeMap<String, Option<String>>,
+    /// Files the scaffold would have written that were already there, relative to the nest, so were
+    /// left as they were (or, for `AGENTS.md` and `.gitignore`, had a delimited section appended).
+    skipped: Vec<String>,
+    /// Existing files a delimited nuthatch section was appended to this run, as absolute paths.
+    appended: Vec<PathBuf>,
+    /// `--dir` was not given and the current directory is a repository with its own agent or ignore
+    /// file, so the nest went to `./nest`.
+    dir_defaulted: bool,
 }
 
 impl Scaffolded {
@@ -90,6 +98,9 @@ impl Scaffolded {
             "contracts": contracts,
             "tables": tables,
             "files_written": before.written_since(dir),
+            "files_skipped": self.skipped,
+            "files_appended": self.appended,
+            "dir_defaulted": self.dir_defaulted,
             "next": self.next,
         }))
     }
@@ -152,12 +163,24 @@ impl Files {
     }
 }
 
-pub async fn init(args: InitArgs) -> Result<()> {
+pub async fn init(mut args: InitArgs) -> Result<()> {
+    let defaulted = resolve_dir(&mut args, Path::new("."));
+    if defaulted {
+        say_early(args.json);
+    }
     let count = crate::count::Pending::of(&args); // RFC-0054 hook
     prose_on_stderr(args.json);
     let dir = target_dir(&args);
     let before = Files::when(args.json, &dir);
-    let done = scaffold(args).await?;
+    let mut done = scaffold(args).await?;
+    if defaulted {
+        done.dir_defaulted = true;
+        let more = adopt_host_files(Path::new("."), "nest")?;
+        for path in &more {
+            say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running does not repeat it)", path.display());
+        }
+        done.appended.extend(more);
+    }
     say!("help:  {DISCORD}   (stuck, or something missing? say so here)");
     count.ask(before.is_some()).await; // RFC-0054 hook
     if let Some(before) = &before {
@@ -189,6 +212,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         bail!("provide one or more contract addresses, --from <git-url|dir>, or --from-subgraph <cid>");
     }
     refuse_existing_nest(Path::new(&args.dir))?;
+    let existing = existing_scaffold_files(Path::new(&args.dir));
     // Chain identity: honour an explicit `--chain`, otherwise detect it. The first-run friction we
     // most want to delete is making the user know (and correctly spell) which chain their contract
     // is on - so when they don't say, we go and find out.
@@ -314,6 +338,8 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     let skipped = crate::registry::from_nest(&dir, &config)
         .map(|r| r.skipped_anonymous())
         .unwrap_or(0);
+    done.skipped = existing.clone();
+    done.appended = adopt_existing_files(&dir, &chain.name, &config, &existing)?;
 
     say!(
         "{}",
@@ -333,6 +359,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     say!("    llms.txt                   how an AI agent queries this index");
     say!("    AGENTS.md                  how a coding agent runs, queries and wires up this nest");
     say!("    .claude/skills/nuthatch/   Claude Code skill (offline, no phone-home)");
+    report_adoption(&done);
     say!();
     // The line a person copies. On a long history (#1607) it is the last fifteen windows, which
     // the bundled public RPCs can serve.
@@ -1313,6 +1340,191 @@ fn write_nest_artifacts(
     crate::semantic::save(dir, &sem)?;
 
     Ok(schema.len())
+}
+
+/// Opens and closes the section nuthatch appends to a file that is not its own, so a second run
+/// finds it and leaves the file alone.
+const SECTION_BEGIN: &str = "nuthatch:begin";
+const SECTION_END: &str = "nuthatch:end";
+
+/// The directory `init` writes to when `--dir` is not given: the current one, unless that is a
+/// non-empty git repository with its own `AGENTS.md` or `.gitignore`, where scaffolding at the root
+/// would skip both (#3025) and bury the repository's files under a nest's. Returns whether it chose
+/// `nest` for that reason. An explicit `--dir` (even `.`) is never second-guessed.
+fn resolve_dir(args: &mut InitArgs, cwd: &Path) -> bool {
+    if !args.dir.is_empty() {
+        return false;
+    }
+    let host = args.from.is_none() && in_host_repo(cwd);
+    args.dir = if host { "nest" } else { "." }.to_string();
+    host
+}
+
+/// Said before anything else, so it is the first thing a person sees.
+fn say_early(json: bool) {
+    prose_on_stderr(json);
+    say!(
+        "note:  this is a git repository with its own AGENTS.md or .gitignore, so the nest goes in \
+         ./nest (pass --dir . to scaffold here instead)"
+    );
+}
+
+fn in_host_repo(dir: &Path) -> bool {
+    dir.join(".git").exists()
+        && !dir.join(crate::config::CONFIG_FILE).exists()
+        && (dir.join("AGENTS.md").is_file() || dir.join(".gitignore").is_file())
+}
+
+/// Scaffold files that were already in `dir`, which the scaffold keeps rather than writes.
+fn existing_scaffold_files(dir: &Path) -> Vec<String> {
+    [
+        "AGENTS.md",
+        ".gitignore",
+        ".gitattributes",
+        "semantic.toml",
+        "views/README.md",
+        "views/10-example.sql",
+    ]
+    .into_iter()
+    .filter(|f| dir.join(f).is_file())
+    .map(String::from)
+    .collect()
+}
+
+/// Append a `begin`/`end`-delimited section to `path` unless one is there already. `html` picks
+/// Markdown's comment syntax over a `#` line. Returns whether the file changed.
+fn append_section(path: &Path, html: bool, body: &str) -> Result<bool> {
+    let mut text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if text.contains(SECTION_BEGIN) {
+        return Ok(false);
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    let what = "written by `nuthatch init`; safe to delete";
+    if html {
+        text.push_str(&format!(
+            "<!-- {SECTION_BEGIN}: {what} -->\n{body}<!-- {SECTION_END} -->\n"
+        ));
+    } else {
+        text.push_str(&format!(
+            "# {SECTION_BEGIN}: {what}\n{body}# {SECTION_END}\n"
+        ));
+    }
+    std::fs::write(path, text)
+        .with_context(|| format!("failed to append to {}", path.display()))?;
+    Ok(true)
+}
+
+/// Ignore rules for a nest at `prefix` (`""` inside the nest, `nest/` from the repository root).
+fn ignore_body(prefix: &str) -> String {
+    nuthatch_scaffold::GITIGNORE
+        .lines()
+        .map(|l| format!("{prefix}{l}\n"))
+        .collect()
+}
+
+/// An `AGENTS.md` or `.gitignore` that was already in the nest directory is the author's, so `init`
+/// appends a delimited nuthatch section to it instead of skipping it in silence (#3025). Idempotent:
+/// a section already there is left alone. Returns the files it appended to.
+fn adopt_existing_files(
+    dir: &Path,
+    chain: &str,
+    config: &Config,
+    existing: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut appended = Vec::new();
+    let had = |f: &str| existing.iter().any(|e| e == f);
+    let agents = dir.join(nuthatch_scaffold::AGENTS_MD);
+    // A file `init` wrote itself carries nuthatch's mark and is not the author's.
+    let authored = had("AGENTS.md")
+        && std::fs::read(&agents)
+            .is_ok_and(|b| !b.starts_with(nuthatch_scaffold::AGENTS_MD_MARK.as_bytes()));
+    if authored {
+        let (_, schema) = nest_tables(dir, config)?;
+        let contracts: Vec<(&str, &str)> = config
+            .contracts
+            .iter()
+            .map(|c| (c.alias.as_str(), c.address.as_str()))
+            .collect();
+        let full = nuthatch_scaffold::agents_md(chain, &contracts, &schema);
+        // Minus the "written by nuthatch" mark and the title: this is a section of someone's file,
+        // so its headings go one level down.
+        let body: String = full
+            .lines()
+            .skip_while(|l| *l != "# AGENTS.md")
+            .skip(1)
+            .map(|l| match l.strip_prefix("## ") {
+                Some(h) => format!("### {h}\n"),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        let body = format!("## Nuthatch nest\n{body}");
+        if append_section(&agents, true, &body)? {
+            appended.push(agents);
+        }
+    }
+    if had(".gitignore") {
+        let ignore = dir.join(".gitignore");
+        if append_section(&ignore, false, &ignore_body(""))? {
+            appended.push(ignore);
+        }
+    }
+    Ok(appended
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect())
+}
+
+/// The repository around a nest `init` put in `./<sub>`: a pointer in its `AGENTS.md`, and the nest's
+/// store and sealed data in its `.gitignore`. Returns the files it appended to.
+fn adopt_host_files(host: &Path, sub: &str) -> Result<Vec<PathBuf>> {
+    let mut appended = Vec::new();
+    let agents = host.join("AGENTS.md");
+    if agents.is_file() {
+        let body = format!(
+            "## Nuthatch nest\n\nThe `{sub}/` directory is a nuthatch nest: a local SQL index of its contracts. Read\n`{sub}/AGENTS.md` before running or querying it, and query it with\n`nuthatch sql --dir {sub} \"...\" --json` rather than a third-party API.\n"
+        );
+        if append_section(&agents, true, &body)? {
+            appended.push(agents);
+        }
+    }
+    let ignore = host.join(".gitignore");
+    if ignore.is_file() && append_section(&ignore, false, &ignore_body(&format!("{sub}/")))? {
+        appended.push(ignore);
+    }
+    Ok(appended
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect())
+}
+
+/// What `init` did with files that were there already, in the prose a person reads.
+fn report_adoption(done: &Scaffolded) {
+    for path in &done.appended {
+        say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running does not repeat it)", path.display());
+    }
+    let kept: Vec<&str> = done
+        .skipped
+        .iter()
+        .map(String::as_str)
+        .filter(|f| {
+            !done
+                .appended
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == *f))
+        })
+        .collect();
+    if !kept.is_empty() {
+        say!(
+            "note:  already there, so left as they were: {}",
+            kept.join(", ")
+        );
+    }
 }
 
 /// Scaffold the `views/` logic layer (RFC-0018 §1b) with a commented, ready-to-uncomment starter view

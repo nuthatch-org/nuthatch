@@ -22,7 +22,10 @@ nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth
 ```
 
 - `init` resolves the ABI, detects the chain and writes the nest into the current directory
-  (`--dir` to choose). Omit `--chain` unless detection picks wrong. It runs without a prompt when
+  (`--dir` to choose), so run it in a directory of its own, never `$HOME`. In a git repository that
+  already has an `AGENTS.md` or `.gitignore` it writes to `./nest` instead and says so; an existing
+  `AGENTS.md` or `.gitignore` in the target gets a delimited nuthatch section appended once, and
+  `--json` lists `files_skipped` and `files_appended`. Omit `--chain` unless detection picks wrong. It runs without a prompt when
   stdin is not a terminal.
 - The bundled public RPCs are for trying it out. Use your own with `--rpc`, on `init` or `dev`.
 - More contracts: `nuthatch init 0xA 0xB --alias a,b`, or `nuthatch add 0xC` in an existing nest.

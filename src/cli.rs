@@ -1403,9 +1403,13 @@ pub struct InitArgs {
     #[arg(long)]
     pub rpc: Vec<String>,
 
-    /// Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the
-    /// nest's own name).
-    #[arg(long, default_value = ".")]
+    /// Directory to scaffold into. Defaults to the current directory; for `--from`, to the nest's own
+    /// name; and in a git repository that already has an `AGENTS.md` or `.gitignore`, to `./nest`
+    /// (`init` says so), so the repository's own files are not skipped. `--dir .` scaffolds in place.
+    ///
+    /// An `AGENTS.md` or `.gitignore` already in the directory gets a delimited nuthatch section
+    /// appended (once; a re-run does not repeat it) rather than being skipped.
+    #[arg(long, default_value = "", hide_default_value = true)]
     pub dir: String,
 
     /// Deployment start block per address, in the same order as the addresses (comma-separated).
@@ -1434,8 +1438,9 @@ pub struct InitArgs {
     pub no_timestamps: bool,
 
     /// Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias,
-    /// deployment block, proxy warning), `tables`, `files_written` and `next`, the commands to run
-    /// next. The progress lines go to stderr, and an error is one JSON object there.
+    /// deployment block, proxy warning), `tables`, `files_written`, `files_skipped` (scaffold files that were
+    /// already there and kept), `files_appended` (existing files given a nuthatch section),
+    /// `dir_defaulted` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there.
     #[arg(long)]
     pub json: bool,
 }

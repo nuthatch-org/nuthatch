@@ -6,6 +6,7 @@ keys in [config-reference.md](config-reference.md).
 ## Index one contract (the happy path)
 
 ```sh
+mkdir usdc-nest && cd usdc-nest
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # chain auto-detected
 nuthatch dev --backfill 300    # the last 300 blocks; omit to backfill from deployment
 nuthatch sql "SELECT count(*) FROM usdc__transfer"
@@ -27,7 +28,7 @@ to dodge public-RPC limits.
 Pass multiple addresses to `init`, or grow a nest that has not indexed yet with `add`:
 
 ```sh
-nuthatch init 0xUSDC 0xWETH --alias usdc,weth
+nuthatch init 0xUSDC 0xWETH --alias usdc,weth   # in a nest directory of its own, not $HOME
 # …later…
 nuthatch add 0xDAI --alias dai        # resolves the ABI, appends to nuthatch.toml, regenerates artifacts
 ```

@@ -18,6 +18,7 @@ are node self-protection, not obstacles to remove.
 ## The 90-second happy path
 
 ```sh
+mkdir usdc-nest && cd usdc-nest
 nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc   # USDC - chain auto-detected
 nuthatch dev --backfill 300   # the last 300 blocks, follow the tip, serve an API on :8288
 nuthatch sql "SELECT count(*), sum(value_dec) FROM usdc__transfer WHERE NOT value_overflow"
