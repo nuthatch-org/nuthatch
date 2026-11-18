@@ -19,6 +19,7 @@ Add another contract to a nest that has not indexed yet - resolve its ABI and gr
 - `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Same shape as `init --start-block`
 - `--dir <DIR>` - The nest directory to grow (must contain a nuthatch.toml). Defaults to the current directory
 - `--rpc <RPC>` - Use only these RPC URL(s) for ABI/deploy-block resolution (repeatable). Point at your own node to avoid public-RPC limits
+- `--json` - Print one JSON object on stdout, the shape `init --json` prints. The progress lines go to stderr, and an error is one JSON object there
 
 ## `nuthatch audit`
 
@@ -229,6 +230,7 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--dir <DIR>` - Directory to scaffold into (defaults to the current directory; for `--from`, defaults to the nest's own name)
 - `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Skips the RPC probe for that address. An empty entry still probes
 - `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
+- `--json` - Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias, deployment block, proxy warning), `tables`, `files_written` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there
 
 ## `nuthatch labels`
 
@@ -489,6 +491,7 @@ List the available derive-first recipes
 Regenerate the derived artifacts (`schema.json`, `llms.txt`, `semantic.toml` footguns) from `nuthatch.toml` - run after hand-editing the config (e.g. adding a factory `[[template]]`), so the schema and the derived `*_dec` columns match the tables the config now produces
 
 - `--dir <DIR>` - Nest directory (must contain a `nuthatch.toml`)
+- `--json` - Print one JSON object on stdout: the nest, its tables, the files written, and what to run next. The progress lines go to stderr
 
 ## `nuthatch seed`
 
@@ -548,6 +551,8 @@ Watch a running nest from the terminal: the tip, the seal, memory against its bu
 - `--replay <REPLAY>` - Draw from a recording made with --record instead of a live nest
 - `--speed <SPEED>` - Replay at this multiple of the recorded pace
 - `--exit-after <EXIT_AFTER>` - Stop after this many seconds
+- `--once` - Read once, print one line per nest, and exit: the status of a running nest for a script. Fails with `nest_not_running` when nothing answers
+- `--json` - With --once, print one JSON object instead: `url`, and the bodies of `/ready`, `/` and `/nests`, with each mount's `/ready` under `mounts`
 
 ## `nuthatch worker`
 
@@ -562,3 +567,17 @@ Run a **writer worker** for scaled mode (RFC-0022 §2; scaled build only): recon
 - `--registry <REGISTRY>` - Registry to pull declared nests from when they are not under `--nest-root` (RFC-0019)
 - `--nest-cache <NEST_CACHE>` - Where pulled nests are cached. Written to; keep it off the read-only `--nest-root` mount
 - `--no-secrets` - Skip fetching runtime secrets for assigned nests (RFC-0022 §5)
+
+## Exit status
+
+- `1` `error`: read the message; `nuthatch <command> --help` lists the flags
+- `2` `usage`: run `nuthatch <command> --help` for the flags it takes
+- `3` `no_nest`: run `nuthatch init 0xADDRESS` here, or pass --dir with the nest's directory
+- `4` `nest_not_running`: run `nuthatch dev` in the nest's directory, or pass --url to a running one
+- `5` `sql_invalid`: fix the query: `SELECT table_name FROM information_schema.tables` lists the tables
+- `6` `abi_not_found`: pass --abi path/to/abi.json, or set ETHERSCAN_API_KEY for a verified contract
+- `7` `chain_not_detected`: pass --chain <name>, or --rpc with an endpoint on its chain
+- `8` `rpc_refused`: pass --rpc with an endpoint that answers; `nuthatch doctor --rpc <url>` probes one
+- `9` `rpc_range_too_wide`: `nuthatch doctor --rpc <url>` prints the largest safe --window; pass it to dev
+
+With `--json`, an error is one object on stderr: `{"error": {"code", "exit", "message", "next"}}`. 0 is success.

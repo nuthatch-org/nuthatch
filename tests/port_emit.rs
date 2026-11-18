@@ -67,6 +67,7 @@ template = "pool"
     std::fs::write(dir.join("nuthatch.toml"), toml).unwrap();
     nuthatch::project::regen(nuthatch::cli::SchemaArgs {
         dir: dir.display().to_string(),
+        json: false,
     })
     .expect("regen nest artifacts");
 }
@@ -962,6 +963,7 @@ events = ["PoolCreated", "TokenUpdated"]
     .unwrap();
     nuthatch::project::regen(nuthatch::cli::SchemaArgs {
         dir: nest.path().display().to_string(),
+        json: false,
     })
     .expect("regen nest artifacts");
 

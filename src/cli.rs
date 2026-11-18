@@ -1197,6 +1197,11 @@ pub struct SchemaArgs {
     /// Nest directory (must contain a `nuthatch.toml`).
     #[arg(long, default_value = ".")]
     pub dir: String,
+
+    /// Print one JSON object on stdout: the nest, its tables, the files written, and what to run
+    /// next. The progress lines go to stderr.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -1425,6 +1430,12 @@ pub struct InitArgs {
     /// and time-series questions ("per day", "per hour") cannot be asked without it.
     #[arg(long)]
     pub no_timestamps: bool,
+
+    /// Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias,
+    /// deployment block, proxy warning), `tables`, `files_written` and `next`, the commands to run
+    /// next. The progress lines go to stderr, and an error is one JSON object there.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -1470,6 +1481,11 @@ pub struct AddArgs {
     /// node to avoid public-RPC limits.
     #[arg(long)]
     pub rpc: Vec<String>,
+
+    /// Print one JSON object on stdout, the shape `init --json` prints. The progress lines go to
+    /// stderr, and an error is one JSON object there.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]

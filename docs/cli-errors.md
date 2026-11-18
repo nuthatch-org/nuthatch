@@ -41,3 +41,21 @@ case $? in
   5) echo "fix the query" ;;
 esac
 ```
+
+## Output a script can read
+
+These commands print one JSON object on stdout with `--json`, and move the lines a person reads to
+stderr:
+
+- `nuthatch init 0xADDR --json` and `nuthatch add 0xADDR --json`: `nest_dir`, `name`, `chain`,
+  `chain_id`, `contracts` (each with `address`, `alias`, `deployment_block` and `proxy_warning`),
+  `tables`, `files_written` and `next`, the commands to run next.
+- `nuthatch schema --json`: the same object, after the artifacts are regenerated.
+- `nuthatch watch --once --json`: the running nest's own `/ready`, `/` and `/nests` answers, as
+  `ready`, `summary` and `nests`, with each mount's `/ready` under `mounts`. Nothing answering is
+  `nest_not_running`.
+- `nuthatch sql "..." --json`: one row per line, as before.
+
+```sh
+nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --json | jq .tables
+```

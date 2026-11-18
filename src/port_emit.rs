@@ -304,6 +304,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     config.save(nest)?;
     crate::project::regen(crate::cli::SchemaArgs {
         dir: nest.display().to_string(),
+        json: false,
     })?;
 
     // The real decoded columns, so a mapped column name is *resolved* rather than guessed (#1250).

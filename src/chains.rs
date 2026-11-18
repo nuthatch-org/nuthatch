@@ -101,10 +101,10 @@ pub async fn resolve(name: &str, rpc_urls: &[String]) -> anyhow::Result<Resolved
         .map_err(|e| crate::cli_error::tag(crate::cli_error::Code::RpcRefused, e))?;
     // A provider's own name for a registered chain keeps the registry's policy, on the caller's RPC (#2686).
     if let Some(c) = lookup_by_id(chain_id) {
-        println!(
+        crate::project::say(format_args!(
             "chain_id {chain_id} is '{}' in the built-in registry; using that name",
             c.name
-        );
+        ));
         return Ok(ResolvedChain {
             rpc_urls: rpc_urls.to_vec(),
             ..c.into()

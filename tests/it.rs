@@ -49,6 +49,8 @@ mod doc_command_check;
 mod e2e_bare_help;
 #[path = "e2e_cli_errors.rs"]
 mod e2e_cli_errors;
+#[path = "e2e_cli_json.rs"]
+mod e2e_cli_json;
 #[path = "e2e_cli_output.rs"]
 mod e2e_cli_output;
 #[path = "e2e_crash_safety.rs"]
