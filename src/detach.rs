@@ -25,6 +25,8 @@ struct Record {
     log: PathBuf,
     /// The executable spawned, which is what identifies the process later, whatever it is named.
     exe: PathBuf,
+    /// When it started, so a later process given the same pid is not taken for it.
+    started: u64,
 }
 
 /// `$XDG_STATE_HOME/nuthatch/dev/<hash of the nest's path>/`, else under `~/.local/state`.
@@ -98,30 +100,94 @@ fn read_record(state: &Path) -> Option<Record> {
 /// What the pid in a record is now. A recycled pid running something else is not ours to stop.
 #[derive(Debug, PartialEq)]
 enum Identity {
+    /// No such process, a zombie, another user's, or a later process given the same pid.
     Gone,
-    /// Running the executable the record names.
+    /// The process started then, running the executable the record names.
     Ours,
     Other(PathBuf),
-    /// Alive, and what it runs could not be read: never signalled on a guess.
+    /// The process started then, and what it runs could not be read: never signalled on a guess.
     Unconfirmed(String),
 }
 
-fn identify(pid: u32, exe: &Path) -> Identity {
+fn identify(pid: u32, exe: &Path, started: u64) -> Identity {
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
         return Identity::Gone;
     };
     // SAFETY: signal 0 checks for the process without sending anything.
     if unsafe { libc::kill(pid_t, 0) } != 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::EPERM) => Identity::Unconfirmed("it belongs to another user".into()),
-            _ => Identity::Gone,
-        };
+        // EPERM is a process of another user, which this user did not start.
+        return Identity::Gone;
+    }
+    match process_start(pid_t) {
+        Ok(Some(t)) if t == started => {}
+        Ok(_) => return Identity::Gone,
+        Err(why) => return Identity::Unconfirmed(why),
     }
     match executable_of(pid_t) {
         Ok(path) if same_executable(&path, exe) => Identity::Ours,
         Ok(path) => Identity::Other(path),
         Err(why) => Identity::Unconfirmed(why),
     }
+}
+
+/// When the process started, in the kernel's own units, or `None` for a zombie: it has exited, and
+/// waits only for a parent that may never reap it.
+#[cfg(target_os = "linux")]
+fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|e| format!("/proc/{pid}/stat could not be read: {e}"))?;
+    // The command name may hold spaces and parentheses; the fields after its last `)` do not.
+    let rest = stat
+        .rsplit_once(')')
+        .map(|(_, r)| r)
+        .ok_or_else(|| format!("/proc/{pid}/stat has no command name"))?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // Field 3 is the state, field 22 the start time in clock ticks since boot.
+    if fields.first() == Some(&"Z") {
+        return Ok(None);
+    }
+    fields
+        .get(19)
+        .and_then(|t| t.parse().ok())
+        .map(Some)
+        .ok_or_else(|| format!("/proc/{pid}/stat has no start time"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is a proc_bsdinfo, and its size is the size passed.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if n != size {
+        let err = std::io::Error::last_os_error();
+        // A zombie answers kill(pid, 0), and proc_pidinfo no longer finds it.
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(format!("proc_pidinfo failed: {err}"));
+    }
+    // SAFETY: proc_pidinfo filled all of it.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_status == libc::SZOMB {
+        return Ok(None);
+    }
+    Ok(Some(
+        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_start(_: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+    Err("this platform gives no way to read when a process started".into())
 }
 
 fn same_executable(running: &Path, recorded: &Path) -> bool {
@@ -164,7 +230,15 @@ fn executable_of(_: libc::pid_t) -> std::result::Result<PathBuf, String> {
 /// The record's process, if it is still ours. One that cannot be identified stops the command:
 /// neither a second start nor a signal is safe on a guess.
 fn still_ours(record: &Record, record_path: &Path) -> Result<bool> {
-    match identify(record.pid, &record.exe) {
+    verdict(
+        identify(record.pid, &record.exe, record.started),
+        record,
+        record_path,
+    )
+}
+
+fn verdict(identity: Identity, record: &Record, record_path: &Path) -> Result<bool> {
+    match identity {
         Identity::Ours => Ok(true),
         Identity::Gone | Identity::Other(_) => Ok(false),
         Identity::Unconfirmed(why) => bail!(
@@ -177,6 +251,37 @@ fn still_ours(record: &Record, record_path: &Path) -> Result<bool> {
             record_path.display()
         ),
     }
+}
+
+/// How long a child that is not yet serving gets to finish after SIGTERM.
+const TERM_GRACE: Duration = Duration::from_secs(10);
+
+#[derive(Debug, PartialEq)]
+enum Stopped {
+    Exited,
+    Killed,
+}
+
+/// SIGTERM, as `stop` sends, and SIGKILL only if the child has not exited within [`TERM_GRACE`].
+fn stop_child(child: &mut std::process::Child) -> Stopped {
+    stop_child_within(child, TERM_GRACE)
+}
+
+fn stop_child_within(child: &mut std::process::Child, grace: Duration) -> Stopped {
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: a plain signal to our own child, not yet reaped.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let until = Instant::now() + grace;
+        while Instant::now() < until {
+            if let Ok(Some(_)) = child.try_wait() {
+                return Stopped::Exited;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Stopped::Killed
 }
 
 fn log_tail(log: &Path, lines: usize) -> String {
@@ -275,6 +380,13 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
         }
     }
     let mut child = cmd.spawn().context("starting nuthatch dev")?;
+    let began = match libc::pid_t::try_from(child.id()).map(process_start) {
+        Ok(Ok(Some(t))) => t,
+        _ => {
+            stop_child(&mut child);
+            bail!("could not read when the nuthatch dev just started began, so it was stopped");
+        }
+    };
     let url = local_url(listen);
     let record = Record {
         pid: child.id(),
@@ -282,6 +394,7 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
         url: url.clone(),
         log: log_path.clone(),
         exe,
+        started: began,
     };
     std::fs::write(state.join(RECORD), serde_json::to_vec(&record)?)?;
 
@@ -308,11 +421,13 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
             break;
         }
         if started.elapsed() > READY_WITHIN {
-            let _ = child.kill();
-            let _ = child.wait();
+            let how = match stop_child(&mut child) {
+                Stopped::Exited => "stopped with SIGTERM",
+                Stopped::Killed => "killed with SIGKILL, as SIGTERM had not ended it",
+            };
             let _ = std::fs::remove_file(state.join(RECORD));
             bail!(
-                "nuthatch dev was not serving at {url} after {}s, so it was stopped. The end of {}:\n{}",
+                "nuthatch dev was not serving at {url} after {}s, so it was {how}. The end of {}:\n{}",
                 READY_WITHIN.as_secs(),
                 log_path.display(),
                 log_tail(&log_path, 20)
@@ -367,7 +482,7 @@ pub async fn stop(dir: &str, json: bool) -> Result<()> {
         bail!("could not signal pid {}", record.pid);
     }
     let started = Instant::now();
-    while identify(record.pid, &record.exe) == Identity::Ours {
+    while identify(record.pid, &record.exe, record.started) == Identity::Ours {
         if started.elapsed() > STOP_WITHIN {
             bail!(
                 "pid {} is still running {}s after SIGTERM; its log is {}",
@@ -463,35 +578,94 @@ mod tests {
 
     #[test]
     fn this_process_is_identified_by_its_executable_not_its_name() {
+        let pid = std::process::id();
         let exe = std::env::current_exe().unwrap();
-        assert_eq!(identify(std::process::id(), &exe), Identity::Ours);
-        let other = identify(std::process::id(), Path::new("/usr/bin/true"));
+        let began = process_start(pid as libc::pid_t).unwrap().unwrap();
+        assert_eq!(identify(pid, &exe, began), Identity::Ours);
+        let other = identify(pid, Path::new("/usr/bin/true"), began);
         assert!(matches!(other, Identity::Other(_)), "{other:?}");
     }
 
-    /// A pid that is alive and cannot be read is refused, not signalled on a guess.
+    /// After a reboot, or once the pid is reused, the pid names a process that started at another
+    /// time: that is not the recorded dev, whatever it runs.
     #[test]
-    fn an_unconfirmed_pid_is_never_treated_as_gone_or_ours() {
+    fn a_pid_that_started_at_another_time_is_gone() {
+        let pid = std::process::id();
+        let exe = std::env::current_exe().unwrap();
+        let began = process_start(pid as libc::pid_t).unwrap().unwrap();
+        assert_eq!(identify(pid, &exe, began + 1), Identity::Gone);
+    }
+
+    /// Another user's process was not started by this one.
+    #[test]
+    fn another_users_pid_is_gone() {
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
-            return; // root may read pid 1, which then is merely another program
+            return;
         }
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(identify(1, &exe, 0), Identity::Gone);
+    }
+
+    /// A crashed dev nobody reaps stays a zombie; it has exited, and must not block start or stop.
+    #[test]
+    fn a_zombie_is_gone() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let began = process_start(pid as libc::pid_t).unwrap().unwrap_or(0);
+        let exe = std::fs::canonicalize("/usr/bin/true").unwrap_or_else(|_| "/bin/true".into());
+        let until = Instant::now() + Duration::from_secs(10);
+        while process_start(pid as libc::pid_t) != Ok(None) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            process_start(pid as libc::pid_t),
+            Ok(None),
+            "the child is a zombie"
+        );
+        assert_eq!(identify(pid, &exe, began), Identity::Gone);
+        child.wait().unwrap();
+    }
+
+    /// Only a live process of ours whose executable cannot be read is refused.
+    #[test]
+    fn an_unconfirmed_identity_is_refused_not_signalled() {
         let record = Record {
             pid: 1,
             dir: "/n".into(),
             url: "http://127.0.0.1:1".into(),
             log: "/l".into(),
-            exe: std::env::current_exe().unwrap(),
+            exe: "/x".into(),
+            started: 0,
         };
-        match identify(1, &record.exe) {
-            Identity::Unconfirmed(_) => {
-                let err = still_ours(&record, Path::new("/s/dev.json")).unwrap_err();
-                assert!(format!("{err:#}").contains("not signalled"), "{err:#}");
-            }
-            // Some systems let any user read pid 1's executable; that is a refusal of its own.
-            Identity::Other(_) => assert!(!still_ours(&record, Path::new("/s")).unwrap()),
-            seen => panic!("pid 1 read as {seen:?}"),
-        }
+        let path = Path::new("/s/dev.json");
+        let err = verdict(Identity::Unconfirmed("no".into()), &record, path).unwrap_err();
+        assert!(format!("{err:#}").contains("not signalled"), "{err:#}");
+        assert!(!verdict(Identity::Gone, &record, path).unwrap());
+        assert!(verdict(Identity::Ours, &record, path).unwrap());
+    }
+
+    /// The start timeout stops `dev` as `stop` does, by SIGTERM, and kills only what ignores it.
+    #[test]
+    fn a_child_is_asked_to_stop_before_it_is_killed() {
+        let spawn = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .unwrap()
+        };
+        let mut polite = spawn("trap 'exit 0' TERM; while :; do sleep 0.05; done");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            stop_child_within(&mut polite, Duration::from_secs(5)),
+            Stopped::Exited
+        );
+        let mut stubborn = spawn("trap '' TERM; while :; do sleep 0.05; done");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            stop_child_within(&mut stubborn, Duration::from_millis(500)),
+            Stopped::Killed
+        );
     }
 
     #[test]

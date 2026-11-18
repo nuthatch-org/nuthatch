@@ -75,11 +75,15 @@ it had one. With `--json` it prints `pid`, `url`, `dir`, `log` and `stop`.
 
 The log and the record of the process are kept in `$XDG_STATE_HOME/nuthatch/dev/` (else
 `~/.local/state/nuthatch/dev/`), one directory per nest, and never in the nest itself: every file in
-a nest counts toward its NID. The record names the executable that was started, and a pid counts
-as that `dev` only while it runs that executable, whatever the file is called. `nuthatch stop` sends
-the process SIGTERM and waits for it to finish; with no detached `dev` running for the directory it
-fails with `nest_not_running`. A pid that is alive but whose executable cannot be read is not
-signalled: `stop` and a second `--detach` refuse and say so.
+a nest counts toward its NID. The record names the executable that was started and when the
+process began, and a pid counts as that `dev` only while it is the same process running that
+executable, whatever the file is called. A pid that has exited and not been reaped, belongs to
+another user, or began at another time (after a reboot, say) is treated as gone. `nuthatch stop`
+sends the process SIGTERM and waits for it to finish; with no detached `dev` running for the
+directory it fails with `nest_not_running`. Only a process that is the recorded one by its start
+time but whose executable cannot be read is refused rather than signalled, by `stop` and by a
+second `--detach`. When `dev` is not serving in time, `--detach` stops it the same way, with
+SIGKILL only if it has not exited ten seconds after SIGTERM.
 
 ```sh
 nuthatch dev --backfill 300 --detach && nuthatch sql "SELECT count(*) FROM weth__transfer" --json
