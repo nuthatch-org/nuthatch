@@ -1,0 +1,51 @@
+# /etc/systemd/system/nuthatch-public-arc-testnet.service
+# The Arc testnet USDC nest, public and read-only (#3031, #3028). docs/public-nests.md.
+#
+# --no-admin: the /_admin routes are never registered, so there is no UI, mount, unmount or token to
+#   expose. What is left is the read surface (GET, plus POST /sql, /explain and /mcp, which only read).
+# --public-host: the nest is bound to loopback and refuses a Host it was not told about (#3002);
+#   Caddy and nginx forward the public name, so it is named here.
+# --poll-interval 2s: Arc blocks come about every 0.6 s; the nest's README measured 5 to 6 blocks behind.
+# Not --seal-direct: the nest's README measured its 17 minute backfill without it, against this
+#   endpoint's 429s, so that is the combination this unit runs.
+[Unit]
+Description=nuthatch public read-only nest: Arc testnet USDC
+Documentation=https://github.com/nuthatch-org/nuthatch/blob/main/docs/public-nests.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nests-public
+Group=nests-public
+EnvironmentFile=/etc/nuthatch-public/arc-testnet.env
+WorkingDirectory=/var/lib/nuthatch-public/arc-usdc-nest
+ExecStart=/usr/local/bin/nuthatch-5.23.0 dev \
+    --dir /var/lib/nuthatch-public/arc-usdc-nest \
+    --listen 127.0.0.1:8120 \
+    --no-admin \
+    --public-host ${PUBLIC_HOST} \
+    --poll-interval 2s \
+    --rpc ${ARC_RPC_URL} \
+    --rpc ${ARC_RPC_URL_2}
+Restart=on-failure
+RestartSec=5
+# The 2 GB per-cursor budget (CLAUDE.md non-negotiable 2). The nest's README measured 490 MB at peak.
+MemoryMax=2G
+
+# Sandbox. The service writes only to its own state directory and talks only to its RPCs and loopback.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nuthatch-public
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
