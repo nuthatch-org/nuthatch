@@ -2584,6 +2584,12 @@ fn ready_answer(s: &AppState) -> Answer {
         #[cfg(feature = "folds")]
             folds_stalled: _,
     } = nest_readiness(s);
+    let first_block_indexed = s
+        .store
+        .sample_entity_keys(1)
+        .ok()
+        .and_then(|k| k.first()?.get(..12)?.parse::<u64>().ok());
+    let has_rows = first_block_indexed.is_some() || sealed > 0;
     #[cfg(feature = "folds")]
     let folds = (!folds.is_null()).then_some(folds);
     #[cfg(not(feature = "folds"))]
@@ -2598,6 +2604,8 @@ fn ready_answer(s: &AppState) -> Answer {
         last,
         lag,
         sealed,
+        has_rows,
+        first_block_indexed,
         freshness: answer::Freshness {
             mode: s.freshness.mode(),
             poll_interval_secs: s.freshness.poll_interval.as_secs(),

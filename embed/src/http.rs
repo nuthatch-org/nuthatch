@@ -549,6 +549,8 @@ fn ready(n: &Nest) -> Answer {
         last,
         lag: tip.saturating_sub(last),
         sealed: sealed_through(n),
+        has_rows: sealed_through(n) > 0,
+        first_block_indexed: None,
         freshness: answer::Freshness {
             mode: "tip",
             poll_interval_secs,

@@ -17,6 +17,7 @@ SQL" without reading the message.
 | 8 | `rpc_refused` | An RPC endpoint could not be reached, or refused the request. |
 | 9 | `rpc_range_too_wide` | An RPC endpoint refused an `eth_getLogs` range that could not be narrowed further. |
 | 10 | `port_in_use` | Something already listens on the `--listen` address, so `dev --detach` would have reported another process's nest as its own. |
+| 11 | `rows_timeout` | `dev --detach --wait-rows` found the nest serving but no row indexed within `--wait-timeout`. The nest is left running. |
 
 The codes and statuses are stable: new ones may be added, and none is renumbered or renamed.
 
@@ -72,7 +73,15 @@ nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --json | jq .tables
 answers `/ready` with a first poll of the chain behind it; for a `mounts.toml` runtime, once every
 mount listed at `/nests` has polled. If `dev` exits first, or is not serving
 within two minutes, `--detach` fails with the end of its log, and with `dev`'s own exit status where
-it had one. With `--json` it prints `pid`, `url`, `dir`, `log` and `stop`.
+it had one. With `--json` it prints `pid`, `url`, `dir`, `log`, `stop`, `has_rows` and
+`first_block_indexed`.
+
+Serving is not the same as holding data: a nest that has polled once can still have no row, and
+`nuthatch sql "SELECT count(*) ..."` straight after `--detach` then returns 0. Add `--wait-rows` to
+also block until a row is indexed (any mount's, for a runtime), for at most `--wait-timeout` seconds
+(default 300). On timeout it exits 11 (`rows_timeout`) and leaves the nest running. `/ready` and the
+MCP `index_status` report `has_rows` (a row in the hot store or a sealed segment) and
+`first_block_indexed` (the oldest row still in the hot store; null once rows are sealed away).
 
 The log and the record of the process are kept in `$XDG_STATE_HOME/nuthatch/dev/` (else
 `~/.local/state/nuthatch/dev/`), one directory per nest, and never in the nest itself: every file in

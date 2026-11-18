@@ -504,6 +504,10 @@ pub struct Ready {
     pub last: u64,
     pub lag: u64,
     pub sealed: u64,
+    /// Whether any row has been indexed: in the hot store or past it in a sealed segment.
+    pub has_rows: bool,
+    /// The block of the oldest row still in the hot store; null once rows are sealed away or before any.
+    pub first_block_indexed: Option<u64>,
     pub freshness: Freshness,
     pub last_poll: u64,
     pub age: Option<u64>,
@@ -547,6 +551,8 @@ pub fn ready(r: &Ready) -> Answer {
         "initial_poll_failed": r.initial_failure,
         "tip": if unpolled { Value::Null } else { r.tip.into() },
         "last_block": r.last,
+        "has_rows": r.has_rows,
+        "first_block_indexed": r.first_block_indexed,
         "lag_blocks": if unpolled { Value::Null } else { r.lag.into() },
         "cursorless": r.cursorless,
         "freshness": {

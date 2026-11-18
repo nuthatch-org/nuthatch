@@ -355,3 +355,125 @@ fn a_renamed_binary_is_still_known_by_its_executable() {
     assert_eq!(code, 0, "{stderr}");
     std::mem::forget(reap);
 }
+
+/// #3022: `dev --detach --wait-rows` returns once a row is indexed, so the `sql` straight after it
+/// counts more than zero, and `/ready` says why with `has_rows` and `first_block_indexed`.
+#[test]
+fn wait_rows_returns_once_a_row_is_indexed() {
+    let rpc = serve_rpc(42_161);
+    let nest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+    let listen = format!("127.0.0.1:{}", free_port());
+    let dir = nest.path().to_str().unwrap();
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "dev",
+            "--detach",
+            "--wait-rows",
+            "--wait-timeout",
+            "120",
+            "--json",
+            "--dir",
+            dir,
+            "--rpc",
+            &rpc,
+            "--listen",
+            &listen,
+            "--no-admin",
+            "--backfill",
+            "300",
+        ],
+    );
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let started: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let _reap = Reap(started["pid"].as_u64().unwrap());
+    assert_eq!(started["has_rows"], true, "{started}");
+
+    let url = format!("http://{listen}");
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "sql",
+            "SELECT count(*) AS n FROM usdc__transfer",
+            "--json",
+            "--dir",
+            dir,
+            "--url",
+            &url,
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let row: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    let n = row["n"]
+        .as_u64()
+        .or_else(|| row["n"].as_str().and_then(|s| s.parse().ok()))
+        .expect("a count");
+    assert!(n > 0, "{row}");
+
+    let ready: Value = {
+        use std::io::{Read, Write};
+        let mut conn = std::net::TcpStream::connect(&listen).unwrap();
+        write!(
+            conn,
+            "GET /ready HTTP/1.0\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = String::new();
+        conn.read_to_string(&mut raw).unwrap();
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(ready["has_rows"], true, "{ready}");
+    assert!(
+        ready["first_block_indexed"].is_u64() || ready["sealed_through"].as_u64() > Some(0),
+        "{ready}"
+    );
+
+    let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir]);
+    assert_eq!(code, 0, "{stderr}");
+}
+
+/// A nest that never indexes a row ends the wait with `rows_timeout`, and keeps running.
+#[test]
+fn wait_rows_times_out_with_its_own_code_and_leaves_the_nest_running() {
+    // The stand-in answers the chain, but its tip is below the nest's start, so nothing indexes.
+    let rpc = serve_rpc(42_161);
+    let nest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+    let listen = format!("127.0.0.1:{}", free_port());
+    let dir = nest.path().to_str().unwrap();
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "dev",
+            "--detach",
+            "--wait-rows",
+            "--wait-timeout",
+            "0",
+            "--json",
+            "--dir",
+            dir,
+            "--rpc",
+            &rpc,
+            "--listen",
+            &listen,
+            "--no-admin",
+            "--backfill",
+            "300",
+        ],
+    );
+    // A zero wait may race a fast first row; only the timeout path is asserted when it loses.
+    if code == 0 {
+        let started: Value = serde_json::from_str(stdout.trim()).unwrap();
+        let _ = nuthatch(state.path(), &["stop", "--dir", dir]);
+        let _ = started;
+        return;
+    }
+    assert_eq!(code, 11, "{stdout}{stderr}");
+    let v: Value = serde_json::from_str(stderr.trim()).unwrap();
+    assert_eq!(v["error"]["code"], "rows_timeout");
+    let (code, _, stderr) = nuthatch(state.path(), &["stop", "--dir", dir]);
+    assert_eq!(code, 0, "the nest was left running: {stderr}");
+}

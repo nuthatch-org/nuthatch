@@ -19,6 +19,7 @@ pub enum Code {
     RpcRefused,
     RpcRangeTooWide,
     PortInUse,
+    RowsTimeout,
 }
 
 /// The table in `nuthatch --help`.
@@ -35,10 +36,11 @@ Exit status:
   8  rpc_refused
   9  rpc_range_too_wide
   10  port_in_use
+  11  rows_timeout
 With --json, an error is one JSON object on stderr with its code and a next step (docs/cli-errors.md).";
 
 impl Code {
-    pub const ALL: [Code; 10] = [
+    pub const ALL: [Code; 11] = [
         Code::Error,
         Code::Usage,
         Code::NoNest,
@@ -49,6 +51,7 @@ impl Code {
         Code::RpcRefused,
         Code::RpcRangeTooWide,
         Code::PortInUse,
+        Code::RowsTimeout,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -63,6 +66,7 @@ impl Code {
             Code::RpcRefused => "rpc_refused",
             Code::RpcRangeTooWide => "rpc_range_too_wide",
             Code::PortInUse => "port_in_use",
+            Code::RowsTimeout => "rows_timeout",
         }
     }
 
@@ -79,6 +83,7 @@ impl Code {
             Code::RpcRefused => 8,
             Code::RpcRangeTooWide => 9,
             Code::PortInUse => 10,
+            Code::RowsTimeout => 11,
         }
     }
 
@@ -108,6 +113,9 @@ impl Code {
             }
             Code::PortInUse => {
                 "pass --listen 127.0.0.1:<free port>, or `nuthatch stop` the nest holding this one"
+            }
+            Code::RowsTimeout => {
+                "the nest is still running; read /ready for `has_rows`, or raise --wait-timeout"
             }
         }
     }
@@ -321,6 +329,7 @@ mod tests {
                 ("rpc_refused", 8),
                 ("rpc_range_too_wide", 9),
                 ("port_in_use", 10),
+                ("rows_timeout", 11),
             ]
         );
         let doc = std::fs::read_to_string(

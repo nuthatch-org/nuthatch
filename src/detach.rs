@@ -334,9 +334,36 @@ async fn serving(client: &reqwest::Client, url: &str) -> bool {
     true
 }
 
+/// Whether the instance at `url` has indexed a row: `Some(first block)` once its `/ready` (or any
+/// mount's, for a runtime) says `has_rows`. The inner option is `first_block_indexed`.
+async fn first_rows(client: &reqwest::Client, url: &str) -> Option<Option<u64>> {
+    let mut bases = vec![String::new()];
+    if let Some((200, nests)) = get_json(client, &format!("{url}/nests")).await {
+        bases = nests["nests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|m| match (m["base_path"].as_str(), m["name"].as_str()) {
+                (Some(path), _) => Some(path.to_string()),
+                (None, Some(name)) => Some(format!("/{name}")),
+                _ => None,
+            })
+            .collect();
+    }
+    for base in bases {
+        if let Some((200, body)) = get_json(client, &format!("{url}{base}/ready")).await {
+            if body["has_rows"].as_bool() == Some(true) {
+                return Some(body["first_block_indexed"].as_u64());
+            }
+        }
+    }
+    None
+}
+
 /// Start `nuthatch dev` with the same arguments, less `--detach` and `--json`, in its own session,
 /// and return once it serves.
-pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
+pub async fn start(dir: &str, listen: &str, json: bool, wait_rows: Option<Duration>) -> Result<()> {
     let nest = nest_path(dir)?;
     let state = state_dir(&nest)?;
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
@@ -365,10 +392,26 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
     let log_path = state.join(LOG);
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
-    let args: Vec<std::ffi::OsString> = std::env::args_os()
-        .skip(1)
-        .filter(|a| a != "--detach" && a != "--json")
-        .collect();
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    let mut skip_value = false;
+    for a in std::env::args_os().skip(1) {
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        let text = a.to_string_lossy();
+        if text == "--wait-timeout" {
+            skip_value = true;
+            continue;
+        }
+        if a == "--detach"
+            || a == "--json"
+            || a == "--wait-rows"
+            || text.starts_with("--wait-timeout=")
+        {
+            continue;
+        }
+        args.push(a);
+    }
     let exe = std::env::current_exe().context("finding this executable")?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
     let mut cmd = std::process::Command::new(&exe);
@@ -449,6 +492,39 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    let mut rows = None;
+    if let Some(within) = wait_rows {
+        let waited = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let _ = std::fs::remove_file(state.join(RECORD));
+                bail!(
+                    "nuthatch dev exited ({status}) while waiting for its first row. The end of {}:\n{}",
+                    log_path.display(),
+                    log_tail(&log_path, 20)
+                );
+            }
+            if let Some(first) = first_rows(&client, &url).await {
+                rows = Some(first);
+                break;
+            }
+            if waited.elapsed() > within {
+                // The nest is healthy and still indexing, so it is left running.
+                return Err(tag(
+                    Code::RowsTimeout,
+                    anyhow::anyhow!(
+                        "nuthatch dev is serving at {url} (pid {}) but indexed no row within {}s \
+                         (--wait-timeout). It is still running; the end of {}:\n{}",
+                        record.pid,
+                        within.as_secs(),
+                        log_path.display(),
+                        log_tail(&log_path, 20)
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
     let stop = format!("nuthatch stop --dir {}", nest.display());
     if json {
         println!(
@@ -459,6 +535,8 @@ pub async fn start(dir: &str, listen: &str, json: bool) -> Result<()> {
                 "dir": nest,
                 "log": log_path,
                 "stop": stop,
+                "has_rows": rows.is_some(),
+                "first_block_indexed": rows.flatten(),
             })
         );
     } else {

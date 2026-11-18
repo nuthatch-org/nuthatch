@@ -174,14 +174,14 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         let target = target_dir(&args);
         init_from(&source, &target)?;
         return Ok(Scaffolded::next(format!(
-            "nuthatch dev --dir {}",
+            "nuthatch dev --detach --wait-rows --dir {}",
             target.display()
         )));
     }
     if let Some(source) = args.from_subgraph.clone() {
         init_from_subgraph(&source, &args).await?;
         return Ok(Scaffolded::next(format!(
-            "nuthatch dev{}",
+            "nuthatch dev --detach --wait-rows{}",
             dir_hint(&args.dir)
         )));
     }
@@ -493,12 +493,15 @@ pub async fn add(args: AddArgs) -> Result<()> {
         table_count,
     );
     say!(
-        "next:  nuthatch dev{}   (backfills every contract from deployment)",
+        "next:  nuthatch dev --detach --wait-rows{}   (backfills every contract from deployment)",
         dir_hint(&args.dir)
     );
     print_undetected_start_blocks(&undetected);
     if let Some(before) = &before {
-        done.next = vec![format!("nuthatch dev{}", dir_hint(&args.dir))];
+        done.next = vec![format!(
+            "nuthatch dev --detach --wait-rows{}",
+            dir_hint(&args.dir)
+        )];
         println!("{}", done.report(&dir, before)?);
     }
     Ok(())
@@ -540,7 +543,10 @@ pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     let n = write_nest_artifacts(&dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
     say!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
     if let Some(before) = &before {
-        let done = Scaffolded::next(format!("nuthatch dev{}", dir_hint(&args.dir)));
+        let done = Scaffolded::next(format!(
+            "nuthatch dev --detach --wait-rows{}",
+            dir_hint(&args.dir)
+        ));
         println!("{}", done.report(&dir, before)?);
     }
     Ok(())
@@ -1061,7 +1067,10 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ipfs_templates.join(", ")
         );
     }
-    say!("\n  Next: nuthatch dev{}", dir_hint(&args.dir));
+    say!(
+        "\n  Next: nuthatch dev --detach --wait-rows{}",
+        dir_hint(&args.dir)
+    );
     Ok(())
 }
 
@@ -1469,7 +1478,10 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
             config.factories.len(),
         );
     }
-    say!("next:  nuthatch dev --dir {}", target.display());
+    say!(
+        "next:  nuthatch dev --detach --wait-rows --dir {}",
+        target.display()
+    );
     Ok(())
 }
 
@@ -2355,7 +2367,7 @@ struct NextStep {
 }
 
 fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> NextStep {
-    let dev = format!("nuthatch dev{}", dir_hint(dir));
+    let dev = format!("nuthatch dev --detach --wait-rows{}", dir_hint(dir));
     let Some(span) = start
         .zip(tip)
         .and_then(|(start, tip)| crate::indexer::long_backfill(start, tip, window))
@@ -2907,11 +2919,14 @@ mod tests {
     #[test]
     fn init_offers_recent_history_only_beside_a_long_backfill() {
         let step = next_step("usdc", Some(6_082_465), Some(26_096_175), 20);
-        assert_eq!(step.command, "nuthatch dev --dir usdc --backfill 300");
+        assert_eq!(
+            step.command,
+            "nuthatch dev --detach --wait-rows --dir usdc --backfill 300"
+        );
         let note = step.note.expect("a long backfill names the full span");
         assert!(note.contains("20013710 blocks from deployment"), "{note}");
         assert!(
-            note.contains("nuthatch dev --dir usdc --rpc=<url>"),
+            note.contains("nuthatch dev --detach --wait-rows --dir usdc --rpc=<url>"),
             "{note}"
         );
         assert!(note.contains("rpc_urls in nuthatch.toml"), "{note}");
@@ -2920,13 +2935,13 @@ mod tests {
         assert!(!note.contains("rpc "), "{note}");
 
         let short = next_step(".", Some(26_090_000), Some(26_096_175), 20);
-        assert_eq!(short.command, "nuthatch dev");
+        assert_eq!(short.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(short.note, None);
         let no_tip = next_step(".", Some(6_082_465), None, 20);
-        assert_eq!(no_tip.command, "nuthatch dev");
+        assert_eq!(no_tip.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(no_tip.note, None);
         let no_start = next_step(".", None, Some(26_096_175), 20);
-        assert_eq!(no_start.command, "nuthatch dev");
+        assert_eq!(no_start.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(no_start.note, None);
     }
 
