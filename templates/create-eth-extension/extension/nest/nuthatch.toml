@@ -1,0 +1,13 @@
+[nest]
+name = "base-usdc"
+chain = "base"
+chain_id = 8453
+schema_version = 1
+block_timestamps = true
+# Supply NUTHATCH_RPC at runtime; do not commit provider keys.
+
+[[contracts]]
+alias = "usdc"
+address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+abi = "abis/usdc.json"
+events = ["Transfer"]

@@ -1,0 +1,9 @@
+:root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+body { margin: 0 auto; max-width: 1100px; padding: 2rem; }
+h1 { margin-bottom: 0.25rem; }
+.subtle { opacity: 0.7; }
+.error { border: 1px solid #c44; padding: 1rem; }
+table { border-collapse: collapse; margin-top: 2rem; width: 100%; }
+th, td { border-bottom: 1px solid #8885; padding: 0.65rem; text-align: left; }
+td { font-family: ui-monospace, monospace; font-size: 0.85rem; overflow-wrap: anywhere; }
+.amount { white-space: nowrap; }

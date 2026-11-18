@@ -528,6 +528,9 @@ lies about a flag ([RFC-0017](docs/rfcs/0017-builder-skill.md)).
 
 ## Everything else it can do
 
+- [viem + Next.js template](templates/viem-next/): a Base USDC transfer page backed by a local nest.
+- [Scaffold-ETH 2 extension](templates/create-eth-extension/): add a nest and `yarn index` to a `create-eth` app.
+
 The core is "your contract → SQL." Beyond that, nuthatch has a full feature set for teams and operators
 who need more - none of it in the way of the happy path:
 
