@@ -158,7 +158,9 @@ sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src
 
 [tasks.test-features]
 desc = "The suite with every optional feature on"
-depends = ["doctest-features", "parity-bin"]
+# After `test`: both build target/debug/nuthatch, and a default build landing mid-run hands the
+# feature tests a binary without their subcommands.
+depends = ["doctest-features", "parity-bin", "test"]
 run = ["cargo nextest run --locked --features graph,counter,crash-points,flight,sync-server"]
 sources = ["**/*"]
 
