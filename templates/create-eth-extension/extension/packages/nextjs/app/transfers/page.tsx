@@ -28,7 +28,7 @@ async function latestTransfers(): Promise<Transfer[]> {
   return answer.rows;
 }
 
-export default async function Home() {
+export default async function Transfers() {
   const transfers = await latestTransfers();
   return (
     <main style={{ padding: "2rem" }}>

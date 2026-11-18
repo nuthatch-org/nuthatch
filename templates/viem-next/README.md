@@ -6,14 +6,14 @@ USDC amount formatting. There is no browser CORS setup and no `eth_getLogs` appl
 
 ## Clean clone
 
-Requires Node.js 20.9+ and a public Base JSON-RPC endpoint. `npx` downloads the nuthatch release
+Requires Node.js 20.9+ and a Base JSON-RPC endpoint that allows `eth_getLogs` (verified with `https://base-rpc.publicnode.com`; `https://mainnet.base.org` rate-limits it with HTTP 429 and never reaches rows). `npx` downloads the nuthatch release
 binary on first use. No Rust toolchain, Postgres, or API token is required by nuthatch itself.
 
 ```sh
 cd templates/viem-next
 cp .env.example .env.local
 npm install
-export NUTHATCH_RPC_8453=https://your-base-rpc.example
+export NUTHATCH_RPC=https://your-base-rpc.example
 npm run index
 npm run dev
 ```

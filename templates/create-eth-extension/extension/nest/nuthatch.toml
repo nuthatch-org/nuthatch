@@ -4,7 +4,7 @@ chain = "base"
 chain_id = 8453
 schema_version = 1
 block_timestamps = true
-# Supply NUTHATCH_RPC_8453 at runtime; do not commit provider keys.
+# Supply NUTHATCH_RPC at runtime; do not commit provider keys.
 
 [[contracts]]
 alias = "usdc"

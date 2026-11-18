@@ -12,7 +12,7 @@ for example, `Approval` becomes `usdc__approval`.
 
 Restart `npm run index` after config changes. The initial `--backfill 300` applies only to a new
 store; existing stores resume from their checkpoint. Keep RPC URLs and provider keys in
-`NUTHATCH_RPC_8453`, never in `nuthatch.toml`.
+`NUTHATCH_RPC`, never in `nuthatch.toml`.
 
 ## Query
 

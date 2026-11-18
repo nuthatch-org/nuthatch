@@ -5,3 +5,12 @@ out/
 .env.local
 nest/data/
 nest/.admin-token
+nest/nuthatch.redb
+nest/segments/
+nest/.claude/
+nest/llms.txt
+nest/schema.json
+nest/semantic.toml
+nest/views/
+nest/.gitattributes
+nest/.gitignore

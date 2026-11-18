@@ -1,30 +1,41 @@
 # create-eth nuthatch extension
 
-This is a deliberately small Scaffold-ETH 2 extension skeleton: `extension/packages/nextjs` holds the
-page overlay, `extension/nest` is the nest at the extension root, and the root
-`package.json.args.mjs` adds an `index` script. `extension/scripts/index.mjs` runs
-`npx -y nuthatch-indexer dev --dir nest --backfill 300 --detach` and polls `POST /sql` until rows
-exist. The current CLI has **no `--wait-rows` flag**; `--detach` only waits for the first chain poll.
+A [Scaffold-ETH 2 extension](https://github.com/scaffold-eth/create-eth) that ships a nest. It
+follows create-eth's layout (everything lives under `extension/`, merged into the generated app):
 
-**Offline convention caveat:** this repository does not contain Scaffold-ETH 2 or its extension
-schema, and the exact merge/export and overlay conventions could not be checked offline. The layout
-is intentionally limited to the conventional `package.json.args.mjs` plus `extension/` files; check
-it against the `create-eth` version you publish for before release.
+- `extension/package.json` - merged into the root `package.json`; adds `yarn index` and `yarn index:stop`.
+- `extension/scripts/index.mjs` - runs `npx -y nuthatch-indexer dev --dir nest --backfill 300 --detach`,
+  then polls `POST /sql` until a USDC Transfer row exists (the released CLI has no `--wait-rows`).
+- `extension/nest/` - the nest (Base USDC `Transfer`), plus an `AGENTS.md` for coding agents.
+- `extension/packages/nextjs/app/transfers/page.tsx` - a new `/transfers` route reading the nest
+  server-side. It is a new route, not an overlay of `app/page.tsx`: create-eth copies extension files
+  with `clobber: false`, so an extension cannot replace a file the base template already has.
 
-Publish this directory as its own repository, **`nuthatch-org/create-eth-nuthatch`**, for:
+## Verified
+
+Run against `create-eth` 2.0.23 in its `--dev` mode (which reads `externalExtensions/<name>/extension`
+from the create-eth package, since non-dev `-e` only accepts GitHub repositories, not local paths):
+`create-dapp-se2 app1 --dev -e nuthatch --skip-install --solidity-framework hardhat` produced
+`scripts/index.mjs`, `nest/`, `packages/nextjs/app/transfers/page.tsx` and the `index` scripts in
+`package.json`. The `yarn install` and `/transfers` render steps were not run; the same page logic
+is proven end to end in `templates/viem-next`.
+
+## Publishing
+
+This directory must be published as **its own repository**, e.g. `nuthatch-org/create-eth-nuthatch`,
+with `extension/` at the repo root, because create-eth fetches `owner/repo[:branch]` from GitHub. Then:
 
 ```sh
-npx create-eth -e nuthatch-org/create-eth-nuthatch
+npx create-eth@latest -e nuthatch-org/create-eth-nuthatch
 ```
 
-After creating a project, supply a Base RPC and start indexing, then start Next.js:
+## Use
 
 ```sh
-export NUTHATCH_RPC_8453=https://your-base-rpc.example
+export NUTHATCH_RPC=https://your-base-rpc.example   # a public RPC that allows eth_getLogs
 yarn index
-yarn dev
+yarn start
 ```
 
-The page reads the latest 20 transfers from the nest server-side. `NUTHATCH_URL` defaults to
-`http://127.0.0.1:8288`. Stop the nest with `npx -y nuthatch-indexer stop --dir nest` from the
-project root. Do not commit RPC provider keys.
+Open http://localhost:3000/transfers. `NUTHATCH_URL` defaults to `http://127.0.0.1:8288`. Never
+commit RPC provider keys.

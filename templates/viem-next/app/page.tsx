@@ -6,7 +6,7 @@ export const dynamic = "force-dynamic";
 
 const client = createPublicClient({
   chain: base,
-  transport: http(process.env.NUTHATCH_RPC_8453),
+  transport: http(process.env.NUTHATCH_RPC),
 });
 
 function short(address: string) {
