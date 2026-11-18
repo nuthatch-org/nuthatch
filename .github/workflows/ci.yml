@@ -49,6 +49,11 @@ env:
   CARGO_TERM_COLOR: always
   # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
   CFLAGS: -std=gnu17
+  # #3041: nothing in CI rebuilds incrementally, and incremental artifacts only bloat the cache and
+  # the disk. Test binaries need line tables for backtraces, not full debuginfo; it dominates link time.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # The commands the jobs run live in yatr.toml. Bump deliberately.
   YATR_VERSION: "1.5.0"
 
@@ -213,6 +218,7 @@ jobs:
             exit 1
           fi
           echo "$notes present, $(wc -c < "$notes") bytes"
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
@@ -423,6 +429,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
@@ -514,6 +521,7 @@ jobs:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
@@ -606,6 +614,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -616,6 +625,10 @@ jobs:
         with:
           version: ${{ env.YATR_VERSION }}
       - name: native step test (embed)
+        # #3041: thin LTO on the test binaries is most of this job's 20 minutes and buys a test
+        # nothing; the shipped module's profiles (`tab`, `release` for wasm) are untouched.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: yatr embed-native
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
@@ -1264,7 +1277,10 @@ jobs:
   build-release:
     name: build release
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    # #3041: the slow tier only (merge queue, main, or a `full-ci` label). On a PR it was the second
+    # longest job and gated nothing but the measurement jobs below, which are slow-tier too. A
+    # skipped job still satisfies its required context, as the other slow-tier jobs do.
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     # 45, not 20 (#584). Warm this job is 3m40s-5m12s; cold - triggered by any `Cargo.lock`
     # change, since `Swatinem/rust-cache` keys on the lock hash - it is a full `--release` build
@@ -1275,6 +1291,7 @@ jobs:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -1310,7 +1327,8 @@ jobs:
 
   footprint:
     name: footprint (RAM budget)
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1419,7 +1437,8 @@ jobs:
 
   point-read:
     name: point-read latency
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1507,7 +1526,8 @@ jobs:
   # they share nothing but the binary; what they used to cost was a second job in the queue.
   backfill-throughput:
     name: backfill throughput · tip lag
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
