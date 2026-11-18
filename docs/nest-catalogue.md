@@ -13,6 +13,16 @@ never as "this has not shipped" - as of 2026-08-04 the index lists Graph Horizon
 Uniswap V4, Livepeer and POA as 🟢 available, and two of those are not ranked in this file at all.
 Keeping a plan and a status board in one document is what let a shipped nest sit in Tier 3 for weeks.
 
+**Showcase nests (#2978, 2026-11-18).** The contracts people ask about most, each public, measured on
+5.22.0 and checked against an explorer or `eth_call` in its own README:
+[USDC](https://github.com/nuthatch-org/usdc-nest),
+[USDC on Base](https://github.com/nuthatch-org/usdc-base-nest),
+[WETH](https://github.com/nuthatch-org/weth-nest),
+[USDC on Arc testnet](https://github.com/nuthatch-org/arc-usdc-nest),
+[Uniswap V3](https://github.com/nuthatch-org/uniswap-v3) and
+[Aave V3](https://github.com/nuthatch-org/aave-v3). Each starts with
+`nuthatch init --from <repo URL>`.
+
 **Scope:** EVM-only - Ethereum mainnet + major L2s (Arbitrum, Optimism, Base, Polygon), per
 [CLAUDE.md](../CLAUDE.md): non-EVM stays out of scope until EVM is airtight, except that a named user
 asking for a named chain is a decision for Chief. None is built.
