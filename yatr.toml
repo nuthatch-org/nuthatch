@@ -42,7 +42,7 @@ sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src
 
 [tasks.test]
 desc = "Run the test suite (needs cargo-nextest, as CI does)"
-depends = ["doctest"]
+depends = ["doctest", "parity-bin"]
 run = ["cargo nextest run --locked"]
 # Tests read fixtures, docs, scripts and .github/ from across the tree.
 sources = ["**/*"]
@@ -158,7 +158,7 @@ sources = ["**/*.rs", "**/Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "src
 
 [tasks.test-features]
 desc = "The suite with every optional feature on"
-depends = ["doctest-features"]
+depends = ["doctest-features", "parity-bin"]
 run = ["cargo nextest run --locked --features graph,counter,crash-points,flight,sync-server"]
 sources = ["**/*"]
 
