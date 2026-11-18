@@ -12,23 +12,26 @@ use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 
-/// The comparison binary `scripts/lodestar-parity.sh` runs. CI builds it into `<target>/parity-bin`
-/// and ships it in the nextest archive, since a shard has no cargo; elsewhere it is built here.
+/// The comparison binary `scripts/lodestar-parity.sh` runs. The `parity-bin` task builds it into
+/// `<target>/parity-bin` (CI ships it in the nextest archive, since a shard has no cargo), and it is
+/// used wherever it is there: nextest runs each test in its own process, so building it here races
+/// another process reading it mid-link (#3007). Without it, it is built here.
 pub(crate) fn compare_bin() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
         let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let shipped = tmp
+            .parent()
+            .unwrap()
+            .join("parity-bin/lodestar-parity-compare");
+        if shipped.is_file() {
+            return shipped;
+        }
         if std::env::var_os("CI").is_some() {
-            let shipped = tmp
-                .parent()
-                .unwrap()
-                .join("parity-bin/lodestar-parity-compare");
-            assert!(
-                shipped.is_file(),
+            panic!(
                 "{} is missing: ci.yml builds it before the nextest archive, which must carry it",
                 shipped.display()
             );
-            return shipped;
         }
         let target = tmp.join("lodestar-parity");
         let built = Command::new(env!("CARGO"))
