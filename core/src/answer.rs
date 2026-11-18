@@ -752,7 +752,13 @@ mod tests {
         use super::block_of_entity_key as block;
         assert_eq!(block("000000000007-000003"), Some(7));
         assert_eq!(block("000041000000-000000"), Some(41_000_000));
-        for bad in ["", "7-3", "00000000000x-000001", "000000000007", "balances:0xab"] {
+        for bad in [
+            "",
+            "7-3",
+            "00000000000x-000001",
+            "000000000007",
+            "balances:0xab",
+        ] {
             assert_eq!(block(bad), None, "{bad}");
         }
     }
