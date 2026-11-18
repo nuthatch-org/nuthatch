@@ -226,6 +226,8 @@ mod semantic_layer;
 mod shipped_endpoints;
 #[path = "single_host_backfill.rs"]
 mod single_host_backfill;
+#[path = "skill_commands.rs"]
+mod skill_commands;
 #[path = "tape_clean.rs"]
 mod tape_clean;
 #[path = "tip_gauges_are_published_per_nest.rs"]

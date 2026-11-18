@@ -3,8 +3,8 @@
   "mcpServers": {
     "nuthatch": {
       "type": "stdio",
-      "command": "nuthatch",
-      "args": ["mcp", "--url", "http://127.0.0.1:8288"]
+      "command": "npx",
+      "args": ["-y", "nuthatch-indexer", "mcp", "--authoring", "--dir", "nest"]
     }
   }
 }

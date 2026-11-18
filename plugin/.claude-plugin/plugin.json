@@ -1,7 +1,7 @@
 {
   "name": "nuthatch",
   "displayName": "nuthatch",
-  "description": "Index an EVM contract's events into a local SQL database with nuthatch, and query it over MCP. The MCP server needs the nuthatch binary on PATH and a running `nuthatch dev`.",
+  "description": "Index an EVM contract's events into a local SQL database with nuthatch, and query it over MCP. The MCP server runs through npx, so it needs only Node, and it can create and index a nest itself.",
   "author": {
     "name": "nuthatch",
     "url": "https://www.nuthatch-indexer.com"
@@ -12,8 +12,8 @@
   "keywords": ["evm", "ethereum", "indexer", "sql", "mcp", "subgraph", "nuthatch"],
   "mcpServers": {
     "nuthatch": {
-      "command": "nuthatch",
-      "args": ["mcp", "--url", "http://127.0.0.1:8288"]
+      "command": "npx",
+      "args": ["-y", "nuthatch-indexer", "mcp", "--authoring", "--dir", "nest"]
     }
   }
 }

@@ -80,6 +80,13 @@ pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Optio
         "{}",
         serde_json::to_string_pretty(&snippet).unwrap_or_default()
     );
+    if authoring.is_none() {
+        println!("\n  No shell, no nest yet, or no binary installed? Let the client create and index one:");
+        println!(
+            "    claude mcp add nuthatch -- npx -y nuthatch-indexer mcp --authoring --dir nest"
+        );
+        println!("  (`nuthatch mcp --authoring --dir nest --print-config` prints the same for your client.)");
+    }
     println!(
         "\nThen ask your agent: \"what are the top USDC holders?\" - it queries the nest over MCP."
     );
@@ -2832,16 +2839,45 @@ mod tests {
         assert_eq!(npm["version"], v);
         assert_eq!(launcher["version"], v);
         assert_eq!(launcher["mcpName"], entry["name"]);
-        let args = |p: &Value| -> Vec<Value> {
-            let a = p["packageArguments"].as_array().unwrap();
-            a.iter()
-                .map(|a| match &a["value"] {
-                    Value::Null => a["name"].clone(),
-                    v => v.clone(),
-                })
-                .collect()
+        // The two packages deliberately differ (#3021). The npm launcher runs on the user's host
+        // and can create and index a nest itself, so it takes the authoring form; the container
+        // talks to a `nuthatch dev` that is already running, so it takes `--url`. Each argv, as
+        // the registry would assemble it, must parse with the binary's own clap definition.
+        let argv = |p: &Value| -> Vec<String> {
+            let mut out = vec!["nuthatch".to_string()];
+            for a in p["packageArguments"].as_array().unwrap() {
+                // An optional argument is the user's to fill in; it is not part of the base argv.
+                if a["isRequired"] == false {
+                    continue;
+                }
+                match (a["type"].as_str().unwrap(), a["name"].as_str()) {
+                    ("positional", _) => out.push(a["value"].as_str().unwrap().to_string()),
+                    ("named", Some(n)) => {
+                        out.push(n.to_string());
+                        // A flag with no value is a bare `named` entry; one with a value or a
+                        // default takes it.
+                        if let Some(v) = a["value"].as_str().or(a["default"].as_str()) {
+                            out.push(v.to_string());
+                        }
+                    }
+                    other => panic!("unexpected argument {other:?}"),
+                }
+            }
+            out
         };
-        assert_eq!(args(npm), args(&entry["packages"][0]));
+        let mcp = |p: &Value| match <crate::cli::Cli as clap::Parser>::try_parse_from(argv(p))
+            .unwrap_or_else(|e| panic!("{:?}: {e}", argv(p)))
+            .command
+        {
+            crate::cli::Command::Mcp(m) => m,
+            _ => panic!("not an mcp command: {:?}", argv(p)),
+        };
+        let n = mcp(npm);
+        assert!(n.authoring, "the npm entry must ask for --authoring");
+        assert_eq!(n.dir, "nest");
+        let o = mcp(&entry["packages"][0]);
+        assert!(!o.authoring, "the container bridges to a running nest");
+        assert!(o.url.starts_with("http://"), "{}", o.url);
     }
 
     #[test]

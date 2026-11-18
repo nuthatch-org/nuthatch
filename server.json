@@ -61,15 +61,14 @@
         },
         {
           "type": "named",
-          "name": "--url",
-          "description": "Base URL of the running `nuthatch dev` HTTP API; for a runtime hosting several nests, one mount of it (http://host:port/<alias>)",
-          "default": "http://127.0.0.1:8288"
+          "name": "--authoring",
+          "description": "Also offer the tools that create a nest in --dir and index it, so the client needs no shell"
         },
         {
           "type": "named",
-          "name": "--token-env",
-          "description": "Name of an environment variable holding a bearer token, for a nest behind a gateway that wants one",
-          "isRequired": false
+          "name": "--dir",
+          "description": "Directory the client creates the nest in and indexes from. It need not exist yet: the server lists its tools with no nest present",
+          "default": "nest"
         }
       ]
     }
