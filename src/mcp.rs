@@ -1852,13 +1852,15 @@ mod tests {
             assert_eq!(v["mcpServers"]["nuthatch"]["args"], want, "{client:?}");
         }
 
-        let (_, text) = client_config_file(McpClient::Vscode, "/bin/nh", "http://h:1", Some("T"), None);
+        let (_, text) =
+            client_config_file(McpClient::Vscode, "/bin/nh", "http://h:1", Some("T"), None);
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["servers"]["nuthatch"]["type"], "stdio");
         assert_eq!(v["servers"]["nuthatch"]["command"], "/bin/nh");
         assert_eq!(v["servers"]["nuthatch"]["args"], want);
 
-        let (_, text) = client_config_file(McpClient::Codex, "/bin/nh", "http://h:1", Some("T"), None);
+        let (_, text) =
+            client_config_file(McpClient::Codex, "/bin/nh", "http://h:1", Some("T"), None);
         let v: toml::Value = toml::from_str(&text).unwrap();
         let server = &v["mcp_servers"]["nuthatch"];
         assert_eq!(server["command"].as_str(), Some("/bin/nh"));
