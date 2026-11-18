@@ -80,6 +80,13 @@ pub fn print_client_config(base: &str, token_env: Option<&str>, authoring: Optio
         "{}",
         serde_json::to_string_pretty(&snippet).unwrap_or_default()
     );
+    if authoring.is_none() {
+        println!("\n  No shell, no nest yet, or no binary installed? Let the client create and index one:");
+        println!(
+            "    claude mcp add nuthatch -- npx -y nuthatch-indexer mcp --authoring --dir nest"
+        );
+        println!("  (`nuthatch mcp --authoring --dir nest --print-config` prints the same for your client.)");
+    }
     println!(
         "\nThen ask your agent: \"what are the top USDC holders?\" - it queries the nest over MCP."
     );

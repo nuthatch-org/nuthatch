@@ -71,15 +71,19 @@ fn the_plugin_manifests_start_a_real_mcp_command_and_name_real_paths() {
         ),
         ("mcp.json", &agent["mcpServers"]["nuthatch"]),
     ] {
-        assert_eq!(server["command"], "nuthatch", "{file}");
+        // #3021: npx, so the server starts with only Node installed; `-y nuthatch-indexer` is the
+        // launcher, and what follows is the binary's own command line.
+        assert_eq!(server["command"], "npx", "{file}");
+        let mut args: Vec<String> = server["args"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{file} has no args"))
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(args[..2], ["-y", "nuthatch-indexer"], "{file}");
         let mut argv = vec!["nuthatch".to_string()];
-        argv.extend(
-            server["args"]
-                .as_array()
-                .unwrap_or_else(|| panic!("{file} has no args"))
-                .iter()
-                .map(|a| a.as_str().unwrap().to_string()),
-        );
+        argv.extend(args.drain(2..));
+        assert!(argv.iter().any(|a| a == "--authoring"), "{file}");
         if let Err(e) = nuthatch::cli::Cli::try_parse_from(&argv) {
             panic!(
                 "{file} starts `{}`, which the binary refuses: {e}",
