@@ -1,0 +1,24 @@
+{
+  "name": "nuthatch-viem-next",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "index": "node scripts/index.mjs",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "stop:index": "npx -y nuthatch-indexer stop --dir nest"
+  },
+  "dependencies": {
+    "next": "^16.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.9.0"
+  }
+}
