@@ -275,7 +275,7 @@ pub fn llms_txt(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema])
          - `GET /diff?from=X&to=Y`    what happened in a range (`block=N`, or `tx=0x..&block=N`), as JSON, `format=text` or `markdown`\n\
          \n\
          ## MCP (for coding agents)\n\
-         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, explain, entity, diff{balance_tools}.\n\
+         Run `nuthatch mcp` (stdio) to expose tools: status, schema, tables, table, sql, at, explain, entity, diff{balance_tools}.\n\
          Fully offline against the local instance; nothing phones home.\n"
     )
 }
@@ -476,7 +476,7 @@ mod tests {
     }
 
     /// The balance routes and tools exist only where a Transfer table does, as the MCP bridge
-    /// advertises them, and `explain` is always listed.
+    /// advertises them, and `at` and `explain` are always listed.
     #[test]
     fn the_agent_docs_name_the_balance_tools_only_for_a_transfer_nest() {
         let address =
@@ -493,7 +493,7 @@ mod tests {
                 && llms.contains("history_from_deployment"),
             "{llms}"
         );
-        assert!(llms.contains("explain"), "{llms}");
+        assert!(llms.contains("sql, at, explain"), "{llms}");
         assert!(
             skill.contains("top_balances")
                 && skill.contains("complete_history")
@@ -509,6 +509,6 @@ mod tests {
         for text in [&llms, &skill] {
             assert!(!text.contains("balance"), "{text}");
         }
-        assert!(llms.contains("explain"), "{llms}");
+        assert!(llms.contains("sql, at, explain"), "{llms}");
     }
 }

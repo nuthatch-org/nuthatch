@@ -343,7 +343,8 @@ the same `as_of`, `sealed_through` and `nid`.
   | Beside the writer | On another host |
   |---|---|
   | Sealed segments from the runtime directory | From the mirror, each file's sha256 checked against the hash its catalogue names before anything reads it |
-  | Each nest's `nuthatch.toml`, labels and entities from `data/<nid>` | From the registry by the NID the `mount` line carries, verified as `nest load` verifies it |
+  | Each nest's `nuthatch.toml` and entities from `data/<nid>` | From the registry by the NID the `mount` line carries, verified as `nest load` verifies it |
+  | Label sets from `data/<nid>/labels` | None: neither the registry's bundle nor the mirror carries them (#2946). To serve exposure, `nuthatch labels import <file> --dir <cache>/data/<nid>` on the follower and restart it |
   | Offchain snapshots from `<dataset>/offchain` | From the mirror's `_offchain/`, content-addressed and checked the same way, every 5 s |
   | `max_rss_mb` from `mounts.toml` | `--max-rss-mb`, default 2048 |
   | The token from the environment or `.admin-token` | `NUTHATCH_ADMIN_TOKEN` only |
@@ -2307,10 +2308,11 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   a symbolic link anywhere in the nest other than `nuthatch.redb` or `segments/` is refused by `dev`,
   `init --from` and every command that computes the NID, because the NID cannot see what it points to. Whether it is indexed again
   depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt`, `AGENTS.md` and the
-  scaffolded skill are outside the **data identity**. On a runtime, or through `migrate`, a new NID
+  scaffolded skill are outside the **data identity**. Label sets are outside both it and the NID (#2946), so
+  importing or deleting one changes neither. On a runtime, or through `migrate`, a new NID
   whose data identity and recorded decode (registry hash) both match a dataset that holds data adopts
   that dataset's decoded facts instead of re-indexing, and says so at startup (RFC-0033 §5). An edit
-  to the ABIs, contracts, labels or anything else in the data identity is indexed from its start
+  to the ABIs, contracts or anything else in the data identity is indexed from its start
   block; a single-nest directory whose decode changed refuses to start until you re-index it. Even then
   a sealed segment is content-addressed, so two datasets that decode the same contract over the same
   range hold one copy under the runtime's `segments/`. Per-derivation reuse across an NID change
