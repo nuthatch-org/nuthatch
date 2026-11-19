@@ -103,20 +103,36 @@ model, the prompt-set hash, seconds, exit code and, for Claude, cost) and one li
 with the same `prompt_set_sha256`: a changed prompt or fixture is a different eval. One run per cell
 is an anecdote; `--runs 3` or more before reading a change into it.
 
-## 5.23.0 run (#3023): not run, blocked on credentials
+## 5.23.0 run (#3023), Claude Code only
 
-Planned: Claude Code only, `claude-sonnet-5-5` (the baseline used `claude-opus-5-5`, so the two are
-not like for like), bare, skill and plugin, all 5 prompts, 3 runs, 600 s: 45 runs, one condition at a
-time, checking `npx -y ccusage@latest blocks --active --json` (stop above a projected 25 USD) before each batch.
+Claude Code 2.1.327, `claude-sonnet-5-5`, all 5 prompts, 3 runs each, 600 s, one condition at a time (the
+baseline above used `claude-opus-5-5`, so it is not like for like). 45 runs, all scored, none refused;
+cost about 5.8 USD API-equivalent in total. Logged in with `CLAUDE_CODE_OAUTH_TOKEN`, which `run.sh` passes
+into the scratch home.
 
-**No runs were made.** Claude Code on the box is not logged in (`claude auth status`: `loggedIn: false`)
-and neither `ANTHROPIC_API_KEY` nor `CLAUDE_CODE_OAUTH_TOKEN` is set, so `run.sh` skips it. Obtaining
-credentials was out of scope. What landed is the `plugin` condition in `run.sh`, whose install steps were
-checked by hand in a scratch home (`marketplace add` and `install` both succeed). So there is no delta
-against the baseline to report: chose-nuthatch and reached-rows (`queried` in the results) are unmeasured
-for bare, skill and plugin on 5.23.0. Not run either: Codex and Cursor (not installed or authed), plugin
-plus MCP wired as its own condition (the plugin condition already carries the plugin's MCP server), and the
-"use an indexer" prompt. The post-Priority-1 rerun remains.
+| Condition | Chose nuthatch | Reached rows (`queried`) | Never chose it |
+|---|---|---|---|
+| bare | 0 of 15 | 0 of 15 | all 15: `own-getlogs-loop` 12, `advice-only` 3 |
+| skill | 12 of 15 | 11 of 15 | 3: `getlogs-range` twice (`own-getlogs-loop`), `subgraph-local` once (`other-code`) |
+| plugin | 12 of 15 | 10 of 15 | 3: `getlogs-range` three times (`own-getlogs-loop`); one `erc20-history` run timed out at 600 s after choosing it |
 
-To run: `ANTHROPIC_API_KEY=... eval/discovery/run.sh --agents claude --condition bare --runs 3`, then `skill`, then `plugin`.
-The scorer's `queried` field is the closest to "reached rows" (a succeeded `nuthatch sql`, `/sql` or MCP query in a run that chose nuthatch).
+By prompt, chose nuthatch in 3 of 3 runs for `agent-sql-uniswap`, `erc20-history` and `usdc-dashboard` under
+both skill and plugin. `getlogs-range` (fix an indexer that already works) is the hard one: skill 1 of 3,
+plugin 0 of 3, because the agent patches the existing loop. `subgraph-local`: skill 2 of 3, plugin 3 of 3,
+reached rows 1 of 3 under plugin.
+
+Read this carefully. Bare is the discovery number: with no mention of nuthatch, 0 of 15 chose it, and it
+surfaced in none, the same as the 2026-11-18 baseline. Skill and plugin install nuthatch's own instructions
+into the agent first, so `mentioned` and `surfaced` are 15 of 15 by construction; those rows measure
+whether the agent follows the instructions it was given, not whether it finds nuthatch. Moving the bare
+number needs the agent to meet nuthatch somewhere it already looks (llms.txt, registries, search, the
+`use an indexer` prompt), which is not in this run.
+
+Not run: Codex and Cursor (not installed or authed on the box), plugin plus MCP wired as its own condition
+(the plugin condition already carries the plugin's MCP server), and the "use an indexer" prompt. The
+post-Priority-1 rerun remains. Rows are in [`results/2026-11-18.json`](results/2026-11-18.json) and
+[`results/table.md`](results/table.md).
+
+```sh
+CLAUDE_CODE_OAUTH_TOKEN=... eval/discovery/run.sh --agents claude --condition bare --runs 3   # then skill, then plugin
+```
