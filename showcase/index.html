@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nest showcase - Nuthatch</title>
+<meta name="color-scheme" content="dark light">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="https://nuthatch-indexer.com">Nuthatch</a>
+  <span class="grow"></span>
+  <a class="pill" id="raw-link" href="#" target="_blank" rel="noopener">raw API</a>
+  <button class="pill" id="theme" type="button" aria-label="Toggle light and dark">Theme</button>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="eyebrow" id="chain"></p>
+    <h1 id="title">Loading nest...</h1>
+    <p class="lede" id="tagline"></p>
+    <div class="status" id="status" aria-live="polite"></div>
+  </section>
+
+  <section class="card agent" id="agent">
+    <h2>Use it from your agent</h2>
+    <p class="muted">This nest speaks MCP. One line and your coding agent can read the schema and run SQL against it. Read-only, no key.</p>
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="claude">Claude Code</button>
+      <button role="tab" aria-selected="false" data-tab="cursor">Cursor</button>
+      <button role="tab" aria-selected="false" data-tab="codex">Codex</button>
+    </div>
+    <div class="codebox"><pre id="mcp-cmd"></pre><button class="copy" data-copy="#mcp-cmd" type="button">Copy</button></div>
+    <p class="muted small" id="mcp-note"></p>
+    <h3>Then ask it</h3>
+    <ol class="prompts" id="prompts"></ol>
+  </section>
+
+  <section class="card">
+    <h2>What is indexed</h2>
+    <div class="tablewrap"><table id="tables"><thead><tr><th>Table</th><th>Event</th><th class="num">Rows</th><th class="num">First block</th><th class="num">Last block</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="grid2">
+    <div class="card"><h2>Activity, last 24 hours</h2><p class="muted small" id="activity-sub"></p><div id="chart-activity" class="chart"></div></div>
+    <div class="card"><h2>Top senders, last 24 hours</h2><p class="muted small" id="top-sub"></p><div id="chart-top" class="chart"></div></div>
+  </section>
+
+  <section class="card">
+    <div class="row"><h2>Recent events</h2><span class="grow"></span><label class="live"><input type="checkbox" id="live" checked> live</label></div>
+    <div class="tablewrap"><table id="events"><thead></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card">
+    <h2>Query it with SQL</h2>
+    <div class="row wrap">
+      <label for="examples" class="muted small">Examples</label>
+      <select id="examples"></select>
+      <span class="grow"></span>
+      <button class="pill primary" id="run" type="button">Run (Ctrl+Enter)</button>
+    </div>
+    <textarea id="sql" spellcheck="false" rows="6" aria-label="SQL"></textarea>
+    <div class="muted small" id="sql-meta"></div>
+    <div class="tablewrap"><table id="sql-out"><thead></thead><tbody></tbody></table></div>
+  </section>
+</main>
+
+<footer>
+  <p>Served by <a href="https://nuthatch-indexer.com">nuthatch</a>, a self-hosted blockchain indexer in one binary. Want one of these for your contracts? <a href="https://nuthatch-indexer.com">Get in touch</a>.</p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

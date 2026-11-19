@@ -1,0 +1,20 @@
+{
+  "title": "USDC on Arc testnet",
+  "tagline": "Every USDC transfer on Arc, indexed live by one Rust binary and queryable with plain SQL or from your AI agent.",
+  "chain": "Arc testnet (5042002)",
+  "events": { "table": "usdc__transfer", "from": "from", "to": "to", "amount": "value", "decimals": 6, "symbol": "USDC" },
+  "queries": [
+    { "title": "Latest transfers", "sql": "SELECT block_number, \"from\", \"to\", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 20" },
+    { "title": "Top 10 senders, last 24h", "sql": "SELECT \"from\", sum(value_dec) AS total_base_units, count(*) AS transfers FROM usdc__transfer WHERE block_timestamp > extract(epoch from now()) - 86400 GROUP BY 1 ORDER BY total_base_units DESC LIMIT 10" },
+    { "title": "Transfers per hour, last 24h", "sql": "SELECT date_trunc('hour', to_timestamp(block_timestamp)) AS hour, count(*) AS transfers FROM usdc__transfer WHERE block_timestamp > extract(epoch from now()) - 86400 GROUP BY 1 ORDER BY 1" },
+    { "title": "Mints and burns", "sql": "SELECT 'mint' AS kind, count(*) AS n, sum(amount_dec) AS base_units FROM usdc__mint UNION ALL SELECT 'burn', count(*), sum(amount_dec) FROM usdc__burn" },
+    { "title": "Busiest receivers, all time", "sql": "SELECT \"to\", count(*) AS transfers FROM usdc__transfer GROUP BY 1 ORDER BY transfers DESC LIMIT 10" }
+  ],
+  "prompts": [
+    "Who were the 10 largest USDC senders in the last 24 hours on this nest? Show amounts in USDC (6 decimals).",
+    "How many USDC transfers happened per hour over the last 12 hours, and which hour was the busiest?",
+    "What is the latest block this nest has indexed, and what is the UTC timestamp of the newest USDC transfer?",
+    "Find the single largest USDC transfer ever indexed here and tell me who sent it, who received it and when.",
+    "List every table in this nest with its row count, then explain in two sentences what the data is good for."
+  ]
+}
