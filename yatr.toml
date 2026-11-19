@@ -565,9 +565,9 @@ run = [
 no_cache = true
 
 [tasks.agents-check]
-desc = "Fail if the task table in CLAUDE.md has drifted from this file"
-run = ["yatr agents --check CLAUDE.md"]
-sources = ["yatr.toml", "CLAUDE.md"]
+desc = "Fail if the task table in docs/agent-brief/tasks.md has drifted from this file"
+run = ["yatr agents --check docs/agent-brief/tasks.md"]
+sources = ["yatr.toml", "docs/agent-brief/tasks.md"]
 # The section's wording belongs to the yatr that wrote it.
 tool_inputs = ["yatr --version"]
 

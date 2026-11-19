@@ -105,12 +105,15 @@ fn doc_files() -> Vec<PathBuf> {
     out
 }
 
-const RECORD_DIRS: [&str; 5] = [
+const RECORD_DIRS: [&str; 6] = [
     "docs/rfcs/",
     "docs/releases/",
     "docs/bench/",
     "docs/decisions/",
     "docs/validation/",
+    // The standing brief moved out of CLAUDE.md verbatim. That file was never walked, and the
+    // build-order log it carries names commands that have since gone.
+    "docs/agent-brief/",
 ];
 
 fn is_product_doc(rel: &str) -> bool {

@@ -625,6 +625,14 @@ jq -n -c -f "$tmp/prog.jq" \
 cat "$tmp/system-pre.txt" >> "$tmp/system.txt"
 if [ -f "$CLAUDE_MD_PATH" ]; then
   cat "$CLAUDE_MD_PATH" >> "$tmp/system.txt"
+  # CLAUDE.md is a short index now; the detail it links is the same standing brief the reviewer always
+  # had in full, so it is spliced in too (tasks.md is a generated command table, no review value).
+  for brief in architecture correctness build-order-status out-of-scope; do
+    if [ -f "docs/agent-brief/$brief.md" ]; then
+      printf '\n\n--- docs/agent-brief/%s.md ---\n' "$brief" >> "$tmp/system.txt"
+      cat "docs/agent-brief/$brief.md" >> "$tmp/system.txt"
+    fi
+  done
 else
   printf '(not available)' >> "$tmp/system.txt"
 fi
