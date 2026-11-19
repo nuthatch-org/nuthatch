@@ -1,0 +1,59 @@
+# The Base USDC nest, public and read-only (#3028). docs/public-nests.md, "The second nest: Base USDC".
+# Same shape as nuthatch-public-arc-testnet.service; what differs is below.
+#
+# RPC: GraphOps, through NUTHATCH_RPC in the env file. It is the one setting that carries a secret (the key
+#   is the last path segment of the URL), so it is not an argument: arguments show in `ps` and `systemctl
+#   status`, an EnvironmentFile line does not.
+# --backfill 3000000, not genesis: usdc-base-nest declares start_block 2,797,221 (the proxy's deployment), which
+#   is ~56.7 M blocks on a chain that now makes a block every 200 ms. --backfill overrides it on the first run
+#   only and starts 3 M blocks (about seven days) behind the tip; a store that has indexed a block ignores it.
+# --window 1500: GraphOps answers an eth_getLogs with at most 20,000 results (about 2,250 blocks of USDC
+#   Transfers on 2026-11-19, fewer with every event), so the range is kept under that rather than found by refusals.
+# --seal-direct --concurrency 4: the backfill goes straight to sealed segments, four windows at a time.
+# --local-host 100.82.188.91: Prometheus scrapes /metrics and /ready through the tailnet-only Caddy site on :9180, which
+#   forwards that Host; a loopback-bound nest refuses a Host it was not told (#3002).
+# --poll-interval 6s: each poll at the tip costs a few credits, so the interval is the running bill.
+[Unit]
+Description=nuthatch public read-only nest: Base USDC (GraphOps RPC)
+Documentation=https://github.com/nuthatch-org/nuthatch/blob/main/docs/public-nests.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nests-public
+Group=nests-public
+EnvironmentFile=/etc/nuthatch-public/base-usdc.env
+WorkingDirectory=/var/lib/nuthatch-public/usdc-base-nest
+ExecStart=/usr/local/bin/nuthatch-5.23.0 dev \
+    --dir /var/lib/nuthatch-public/usdc-base-nest \
+    --listen 127.0.0.1:8121 \
+    --no-admin \
+    --public-host ${PUBLIC_HOST} \
+    --local-host 100.82.188.91 \
+    --poll-interval 6s \
+    --backfill 3000000 \
+    --window 1500 \
+    --seal-direct \
+    --concurrency 4
+Restart=on-failure
+RestartSec=5
+# The 2 GB per-cursor budget (CLAUDE.md non-negotiable 2).
+MemoryMax=2G
+
+# Sandbox, as the Arc unit.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/nuthatch-public
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

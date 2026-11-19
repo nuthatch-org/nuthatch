@@ -9,6 +9,8 @@
 - {targets: ["100.82.188.91:8104"], labels: {unit: nuthatch-dips, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8114"], labels: {unit: data-services-nest, box: helsinki, role: cursor}}
 - {targets: ["100.82.188.91:8103"], labels: {unit: graph-staking-legacy-readonly, box: helsinki, role: archive}}
+- {targets: ["100.82.188.91:8120"], labels: {unit: nuthatch-public-arc-testnet, box: helsinki, role: cursor}}
+- {targets: ["100.82.188.91:8121"], labels: {unit: nuthatch-public-base-usdc, box: helsinki, role: cursor}}
 - {targets: ["100.83.44.63:8124"], labels: {unit: qos-reo-nest, box: thinkpad, role: cursor}}
 - {targets: ["100.83.44.63:8431"], labels: {unit: grt-supply-arbitrum-one, box: thinkpad, role: cursor}}
 - {targets: ["100.83.44.63:8432"], labels: {unit: grt-supply-mainnet, box: thinkpad, role: cursor}}
