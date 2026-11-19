@@ -1,6 +1,0 @@
-{
-  "scripts": {
-    "index": "node scripts/index.mjs",
-    "index:stop": "npx -y nuthatch-indexer stop --dir nest"
-  }
-}
