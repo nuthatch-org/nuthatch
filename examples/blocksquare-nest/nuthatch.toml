@@ -1,0 +1,150 @@
+[nest]
+name = "blocksquare-nest"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = [
+    "https://mainnet.gateway.tenderly.co",
+    "https://rpc.mevblocker.io",
+]
+schema_version = 1
+block_timestamps = true
+
+[[contracts]]
+alias = "blocksquare_token"
+address = "0x509a38b7a1cc0dcd83aa9d06214663d9ec7c7f4a"
+start_block = 0
+abi = "abis/BlocksquareToken.json"
+
+[[contracts]]
+alias = "certified_partners"
+address = "0x8dbb99cc3721f5c9cc7c9e92db260813cf78cdd3"
+start_block = 0
+abi = "abis/CertifiedPartners.json"
+
+[[contracts]]
+alias = "data_storage_proxy"
+address = "0x8c2a858fe7b2bf155247c7f528c6ca7b186197b5"
+start_block = 0
+abi = "abis/DataStorageProxy.json"
+
+[[contracts]]
+alias = "governance_pool"
+address = "0x6f1e92fb8a685aaa0710bad194d7b1aa839f7f8a"
+start_block = 0
+abi = "abis/GovernancePool.json"
+
+[[contracts]]
+alias = "liquidity_staking_pool"
+address = "0x1802f66868d0649687a7a6bc9b8a4292e148daec"
+start_block = 0
+abi = "abis/LiquidityStakingPool.json"
+
+[[contracts]]
+alias = "marketplace_pool_factory"
+address = "0x17887106a14f38bf10512565bdbb5bd7ac12f001"
+start_block = 0
+abi = "abis/MarketplacePoolFactory.json"
+
+[[contracts]]
+alias = "property_factory"
+address = "0x1ae91a263a690bf2129cf0b3acac92bbb67e6685"
+start_block = 0
+abi = "abis/PropertyFactory.json"
+
+[[contracts]]
+alias = "property_registry"
+address = "0x05325c1ab1440df7214db38f676f95999729267b"
+start_block = 0
+abi = "abis/PropertyRegistry.json"
+
+[[contracts]]
+alias = "property_revenue_distribution"
+address = "0xbcb1757cdadec25b6cadc1a83953a70eda2da8cb"
+start_block = 0
+abi = "abis/PropertyRevenueDistribution.json"
+
+[[contracts]]
+alias = "property_token_offering"
+address = "0x25862c4fb4ce9d6ff9b463488e0ec656fa08de78"
+start_block = 0
+abi = "abis/PropertyTokenOffering.json"
+
+[[contracts]]
+alias = "users"
+address = "0x13344d0cb96b17df81c4171ce47e14ff6c1975f7"
+start_block = 0
+abi = "abis/Users.json"
+
+[[contracts]]
+alias = "bst_eth_pool"
+address = "0x0e85fb1be698e777f2185350b4a52e5ee8df51a6"
+start_block = 0
+abi = "abis/UniswapPoolV2.json"
+
+[[contracts]]
+alias = "staking_community"
+address = "0x13299657e662894b933bb3ee73f7f8da94b55451"
+start_block = 0
+abi = "abis/PropertyStakingPool.json"
+
+[[contracts]]
+alias = "staking_issuer"
+address = "0x57ba886442d248c2e7a3a5826f2b183a22ecc73e"
+start_block = 0
+abi = "abis/PropertyStakingPool.json"
+
+[[contracts]]
+alias = "staking_rwa"
+address = "0x6f5ecf8a8dadaac3c8440a080c9271f845f34b07"
+start_block = 0
+abi = "abis/PropertyStakingPool.json"
+
+[[contracts]]
+alias = "staking_landhive"
+address = "0xfc7cd245913691fb2d305a0fc60a1dadd1ecdebf"
+start_block = 0
+abi = "abis/PropertyStakingPool.json"
+
+[[contracts]]
+alias = "valuation_community"
+address = "0xaeea40bb8393174459c4016bce2625076fe4deff"
+start_block = 0
+abi = "abis/OceanpointValuation.json"
+
+[[contracts]]
+alias = "valuation_issuer"
+address = "0x14db5b377d13ec9f9e7747f42d71634b5ef5a335"
+start_block = 0
+abi = "abis/OceanpointValuation.json"
+
+[[contracts]]
+alias = "valuation_rwa"
+address = "0x05f5b75d80291910a54b65aea9b45f549cdd0acc"
+start_block = 0
+abi = "abis/OceanpointValuation.json"
+
+[[contracts]]
+alias = "valuation_landhive"
+address = "0x3c18b35e8e919224ea4099acc0d280eda76a71c0"
+start_block = 0
+abi = "abis/OceanpointValuation.json"
+
+[[templates]]
+name = "marketplace_pool"
+abi = "abis/MarketplacePool.json"
+
+[[templates]]
+name = "property_token"
+abi = "abis/PropertyToken.json"
+
+[[factories]]
+watch = "marketplace_pool_factory"
+event = "MarketplacePoolCreated"
+child_param = "marketplacePoolAddress"
+template = "marketplace_pool"
+
+[[factories]]
+watch = "property_factory"
+event = "NewPropToken"
+child_param = "proptoken"
+template = "property_token"
