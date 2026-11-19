@@ -16,6 +16,24 @@ internet -> Caddy :443            TLS, the public name           (already on the
          -> nuthatch 127.0.0.1:8120  --no-admin, read routes only
 ```
 
+## Live
+
+The Arc testnet USDC nest has been live since 2026-11-19 at **https://arc.nuthatch-indexer.com** (helsinki-nests,
+unit `nuthatch-public-arc-testnet` behind `nuthatch-public-proxy` and Caddy, nuthatch 5.23.0, Arc's keyless
+public RPCs). Cold backfill from block 72,550,000 took 35 min 52 s (3,253,137 events, about 1,500 events a
+second, 221 MB on disk, 423 MB peak memory), then it follows the tip at `lag_blocks` 0. Smoke-tested from
+outside: `/sql` and `/mcp` `tools/list` answer `200` with no key, `check-proxy.sh` passes including
+`--burst`, `/_admin` and `/metrics` answer `403`.
+
+```sh
+curl -sG "https://arc.nuthatch-indexer.com/sql" --data-urlencode \
+  'q=SELECT block_number, tx_hash, "from", "to", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 3'
+```
+
+On the host, `nginx` was already installed and in use, so step 5's `apt-get install`, `policy-rc.d` and
+`systemctl disable nginx` were skipped, as the note under step 5 says. The Caddyfile was backed up to
+`/etc/caddy/Caddyfile.bak-public-nests-<timestamp>` before the site was appended.
+
 ## What nuthatch's read-only surface is
 
 Checked against the code (`src/serve.rs`, `mount_router`, and `src/cli.rs`, `DevArgs`) and against a
