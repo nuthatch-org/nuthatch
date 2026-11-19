@@ -16,9 +16,13 @@ internet -> Caddy :443            TLS, the public name           (already on the
          -> nuthatch 127.0.0.1:8120  --no-admin, read routes only
 ```
 
+The URL people are given is a path on the main site, `https://nuthatch-indexer.com/nests/<name>`, not a name of
+its own: [see below](#the-public-url-is-a-path-not-a-subdomain). A new nest needs no DNS record.
+
 ## Live
 
-The Arc testnet USDC nest has been live since 2026-11-19 at **https://arc.nuthatch-indexer.com** (helsinki-nests,
+The Arc testnet USDC nest has been live since 2026-11-19 at **https://nuthatch-indexer.com/nests/arc-usdc**, and
+still at https://arc.nuthatch-indexer.com (helsinki-nests,
 unit `nuthatch-public-arc-testnet` behind `nuthatch-public-proxy` and Caddy, nuthatch 5.23.0, Arc's keyless
 public RPCs). Cold backfill from block 72,550,000 took 35 min 52 s (3,253,137 events, about 1,500 events a
 second, 221 MB on disk, 423 MB peak memory), then it follows the tip at `lag_blocks` 0. Smoke-tested from
@@ -26,29 +30,53 @@ outside: `/sql` and `/mcp` `tools/list` answer `200` with no key, `check-proxy.s
 `--burst`, `/_admin` and `/metrics` answer `403`.
 
 ```sh
-curl -sG "https://arc.nuthatch-indexer.com/sql" --data-urlencode \
+curl -sG "https://nuthatch-indexer.com/nests/arc-usdc/sql" --data-urlencode \
   'q=SELECT block_number, tx_hash, "from", "to", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 3'
 ```
 
-The Base USDC nest is the second one, at **https://base.nuthatch-indexer.com** once its DNS record exists
-(helsinki-nests, unit `nuthatch-public-base-usdc` behind `nuthatch-public-base-usdc-proxy` and Caddy, nuthatch
+The Base USDC nest is the second one, at **https://nuthatch-indexer.com/nests/base-usdc** (it has no name of its
+own; helsinki-nests, unit `nuthatch-public-base-usdc` behind `nuthatch-public-base-usdc-proxy` and Caddy, nuthatch
 5.23.0, the GraphOps RPC; see [the section below](#the-second-nest-base-usdc-on-the-graphops-rpc)).
 
 ```sh
-curl -sG "https://base.nuthatch-indexer.com/sql" --data-urlencode \
+curl -sG "https://nuthatch-indexer.com/nests/base-usdc/sql" --data-urlencode \
   'q=SELECT block_number, tx_hash, "from", "to", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 3'
 ```
 
 For an agent, either nest speaks MCP over HTTP, with no key. With Claude Code:
 
 ```sh
-claude mcp add --transport http arc-usdc https://arc.nuthatch-indexer.com/mcp
-claude mcp add --transport http base-usdc https://base.nuthatch-indexer.com/mcp
+claude mcp add --transport http arc-usdc https://nuthatch-indexer.com/nests/arc-usdc/mcp
+claude mcp add --transport http base-usdc https://nuthatch-indexer.com/nests/base-usdc/mcp
 ```
 
 On the host, `nginx` was already installed and in use, so step 5's `apt-get install`, `policy-rc.d` and
 `systemctl disable nginx` were skipped, as the note under step 5 says. The Caddyfile was backed up to
 `/etc/caddy/Caddyfile.bak-public-nests-<timestamp>` before the site was appended.
+
+## The public URL is a path, not a subdomain
+
+`https://nuthatch-indexer.com/nests/<name>` is what people are given, as it is for the other hosted nests
+(`bounty-nest`, `irmarket`, ...). Two pieces make it work, and neither is a DNS record:
+
+1. **nuthatch-frontend**, `vercel.json`: `/nests/<name>/:path*` rewrites to `https://<name>.89.167.109.4.sslip.io/:path*`,
+   and `src/data/public-nests.ts` has an entry, which renders the page at `/nests/<name>` (status, query it,
+   tables) from the live nest at build. A name under `sslip.io` already resolves to the host.
+2. **Caddy on the host**: [`Caddyfile.path`](../deploy/public-nests/Caddyfile.path) has a site per nest on that
+   `sslip.io` name. It forwards to the same nginx as before, so the route allowlist, body and time limits and
+   per-address limits are unchanged.
+
+Through Vercel, a request reaches Caddy from one of Vercel's addresses, and a different one most times, so left
+alone nginx would count all visitors as one caller. Caddy therefore takes the visitor's address from
+`X-Vercel-Forwarded-For`, which Vercel sets and overwrites, and passes it on as `X-Forwarded-For`. It also sends
+the `Host` the nest was started with (`--public-host`), since the request arrives under the `sslip.io` name.
+`POST /mcp` and `POST /sql` pass through the rewrite as they do direct. The reasoning and what was tested are in
+the comment at the top of `Caddyfile.path`.
+
+To add one: start the nest and its nginx as above, add a site to `Caddyfile.path` on the host (a new name
+`<name>.89.167.109.4.sslip.io`, the port of its nginx and the `Host` it was started with), and add the rewrite and
+the `public-nests.ts` entry to nuthatch-frontend. Merging that repo is not publishing it: the site is deployed
+with `vercel --prod` (see its README).
 
 ## What nuthatch's read-only surface is
 
@@ -304,7 +332,7 @@ Everything above applies; this is what differs, and the files are `*-base-usdc*`
 
 | | Arc testnet USDC | Base USDC |
 |---|---|---|
-| Public name | `arc.nuthatch-indexer.com` | `base.nuthatch-indexer.com` |
+| Public URL | `https://nuthatch-indexer.com/nests/arc-usdc` (and `arc.nuthatch-indexer.com`) | `https://nuthatch-indexer.com/nests/base-usdc` |
 | Unit, port | `nuthatch-public-arc-testnet`, 8120 | `nuthatch-public-base-usdc`, 8121 |
 | Proxy | `nuthatch-public-proxy`, `nginx.conf`, 8480 | `nuthatch-public-base-usdc-proxy`, `nginx-base-usdc.conf`, 8481 |
 | Env file | `arc-testnet.env` | `base-usdc.env` |
