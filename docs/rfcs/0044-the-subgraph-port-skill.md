@@ -169,6 +169,8 @@ The split is clean, and Chief decides it rather than this document:
   configuration surface. That is adoption tooling, which reads as permitted.
 - **Slice 4 is different.** Teaching `--from-subgraph` to read `schema.graphql` would be new binary
   capability and needs its own explicit decision, recorded in CLAUDE.md, or it does not happen.
+  *(Note 2026-11-19: CLAUDE.md now links its decision log, which lives in
+  [docs/agent-brief/build-order-status.md](../agent-brief/build-order-status.md). "Recorded in CLAUDE.md" means that log.)*
 
 Nothing here is a carve-out until it appears in that list.
 

@@ -13,6 +13,10 @@ fn root() -> PathBuf {
 const SURFACES: &[&str] = &[
     "README.md",
     "CLAUDE.md",
+    "docs/agent-brief/architecture.md",
+    "docs/agent-brief/build-order-status.md",
+    "docs/agent-brief/correctness.md",
+    "docs/agent-brief/out-of-scope.md",
     "docs/operators.md",
     "docs/launch/show-hn.md",
     "docs/launch/home-turf.md",
