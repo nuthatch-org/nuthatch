@@ -73,6 +73,11 @@ the `Host` the nest was started with (`--public-host`), since the request arrive
 `POST /mcp` and `POST /sql` pass through the rewrite as they do direct. The reasoning and what was tested are in
 the comment at the top of `Caddyfile.path`.
 
+Checked on 2026-11-19 against the real URLs: `check-proxy.sh https://nuthatch-indexer.com/nests/base-usdc --burst` and
+the same for `/nests/arc-usdc` pass every check except where Vercel answers for the host (a trailing-slash
+`/_admin/` is a 404 and `//_admin/` a 308, both refusals, which the script now accepts); `/sql` and `POST /mcp`
+`tools/list` answer `200`, and the flood from one address is answered `429`.
+
 To add one: start the nest and its nginx as above, add a site to `Caddyfile.path` on the host (a new name
 `<name>.89.167.109.4.sslip.io`, the port of its nginx and the `Host` it was started with), and add the rewrite and
 the `public-nests.ts` entry to nuthatch-frontend. Merging that repo is not publishing it: the site is deployed
@@ -384,7 +389,7 @@ Read from the nest's own `/metrics` and `/ready` on 2026-11-19, nuthatch 5.23.0,
 
 The two reads that are not measured: the credit totals are the call counts times GraphOps' published prices,
 not a figure from platform.graphops.xyz (the CLI's usage report is per organisation, and other nests run on it),
-and the public name was not tried because its DNS record did not exist yet.
+and the public name was not tried because its DNS record did not exist yet. It was served under the path URL instead, below.
 
 ## What this does not prove
 

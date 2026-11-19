@@ -61,7 +61,9 @@ body_has "POST /mcp tools/list"      '"tools"' "${json[@]}" -H 'accept: applicat
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"
 
 echo "== refused: admin and operator surface"
-expect "GET /_admin/"                403 "$base/_admin/"
+# Behind the path URL on nuthatch-indexer.com, Vercel answers a trailing-slash /_admin/ itself with 404 and
+# redirects a double slash (308) before either reaches the host; both are refusals, so they pass here.
+expect "GET /_admin/"                '403|404' "$base/_admin/"
 expect "GET /_admin"                 403 "$base/_admin"
 expect "GET /_admin/config"          403 "$base/_admin/config"
 expect "GET /_admin/events"          403 "$base/_admin/events"
@@ -71,7 +73,7 @@ expect "PUT /_admin/runtime"         403 -X PUT "${json[@]}" -d '{}' "$base/_adm
 expect "GET /metrics"                403 "$base/metrics"
 expect "traversal /sql/../_admin/"   '403|404' --path-as-is "$base/sql/../_admin/config"
 expect "encoded /%5fadmin/config"    '403|404' --path-as-is "$base/%5fadmin/config"
-expect "double slash //_admin/"      '403|404' --path-as-is "$base//_admin/config"
+expect "double slash //_admin/"      '403|404|308' --path-as-is "$base//_admin/config"
 
 echo "== refused: routes not offered publicly"
 for p in /nests /entities /entity/x /derived /derived/x /balances /balance/0x0 /exposure/0x0 /flags \
