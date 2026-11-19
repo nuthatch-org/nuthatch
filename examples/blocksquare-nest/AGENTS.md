@@ -1,0 +1,176 @@
+<!-- Written by nuthatch from nuthatch.toml; `nuthatch schema` rewrites it. -->
+# AGENTS.md
+
+This directory is a nuthatch nest: a local SQL index of these contracts on mainnet.
+Query it here; never call a third-party API for this data.
+
+- `blocksquare_token` = 0x509a38b7a1cc0dcd83aa9d06214663d9ec7c7f4a
+- `certified_partners` = 0x8dbb99cc3721f5c9cc7c9e92db260813cf78cdd3
+- `data_storage_proxy` = 0x8c2a858fe7b2bf155247c7f528c6ca7b186197b5
+- `governance_pool` = 0x6f1e92fb8a685aaa0710bad194d7b1aa839f7f8a
+- `liquidity_staking_pool` = 0x1802f66868d0649687a7a6bc9b8a4292e148daec
+- `marketplace_pool_factory` = 0x17887106a14f38bf10512565bdbb5bd7ac12f001
+- `property_factory` = 0x1ae91a263a690bf2129cf0b3acac92bbb67e6685
+- `property_registry` = 0x05325c1ab1440df7214db38f676f95999729267b
+- `property_revenue_distribution` = 0xbcb1757cdadec25b6cadc1a83953a70eda2da8cb
+- `property_token_offering` = 0x25862c4fb4ce9d6ff9b463488e0ec656fa08de78
+- `users` = 0x13344d0cb96b17df81c4171ce47e14ff6c1975f7
+- `bst_eth_pool` = 0x0e85fb1be698e777f2185350b4a52e5ee8df51a6
+- `staking_community` = 0x13299657e662894b933bb3ee73f7f8da94b55451
+- `staking_issuer` = 0x57ba886442d248c2e7a3a5826f2b183a22ecc73e
+- `staking_rwa` = 0x6f5ecf8a8dadaac3c8440a080c9271f845f34b07
+- `staking_landhive` = 0xfc7cd245913691fb2d305a0fc60a1dadd1ecdebf
+- `valuation_community` = 0xaeea40bb8393174459c4016bce2625076fe4deff
+- `valuation_issuer` = 0x14db5b377d13ec9f9e7747f42d71634b5ef5a335
+- `valuation_rwa` = 0x05f5b75d80291910a54b65aea9b45f549cdd0acc
+- `valuation_landhive` = 0x3c18b35e8e919224ea4099acc0d280eda76a71c0
+
+## Tables
+- `blocksquare_token__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, _owner, _spender, _amount)
+- `blocksquare_token__mint` - Mint(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, _to, _value)
+- `blocksquare_token__token_frozen` - TokenFrozen(bool,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, _frozen, _reason)
+- `blocksquare_token__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, _from, _to, _amount)
+- `bst_eth_pool__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `bst_eth_pool__burn` - Burn(address,uint256,uint256,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0, amount1, to)
+- `bst_eth_pool__mint` - Mint(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0, amount1)
+- `bst_eth_pool__swap` - Swap(address,uint256,uint256,uint256,uint256,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, sender, amount0In, amount1In, amount0Out, amount1Out, to)
+- `bst_eth_pool__sync` - Sync(uint112,uint112) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, reserve0, reserve1)
+- `bst_eth_pool__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `certified_partners__added_certified_partner` - AddedCertifiedPartner(bytes32,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, cpBytes, cp)
+- `certified_partners__added_wallet` - AddedWallet(bytes32,address,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, cp, wallet, cpName)
+- `certified_partners__added_whitelisted` - AddedWhitelisted(bytes32,string[],string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, cp, users, cpName)
+- `certified_partners__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `certified_partners__removed_wallet` - RemovedWallet(bytes32,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, cp, wallet)
+- `certified_partners__removed_whitelisted` - RemovedWhitelisted(bytes32,string[],string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, cp, users, cpName)
+- `data_storage_proxy__freeze_property` - FreezeProperty(address,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, frozen)
+- `data_storage_proxy__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `data_storage_proxy__transfer_property_to_c_p` - TransferPropertyToCP(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, cp)
+- `governance_pool__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `governance_pool__deposit` - Deposit(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount)
+- `governance_pool__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `governance_pool__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `governance_pool__withdraw` - Withdraw(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount)
+- `liquidity_staking_pool__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `liquidity_staking_pool__deposit` - Deposit(address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount, lockedUntil)
+- `liquidity_staking_pool__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `liquidity_staking_pool__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `liquidity_staking_pool__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `liquidity_staking_pool__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `liquidity_staking_pool__withdraw` - Withdraw(address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount, reward)
+- `marketplace_pool__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `marketplace_pool__c_p_can_withdraw` - CPCanWithdraw() (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq)
+- `marketplace_pool__c_p_initialized` - CPInitialized(uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, amount, lockPeriod)
+- `marketplace_pool__capped` - Capped(uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, lockEnd)
+- `marketplace_pool__deposit` - Deposit(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount)
+- `marketplace_pool__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `marketplace_pool__liquidate_c_p_collateral` - LiquidateCPCollateral(uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, amount)
+- `marketplace_pool__lock_extended` - LockExtended(uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, extension)
+- `marketplace_pool__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `marketplace_pool__pool_campaign_configured` - PoolCampaignConfigured(uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, startTime, duration, maxPledge)
+- `marketplace_pool__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `marketplace_pool__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `marketplace_pool__withdraw` - Withdraw(address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, inAmount, outAmount, reward)
+- `marketplace_pool_factory__b_s_t_staking_contract_changed` - BSTStakingContractChanged(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, newBSTStakingContract)
+- `marketplace_pool_factory__governance_wallet_changed` - GovernanceWalletChanged(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, newGovernanceWalletContract)
+- `marketplace_pool_factory__implementation_changed` - ImplementationChanged(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, newContract)
+- `marketplace_pool_factory__marketplace_pool_created` - MarketplacePoolCreated(address,address,address,string,string,string,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, marketplacePoolAddress, cpWallet, bsWallet, cpIdentifier, cpUrl, tokenName, tokenSymbol)
+- `marketplace_pool_factory__ownership_transfer_started` - OwnershipTransferStarted(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `marketplace_pool_factory__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_factory__new_prop_token` - NewPropToken(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, certifiedPartner, proptoken, createdAt)
+- `property_factory__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_registry__i_p_f_s_hash_changed` - IPFSHashChanged(address,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newIPFSHash)
+- `property_registry__name_and_symbol_change` - NameAndSymbolChange(address,string,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newName, newSymbol)
+- `property_registry__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_registry__property_basic_info_changed` - PropertyBasicInfoChanged(address,string,string,string,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, streetLocation, geoLocation, propertyValuationCurrency, propertyValuation)
+- `property_registry__property_info_added` - PropertyInfoAdded(address,string,string,string,string,uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, propertyType, kadastralMunicipality, parcelNumber, ID, buildingPart)
+- `property_registry__property_info_changed` - PropertyInfoChanged(address,uint64,string,string,string,string,uint64) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, idProp, propertyType, kadastralMunicipality, parcelNumber, ID, buildingPart)
+- `property_registry__property_valuation_change` - PropertyValuationChange(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newValuationProperty)
+- `property_registry__token_valuation_change` - TokenValuationChange(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newTokenValuation)
+- `property_revenue_distribution__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_revenue_distribution__revenue_added` - RevenueAdded(address,address[],uint256[],uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, users, amounts, fromTime, toTime)
+- `property_revenue_distribution__revenue_claimed` - RevenueClaimed(address,address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, user, amount, time)
+- `property_revenue_distribution__revenue_sent` - RevenueSent(address,address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, user, amount, time)
+- `property_token__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `property_token__capital_stack_change` - CapitalStackChange(address,uint256,uint256,uint256,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, tokenizationAmount, commonEquity, preferredEquity, mezzanine, juniorDebt, seniorDebt)
+- `property_token__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_token__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `property_token_offering__claim_investment` - ClaimInvestment(address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, amount, feeAmount)
+- `property_token_offering__initial_offer` - InitialOffer(address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,address,address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, pricePerToken, presaleMaxInvestment, presaleMinInvestment, maxInvestment, minInvestment, softCap, presaleStart, presaleEnd, saleStart, saleEnd, investmentCurrency, collector, feeCollector, fee)
+- `property_token_offering__initial_offering_canceled` - InitialOfferingCanceled(address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property)
+- `property_token_offering__invested` - Invested(address,address,address,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, wallet, investmentToken, amountInvested, amountReceived)
+- `property_token_offering__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `property_token_offering__returned_investment` - ReturnedInvestment(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, wallet, amount)
+- `property_token_offering__returned_presale_investment` - ReturnedPresaleInvestment(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, wallet, amount)
+- `staking_community__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `staking_community__deposit` - Deposit(address,address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, lockedUntil)
+- `staking_community__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `staking_community__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `staking_community__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `staking_community__withdraw` - Withdraw(address,address,uint256,uint256,uint256,uint256,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, rewardToUser, rewardToFeeReciever, isWithdraw)
+- `staking_issuer__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `staking_issuer__deposit` - Deposit(address,address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, lockedUntil)
+- `staking_issuer__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `staking_issuer__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `staking_issuer__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `staking_issuer__withdraw` - Withdraw(address,address,uint256,uint256,uint256,uint256,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, rewardToUser, rewardToFeeReciever, isWithdraw)
+- `staking_landhive__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `staking_landhive__deposit` - Deposit(address,address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, lockedUntil)
+- `staking_landhive__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `staking_landhive__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `staking_landhive__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `staking_landhive__withdraw` - Withdraw(address,address,uint256,uint256,uint256,uint256,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, rewardToUser, rewardToFeeReciever, isWithdraw)
+- `staking_rwa__approval` - Approval(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, spender, value)
+- `staking_rwa__deposit` - Deposit(address,address,uint256,uint256,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, lockedUntil)
+- `staking_rwa__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `staking_rwa__reward` - Reward(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, amount)
+- `staking_rwa__transfer` - Transfer(address,address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, from, to, value)
+- `staking_rwa__withdraw` - Withdraw(address,address,uint256,uint256,uint256,uint256,bool) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, owner, property, inAmount, outAmount, rewardToUser, rewardToFeeReciever, isWithdraw)
+- `users__added_wallet` - AddedWallet(bytes32,address,string) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, userBytes, wallet, user)
+- `users__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `users__removed_wallet` - RemovedWallet(bytes32,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, userBytes, wallet)
+- `valuation_community__a_p_y_update` - APYUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newAPY)
+- `valuation_community__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `valuation_community__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `valuation_community__valuation_update` - ValuationUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newValuation)
+- `valuation_issuer__a_p_y_update` - APYUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newAPY)
+- `valuation_issuer__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `valuation_issuer__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `valuation_issuer__valuation_update` - ValuationUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newValuation)
+- `valuation_landhive__a_p_y_update` - APYUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newAPY)
+- `valuation_landhive__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `valuation_landhive__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `valuation_landhive__valuation_update` - ValuationUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newValuation)
+- `valuation_rwa__a_p_y_update` - APYUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newAPY)
+- `valuation_rwa__initialized` - Initialized(uint8) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, version)
+- `valuation_rwa__ownership_transferred` - OwnershipTransferred(address,address) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, previousOwner, newOwner)
+- `valuation_rwa__valuation_update` - ValuationUpdate(address,uint256) (block_number, block_hash, block_timestamp, tx_hash, log_index, address, _seq, property, newValuation)
+
+## Run it headless
+
+`nuthatch dev` runs until it is stopped. Start it in the background with its log outside the
+nest, whose identity counts every file in it, then wait until `/ready` puts it fewer than ten
+blocks behind the tip:
+
+```sh
+nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
+for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
+```
+
+`--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's
+start block. A nest that has already indexed ignores it. The log says why if it never gets
+there.
+
+## Query
+
+```sh
+nuthatch sql "SELECT count(*) FROM blocksquare_token__approval" --json
+```
+
+`llms.txt` has the HTTP routes and the SQL type rules: wide integers are text with a `_dec`
+companion, and `"from"` and `"to"` must be double-quoted.
+
+## MCP
+
+`nuthatch mcp --print-config --client <name>` prints the config file for `claude`, `cursor`,
+`codex`, `vscode`, `windsurf` or `gemini`, and says on stderr where it goes. The server bridges
+to the running `nuthatch dev`; call its `schema` tool first.

@@ -1,0 +1,1632 @@
+# semantic.toml - what this nest's data *means* (RFC-0016). Read by the MCP `schema`
+# tool, the admin UI, and the scaffolded skill. Edit descriptions freely; the
+# `[table.*.footguns]` are DERIVED from the ABI and regenerated - leave them be.
+
+schema_version = 1
+
+[nest]
+description = "The `blocksquare-nest` nest on mainnet. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.blocksquare_token__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `blocksquare_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.blocksquare_token__approval.columns]
+_amount = "The `_amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+_owner = "The `_owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+_spender = "The `_spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.blocksquare_token__approval.footguns]
+big_ints = ["_amount"]
+overflows_dec = ["_amount"]
+
+[table.blocksquare_token__mint]
+description = "`Mint(address,uint256)` events emitted by the `blocksquare_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Mint(address,uint256) event"
+
+[table.blocksquare_token__mint.columns]
+_to = "The `_to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+_value = "The `_value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.blocksquare_token__mint.footguns]
+big_ints = ["_value"]
+overflows_dec = ["_value"]
+
+[table.blocksquare_token__token_frozen]
+description = "`TokenFrozen(bool,string)` events emitted by the `blocksquare_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per TokenFrozen(bool,string) event"
+
+[table.blocksquare_token__token_frozen.columns]
+_frozen = "The `_frozen` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `_frozen = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `_frozen = 'true'` or `CAST(_frozen AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+_reason = "The `_reason` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.blocksquare_token__token_frozen.footguns]
+bools = ["_frozen"]
+
+[table.blocksquare_token__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `blocksquare_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.blocksquare_token__transfer.columns]
+_amount = "The `_amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+_from = "The `_from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+_to = "The `_to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.blocksquare_token__transfer.footguns]
+big_ints = ["_amount"]
+overflows_dec = ["_amount"]
+
+[table.bst_eth_pool__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.bst_eth_pool__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.bst_eth_pool__burn]
+description = "`Burn(address,uint256,uint256,address)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Burn(address,uint256,uint256,address) event"
+
+[table.bst_eth_pool__burn.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__burn.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.bst_eth_pool__mint]
+description = "`Mint(address,uint256,uint256)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Mint(address,uint256,uint256) event"
+
+[table.bst_eth_pool__mint.columns]
+amount0 = "The `amount0` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1 = "The `amount1` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__mint.footguns]
+big_ints = [
+    "amount0",
+    "amount1",
+]
+overflows_dec = [
+    "amount0",
+    "amount1",
+]
+
+[table.bst_eth_pool__swap]
+description = "`Swap(address,uint256,uint256,uint256,uint256,address)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Swap(address,uint256,uint256,uint256,uint256,address) event"
+
+[table.bst_eth_pool__swap.columns]
+amount0In = "The `amount0In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount0Out = "The `amount0Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1In = "The `amount1In` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amount1Out = "The `amount1Out` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+sender = "The `sender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__swap.footguns]
+reserved_words = ["to"]
+big_ints = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+overflows_dec = [
+    "amount0In",
+    "amount1In",
+    "amount0Out",
+    "amount1Out",
+]
+
+[table.bst_eth_pool__sync]
+description = "`Sync(uint112,uint112)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Sync(uint112,uint112) event"
+
+[table.bst_eth_pool__sync.columns]
+reserve0 = "The `reserve0` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+reserve1 = "The `reserve1` uint112 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__sync.footguns]
+big_ints = [
+    "reserve0",
+    "reserve1",
+]
+
+[table.bst_eth_pool__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `bst_eth_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.bst_eth_pool__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.bst_eth_pool__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.certified_partners__added_certified_partner]
+description = "`AddedCertifiedPartner(bytes32,string)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AddedCertifiedPartner(bytes32,string) event"
+
+[table.certified_partners__added_certified_partner.columns]
+cp = "The `cp` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpBytes = "The `cpBytes` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.certified_partners__added_wallet]
+description = "`AddedWallet(bytes32,address,string)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AddedWallet(bytes32,address,string) event"
+
+[table.certified_partners__added_wallet.columns]
+cp = "The `cp` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpName = "The `cpName` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.certified_partners__added_whitelisted]
+description = "`AddedWhitelisted(bytes32,string[],string)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AddedWhitelisted(bytes32,string[],string) event"
+
+[table.certified_partners__added_whitelisted.columns]
+cp = "The `cp` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpName = "The `cpName` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+users = "The `users` string[] parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.certified_partners__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.certified_partners__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.certified_partners__removed_wallet]
+description = "`RemovedWallet(bytes32,address)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RemovedWallet(bytes32,address) event"
+
+[table.certified_partners__removed_wallet.columns]
+cp = "The `cp` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.certified_partners__removed_whitelisted]
+description = "`RemovedWhitelisted(bytes32,string[],string)` events emitted by the `certified_partners` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RemovedWhitelisted(bytes32,string[],string) event"
+
+[table.certified_partners__removed_whitelisted.columns]
+cp = "The `cp` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpName = "The `cpName` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+users = "The `users` string[] parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.data_storage_proxy__freeze_property]
+description = "`FreezeProperty(address,bool)` events emitted by the `data_storage_proxy` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per FreezeProperty(address,bool) event"
+
+[table.data_storage_proxy__freeze_property.columns]
+frozen = "The `frozen` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `frozen = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `frozen = 'true'` or `CAST(frozen AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.data_storage_proxy__freeze_property.footguns]
+bools = ["frozen"]
+
+[table.data_storage_proxy__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `data_storage_proxy` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.data_storage_proxy__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.data_storage_proxy__transfer_property_to_c_p]
+description = "`TransferPropertyToCP(address,address)` events emitted by the `data_storage_proxy` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per TransferPropertyToCP(address,address) event"
+
+[table.data_storage_proxy__transfer_property_to_c_p.columns]
+cp = "The `cp` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `governance_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.governance_pool__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.governance_pool__deposit]
+description = "`Deposit(address,uint256,uint256)` events emitted by the `governance_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,uint256,uint256) event"
+
+[table.governance_pool__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+]
+
+[table.governance_pool__reward]
+description = "`Reward(address,uint256)` events emitted by the `governance_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.governance_pool__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.governance_pool__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `governance_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.governance_pool__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.governance_pool__withdraw]
+description = "`Withdraw(address,uint256,uint256)` events emitted by the `governance_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,uint256,uint256) event"
+
+[table.governance_pool__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.governance_pool__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+]
+
+[table.liquidity_staking_pool__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.liquidity_staking_pool__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.liquidity_staking_pool__deposit]
+description = "`Deposit(address,uint256,uint256,uint256)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,uint256,uint256,uint256) event"
+
+[table.liquidity_staking_pool__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockedUntil = "The `lockedUntil` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+
+[table.liquidity_staking_pool__initialized]
+description = "`Initialized(uint8)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.liquidity_staking_pool__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.liquidity_staking_pool__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__reward]
+description = "`Reward(address,uint256)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.liquidity_staking_pool__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.liquidity_staking_pool__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.liquidity_staking_pool__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.liquidity_staking_pool__withdraw]
+description = "`Withdraw(address,uint256,uint256,uint256)` events emitted by the `liquidity_staking_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,uint256,uint256,uint256) event"
+
+[table.liquidity_staking_pool__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+reward = "The `reward` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.liquidity_staking_pool__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "reward",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "reward",
+]
+
+[table.marketplace_pool__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.marketplace_pool__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.marketplace_pool__c_p_can_withdraw]
+description = "`CPCanWithdraw()` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per CPCanWithdraw() event"
+
+[table.marketplace_pool__c_p_initialized]
+description = "`CPInitialized(uint256,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per CPInitialized(uint256,uint256) event"
+
+[table.marketplace_pool__c_p_initialized.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockPeriod = "The `lockPeriod` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__c_p_initialized.footguns]
+big_ints = [
+    "amount",
+    "lockPeriod",
+]
+overflows_dec = [
+    "amount",
+    "lockPeriod",
+]
+
+[table.marketplace_pool__capped]
+description = "`Capped(uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Capped(uint256) event"
+
+[table.marketplace_pool__capped.columns]
+lockEnd = "The `lockEnd` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__capped.footguns]
+big_ints = ["lockEnd"]
+overflows_dec = ["lockEnd"]
+
+[table.marketplace_pool__deposit]
+description = "`Deposit(address,uint256,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,uint256,uint256) event"
+
+[table.marketplace_pool__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+]
+
+[table.marketplace_pool__initialized]
+description = "`Initialized(uint8)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.marketplace_pool__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__liquidate_c_p_collateral]
+description = "`LiquidateCPCollateral(uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per LiquidateCPCollateral(uint256) event"
+
+[table.marketplace_pool__liquidate_c_p_collateral.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__liquidate_c_p_collateral.footguns]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.marketplace_pool__lock_extended]
+description = "`LockExtended(uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per LockExtended(uint256) event"
+
+[table.marketplace_pool__lock_extended.columns]
+extension = "The `extension` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__lock_extended.footguns]
+big_ints = ["extension"]
+overflows_dec = ["extension"]
+
+[table.marketplace_pool__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.marketplace_pool__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__pool_campaign_configured]
+description = "`PoolCampaignConfigured(uint256,uint256,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PoolCampaignConfigured(uint256,uint256,uint256) event"
+
+[table.marketplace_pool__pool_campaign_configured.columns]
+duration = "The `duration` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+maxPledge = "The `maxPledge` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+startTime = "The `startTime` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__pool_campaign_configured.footguns]
+big_ints = [
+    "startTime",
+    "duration",
+    "maxPledge",
+]
+overflows_dec = [
+    "startTime",
+    "duration",
+    "maxPledge",
+]
+
+[table.marketplace_pool__reward]
+description = "`Reward(address,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.marketplace_pool__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.marketplace_pool__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.marketplace_pool__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.marketplace_pool__withdraw]
+description = "`Withdraw(address,uint256,uint256,uint256)` events emitted by the `marketplace_pool` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,uint256,uint256,uint256) event"
+
+[table.marketplace_pool__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+reward = "The `reward` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "reward",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "reward",
+]
+
+[table.marketplace_pool_factory__b_s_t_staking_contract_changed]
+description = "`BSTStakingContractChanged(address)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per BSTStakingContractChanged(address) event"
+
+[table.marketplace_pool_factory__b_s_t_staking_contract_changed.columns]
+newBSTStakingContract = "The `newBSTStakingContract` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool_factory__governance_wallet_changed]
+description = "`GovernanceWalletChanged(address)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per GovernanceWalletChanged(address) event"
+
+[table.marketplace_pool_factory__governance_wallet_changed.columns]
+newGovernanceWalletContract = "The `newGovernanceWalletContract` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool_factory__implementation_changed]
+description = "`ImplementationChanged(address)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ImplementationChanged(address) event"
+
+[table.marketplace_pool_factory__implementation_changed.columns]
+newContract = "The `newContract` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool_factory__marketplace_pool_created]
+description = "`MarketplacePoolCreated(address,address,address,string,string,string,string)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per MarketplacePoolCreated(address,address,address,string,string,string,string) event"
+
+[table.marketplace_pool_factory__marketplace_pool_created.columns]
+bsWallet = "The `bsWallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpIdentifier = "The `cpIdentifier` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpUrl = "The `cpUrl` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+cpWallet = "The `cpWallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+marketplacePoolAddress = "The `marketplacePoolAddress` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+tokenName = "The `tokenName` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+tokenSymbol = "The `tokenSymbol` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool_factory__ownership_transfer_started]
+description = "`OwnershipTransferStarted(address,address)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferStarted(address,address) event"
+
+[table.marketplace_pool_factory__ownership_transfer_started.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.marketplace_pool_factory__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `marketplace_pool_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.marketplace_pool_factory__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_factory__new_prop_token]
+description = "`NewPropToken(address,address,uint256)` events emitted by the `property_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per NewPropToken(address,address,uint256) event"
+
+[table.property_factory__new_prop_token.columns]
+certifiedPartner = "The `certifiedPartner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+createdAt = "The `createdAt` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+proptoken = "The `proptoken` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_factory__new_prop_token.footguns]
+big_ints = ["createdAt"]
+overflows_dec = ["createdAt"]
+
+[table.property_factory__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `property_factory` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.property_factory__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__i_p_f_s_hash_changed]
+description = "`IPFSHashChanged(address,string)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per IPFSHashChanged(address,string) event"
+
+[table.property_registry__i_p_f_s_hash_changed.columns]
+newIPFSHash = "The `newIPFSHash` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__name_and_symbol_change]
+description = "`NameAndSymbolChange(address,string,string)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per NameAndSymbolChange(address,string,string) event"
+
+[table.property_registry__name_and_symbol_change.columns]
+newName = "The `newName` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+newSymbol = "The `newSymbol` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.property_registry__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__property_basic_info_changed]
+description = "`PropertyBasicInfoChanged(address,string,string,string,uint256)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PropertyBasicInfoChanged(address,string,string,string,uint256) event"
+
+[table.property_registry__property_basic_info_changed.columns]
+geoLocation = "The `geoLocation` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+propertyValuation = "The `propertyValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+propertyValuationCurrency = "The `propertyValuationCurrency` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+streetLocation = "The `streetLocation` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__property_basic_info_changed.footguns]
+big_ints = ["propertyValuation"]
+overflows_dec = ["propertyValuation"]
+
+[table.property_registry__property_info_added]
+description = "`PropertyInfoAdded(address,string,string,string,string,uint64)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PropertyInfoAdded(address,string,string,string,string,uint64) event"
+
+[table.property_registry__property_info_added.columns]
+ID = "The `ID` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+buildingPart = "The `buildingPart` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+kadastralMunicipality = "The `kadastralMunicipality` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+parcelNumber = "The `parcelNumber` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+propertyType = "The `propertyType` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__property_info_changed]
+description = "`PropertyInfoChanged(address,uint64,string,string,string,string,uint64)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PropertyInfoChanged(address,uint64,string,string,string,string,uint64) event"
+
+[table.property_registry__property_info_changed.columns]
+ID = "The `ID` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+buildingPart = "The `buildingPart` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+idProp = "The `idProp` uint64 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+kadastralMunicipality = "The `kadastralMunicipality` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+parcelNumber = "The `parcelNumber` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+propertyType = "The `propertyType` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__property_valuation_change]
+description = "`PropertyValuationChange(address,uint256)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per PropertyValuationChange(address,uint256) event"
+
+[table.property_registry__property_valuation_change.columns]
+newValuationProperty = "The `newValuationProperty` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__property_valuation_change.footguns]
+big_ints = ["newValuationProperty"]
+overflows_dec = ["newValuationProperty"]
+
+[table.property_registry__token_valuation_change]
+description = "`TokenValuationChange(address,uint256)` events emitted by the `property_registry` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per TokenValuationChange(address,uint256) event"
+
+[table.property_registry__token_valuation_change.columns]
+newTokenValuation = "The `newTokenValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_registry__token_valuation_change.footguns]
+big_ints = ["newTokenValuation"]
+overflows_dec = ["newTokenValuation"]
+
+[table.property_revenue_distribution__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `property_revenue_distribution` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.property_revenue_distribution__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_revenue_distribution__revenue_added]
+description = "`RevenueAdded(address,address[],uint256[],uint256,uint256)` events emitted by the `property_revenue_distribution` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RevenueAdded(address,address[],uint256[],uint256,uint256) event"
+
+[table.property_revenue_distribution__revenue_added.columns]
+amounts = "The `amounts` uint256[] parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+fromTime = "The `fromTime` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+toTime = "The `toTime` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+users = "The `users` address[] parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_revenue_distribution__revenue_added.footguns]
+big_ints = [
+    "fromTime",
+    "toTime",
+]
+overflows_dec = [
+    "fromTime",
+    "toTime",
+]
+
+[table.property_revenue_distribution__revenue_claimed]
+description = "`RevenueClaimed(address,address,uint256,uint256)` events emitted by the `property_revenue_distribution` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RevenueClaimed(address,address,uint256,uint256) event"
+
+[table.property_revenue_distribution__revenue_claimed.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+time = "The `time` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+user = "The `user` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_revenue_distribution__revenue_claimed.footguns]
+reserved_words = ["user"]
+big_ints = [
+    "amount",
+    "time",
+]
+overflows_dec = [
+    "amount",
+    "time",
+]
+
+[table.property_revenue_distribution__revenue_sent]
+description = "`RevenueSent(address,address,uint256,uint256)` events emitted by the `property_revenue_distribution` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RevenueSent(address,address,uint256,uint256) event"
+
+[table.property_revenue_distribution__revenue_sent.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+time = "The `time` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+user = "The `user` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_revenue_distribution__revenue_sent.footguns]
+reserved_words = ["user"]
+big_ints = [
+    "amount",
+    "time",
+]
+overflows_dec = [
+    "amount",
+    "time",
+]
+
+[table.property_token__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `property_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.property_token__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.property_token__capital_stack_change]
+description = "`CapitalStackChange(address,uint256,uint256,uint256,uint256,uint256,uint256)` events emitted by the `property_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per CapitalStackChange(address,uint256,uint256,uint256,uint256,uint256,uint256) event"
+
+[table.property_token__capital_stack_change.columns]
+commonEquity = "The `commonEquity` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+juniorDebt = "The `juniorDebt` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+mezzanine = "The `mezzanine` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+preferredEquity = "The `preferredEquity` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+seniorDebt = "The `seniorDebt` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+tokenizationAmount = "The `tokenizationAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token__capital_stack_change.footguns]
+big_ints = [
+    "tokenizationAmount",
+    "commonEquity",
+    "preferredEquity",
+    "mezzanine",
+    "juniorDebt",
+    "seniorDebt",
+]
+overflows_dec = [
+    "tokenizationAmount",
+    "commonEquity",
+    "preferredEquity",
+    "mezzanine",
+    "juniorDebt",
+    "seniorDebt",
+]
+
+[table.property_token__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `property_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.property_token__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `property_token` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.property_token__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.property_token_offering__claim_investment]
+description = "`ClaimInvestment(address,uint256,uint256)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ClaimInvestment(address,uint256,uint256) event"
+
+[table.property_token_offering__claim_investment.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+feeAmount = "The `feeAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__claim_investment.footguns]
+big_ints = [
+    "amount",
+    "feeAmount",
+]
+overflows_dec = [
+    "amount",
+    "feeAmount",
+]
+
+[table.property_token_offering__initial_offer]
+description = "`InitialOffer(address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,address,address,address,uint256)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per InitialOffer(address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,address,address,address,uint256) event"
+
+[table.property_token_offering__initial_offer.columns]
+collector = "The `collector` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+fee = "The `fee` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+feeCollector = "The `feeCollector` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+investmentCurrency = "The `investmentCurrency` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+maxInvestment = "The `maxInvestment` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+minInvestment = "The `minInvestment` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+presaleEnd = "The `presaleEnd` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+presaleMaxInvestment = "The `presaleMaxInvestment` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+presaleMinInvestment = "The `presaleMinInvestment` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+presaleStart = "The `presaleStart` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+pricePerToken = "The `pricePerToken` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+saleEnd = "The `saleEnd` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+saleStart = "The `saleStart` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+softCap = "The `softCap` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__initial_offer.footguns]
+big_ints = [
+    "pricePerToken",
+    "presaleMaxInvestment",
+    "presaleMinInvestment",
+    "maxInvestment",
+    "minInvestment",
+    "softCap",
+    "presaleStart",
+    "presaleEnd",
+    "saleStart",
+    "saleEnd",
+    "fee",
+]
+overflows_dec = [
+    "pricePerToken",
+    "presaleMaxInvestment",
+    "presaleMinInvestment",
+    "maxInvestment",
+    "minInvestment",
+    "softCap",
+    "presaleStart",
+    "presaleEnd",
+    "saleStart",
+    "saleEnd",
+    "fee",
+]
+
+[table.property_token_offering__initial_offering_canceled]
+description = "`InitialOfferingCanceled(address)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per InitialOfferingCanceled(address) event"
+
+[table.property_token_offering__initial_offering_canceled.columns]
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__invested]
+description = "`Invested(address,address,address,uint256,uint256)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Invested(address,address,address,uint256,uint256) event"
+
+[table.property_token_offering__invested.columns]
+amountInvested = "The `amountInvested` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+amountReceived = "The `amountReceived` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+investmentToken = "The `investmentToken` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__invested.footguns]
+big_ints = [
+    "amountInvested",
+    "amountReceived",
+]
+overflows_dec = [
+    "amountInvested",
+    "amountReceived",
+]
+
+[table.property_token_offering__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.property_token_offering__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__returned_investment]
+description = "`ReturnedInvestment(address,address,uint256)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ReturnedInvestment(address,address,uint256) event"
+
+[table.property_token_offering__returned_investment.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__returned_investment.footguns]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.property_token_offering__returned_presale_investment]
+description = "`ReturnedPresaleInvestment(address,address,uint256)` events emitted by the `property_token_offering` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ReturnedPresaleInvestment(address,address,uint256) event"
+
+[table.property_token_offering__returned_presale_investment.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.property_token_offering__returned_presale_investment.footguns]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.staking_community__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.staking_community__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_community__deposit]
+description = "`Deposit(address,address,uint256,uint256,uint256)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,address,uint256,uint256,uint256) event"
+
+[table.staking_community__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockedUntil = "The `lockedUntil` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+
+[table.staking_community__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.staking_community__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__reward]
+description = "`Reward(address,uint256)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.staking_community__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.staking_community__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.staking_community__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_community__withdraw]
+description = "`Withdraw(address,address,uint256,uint256,uint256,uint256,bool)` events emitted by the `staking_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,address,uint256,uint256,uint256,uint256,bool) event"
+
+[table.staking_community__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+isWithdraw = "The `isWithdraw` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `isWithdraw = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `isWithdraw = 'true'` or `CAST(isWithdraw AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToFeeReciever = "The `rewardToFeeReciever` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToUser = "The `rewardToUser` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_community__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+bools = ["isWithdraw"]
+
+[table.staking_issuer__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.staking_issuer__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_issuer__deposit]
+description = "`Deposit(address,address,uint256,uint256,uint256)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,address,uint256,uint256,uint256) event"
+
+[table.staking_issuer__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockedUntil = "The `lockedUntil` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+
+[table.staking_issuer__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.staking_issuer__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__reward]
+description = "`Reward(address,uint256)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.staking_issuer__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.staking_issuer__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.staking_issuer__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_issuer__withdraw]
+description = "`Withdraw(address,address,uint256,uint256,uint256,uint256,bool)` events emitted by the `staking_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,address,uint256,uint256,uint256,uint256,bool) event"
+
+[table.staking_issuer__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+isWithdraw = "The `isWithdraw` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `isWithdraw = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `isWithdraw = 'true'` or `CAST(isWithdraw AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToFeeReciever = "The `rewardToFeeReciever` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToUser = "The `rewardToUser` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_issuer__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+bools = ["isWithdraw"]
+
+[table.staking_landhive__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.staking_landhive__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_landhive__deposit]
+description = "`Deposit(address,address,uint256,uint256,uint256)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,address,uint256,uint256,uint256) event"
+
+[table.staking_landhive__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockedUntil = "The `lockedUntil` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+
+[table.staking_landhive__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.staking_landhive__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__reward]
+description = "`Reward(address,uint256)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.staking_landhive__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.staking_landhive__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.staking_landhive__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_landhive__withdraw]
+description = "`Withdraw(address,address,uint256,uint256,uint256,uint256,bool)` events emitted by the `staking_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,address,uint256,uint256,uint256,uint256,bool) event"
+
+[table.staking_landhive__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+isWithdraw = "The `isWithdraw` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `isWithdraw = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `isWithdraw = 'true'` or `CAST(isWithdraw AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToFeeReciever = "The `rewardToFeeReciever` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToUser = "The `rewardToUser` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_landhive__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+bools = ["isWithdraw"]
+
+[table.staking_rwa__approval]
+description = "`Approval(address,address,uint256)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Approval(address,address,uint256) event"
+
+[table.staking_rwa__approval.columns]
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+spender = "The `spender` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__approval.footguns]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_rwa__deposit]
+description = "`Deposit(address,address,uint256,uint256,uint256)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Deposit(address,address,uint256,uint256,uint256) event"
+
+[table.staking_rwa__deposit.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+lockedUntil = "The `lockedUntil` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__deposit.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "lockedUntil",
+]
+
+[table.staking_rwa__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.staking_rwa__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__reward]
+description = "`Reward(address,uint256)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Reward(address,uint256) event"
+
+[table.staking_rwa__reward.columns]
+amount = "The `amount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__reward.footguns]
+reserved_words = ["from"]
+big_ints = ["amount"]
+overflows_dec = ["amount"]
+
+[table.staking_rwa__transfer]
+description = "`Transfer(address,address,uint256)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Transfer(address,address,uint256) event"
+
+[table.staking_rwa__transfer.columns]
+from = "The `from` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+to = "The `to` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+value = "The `value` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__transfer.footguns]
+reserved_words = [
+    "from",
+    "to",
+]
+big_ints = ["value"]
+overflows_dec = ["value"]
+
+[table.staking_rwa__withdraw]
+description = "`Withdraw(address,address,uint256,uint256,uint256,uint256,bool)` events emitted by the `staking_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Withdraw(address,address,uint256,uint256,uint256,uint256,bool) event"
+
+[table.staking_rwa__withdraw.columns]
+inAmount = "The `inAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+isWithdraw = "The `isWithdraw` bool parameter - stored as exact text `'true'`/`'false'`, not a SQL boolean. `isWithdraw = true` and `AND`/`NOT` implicitly cast and work; `COALESCE`, `CASE`, `bool_and`/`bool_or` and `UNION` do not. Write `isWithdraw = 'true'` or `CAST(isWithdraw AS BOOLEAN)`. (seeded from the ABI - edit semantic.toml to improve this)"
+outAmount = "The `outAmount` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+owner = "The `owner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToFeeReciever = "The `rewardToFeeReciever` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+rewardToUser = "The `rewardToUser` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.staking_rwa__withdraw.footguns]
+big_ints = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+overflows_dec = [
+    "inAmount",
+    "outAmount",
+    "rewardToUser",
+    "rewardToFeeReciever",
+]
+bools = ["isWithdraw"]
+
+[table.users__added_wallet]
+description = "`AddedWallet(bytes32,address,string)` events emitted by the `users` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per AddedWallet(bytes32,address,string) event"
+
+[table.users__added_wallet.columns]
+user = "The `user` string parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+userBytes = "The `userBytes` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.users__added_wallet.footguns]
+reserved_words = ["user"]
+
+[table.users__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `users` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.users__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.users__removed_wallet]
+description = "`RemovedWallet(bytes32,address)` events emitted by the `users` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per RemovedWallet(bytes32,address) event"
+
+[table.users__removed_wallet.columns]
+userBytes = "The `userBytes` bytes32 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+wallet = "The `wallet` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_community__a_p_y_update]
+description = "`APYUpdate(address,uint256)` events emitted by the `valuation_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per APYUpdate(address,uint256) event"
+
+[table.valuation_community__a_p_y_update.columns]
+newAPY = "The `newAPY` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_community__a_p_y_update.footguns]
+big_ints = ["newAPY"]
+overflows_dec = ["newAPY"]
+
+[table.valuation_community__initialized]
+description = "`Initialized(uint8)` events emitted by the `valuation_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.valuation_community__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_community__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `valuation_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.valuation_community__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_community__valuation_update]
+description = "`ValuationUpdate(address,uint256)` events emitted by the `valuation_community` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ValuationUpdate(address,uint256) event"
+
+[table.valuation_community__valuation_update.columns]
+newValuation = "The `newValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_community__valuation_update.footguns]
+big_ints = ["newValuation"]
+overflows_dec = ["newValuation"]
+
+[table.valuation_issuer__a_p_y_update]
+description = "`APYUpdate(address,uint256)` events emitted by the `valuation_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per APYUpdate(address,uint256) event"
+
+[table.valuation_issuer__a_p_y_update.columns]
+newAPY = "The `newAPY` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_issuer__a_p_y_update.footguns]
+big_ints = ["newAPY"]
+overflows_dec = ["newAPY"]
+
+[table.valuation_issuer__initialized]
+description = "`Initialized(uint8)` events emitted by the `valuation_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.valuation_issuer__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_issuer__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `valuation_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.valuation_issuer__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_issuer__valuation_update]
+description = "`ValuationUpdate(address,uint256)` events emitted by the `valuation_issuer` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ValuationUpdate(address,uint256) event"
+
+[table.valuation_issuer__valuation_update.columns]
+newValuation = "The `newValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_issuer__valuation_update.footguns]
+big_ints = ["newValuation"]
+overflows_dec = ["newValuation"]
+
+[table.valuation_landhive__a_p_y_update]
+description = "`APYUpdate(address,uint256)` events emitted by the `valuation_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per APYUpdate(address,uint256) event"
+
+[table.valuation_landhive__a_p_y_update.columns]
+newAPY = "The `newAPY` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_landhive__a_p_y_update.footguns]
+big_ints = ["newAPY"]
+overflows_dec = ["newAPY"]
+
+[table.valuation_landhive__initialized]
+description = "`Initialized(uint8)` events emitted by the `valuation_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.valuation_landhive__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_landhive__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `valuation_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.valuation_landhive__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_landhive__valuation_update]
+description = "`ValuationUpdate(address,uint256)` events emitted by the `valuation_landhive` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ValuationUpdate(address,uint256) event"
+
+[table.valuation_landhive__valuation_update.columns]
+newValuation = "The `newValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_landhive__valuation_update.footguns]
+big_ints = ["newValuation"]
+overflows_dec = ["newValuation"]
+
+[table.valuation_rwa__a_p_y_update]
+description = "`APYUpdate(address,uint256)` events emitted by the `valuation_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per APYUpdate(address,uint256) event"
+
+[table.valuation_rwa__a_p_y_update.columns]
+newAPY = "The `newAPY` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_rwa__a_p_y_update.footguns]
+big_ints = ["newAPY"]
+overflows_dec = ["newAPY"]
+
+[table.valuation_rwa__initialized]
+description = "`Initialized(uint8)` events emitted by the `valuation_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per Initialized(uint8) event"
+
+[table.valuation_rwa__initialized.columns]
+version = "The `version` uint8 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_rwa__ownership_transferred]
+description = "`OwnershipTransferred(address,address)` events emitted by the `valuation_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per OwnershipTransferred(address,address) event"
+
+[table.valuation_rwa__ownership_transferred.columns]
+newOwner = "The `newOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+previousOwner = "The `previousOwner` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_rwa__valuation_update]
+description = "`ValuationUpdate(address,uint256)` events emitted by the `valuation_rwa` contract. (seeded from the ABI - edit semantic.toml to improve this)"
+grain = "one row per ValuationUpdate(address,uint256) event"
+
+[table.valuation_rwa__valuation_update.columns]
+newValuation = "The `newValuation` uint256 parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+property = "The `property` address parameter. (seeded from the ABI - edit semantic.toml to improve this)"
+
+[table.valuation_rwa__valuation_update.footguns]
+big_ints = ["newValuation"]
+overflows_dec = ["newValuation"]
+
+[view]
+
+# Authored views (views/*.sql) are described here so the MCP/`/schema` can render them:
+# [view.your_view_name]
+# description = "What this derivation computes."
