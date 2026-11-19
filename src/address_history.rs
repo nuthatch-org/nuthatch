@@ -2710,7 +2710,7 @@ impl AddressHistory {
 
     /// Raw writes for tests that need a store in a state `record` would refuse to produce.
     #[cfg(test)]
-    fn insert(&self, action: Action, address: &str, rows: &[Row]) -> Result<()> {
+    pub(crate) fn insert(&self, action: Action, address: &str, rows: &[Row]) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         put_rows(&wtx, action, &parse_address(address)?, rows)?;
         wtx.commit()?;
@@ -2718,7 +2718,13 @@ impl AddressHistory {
     }
 
     #[cfg(test)]
-    fn mark_covered(&self, action: Action, address: &str, from: u64, to: u64) -> Result<()> {
+    pub(crate) fn mark_covered(
+        &self,
+        action: Action,
+        address: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<()> {
         let wtx = self.store.database().begin_write()?;
         cover(&wtx, action, &parse_address(address)?, from, to)?;
         wtx.commit()?;
