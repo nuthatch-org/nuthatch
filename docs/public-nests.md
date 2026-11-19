@@ -272,3 +272,28 @@ nest repo's README with `<PUBLIC_URL>` replaced.
 - `/mcp` tool calls (`diff`, `entity`, `balance`, ...) run in the nest, past the proxy's route list. `diff`
   has its own 30 s budget and takes one of the two query permits while it runs; the proxy cuts the
   client off at 15 s, the nest finishes or times out by itself.
+
+## Handing the deploy to a sudo user (what an unprivileged session cannot do)
+
+An agent session without root (the 2026-11-19 attempt at #3031 had no credentials for helsinki-nests at
+all) can do nothing on the host. For a sudo user, steps 0 to 9 above are the whole list. Checked against
+the steps as written, the ones that need root, and have no user-level equivalent that keeps the limits, are:
+
+- step 1 (`useradd`), step 2 (`/usr/local/bin`), step 3 (`sudo -u nests-public`, the state directory is
+  `0750` and owned by that user), step 4 (`/etc/nuthatch-public`), step 5 (`apt-get install nginx`, the
+  system units: `MemoryMax`, `ProtectSystem` and the sandbox are the read-only limits), step 7
+  (`systemctl enable --now`, `journalctl -u`) and step 8 (DNS, and editing the Caddyfile).
+- Steps 0, 6, 9 (and the `curl` lines in step 7) need no root, though step 6 needs the nginx binary that
+  step 5 installs. Step 10 is a comment on the issues.
+
+If the nest is to run as an existing low-privilege account instead of `nests-public`, change `User=`,
+`Group=`, `ReadWritePaths=` and `WorkingDirectory=` in both units and the `--dir` path together, and keep the
+rest.
+
+**Verify the host key out of band before the first `ssh`; do not accept it blind.** On the host, read
+the fingerprint of its own key with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` (or from the
+provider's console) and compare it with what `ssh` shows on first connect. A value recorded in this repo
+cannot stand in for that check. For the record, grokbot-box saw the ED25519 fingerprint
+`SHA256:L1nA/wyDwfKi6vOtgfNsV7xTzA6nMd71aMBA67BAyKM` for 100.82.188.91 on 2026-11-19 from an
+unauthenticated first contact over the network, so it is what the network returned, not an authenticated
+key. Matching it proves nothing about the host; a mismatch would show the key changed since then.
