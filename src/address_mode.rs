@@ -88,6 +88,8 @@ pub struct ModeState {
     skipped_logs: Arc<AtomicU64>,
     /// Forwards `proxy` and `logs` requests to the nest's RPC.
     pub forward: Option<crate::address_proxy::Forward>,
+    /// Token names, symbols and decimals for served `tokentx` rows.
+    token_meta: crate::address_token_meta::TokenMeta,
     /// Reads the RPC counters as they stand, so calls forwarded for a request show at once rather
     /// than when the cursor next reports.
     counter: Option<Counter>,
@@ -353,6 +355,7 @@ impl ModeState {
             discovery_errors: AtomicU64::new(0),
             skipped_logs: Arc::default(),
             forward: None,
+            token_meta: Default::default(),
             relays: None,
             mirror: None,
             requests: tx,
@@ -3471,7 +3474,32 @@ async fn off_loopback(
     }
 }
 
+/// [`serve_api_rows`], with `tokentx` rows given their token's name, symbol and decimals. Resolved here,
+/// per response, and never stored: see [`crate::address_token_meta`].
 async fn serve_api(s: Arc<ModeState>, q: HashMap<String, String>, caller: &Caller) -> Json<Value> {
+    let tokentx = q.get("module").map(String::as_str) == Some("account")
+        && q.get("action").map(String::as_str) == Some("tokentx");
+    let (state, Json(mut answer)) = (s.clone(), serve_api_rows(s, q, caller).await);
+    if !tokentx || answer["status"] != "1" {
+        return Json(answer);
+    }
+    let (Some(forward), Some(rows)) = (state.forward.clone(), answer["result"].as_array_mut())
+    else {
+        return Json(answer);
+    };
+    match state.token_meta.annotate(&forward, rows).await {
+        Ok(()) => Json(answer),
+        Err(e) => Json(crate::address_history::incomplete(&format!(
+            "token metadata could not be read: {e:#}"
+        ))),
+    }
+}
+
+async fn serve_api_rows(
+    s: Arc<ModeState>,
+    q: HashMap<String, String>,
+    caller: &Caller,
+) -> Json<Value> {
     let caller = &caller.on(&s);
     let conflict = |s: &ModeState| s.conflicted();
     if let Some(why) = conflict(&s) {
@@ -6569,6 +6597,122 @@ mod tests {
         }
     }
 
+    /// `tokentx` rows are stored without token metadata; the response gets it from the token contract
+    /// at request time, once per token per response, and a transport failure is an error, not a guess.
+    #[tokio::test]
+    async fn tokentx_responses_carry_token_metadata_resolved_at_query_time() {
+        use crate::address_history::{Action, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("1.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        let token = "0x00000000000000000000000000000000000000a1";
+        let rows: Vec<Row> = (1..=3u64)
+            .map(|b| {
+                let mut record = serde_json::Map::new();
+                record.insert("blockNumber".into(), b.to_string().into());
+                record.insert("hash".into(), format!("0x{b:064x}").into());
+                record.insert("contractAddress".into(), token.into());
+                Row {
+                    block: b,
+                    tx_index: 0,
+                    position: 0,
+                    record,
+                }
+            })
+            .collect();
+        history.insert(Action::TokenTx, ALICE, &rows).unwrap();
+        history
+            .mark_covered(Action::TokenTx, ALICE, 0, 100)
+            .unwrap();
+        history.set_head(100).unwrap();
+        history.finalize(100).unwrap();
+        let calls: Recorded = Arc::default();
+        let (seen, down) = (
+            calls.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let flag = down.clone();
+        let forward: crate::address_proxy::Forward = Arc::new(move |m: String, p: Value| {
+            seen.lock().unwrap().push((m, p.clone()));
+            let down = flag.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if down {
+                    bail!("429 Too Many Requests");
+                }
+                let abi =
+                    |s: &str| format!("0x{:0>64}{:0>64x}{:0<64}", "20", s.len(), hex::encode(s));
+                Ok(json!(match p[0]["data"].as_str().unwrap() {
+                    "0x06fdde03" => abi("USD Coin"),
+                    "0x95d89b41" => abi("USDC"),
+                    _ => format!("0x{:0>64}", "6"),
+                }))
+            })
+        });
+        let s = Arc::new(
+            ModeState::new(history, 1, Duration::from_secs(300), true).with_forward(forward),
+        );
+        let q =
+            format!("/api?module=account&action=tokentx&address={ALICE}&startblock=0&endblock=100");
+        let (_, v) = call(router(s.clone()), "GET", &q, None).await;
+        assert_eq!(v["status"], "1", "{v}");
+        let r = v["result"].as_array().unwrap();
+        assert_eq!(r.len(), 3);
+        for row in r {
+            assert_eq!(row["tokenName"], "USD Coin");
+            assert_eq!(row["tokenSymbol"], "USDC");
+            assert_eq!(row["tokenDecimal"], "6");
+        }
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            3,
+            "once per token, not per row"
+        );
+        // The store is untouched: the same rows read back carry no metadata.
+        let stored = crate::address_history::respond(
+            Some(&s.history),
+            &[
+                ("module", "account"),
+                ("action", "tokentx"),
+                ("address", ALICE),
+                ("startblock", "0"),
+                ("endblock", "100"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .into(),
+        );
+        assert!(stored["result"][0].get("tokenName").is_none(), "{stored}");
+        // A cached token costs no further call; a failing RPC for a new token is an error.
+        let (_, v) = call(router(s.clone()), "GET", &q, None).await;
+        assert_eq!(v["result"].as_array().unwrap().len(), 3);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        let fresh = {
+            let store = Store::open(&dir.path().join("2.redb")).unwrap();
+            let h = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+            h.insert(Action::TokenTx, ALICE, &rows).unwrap();
+            h.mark_covered(Action::TokenTx, ALICE, 0, 100).unwrap();
+            h.set_head(100).unwrap();
+            h.finalize(100).unwrap();
+            let flag = down.clone();
+            let forward: crate::address_proxy::Forward = Arc::new(move |_m, _p| {
+                let down = flag.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    if down {
+                        bail!("429 Too Many Requests");
+                    }
+                    Ok(json!("0x"))
+                })
+            });
+            Arc::new(ModeState::new(h, 1, Duration::from_secs(300), true).with_forward(forward))
+        };
+        down.store(true, Ordering::SeqCst);
+        let (_, v) = call(router(fresh), "GET", &q, None).await;
+        assert_eq!(v["status"], "0", "{v}");
+        assert!(
+            v["result"].as_str().unwrap().contains("token metadata"),
+            "{v}"
+        );
+    }
+
     type Recorded = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
     /// A loopback nest on `id` whose RPC answers its chain id to everything, recording each call.
@@ -8781,7 +8925,6 @@ mod tests {
             "trace_filter" => Ok(json!([])),
             "trace_block" => Ok(json!([{"x": 1}])),
             "eth_getBlockByNumber" => (twin.answer)(m, p),
-            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(Counted::new(main), Counted::new(trace));
@@ -8939,7 +9082,6 @@ mod tests {
         let trace = Fake::new(move |m, p| match m {
             "trace_filter" => Ok(json!([])),
             "eth_getBlockByNumber" => (twin.answer)(m, p),
-            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(Counted::new(main), Counted::new(trace));
@@ -9012,7 +9154,6 @@ mod tests {
                 "trace_filter" => Ok(json!([])),
                 "trace_block" => Ok(json!([{"x": 1}])),
                 "eth_getBlockByNumber" => (twin.answer)(m, p),
-                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let dir = tempfile::tempdir().unwrap();
@@ -9169,7 +9310,6 @@ mod tests {
                     c.after_read(b);
                     Ok(answer)
                 }
-                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
@@ -9234,7 +9374,6 @@ mod tests {
                 "eth_getCode" => Ok(json!("0x")),
                 "eth_getTransactionCount" => Ok(json!("0x0")),
                 "eth_getLogs" => Ok(json!([])),
-                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let c = self.clone();
@@ -9310,7 +9449,6 @@ mod tests {
                     ]))
                 }
                 "trace_block" => Ok(json!([{"x": 1}])),
-                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let c = self.clone();
@@ -9435,7 +9573,6 @@ mod tests {
                         "removed": false}))
                     .collect::<Vec<_>>()))
             }
-            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         })
     }

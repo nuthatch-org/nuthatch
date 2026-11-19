@@ -90,11 +90,11 @@ The full directory, with the two variables pointed at keyless endpoints, started
   `txlist` and `txlistinternal` from the block it had code; its token transfers are still served.
   On Gnosis it is traced with `trace_filter` instead when the trace endpoint serves it: Alchemy read
   20,000 blocks a call, the keyless endpoints 100, at 2 to 4 s each.
-- `tokentx` rows carry `tokenName`, `tokenSymbol` and `tokenDecimal`, read from the token contract
-  once per token at the latest block, as Etherscan's are (the sample above predates them). A token
-  that does not answer gets an empty name and symbol and `0` decimals. This metadata is presentation
-  only, the contract's current answer: it never derives a key, an ordering or a decision, and rows
-  already stored are not backfilled.
+- `tokentx` rows carry `tokenName`, `tokenSymbol` and `tokenDecimal`, as Etherscan's do (the sample above
+  predates them). They are resolved when the response is built, from the token contract at the latest
+  block through your RPC, and are not stored: the stored rows stay deterministic. Each token is read
+  once per response and kept in a bounded in-memory cache. A token that reverts gets an empty name and
+  symbol and `0` decimals; any other RPC failure fails the response with an error rather than a guess.
 - An incoming transaction that moves no value is not listed, though Etherscan lists it.
 - `getblocknobytime` is refused on BNB Chain, whose blocks can share a second.
 - Your RPC provider sees which addresses you watch. The history itself stays on your machine.
