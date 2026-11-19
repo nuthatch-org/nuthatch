@@ -2639,11 +2639,17 @@ impl AddressHistory {
                     .into(),
             ));
         }
+        // Whether a missing range is owed (watched, backfilling) or not asked for at all (#3048).
+        let pending = |covered: Option<u64>| -> Result<String> {
+            let watched = rtx.open_table(WATCHED)?.get(a.as_slice())?.is_some();
+            Ok(pending_hint(&address_hex(&a), watched, covered))
+        };
         let Some(&(_, covered_to)) = spans.iter().find(|(f, t)| *f <= start && start <= *t) else {
             return answer(Answer::Incomplete(format!(
-                "{} for {} is not indexed at block {start}",
+                "{} for {} is not indexed at block {start}; {}",
                 action.etherscan(),
-                address_hex(&a)
+                address_hex(&a),
+                pending(spans.iter().map(|s| s.1).filter(|t| *t < start).max())?
             )));
         };
         // An explicit end is answered whole or refused: shortening it to what is covered would let a
@@ -2651,10 +2657,11 @@ impl AddressHistory {
         let end = req.end_block.unwrap_or(covered_to);
         if end > covered_to {
             return answer(Answer::Incomplete(format!(
-                "{} for {} is indexed through block {covered_to}, not {}",
+                "{} for {} is indexed through block {covered_to}, not {}; {}",
                 action.etherscan(),
                 address_hex(&a),
-                req.end_block.unwrap_or(end)
+                req.end_block.unwrap_or(end),
+                pending(Some(covered_to))?
             )));
         }
         let t = rtx.open_table(action.table())?;
@@ -3277,6 +3284,29 @@ pub fn unsupported(why: &str) -> Value {
     serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("NUTHATCH_UNSUPPORTED: {why}") })
 }
 
+/// What a caller does about a range that is not covered: an address nobody watches is asked for
+/// through `/api/watch`; a watched one is backfilling and is asked again (#3048).
+fn pending_hint(address: &str, watched: bool, covered: Option<u64>) -> String {
+    if watched {
+        let progress = covered.map_or(String::new(), |t| format!(" (covered through block {t})"));
+        format!("pending: {address} is watched and backfilling{progress}; retry shortly")
+    } else {
+        format!(
+            "not watched: POST /api/watch {{\"address\":\"{address}\"}} from this machine to start a backfill, then retry"
+        )
+    }
+}
+
+/// `why` without the retry hint, for a nest whose sweep will never read the range: telling its caller
+/// to retry would contradict the refusal.
+pub fn without_hint(why: &str) -> &str {
+    let at = ["; pending: ", "; not watched: "]
+        .iter()
+        .filter_map(|m| why.find(m))
+        .min();
+    at.map_or(why, |i| &why[..i])
+}
+
 pub fn incomplete(why: &str) -> Value {
     serde_json::json!({ "status": "0", "message": "NOTOK", "result": format!("NUTHATCH_INCOMPLETE: {why}") })
 }
@@ -3834,6 +3864,36 @@ mod tests {
         h.mark_covered(Action::TxList, ALICE, 100, 100).unwrap();
         assert_eq!(h.coverage(Action::TxList, ALICE).unwrap(), vec![(0, 200)]);
         assert_eq!(h.page(Action::TxList, &r).unwrap(), Answer::Rows(vec![]));
+    }
+
+    /// An address found mid-run is told how to be asked for, and one already asked for is told it is
+    /// pending and how far it has got, so a crawler retries instead of failing (#3048).
+    #[test]
+    fn an_uncovered_range_says_whether_it_is_unwatched_or_pending() {
+        let (_d, h) = history();
+        let ask = || {
+            respond(
+                Some(&h),
+                &params(&[
+                    ("module", "account"),
+                    ("action", "txlist"),
+                    ("address", BOB),
+                    ("startblock", "0"),
+                    ("endblock", "200"),
+                ]),
+            )
+        };
+        let r = ask()["result"].as_str().unwrap().to_string();
+        assert!(
+            r.starts_with("NUTHATCH_INCOMPLETE:") && r.contains("not watched: POST /api/watch"),
+            "{r}"
+        );
+        h.watch(BOB).unwrap();
+        let r = ask()["result"].as_str().unwrap().to_string();
+        assert!(r.contains("pending") && r.contains("retry shortly"), "{r}");
+        h.mark_covered(Action::TxList, BOB, 0, 100).unwrap();
+        let r = ask()["result"].as_str().unwrap().to_string();
+        assert!(r.contains("covered through block 100"), "{r}");
     }
 
     /// An explicit end past what is covered is refused whole, never answered short: a client that

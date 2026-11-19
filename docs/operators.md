@@ -1318,6 +1318,11 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   a form `POST`. A range the nest has not covered answers `NUTHATCH_INCOMPLETE`, never an empty
   list, so a client falls through to its next source. A range before `start_block` or past
   `end_block`, which it never will cover, answers `NUTHATCH_UNSUPPORTED`.
+  **Addresses discovered mid-run** (a tracer or wallet crawler hopping address to address): an
+  address the nest does not watch answers `NUTHATCH_INCOMPLETE: ... not watched: POST /api/watch ...`.
+  Watch it from this machine, then ask again; a watched address still backfilling answers
+  `NUTHATCH_INCOMPLETE: ... pending: ... retry shortly`, with the block it is covered through when it
+  has started. Treat both as "not yet", never as an empty history.
 - **`POST /api/watch` and `/api/unwatch`** change the watched set at runtime and are accepted only on
   a loopback bind, as are the RPC-backed actions (balances, the `proxy` module), and there only from
   this machine: a loopback `Host` (or one named by `--local-host`), no proxy header (`Forwarded`,
