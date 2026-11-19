@@ -108,7 +108,7 @@ every change:
 - **RFC-0059 (folds) and RFC-0060 (Network Subgraph endpoint) stay outside the default binary, behind
   off-by-default cargo features** (`folds`, `graph`). A default build's CLI help, `init` config, on-disk
   layout and behaviour must be what they would be had neither RFC been written. Both are parked.
-- New binary capability is decided by Chief and recorded in that status log; an RFC acceptance is
+- New binary capability is decided by Chief and recorded in that status log (RFC-0044 §8's "recorded in CLAUDE.md" now means this log); an RFC acceptance is
   scoped to its evidence (S0 spikes can stop the rest).
 
 Slices (each ends runnable). Do not start slice N+1 while slice N has failing tests or an unmet budget:
@@ -145,10 +145,10 @@ The full list has amendments and exact wording; read it before proposing any new
   (a tenant is an opaque label plus refcounting, no identity, authn, quotas or metering) and
   distributed **self-hosted** scaled mode (RFC-0022). The line is what nuthatch does about tenants,
   not who they are.
-- **Nuthatch does not run a hosted nest service** (platform retired 2026-09-29). Amendments allow
-  Pete/Chief's team to offer to host nests for named users, publicly offered on the site, as the stock
-  binary run as an operator would (ThinkPad or VPSes): no billing, no accounts, nothing in this tree built
-  for it. The shared runtime (RFC-0073) put per-tenant-label shares and caps, query isolation between
+- **Nuthatch does not run a hosted nest service** (platform retired 2026-09-29). Amendments (2026-10-09, 2026-10-21 by
+  Chief) say we may offer to host nests for people and teams, and the offer is public on the site, as the
+  stock binary run as an operator would (ThinkPad or VPSes): no billing, no accounts, nothing in this tree
+  built for it. The shared runtime (RFC-0073) put per-tenant-label shares and caps, query isolation between
   mounts and a per-request cost report in scope; authentication, API keys, accounts, billing and identity
   stay out and stay the gateway's job.
 - Token, staking, decentralized network features.

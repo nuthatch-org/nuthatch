@@ -1,6 +1,6 @@
 # Architecture, the transform layer and entity derivation (full text)
 
-Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
+Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped; only relative links were re-pointed (`../../`) because the file moved two directories down. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
 
 ## Architecture (two modes, one codebase)
 
@@ -56,7 +56,7 @@ change requires mutating sealed segments, the design is wrong - go back.
   are retractions; backfills are batch runs of the same circuit.
 - Authored SQL (shipped, RFC-0018 §1): `views/*.sql` are named queries evaluated at request
   time over hot ∪ sealed. Not incremental.
-- Authored incremental entities: [RFC-0041](docs/rfcs/0041-authored-incremental-entities.md),
+- Authored incremental entities: [RFC-0041](../../docs/rfcs/0041-authored-incremental-entities.md),
   **shipped 2026-08-28** in 3.0.0-alpha, off the back of GraphOps feedback that a view recomputed on
   every query gives the caller a name but no query-performance benefit. It was built under the 2026
   feature freeze as the first of five carve-outs, and the ordered sequence in §9 is complete (#818,

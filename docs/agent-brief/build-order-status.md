@@ -1,8 +1,8 @@
 # Build order, status log and Chief's decisions (full text)
 
-This is the record RFC-0044 §8 refers to when it says a decision is "recorded in CLAUDE.md".
+RFC-0044 §8 says a new binary capability is decided and "recorded in CLAUDE.md". Since 2026-11-19 the log below is that record: CLAUDE.md links it, and RFC-0044 §8 carries a note saying so.
 
-Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
+Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped; only relative links were re-pointed (`../../`) because the file moved two directories down. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
 
 ## Build order (vertical slices; each ends runnable)
 
@@ -29,7 +29,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > paragraph: *delete every payment feature from the tree and a self-hoster loses nothing.*
 >
 > **RFC-0053 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0053](docs/rfcs/0053-graph-subgraph-compatibility.md) on 2026-09-09, a Graph-dialect-to-SQL
+> [RFC-0053](../../docs/rfcs/0053-graph-subgraph-compatibility.md) on 2026-09-09, a Graph-dialect-to-SQL
 > compatibility surface so a caller adopts a nest by changing a GraphQL URL. **Rescoped 2026-09-12:
 > that last clause did not survive contact with a measurement. What was built is a partial read
 > surface - exact for a subgraph's event-shaped fields, a named refusal for the rest - and an
@@ -55,7 +55,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > the build-out sight unseen.
 >
 > **RFC-0058 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief unparked #1324 on
-> 2026-09-26 and asked for [RFC-0058](docs/rfcs/0058-cross-nest-sql.md) to be built: a cross view, a
+> 2026-09-26 and asked for [RFC-0058](../../docs/rfcs/0058-cross-nest-sql.md) to be built: a cross view, a
 > declared, read-only SQL route over two or more mounts of one tenant in one runtime. It is new query
 > surface in the default binary. It stores nothing, feeds no circuit and never merges two chains' block
 > streams, so the single-cursor law holds. Its capacity comes out of each member cursor's budget at
@@ -65,8 +65,8 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > change, and nobody else asked for it. S1 to S5 wait for a user who does.
 >
 > **RFC-0059 and RFC-0060 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief
-> accepted [RFC-0059](docs/rfcs/0059-checkpointed-folds.md) (checkpointed folds) and
-> [RFC-0060](docs/rfcs/0060-the-network-subgraph-endpoint.md) (the Network Subgraph endpoint) on
+> accepted [RFC-0059](../../docs/rfcs/0059-checkpointed-folds.md) (checkpointed folds) and
+> [RFC-0060](../../docs/rfcs/0060-the-network-subgraph-endpoint.md) (the Network Subgraph endpoint) on
 > 2026-09-21, on one condition that binds every slice: **all of it stays outside the default binary,
 > behind cargo features that are off by default** (`folds`, and `graph`, which enables it). No
 > regular nuthatch user sees any graph-facing surface unless they opt in. The test is RFC-0046 §1's
@@ -86,7 +86,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > is Chief's call on whether that is worth the remaining sprints. The trackers are #1441 and #1442.
 >
 > **RFC-0062 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0062](docs/rfcs/0062-maintained-views.md) (maintained views) on 2026-10-07 after its S0 spike put
+> [RFC-0062](../../docs/rfcs/0062-maintained-views.md) (maintained views) on 2026-10-07 after its S0 spike put
 > every BetSwirl SDK shape under 1 s cold with byte-identical answers. It is new capability in the
 > default binary, opt-in per nest through `maintained.toml`, which stays outside the data identity. A
 > maintained copy is the request-time view evaluated by the same engine and reused only when every
@@ -94,7 +94,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > determinism forbids. Each slice is gated on byte-identical answers and the Lodestar release gate.
 >
 > **RFC-0054 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0054](docs/rfcs/0054-the-head-count.md) (the head count) on 2026-10-08 and amended
+> [RFC-0054](../../docs/rfcs/0054-the-head-count.md) (the head count) on 2026-10-08 and amended
 > non-negotiable 3 above with its §1 wording. It is the first network call the binary makes *about*
 > an operator rather than *for* one, which is why it needed the amendment and not a reading: off until
 > a person types `y` after a successful `init`, two events, no identifier, tallies not records, the
@@ -106,7 +106,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > one line saying how to be counted. On-by-default was built and withdrawn the same day.
 >
 > **RFC-0063 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0063](docs/rfcs/0063-address-history.md) (address history) on 2026-10-09 for rotki, whose
+> [RFC-0063](../../docs/rfcs/0063-address-history.md) (address history) on 2026-10-09 for rotki, whose
 > founder said yes to a local indexer source the same day (rotki/rotki#13335). Chief's words: build
 > everything rotki needs, extending nuthatch as far as that takes. It reopens #272, #277 and #308 from
 > frozen-for-2027, now scoped as RFC-0063 slices. A rotki-mode nest is its own cursor beside the
@@ -115,7 +115,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > each gated on Etherscan parity, MEV from the relays included.
 >
 > **RFC-0065 is accepted through S6, and this line is the record RFC-0044 §8 asks for.** Chief
-> accepted [RFC-0065](docs/rfcs/0065-the-nest-in-a-tab.md) (the nest in a tab) on 2026-10-17. It
+> accepted [RFC-0065](../../docs/rfcs/0065-the-nest-in-a-tab.md) (the nest in a tab) on 2026-10-17. It
 > runs nuthatch's core somewhere new: decode, sealing and Burrmill compiled to WebAssembly in a
 > browser worker, following a chain from an RPC. S0 and S1 are done (#2083): defi-pulse-nest is the
 > demo, and the playground is live at nuthatch-indexer.com/play. S2 to S5 are authorised in order,
@@ -127,7 +127,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > tab, gated on segment hashes equal to native sealing, as the engine for RFC-0066's nest builder.
 >
 > **RFC-0066 is accepted through S2, and this line is the record RFC-0044 §8 asks for.** Chief
-> accepted [RFC-0066](docs/rfcs/0066-the-nest-builder.md) (the nest builder) on 2026-10-18 ("letsgooooo",
+> accepted [RFC-0066](../../docs/rfcs/0066-the-nest-builder.md) (the nest builder) on 2026-10-18 ("letsgooooo",
 > after S0 landed in #2097 and #2098). It is a static page beside the playground, not a binary change:
 > a visitor pastes a contract address, the tab scaffolds the nest with `init`'s own code compiled to
 > wasm (`nuthatch-scaffold`, `nuthatch-identity`), shows its NID, and indexes it on RFC-0065 S6's
@@ -139,15 +139,15 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > **RFC-0068 to RFC-0072 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief asked
 > for "something fun" on 2026-10-21 and accepted all five the same day, each on its own RFC's
 > recommendations, to be built one after another in this order:
-> [0071](docs/rfcs/0071-nuthatch-diff.md) (the diff, default binary, read-only, templated sentences,
-> no model), [0070](docs/rfcs/0070-time-lapse.md) (time-lapse, the tab first, the binary producer
-> behind an off-by-default `timelapse` feature), [0072](docs/rfcs/0072-chain-weather.md) (chain
+> [0071](../../docs/rfcs/0071-nuthatch-diff.md) (the diff, default binary, read-only, templated sentences,
+> no model), [0070](../../docs/rfcs/0070-time-lapse.md) (time-lapse, the tab first, the binary producer
+> behind an off-by-default `timelapse` feature), [0072](../../docs/rfcs/0072-chain-weather.md) (chain
 > weather, default binary, opt-in per nest by `weather.toml`, model prose off until `[prose]` is
 > written, and model text is never stored or served by the nest, only sent at delivery),
-> [0068](docs/rfcs/0068-nest-postcards.md) (postcards, reshaped by Chief the same day into a link: a `/play` URL
+> [0068](../../docs/rfcs/0068-nest-postcards.md) (postcards, reshaped by Chief the same day into a link: a `/play` URL
 > whose fragment pins a published nest's segments by hash, read from any static host; no binary
 > change), and
-> [0069](docs/rfcs/0069-the-engine-room.md) (the engine room, a watch subcommand behind a `watch`
+> [0069](../../docs/rfcs/0069-the-engine-room.md) (the engine room, a watch subcommand behind a `watch`
 > feature on by default, which lifts his 2026-10-03 preference for the cockpit over a TUI for this
 > one). Each slice keeps its own gate; an S0 that fails stops its RFC.
 >
@@ -158,7 +158,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > S0, with nothing in the binary. Do not resume either unasked.
 >
 > **RFC-0073 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0073](docs/rfcs/0073-the-shared-runtime.md) (the shared runtime) on 2026-10-27, all sixteen of
+> [RFC-0073](../../docs/rfcs/0073-the-shared-runtime.md) (the shared runtime) on 2026-10-27, all sixteen of
 > GraphOps's requests: "lets do ALL of it". It is new capability in the default binary for an operator
 > who hosts many organisations' nests in one runtime, and the out-of-scope list below is amended the
 > same day for the three items that crossed it. The order is the RFC's: the small operability items
@@ -167,7 +167,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > slices. FR8's isolation guarantee ships only after an independent review.
 >
 > **RFC-0077 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0077](docs/rfcs/0077-the-embeddable-engine.md) (the embeddable engine) on 2026-10-30, from
+> [RFC-0077](../../docs/rfcs/0077-the-embeddable-engine.md) (the embeddable engine) on 2026-10-30, from
 > Chris's "it's pure rust and can(?) be embedded as a wasm blob". Chief's rule binds every slice:
 > "nuthatch is one indexer software with many ways to run it, wasm only if needed (as a feature) and
 > the main path, the delightful core, stays as is." The binary stays the main pitch. The engine is
@@ -179,7 +179,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > blog post on what it is and how it works follows completion.
 >
 > **RFC-0081 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0081](docs/rfcs/0081-the-engine-in-use.md) (the engine in use) on 2026-10-31: what S7 had to
+> [RFC-0081](../../docs/rfcs/0081-the-engine-in-use.md) (the engine in use) on 2026-10-31: what S7 had to
 > work round, fixed in the engine, plus `verify` for a hosted `/sql` answer. Each slice begins only when
 > Chief says. S0 to S2 are built (S0 narrowed the hybrid open to whole pool tables, 179 MiB once); S3 and
 > S4 are authorised; S5 waits (Safari skipped for now); **S6, Arbitrum's verified head, is declined**
@@ -187,7 +187,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > in each, and no slice raises the module's size ceiling on its own.
 >
 > **RFC-0076 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
-> [RFC-0076](docs/rfcs/0076-scaling-the-shared-runtime.md) (scaling the shared runtime) on 2026-10-29,
+> [RFC-0076](../../docs/rfcs/0076-scaling-the-shared-runtime.md) (scaling the shared runtime) on 2026-10-29,
 > GraphOps's follow-up requests: "yes. letsgooo". FR17 to FR19 are new capability in the default binary:
 > followers on other hosts from the mirror, nests on one chain progressing from their own watermarks
 > behind one extraction stage, and tenant reservations held only while a tenant queries. The cursor
@@ -197,9 +197,9 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > exceed one machine after them.
 >
 > **RFC-0078 to RFC-0080 are accepted, and this line is the record RFC-0044 §8 asks for.** Chief
-> accepted [RFC-0078](docs/rfcs/0078-writer-failover.md) (writer failover),
-> [RFC-0079](docs/rfcs/0079-arrow-results.md) (Arrow results) and
-> [RFC-0080](docs/rfcs/0080-partial-sync.md) (partial sync) on 2026-10-30, after GraphOps's "this is
+> accepted [RFC-0078](../../docs/rfcs/0078-writer-failover.md) (writer failover),
+> [RFC-0079](../../docs/rfcs/0079-arrow-results.md) (Arrow results) and
+> [RFC-0080](../../docs/rfcs/0080-partial-sync.md) (partial sync) on 2026-10-30, after GraphOps's "this is
 > fundamentally not HA" on FR20 and their Electric SQL suggestion: "ok letsgoooo with the wave of rfcs".
 > Built in that order, HA first. RFC-0078 keeps the single-cursor law as written: one writer per chain
 > at any moment, a standby taking over through a lease in the operator's mirror, opt-in, embedded mode

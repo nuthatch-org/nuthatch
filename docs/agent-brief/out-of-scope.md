@@ -1,6 +1,6 @@
 # Out of scope: do not build, do not suggest (full text)
 
-Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
+Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing brief short. Nothing was reworded or dropped; only relative links were re-pointed (`../../`) because the file moved two directories down. `CLAUDE.md` links here; the non-negotiables and the rules summarised there still bind.
 
 ## Out of scope - do not build, do not suggest
 
@@ -23,7 +23,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
   nuthatch feature on its own merits, or it is not built.
   **Amended 2026-10-06: Chief lifted that rule for the subgraph stopgap.** Nuthatch serves stopgap
   nests for BNB and Polygon subgraphs the network does not serve, on the ThinkPad or new VPSes, until an
-  indexer picks each one up ([docs/subgraph-stopgap.md](docs/subgraph-stopgap.md)). It is the stock
+  indexer picks each one up ([docs/subgraph-stopgap.md](../../docs/subgraph-stopgap.md)). It is the stock
   binary run as an operator would, not a platform: no billing, no accounts, nothing in this tree built
   for it. The hosted-platform retirement above otherwise stands.
   **Amended 2026-10-09 by Chief: we may offer to host nests for people and teams**, not only stopgap
@@ -37,7 +37,7 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
   nuthatch-indexer.com/subgraphs says so, and people reach out on the Nuthatch Discord server. The
   other terms of the 2026-10-09 amendment still bind: the stock binary, no billing, no accounts,
   nothing in this tree built for it.
-  **Amended 2026-10-27 by Chief: the shared runtime ([RFC-0073](docs/rfcs/0073-the-shared-runtime.md)).**
+  **Amended 2026-10-27 by Chief: the shared runtime ([RFC-0073](../../docs/rfcs/0073-the-shared-runtime.md)).**
   GraphOps asked for sixteen things to host every customer's nests in one runtime, and Chief said
   "lets do ALL of it". Three of them crossed this list and are now in scope, as operator
   configuration the binary enforces without knowing who anyone is: **per-tenant-label shares and caps
