@@ -49,13 +49,28 @@ env:
   CARGO_TERM_COLOR: always
   # GCC 15 defaults to C23, which removed the ATOMIC_VAR_INIT that mimalloc (via dbsp) still uses.
   CFLAGS: -std=gnu17
+  # #3041: nothing in CI rebuilds incrementally, and incremental artifacts only bloat the cache and
+  # the disk. Test binaries need line tables for backtraces, not full debuginfo; it dominates link time.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   # The commands the jobs run live in yatr.toml. Bump deliberately.
   YATR_VERSION: "1.5.0"
 
 jobs:
   # Two tiers, to fit a 20-job org on a single PR. `full` is false for a change only to docs/ (bar
   # docs/bench/, which point-read reads) or to root *.md: the default leg still runs, since it holds
-  # every test that reads docs. `slow` is the merge queue, a push, or a PR labelled `full-ci`.
+  # every test that reads docs.
+  #
+  # `slow` is computed as `full && (event != pull_request || PR has the full-ci label)`. In words:
+  #   - merge_group (the merge queue): slow = full. A queue entry is slow whenever it changes any
+  #     code; only a docs-only entry skips the slow tier, and it cannot move RSS or latency.
+  #   - push (main, sprint/**): slow = full, so every landed commit runs the slow tier.
+  #   - pull_request: slow only with the `full-ci` label. A plain PR skips the slow tier.
+  # So on a plain PR, build release, footprint, point-read and backfill are skipped, and a skipped
+  # job satisfies its required context. The merge queue is the gate for RAM and latency. Caveat: a
+  # PR based on sprint/** is a pull_request too, so its RAM and latency gates are also skipped
+  # there and run only after the push lands.
   # Gated jobs test `!= 'false'`, so a failed `changes` (empty outputs) runs everything, not nothing.
   changes:
     name: changes (which tiers run)
@@ -213,6 +228,7 @@ jobs:
             exit 1
           fi
           echo "$notes present, $(wc -c < "$notes") bytes"
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: rustfmt, clippy
@@ -423,6 +439,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
@@ -514,6 +531,7 @@ jobs:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
         with:
           components: clippy
@@ -606,6 +624,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -616,6 +635,10 @@ jobs:
         with:
           version: ${{ env.YATR_VERSION }}
       - name: native step test (embed)
+        # #3041: thin LTO on the test binaries is most of this job's 20 minutes and buys a test
+        # nothing; the shipped module's profiles (`tab`, `release` for wasm) are untouched.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: yatr embed-native
 
   # Every gate here runs the module the tab ships: the `tab` profile, then wasm-opt.
@@ -1264,7 +1287,12 @@ jobs:
   build-release:
     name: build release
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.full != 'false' }}
+    # #3041: the slow tier only, as set in `changes` (merge queue, push, or a PR labelled `full-ci`).
+    # On a plain PR this job and the three measurements that consume its binary are skipped. That was
+    # chosen for PR wall time: this was the second-longest job on a PR, and its only consumers there
+    # are those measurements. The cost is that a RAM, point-read or backfill regression is caught in
+    # the merge queue rather than on the PR. `full-ci` restores the pre-merge check.
+    if: ${{ !cancelled() && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     # 45, not 20 (#584). Warm this job is 3m40s-5m12s; cold - triggered by any `Cargo.lock`
     # change, since `Swatinem/rust-cache` keys on the lock hash - it is a full `--release` build
@@ -1275,6 +1303,7 @@ jobs:
       - name: record start time
         run: echo "JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/use-mold
       - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # 1.95.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
@@ -1310,7 +1339,8 @@ jobs:
 
   footprint:
     name: footprint (RAM budget)
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1419,7 +1449,8 @@ jobs:
 
   point-read:
     name: point-read latency
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1507,7 +1538,8 @@ jobs:
   # they share nothing but the binary; what they used to cost was a second job in the queue.
   backfill-throughput:
     name: backfill throughput · tip lag
-    needs: build-release
+    needs: [changes, build-release]
+    if: ${{ !cancelled() && needs.build-release.result == 'success' && needs.changes.outputs.slow != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
