@@ -3667,8 +3667,13 @@ async fn answer(
             let why = answer["result"]
                 .as_str()
                 .unwrap_or("")
-                .trim_start_matches("NUTHATCH_INCOMPLETE: ")
-                .to_string();
+                .trim_start_matches("NUTHATCH_INCOMPLETE: ");
+            let why = if s.sweep.is_some() {
+                crate::address_history::without_hint(why)
+            } else {
+                why
+            }
+            .to_string();
             Json(crate::address_history::incomplete(&if why.is_empty() {
                 e
             } else {
