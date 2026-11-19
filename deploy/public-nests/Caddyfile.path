@@ -20,6 +20,9 @@
 #    per-nest limit on all callers together (`all_query` in nginx.conf) still caps what that can cost.
 #    Do not add `trusted_proxies`: Vercel's addresses are not a fixed list.
 #
+# The `header_up Host` line must name what the nest was started with as PUBLIC_HOST in its env file
+# (arc-testnet.env, base-usdc.env); change the two together.
+#
 # arc.nuthatch-indexer.com (Caddyfile.arc-testnet) keeps working beside this.
 arc-usdc.89.167.109.4.sslip.io {
 	request_body {

@@ -351,7 +351,9 @@ Everything above applies; this is what differs, and the files are `*-base-usdc*`
 - **The key is in one file.** GraphOps' URL is `https://rpc.graphops.xyz/v1/evm/8453/<api key>` (chain id 8453;
   the key is the last segment). It goes in `base-usdc.env` as `NUTHATCH_RPC`, which `nuthatch dev` reads as
   `--rpc`, so it is not in the unit, not in `ps`, not in `systemctl status` and not in this repo.
-  `base-usdc.env.example` has a placeholder. Make the key with `graphops api-keys create` limited to RPC for
+  `base-usdc.env.example` has a placeholder. Checked on 2026-11-19 that the key does not come back on a public route:
+  `/`, `/health`, `/ready`, `/nest`, `/shape`, `/schema`, `/tables`, `/mcp` (`status`) and `/sql` through the proxy
+  contained neither the RPC host nor `/v1/evm`. Make the key with `graphops api-keys create` limited to RPC for
   Base, so it can be revoked without touching another nest.
 - **Not from genesis.** The nest declares `start_block = 2797221`, the proxy's deployment. Base now makes a block
   every 200 ms, so that is 56.7 M blocks. `--backfill 3000000` overrides it on the
@@ -380,11 +382,11 @@ Read from the nest's own `/metrics` and `/ready` on 2026-11-19, nuthatch 5.23.0,
 | | |
 |---|---|
 | Range indexed | blocks 56,516,981 to the tip (59,537,520 at the check), 6.99 days |
-| Backfill time | 65 min (13:09:32 to 14:15:31 UTC), 28.0 M `Transfer` rows, about 8,600 events a second |
-| Backfill RPC | 9,261 `eth_getLogs`, 0 retries, 2 failures that nuthatch retried; about 19,000 credits |
+| Backfill time | 65 min (13:09:32 to 14:15:31 UTC), 28.0 M `Transfer` rows, about 7,100 a second |
+| Backfill RPC | 9,261 `eth_getLogs`, 0 retries, 2 failures that nuthatch retried; about 19,000 credits. 3.02 M blocks over 9,261 calls is about 330 blocks a call, not the 1,500 of `--window`: that is a ceiling, and nuthatch narrows the range it asks for to stay under the 20,000-log answer (`fetch_window_blocks` read 332 at the check) |
 | Disk | 1.8 GB for the nest directory |
 | Memory | 436 MB resident when following; the cgroup's 2 GB limit counts 1.3 GB of page cache, which the kernel gives back |
-| Following the tip | `lag_blocks` 0 at a 6 s poll; 36 `eth_getBlockByNumber`, 36 `eth_getLogs` and 36 tip calls in 4 minutes at the check, about 6 credits a second |
+| Following the tip | `lag_blocks` 0 at a 6 s poll. A poll is one tip call, one `eth_getLogs` and one `eth_getBlockByNumber` per block since the last poll (about 37, sent as batches). Re-read on 2026-11-19 over 63 s from `/metrics`: 9 polls, 9 `eth_getLogs`, 9 tip calls and 335 headers, so 362 credits, **about 5.7 credits a second** (0.5 M a day). The earlier "36 of each in 4 minutes" counted polls, not headers |
 | Through the proxy | `check-proxy.sh http://127.0.0.1:8481 --burst` passed, including the flood (7 served, 73 limited); `/sql`, `/mcp` `tools/list` answer, `/_admin` and a wrong `Host` answer `403` |
 
 The two reads that are not measured: the credit totals are the call counts times GraphOps' published prices,
