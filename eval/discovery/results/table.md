@@ -51,3 +51,18 @@
 | 2026-11-18 | claude 2.1.327 | claude-sonnet-5-5 | plugin | usdc-dashboard | yes | yes | yes | - | 243 |
 | 2026-11-18 | claude 2.1.327 | claude-sonnet-5-5 | plugin | usdc-dashboard | yes | yes | yes | - | 197 |
 | 2026-11-18 | claude 2.1.327 | claude-sonnet-5-5 | plugin | usdc-dashboard | yes | yes | yes | - | 87 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | agent-sql-uniswap | no | no | no | ponder | 291 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | agent-sql-uniswap | no | no | no | ponder | 135 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | agent-sql-uniswap | no | no | no | ponder | 229 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | erc20-history | no | no | no | ponder, own-getlogs-loop | 354 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | erc20-history | no | no | no | ponder | 68 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | erc20-history | no | no | no | ponder | 69 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | getlogs-range | no | no | no | own-getlogs-loop | 20 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | getlogs-range | no | no | no | own-getlogs-loop | 20 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | getlogs-range | no | no | no | own-getlogs-loop | 27 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | subgraph-local | no | no | no | ponder | 58 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | subgraph-local | no | no | no | ponder | 60 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | subgraph-local | no | no | no | ponder | 62 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | usdc-dashboard | no | no | no | ponder | 602 (timed out) |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | usdc-dashboard | no | no | no | ponder | 316 |
+| 2026-11-19 | claude 2.1.327 | claude-sonnet-5-5 | indexer-hint | usdc-dashboard | no | no | no | own-getlogs-loop | 111 |
