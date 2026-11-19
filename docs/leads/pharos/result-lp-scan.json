@@ -1,0 +1,125 @@
+{
+  "backfill_seconds": 5,
+  "tokens": [
+    {
+      "lp": "0xed279fdd11ca84beef15af5d39bb4d4bee23f0ca",
+      "holders_total": 1272,
+      "replay_supply": "12385388070230006883603038",
+      "onchain_total_supply": "12385388070230006883603038",
+      "balanceOf_zero": "0",
+      "check_ok": true,
+      "holders_over_min_pct": [
+        {
+          "address": "0xbddab785b306bcd9fb056da189615cc8ece1d823",
+          "balance": "11036306658186216357784389",
+          "pct": 89.1074
+        },
+        {
+          "address": "0x5fa5b62c8af877cb37031e0a3b2f34a78e3c56a6",
+          "balance": "927349147346646532303529",
+          "pct": 7.4874
+        },
+        {
+          "address": "0xad86df2e8f989c828b25a7da5eb1ec363283fa3f",
+          "balance": "304131301799560398145733",
+          "pct": 2.4555
+        },
+        {
+          "address": "0xeb31da939878d1d780fdbcc244531c0fb80a2cf3",
+          "balance": "68844964163711909425751",
+          "pct": 0.5558
+        }
+      ]
+    },
+    {
+      "lp": "0x3041cbd36888becc7bbcbc0045e3b1f144466f5f",
+      "holders_total": 373,
+      "replay_supply": "1233050967699",
+      "onchain_total_supply": "1233050968699",
+      "balanceOf_zero": "1000",
+      "check_ok": true,
+      "holders_over_min_pct": [
+        {
+          "address": "0x6b03132d5bcca90ec76b78b1e393521157cf49b6",
+          "balance": "680387997181",
+          "pct": 55.1792
+        },
+        {
+          "address": "0x9efaa5dd8ca7c35978483517146f571240b60042",
+          "balance": "396564641887",
+          "pct": 32.1612
+        },
+        {
+          "address": "0x90360da1a6f6ac41817b46f83fb15b454dfbad9e",
+          "balance": "49298631932",
+          "pct": 3.9981
+        },
+        {
+          "address": "0x06799a1e4792001aa9114f0012b9650ca28059a3",
+          "balance": "32986117109",
+          "pct": 2.6751
+        },
+        {
+          "address": "0x0250e4722d6cbb928206b5c46ea7a3f0591145f5",
+          "balance": "25278202371",
+          "pct": 2.05
+        },
+        {
+          "address": "0x9ce2baa7928d3e29f75a07fd8af0d46f464674af",
+          "balance": "8779229769",
+          "pct": 0.7119
+        },
+        {
+          "address": "0x2f64794216cb00837558fc91efe7e07cacb8de0a",
+          "balance": "7364082472",
+          "pct": 0.5972
+        },
+        {
+          "address": "0xc9f6a4dbe8a85ce3c3216d778d9e0dff4c6e378a",
+          "balance": "4331507848",
+          "pct": 0.3512
+        },
+        {
+          "address": "0xe282a128079ecebdcb5f8758e8ff4bc6c692e0db",
+          "balance": "2646121834",
+          "pct": 0.2145
+        },
+        {
+          "address": "0x75b8c48bdb04d426aed57b36bb835ad2dc321c30",
+          "balance": "2233484542",
+          "pct": 0.1811
+        },
+        {
+          "address": "0x1dcac77b0e143695ba0d5e031e2fe15576c899df",
+          "balance": "2055406149",
+          "pct": 0.1666
+        },
+        {
+          "address": "0x21d29838cfa8ae6ac95ca9a7776344f3a7853560",
+          "balance": "1968593873",
+          "pct": 0.1596
+        },
+        {
+          "address": "0x1670c88225c89fe654cf0df300b705485c62ef69",
+          "balance": "1967891972",
+          "pct": 0.1595
+        },
+        {
+          "address": "0x03dcd73533b5a6d0fc4abd143a8cdbe8d87cc615",
+          "balance": "1801113576",
+          "pct": 0.146
+        },
+        {
+          "address": "0xdb812d3b1777dee8f91ba8d823f9d3655b38b8ca",
+          "balance": "1441009994",
+          "pct": 0.1168
+        },
+        {
+          "address": "0xe1936ca561febbc83eb0837004ed19d0744b2dda",
+          "balance": "1391591528",
+          "pct": 0.1128
+        }
+      ]
+    }
+  ]
+}

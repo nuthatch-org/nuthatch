@@ -1,0 +1,19 @@
+[nest]
+name = "pharos-eth"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://gateway.tenderly.co/public/mainnet"]
+schema_version = 2
+block_timestamps = false
+
+[[contracts]]
+alias = "lusd3crv"
+address = "0xed279fdd11ca84beef15af5d39bb4d4bee23f0ca"
+start_block = 12240000
+abi = "abis/lusd3crv.json"
+
+[[contracts]]
+alias = "univ2_usdc_usdt"
+address = "0x3041cbd36888becc7bbcbc0045e3b1f144466f5f"
+start_block = 10000000
+abi = "abis/univ2_usdc_usdt.json"
