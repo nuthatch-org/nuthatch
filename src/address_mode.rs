@@ -8776,6 +8776,7 @@ mod tests {
             "trace_filter" => Ok(json!([])),
             "trace_block" => Ok(json!([{"x": 1}])),
             "eth_getBlockByNumber" => (twin.answer)(m, p),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(Counted::new(main), Counted::new(trace));
@@ -8933,6 +8934,7 @@ mod tests {
         let trace = Fake::new(move |m, p| match m {
             "trace_filter" => Ok(json!([])),
             "eth_getBlockByNumber" => (twin.answer)(m, p),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(Counted::new(main), Counted::new(trace));
@@ -9005,6 +9007,7 @@ mod tests {
                 "trace_filter" => Ok(json!([])),
                 "trace_block" => Ok(json!([{"x": 1}])),
                 "eth_getBlockByNumber" => (twin.answer)(m, p),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let dir = tempfile::tempdir().unwrap();
@@ -9161,6 +9164,7 @@ mod tests {
                     c.after_read(b);
                     Ok(answer)
                 }
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let trace = crate::address_partitions::tests::Fake::new(|m, _| bail!("unexpected {m}"));
@@ -9225,6 +9229,7 @@ mod tests {
                 "eth_getCode" => Ok(json!("0x")),
                 "eth_getTransactionCount" => Ok(json!("0x0")),
                 "eth_getLogs" => Ok(json!([])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let c = self.clone();
@@ -9300,6 +9305,7 @@ mod tests {
                     ]))
                 }
                 "trace_block" => Ok(json!([{"x": 1}])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let c = self.clone();
@@ -9424,6 +9430,7 @@ mod tests {
                         "removed": false}))
                     .collect::<Vec<_>>()))
             }
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         })
     }

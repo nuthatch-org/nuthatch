@@ -908,6 +908,8 @@ pub struct Discoverer<M, T> {
     pub mint_logs: &'static [crate::address_residual::MintLog],
     /// Transfer logs naming an address that filed no row: not the standard event, or undecodable data.
     pub skipped_logs: Arc<AtomicU64>,
+    /// Each token's `(name, symbol, decimals)`, read once from the contract at the latest block.
+    tokens: Mutex<BTreeMap<String, (String, String, String)>>,
 }
 
 impl<M: Rpc, T: Rpc> Discoverer<M, T> {
@@ -921,7 +923,82 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
             trace_code: false,
             mint_logs: &[],
             skipped_logs: Arc::default(),
+            tokens: Mutex::default(),
         }
+    }
+
+    /// Fill `tokenName`, `tokenSymbol` and `tokenDecimal` on `rows`, as Etherscan's `tokentx` does.
+    /// Read from the token contract at the latest block, once per token; a token that does not answer
+    /// (no such method, a revert) gets empty name and symbol and `0` decimals, as there.
+    async fn annotate_tokens(&self, rows: &mut [Row]) -> Result<()> {
+        for row in rows {
+            let Some(c) = row.record.get("contractAddress").and_then(Value::as_str) else {
+                continue;
+            };
+            let c = c.to_string();
+            let cached = self.tokens.lock().expect("tokens lock").get(&c).cloned();
+            let (name, symbol, decimals) = match cached {
+                Some(t) => t,
+                None => {
+                    let t = (
+                        self.token_string(&c, "0x06fdde03").await?,
+                        self.token_string(&c, "0x95d89b41").await?,
+                        self.token_decimals(&c).await?,
+                    );
+                    self.tokens
+                        .lock()
+                        .expect("tokens lock")
+                        .insert(c, t.clone());
+                    t
+                }
+            };
+            row.record.insert("tokenName".into(), Value::String(name));
+            row.record
+                .insert("tokenSymbol".into(), Value::String(symbol));
+            row.record
+                .insert("tokenDecimal".into(), Value::String(decimals));
+        }
+        Ok(())
+    }
+
+    /// A contract's answer to a no-argument call: `None` when it reverts or has no such method.
+    /// Any other failure (a transport error, a rate limit) fails the window rather than file a guess.
+    async fn token_call(&self, c: &str, selector: &str) -> Result<Option<String>> {
+        match self
+            .main
+            .call("eth_call", json!([{"to": c, "data": selector}, "latest"]))
+            .await
+        {
+            Ok(v) => Ok(v
+                .as_str()
+                .map(|s| s.trim_start_matches("0x").to_string())
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))),
+            Err(e) => {
+                let s = format!("{e:#}").to_ascii_lowercase();
+                if s.contains("revert") || s.contains("invalid opcode") || s.contains("-32015") {
+                    Ok(None)
+                } else {
+                    Err(e).with_context(|| format!("reading token metadata of {c}"))
+                }
+            }
+        }
+    }
+
+    /// `name()` or `symbol()`: an ABI string, or the bytes32 older tokens (MKR) return.
+    async fn token_string(&self, c: &str, selector: &str) -> Result<String> {
+        let Some(h) = self.token_call(c, selector).await? else {
+            return Ok(String::new());
+        };
+        Ok(decode_token_string(&h).unwrap_or_default())
+    }
+
+    async fn token_decimals(&self, c: &str) -> Result<String> {
+        let Some(h) = self.token_call(c, "0x313ce567").await? else {
+            return Ok("0".into());
+        };
+        Ok(h.get(..64)
+            .and_then(|w| decimal(&format!("0x{w}")).ok())
+            .unwrap_or_else(|| "0".into()))
     }
 
     /// Discover `actions` (all of [`DISCOVERED`], or [`TOKENS`]) over `[from, to]` for `address`
@@ -984,6 +1061,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 self.skipped_logs.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.annotate_tokens(&mut found.tokentx).await?;
         Ok(found)
     }
 
@@ -1200,6 +1278,9 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
         }
         for (a, r) in refs {
             found.entry(a).or_default().txlist = self.hydrate(history, &r, pending).await?;
+        }
+        for f in found.values_mut() {
+            self.annotate_tokens(&mut f.tokentx).await?;
         }
         Ok(found)
     }
@@ -2752,6 +2833,33 @@ fn transfer_rows(
     Ok(true)
 }
 
+/// A `name()` or `symbol()` answer: an ABI-encoded string, or a bytes32 padded with zeros.
+fn decode_token_string(hex: &str) -> Option<String> {
+    let bytes: Vec<u8> = (0..hex.len() / 2 * 2)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let usable = |b: &[u8]| {
+        String::from_utf8(b.to_vec())
+            .ok()
+            .filter(|s| !s.contains('\0'))
+    };
+    if bytes.len() >= 64 {
+        let offset =
+            usize::try_from(alloy_primitives::U256::try_from_be_slice(&bytes[..32])?).ok()?;
+        let at = bytes.get(offset..offset.checked_add(32)?)?;
+        let len = usize::try_from(alloy_primitives::U256::try_from_be_slice(at)?).ok()?;
+        let start = offset + 32;
+        return usable(bytes.get(start..start.checked_add(len)?)?);
+    }
+    if bytes.len() == 32 {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(32);
+        return usable(&bytes[..end]);
+    }
+    None
+}
+
 /// `TransferBatch` data: two dynamic `uint256[]`, ids then values, as decimal strings.
 /// `None` when the data is not two arrays of one length.
 fn batch_arrays(data: &str) -> Result<Option<(Vec<String>, Vec<String>)>> {
@@ -3810,6 +3918,7 @@ mod tests {
                     json!({"timestamp": "0x10", "number": format!("0x{b:x}"), "hash": format!("0x{b:064x}"),
                            "transactions": ["0x1", "0x2", "0x3", "0x4", "0x5"]})
                 }
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -3845,6 +3954,7 @@ mod tests {
                         json!([{"x": 1}])
                     }
                 }
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -3912,6 +4022,7 @@ mod tests {
                 ]),
                 "trace_filter" => json!([]),
                 "trace_block" => json!([{"x": 1}]),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -3971,6 +4082,7 @@ mod tests {
             } else {
                 json!([])
             }),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, trace);
@@ -4007,6 +4119,7 @@ mod tests {
                 "trace_filter" => Ok(json!([])),
                 "trace_block" if Some(hex_u64(&p[0])?) == busy && traced => Ok(json!([{"x": 1}])),
                 "trace_block" => Ok(json!([])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let d = Discoverer::new(main, trace);
@@ -4153,6 +4266,7 @@ mod tests {
         let blind = script(|m, _| match m {
             "trace_filter" => Ok(json!([])),
             "trace_block" => Ok(json!([{"x": 1}])),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, blind);
@@ -4235,6 +4349,7 @@ mod tests {
             script(|m, _| match m {
                 "trace_filter" => Ok(json!([])),
                 "trace_block" => Ok(json!([{"x": 1}])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         };
@@ -4288,6 +4403,7 @@ mod tests {
                                                      "transactions": ["0x1", "0x2", "0x3", "0x4", "0x5"]})
                     }
                     "eth_getLogs" => json!([]),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 })
             })
@@ -4296,6 +4412,7 @@ mod tests {
             script(|m, _| match m {
                 "trace_filter" => Ok(json!([])),
                 "trace_block" => Ok(json!([{"x": 1}])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         };
@@ -4443,6 +4560,7 @@ mod tests {
                     "timestamp": "0x64", "transactions": []})
                 }
                 "eth_getLogs" => json!(logs),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -4543,6 +4661,7 @@ mod tests {
                         "timestamp": "0x64", "transactions": []})
                     }
                     "eth_getLogs" => json!([]),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 })
             })
@@ -4586,6 +4705,7 @@ mod tests {
                 main(),
                 script(move |m, _| match m {
                     "trace_block" => Ok(answer.clone()),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 }),
             );
@@ -4663,6 +4783,7 @@ mod tests {
                     "eth_getTransactionReceipt" => json!({"status": "0x1", "gasUsed": "0x5208",
                         "cumulativeGasUsed": "0x5208", "effectiveGasPrice": "0x1",
                         "contractAddress": null, "blockHash": receipt_hash}),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 })
             });
@@ -4726,6 +4847,7 @@ mod tests {
                 "eth_getTransactionReceipt" => json!({"status": "0x1", "gasUsed": "0x5208",
                     "cumulativeGasUsed": "0x5208", "effectiveGasPrice": "0x1",
                     "contractAddress": null, "blockHash": bh2}),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -4813,6 +4935,7 @@ mod tests {
                         bail!("response passed the 4194304-byte getLogs body cap; narrowing the range")
                     }
                     "eth_getBlockReceipts" => Ok(answer.clone()),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 },
             );
@@ -4876,6 +4999,7 @@ mod tests {
                 "eth_getBlockReceipts" => Ok(json!([
                     {"transactionHash": h1, "blockHash": bh, "logs": logs.clone()}
                 ])),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             });
             let d = Discoverer::new(main, script(|m, _| bail!("no trace call expected: {m}")));
@@ -4922,6 +5046,7 @@ mod tests {
                         )
                         .collect::<Vec<_>>())
                 }
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -4959,6 +5084,7 @@ mod tests {
                 vec![sweep_tx(&h1, OUT, Some(OUT)), sweep_tx(&h2, OUT, Some(OUT))],
                 |m, _| match m {
                     "eth_getLogs" => Ok(json!([])),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 },
             );
@@ -4966,6 +5092,7 @@ mod tests {
                 main,
                 script(move |m, _| match m {
                     "trace_block" => Ok(frames.clone()),
+                    "eth_call" => bail!("execution reverted"),
                     other => bail!("unexpected {other}"),
                 }),
             );
@@ -5019,6 +5146,7 @@ mod tests {
                            "effectiveGasPrice": "0x1", "contractAddress": contract,
                            "blockHash": bh})
                 }
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
@@ -5081,6 +5209,62 @@ mod tests {
         assert_eq!(found.tokennfttx[0].record["tokenID"], "7");
         assert_eq!(found.token1155tx.len(), 1);
         assert_eq!(found.token1155tx[0].record["tokenValue"], "3");
+    }
+
+    /// An Etherscan client reads `tokenName`, `tokenSymbol` and `tokenDecimal` off a `tokentx` row
+    /// (fund-origin-tracer#35). Read once per token; a token that reverts files empty ones.
+    #[tokio::test]
+    async fn tokentx_rows_carry_the_tokens_metadata_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let who = A.to_string();
+        let usdc = format!("0x{:0>40}", "a1");
+        let odd = format!("0x{:0>40}", "a2");
+        let log = |token: &str, index: u64| {
+            json!({"address": token, "topics": [TRANSFER, padded(A), padded(A)],
+                "data": format!("0x{:0>64}", "64"), "blockNumber": "0x10", "blockHash": "0xBB",
+                "transactionHash": "0xHH", "transactionIndex": "0x1",
+                "logIndex": format!("0x{index:x}"), "blockTimestamp": "0x20", "removed": false})
+        };
+        let string = |s: &str| format!("0x{:0>64}{:0>64x}{:0<64}", "20", s.len(), hex::encode(s));
+        let (main, trace) = chain(false);
+        let (usdc2, odd2) = (usdc.clone(), odd.clone());
+        let logs = vec![log(&usdc, 1), log(&usdc, 2), log(&odd, 3)];
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = calls.clone();
+        let main = script(move |m, p| match m {
+            "eth_getLogs" => Ok(json!(logs)),
+            "eth_call" => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let to = p[0]["to"].as_str().unwrap();
+                if to == odd2 {
+                    bail!("-32000: execution reverted");
+                }
+                assert_eq!(to, usdc2);
+                Ok(json!(match p[0]["data"].as_str().unwrap() {
+                    "0x06fdde03" => string("USD Coin"),
+                    "0x95d89b41" => string("USDC"),
+                    "0x313ce567" => format!("0x{:0>64}", "6"),
+                    d => bail!("unexpected {d}"),
+                }))
+            }
+            _ => (main.answer)(m, p),
+        });
+        let d = Discoverer::new(main, trace);
+        let found = d.discover_now(&h, &who, 0, 63).await.unwrap();
+        assert_eq!(found.tokentx.len(), 3);
+        let meta = |i: usize| {
+            ["tokenName", "tokenSymbol", "tokenDecimal"]
+                .map(|k| found.tokentx[i].record[k].as_str().unwrap().to_string())
+        };
+        assert_eq!(meta(0), ["USD Coin", "USDC", "6"]);
+        assert_eq!(meta(1), meta(0));
+        assert_eq!(meta(2), ["", "", "0"], "a token that reverts");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "three reads for each of two tokens"
+        );
     }
 
     #[test]
@@ -5431,6 +5615,7 @@ mod tests {
             }
             "trace_transaction" => Ok(whole.clone()),
             "trace_block" => Ok(json!([{"x": 1}])),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = Discoverer::new(main, trace);
@@ -5604,10 +5789,12 @@ mod tests {
             "eth_getBlockByNumber" => {
                 Ok(json!({"timestamp": "0x10", "hash": main_300.lock().unwrap().clone()}))
             }
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let trace = script(move |m, _| match m {
             "trace_transaction" => Ok(whole.clone()),
+            "eth_call" => bail!("execution reverted"),
             other => bail!("unexpected {other}"),
         });
         let d = std::sync::Arc::new(Discoverer::new(Counted::new(main), Counted::new(trace)));
@@ -5962,6 +6149,7 @@ mod tests {
                     {"transactionHash": "0x01", "gasUsed": "0x5208", "effectiveGasPrice": "0x66"},
                     {"transactionHash": "0x02", "gasUsed": "0x2", "effectiveGasPrice": "0x64"},
                 ]),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         })
@@ -6222,6 +6410,7 @@ mod tests {
                             "gasUsed": "0x5208", "cumulativeGasUsed": "0x5208",
                             "effectiveGasPrice": "0x1", "contractAddress": null,
                             "blockHash": format!("0x{:064x}", n + 5)}),
+                        "eth_call" => bail!("execution reverted"),
                         other => bail!("unexpected {other}"),
                     })
                 }
@@ -6299,6 +6488,7 @@ mod tests {
                            "timestamp": "0x64", "transactions": []})
                 }
                 "eth_getLogs" => json!([]),
+                "eth_call" => bail!("execution reverted"),
                 other => bail!("unexpected {other}"),
             })
         });
