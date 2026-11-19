@@ -92,7 +92,9 @@ The full directory, with the two variables pointed at keyless endpoints, started
   20,000 blocks a call, the keyless endpoints 100, at 2 to 4 s each.
 - `tokentx` rows carry `tokenName`, `tokenSymbol` and `tokenDecimal`, read from the token contract
   once per token at the latest block, as Etherscan's are (the sample above predates them). A token
-  that does not answer gets an empty name and symbol and `0` decimals.
+  that does not answer gets an empty name and symbol and `0` decimals. This metadata is presentation
+  only, the contract's current answer: it never derives a key, an ordering or a decision, and rows
+  already stored are not backfilled.
 - An incoming transaction that moves no value is not listed, though Etherscan lists it.
 - `getblocknobytime` is refused on BNB Chain, whose blocks can share a second.
 - Your RPC provider sees which addresses you watch. The history itself stays on your machine.

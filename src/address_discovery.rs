@@ -893,6 +893,39 @@ pub struct Found {
     pub callcode: BTreeSet<(u64, u64, u64)>,
 }
 
+/// Most tokens whose metadata a [`Discoverer`] remembers. Past it rows are still annotated, but each
+/// further token is read again rather than cached, so the map cannot grow without bound.
+const TOKEN_CACHE_CAP: usize = 4096;
+
+/// Whether an `eth_call` error is the contract's own failure (a revert, out of gas, a bad opcode) and
+/// not the transport's: transport and rate-limit errors are never contract-side, whatever else they say.
+fn is_contract_failure(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    const TRANSPORT: [&str; 7] = [
+        "429",
+        "timeout",
+        "timed out",
+        "connection",
+        "rate limit",
+        "too many requests",
+        "unavailable",
+    ];
+    const CONTRACT: [&str; 11] = [
+        "revert",
+        "invalid opcode",
+        "out of gas",
+        "execution error",
+        "stack",
+        "invalid jump",
+        "bad instruction",
+        "gas required exceeds",
+        "-32015",
+        "\"code\":3",
+        "code: 3",
+    ];
+    !TRANSPORT.iter().any(|t| e.contains(t)) && CONTRACT.iter().any(|c| e.contains(c))
+}
+
 /// Discovery over a main endpoint pool (logs, hydration, nonces) and a trace one, which may be the
 /// same endpoints.
 pub struct Discoverer<M, T> {
@@ -930,6 +963,12 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
     /// Fill `tokenName`, `tokenSymbol` and `tokenDecimal` on `rows`, as Etherscan's `tokentx` does.
     /// Read from the token contract at the latest block, once per token; a token that does not answer
     /// (no such method, a revert) gets empty name and symbol and `0` decimals, as there.
+    ///
+    /// Determinism exception (CLAUDE.md non-negotiable 4), explicit and bounded: this metadata is
+    /// presentation only, copied from the contract's current answer exactly as Etherscan does. It is
+    /// never used to derive a key, an ordering or any decision, and stored rows are not backfilled, so
+    /// it is not re-executable from the window. A read at the window's block would need archive state,
+    /// which most endpoints prune, and would then fail or fall back to latest anyway.
     async fn annotate_tokens(&self, rows: &mut [Row]) -> Result<()> {
         for row in rows {
             let Some(c) = row.record.get("contractAddress").and_then(Value::as_str) else {
@@ -945,10 +984,11 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                         self.token_string(&c, "0x95d89b41").await?,
                         self.token_decimals(&c).await?,
                     );
-                    self.tokens
-                        .lock()
-                        .expect("tokens lock")
-                        .insert(c, t.clone());
+                    let mut cache = self.tokens.lock().expect("tokens lock");
+                    if cache.len() < TOKEN_CACHE_CAP {
+                        cache.insert(c, t.clone());
+                    }
+                    drop(cache);
                     t
                 }
             };
@@ -974,8 +1014,7 @@ impl<M: Rpc, T: Rpc> Discoverer<M, T> {
                 .map(|s| s.trim_start_matches("0x").to_string())
                 .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))),
             Err(e) => {
-                let s = format!("{e:#}").to_ascii_lowercase();
-                if s.contains("revert") || s.contains("invalid opcode") || s.contains("-32015") {
+                if is_contract_failure(&format!("{e:#}")) {
                     Ok(None)
                 } else {
                     Err(e).with_context(|| format!("reading token metadata of {c}"))
@@ -5265,6 +5304,45 @@ mod tests {
             6,
             "three reads for each of two tokens"
         );
+    }
+
+    /// An out-of-gas style node error is the contract's failure and files empty metadata; a transport
+    /// error still fails the window.
+    #[tokio::test]
+    async fn token_metadata_error_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = history(dir.path());
+        let who = A.to_string();
+        let tok = format!("0x{:0>40}", "a3");
+        for (msg, ok) in [
+            ("-32000: out of gas", true),
+            ("VM execution error: stack underflow", true),
+            ("429 Too Many Requests: rate limit exceeded", false),
+            ("error sending request: connection reset", false),
+            ("out of gas, but the request timed out", false),
+        ] {
+            let l = json!({"address": tok, "topics": [TRANSFER, padded(A), padded(A)],
+                "data": format!("0x{:0>64}", "64"), "blockNumber": "0x10", "blockHash": "0xBB",
+                "transactionHash": "0xHH", "transactionIndex": "0x1", "logIndex": "0x1",
+                "blockTimestamp": "0x20", "removed": false});
+            let (main, trace) = chain(false);
+            let main = script(move |m, p| match m {
+                "eth_getLogs" => Ok(json!([l])),
+                "eth_call" => bail!("{msg}"),
+                _ => (main.answer)(m, p),
+            });
+            let r = Discoverer::new(main, trace)
+                .discover_now(&h, &who, 0, 63)
+                .await;
+            assert_eq!(r.is_ok(), ok, "{msg}");
+            if let Ok(f) = r {
+                let rec = &f.tokentx[0].record;
+                assert_eq!(
+                    [&rec["tokenName"], &rec["tokenSymbol"], &rec["tokenDecimal"]],
+                    ["", "", "0"]
+                );
+            }
+        }
     }
 
     #[test]
