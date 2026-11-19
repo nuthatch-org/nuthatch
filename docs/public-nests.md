@@ -272,3 +272,20 @@ nest repo's README with `<PUBLIC_URL>` replaced.
 - `/mcp` tool calls (`diff`, `entity`, `balance`, ...) run in the nest, past the proxy's route list. `diff`
   has its own 30 s budget and takes one of the two query permits while it runs; the proxy cuts the
   client off at 15 s, the nest finishes or times out by itself.
+
+## Handing the deploy to a sudo user (what an unprivileged session cannot do)
+
+An agent session without root (the 2026-11-19 attempt at #3031 had no credentials for helsinki-nests at
+all) can do nothing on the host. For a sudo user, steps 0 to 9 above are the whole list. The ones that
+cannot be done without root, and have no user-level equivalent that keeps the limits, are:
+
+- step 1 (`useradd`), step 2 (`/usr/local/bin`), step 4 (`/etc/nuthatch-public`), step 5 (`apt-get install nginx`,
+  the system units: `MemoryMax`, `ProtectSystem` and the sandbox are the read-only limits);
+- step 8 (DNS, and editing the Caddyfile).
+
+If the nest is to run as an existing low-privilege account instead of `nests-public`, change `User=`,
+`Group=`, `ReadWritePaths=` and `WorkingDirectory=` in both units and the `--dir` path together, and keep the
+rest. Verify the host key out of band before the first `ssh`; do not accept it blind. The ED25519
+fingerprint seen from grokbot-box for 100.82.188.91 on 2026-11-19 was
+`SHA256:L1nA/wyDwfKi6vOtgfNsV7xTzA6nMd71aMBA67BAyKM` (compare it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`
+on the host).
