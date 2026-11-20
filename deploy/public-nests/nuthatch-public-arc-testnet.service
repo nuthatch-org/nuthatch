@@ -6,6 +6,8 @@
 # --public-host: the nest is bound to loopback and refuses a Host it was not told about (#3002);
 #   Caddy and nginx forward the public name, so it is named here.
 # --poll-interval 2s: Arc blocks come about every 0.6 s; the nest's README measured 5 to 6 blocks behind.
+# --local-host 100.82.188.91: Prometheus scrapes /metrics and /ready through the tailnet-only Caddy site on :9180, which
+#   forwards that Host; a loopback-bound nest refuses a Host it was not told (#3002).
 # Not --seal-direct: the nest's README measured its 17 minute backfill without it, against this
 #   endpoint's 429s, so that is the combination this unit runs.
 [Unit]
@@ -25,6 +27,7 @@ ExecStart=/usr/local/bin/nuthatch-5.23.0 dev \
     --listen 127.0.0.1:8120 \
     --no-admin \
     --public-host ${PUBLIC_HOST} \
+    --local-host 100.82.188.91 \
     --poll-interval 2s \
     --rpc ${ARC_RPC_URL} \
     --rpc ${ARC_RPC_URL_2}
