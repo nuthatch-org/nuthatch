@@ -3620,3 +3620,198 @@ mod rfc0036_tests {
         assert!(!crate::chunker::is_result_too_large(&err), "{err:#}");
     }
 }
+
+/// Each endpoint's batch width is learned from its refusals (GraphOps answers HTTP 413
+/// `rpc_batch_too_large` above 100 calls and runs none of them; Alchemy takes ~1000).
+#[cfg(test)]
+mod batch_width_tests {
+    use super::RpcClient;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        /// GraphOps: HTTP 413, named code, no call run.
+        Http413,
+        /// HTTP 413 that states no maximum.
+        Http413Bare,
+        /// HTTP 200 carrying a top-level JSON-RPC error.
+        RpcError,
+        /// HTTP 200 with an empty array.
+        Empty,
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        /// Sizes of batches the endpoint accepted and ran.
+        accepted: Vec<usize>,
+        rejected: Vec<usize>,
+        /// How many times each call's data was run.
+        runs: std::collections::HashMap<String, usize>,
+    }
+
+    async fn endpoint(limit: usize, how: Refusal) -> (String, Arc<Mutex<Seen>>) {
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let log = log.clone();
+                async move {
+                    let Value::Array(items) = req else {
+                        return Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"})).into_response();
+                    };
+                    let mut seen = log.lock().unwrap();
+                    if items.len() > limit {
+                        seen.rejected.push(items.len());
+                        return match how {
+                            Refusal::Http413 => (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                r#"{"code":"rpc_batch_too_large","message":"max 100 calls per batch"}"#,
+                            )
+                                .into_response(),
+                            Refusal::Http413Bare => {
+                                (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response()
+                            }
+                            Refusal::RpcError => Json(json!({"jsonrpc":"2.0","id":null,
+                                "error":{"code":-32600,"message":"batch size exceeds the limit"}}))
+                            .into_response(),
+                            Refusal::Empty => Json(json!([])).into_response(),
+                        };
+                    }
+                    seen.accepted.push(items.len());
+                    let answers: Vec<Value> = items
+                        .iter()
+                        .map(|item| {
+                            if item["method"] == "eth_getBlockByNumber" {
+                                let b = u64::from_str_radix(
+                                    item["params"][0].as_str().unwrap().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap();
+                                *seen.runs.entry(format!("block {b}")).or_default() += 1;
+                                json!({"jsonrpc":"2.0","id":item["id"],
+                                    "result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
+                            } else {
+                                let data = item["params"][0]["data"].as_str().unwrap().to_string();
+                                *seen.runs.entry(data.clone()).or_default() += 1;
+                                json!({"jsonrpc":"2.0","id":item["id"],"result":data})
+                            }
+                        })
+                        .collect();
+                    Json(Value::Array(answers)).into_response()
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}/"), seen)
+    }
+
+    fn calls(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("0x{:040x}", 1), format!("0x{i:08x}")))
+            .collect()
+    }
+
+    async fn check_calls(
+        how: Refusal,
+        limit: usize,
+        n: usize,
+        max_rejections: usize,
+        learned: usize,
+    ) {
+        let (url, seen) = endpoint(limit, how).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let calls = calls(n);
+        let got = rpc.eth_call_batch_at(&calls, 7).await.expect("answered");
+        assert_eq!(got.len(), n);
+        for (i, r) in got.iter().enumerate() {
+            assert_eq!(
+                r.as_deref(),
+                Some(calls[i].1.as_str()),
+                "call {i} out of place"
+            );
+        }
+        let (accepted, rejected, runs) = {
+            let s = seen.lock().unwrap();
+            (s.accepted.clone(), s.rejected.clone(), s.runs.clone())
+        };
+        assert!(accepted.iter().all(|&s| s <= limit), "{accepted:?}");
+        assert_eq!(runs.len(), n);
+        assert!(runs.values().all(|&c| c == 1), "a call ran twice");
+        assert!(rejected.len() <= max_rejections, "{rejected:?}");
+        // The refusal was about the batch, not the endpoint: it is still served, and the next batch
+        // goes out at the learned width with no further refusal.
+        let before = rpc.request_count();
+        rpc.eth_call_batch_at(&calls, 8)
+            .await
+            .expect("served again");
+        assert_eq!(
+            rpc.request_count() - before,
+            n.div_ceil(learned) as u64,
+            "the learned width was not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_413_above_100_ends_with_batches_of_at_most_100_and_one_rejection() {
+        // The refusal states the maximum, so one rejected attempt is all it costs.
+        check_calls(Refusal::Http413, 100, 450, 1, 100).await;
+    }
+
+    #[tokio::test]
+    async fn a_413_that_states_no_maximum_is_halved_to_a_width_it_takes() {
+        // 450 -> 225 -> 112 -> 56: three rejections, learning 56; nothing above 100 is ever sent.
+        check_calls(Refusal::Http413Bare, 100, 450, 3, 56).await;
+    }
+
+    #[tokio::test]
+    async fn a_json_rpc_error_about_the_batch_is_handled_the_same_way() {
+        check_calls(Refusal::RpcError, 100, 450, 3, 56).await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_empty_answer_is_handled_the_same_way() {
+        check_calls(Refusal::Empty, 100, 450, 3, 56).await;
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_takes_a_thousand_is_not_narrowed() {
+        let (url, seen) = endpoint(1_000, Refusal::Http413).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let calls = calls(800);
+        for block in 1..=3 {
+            rpc.eth_call_batch_at(&calls, block).await.unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.accepted, vec![800, 800, 800]);
+        assert!(seen.rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_batches_learn_the_limit_and_answer_every_block_once() {
+        let (url, seen) = endpoint(100, Refusal::Http413).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let blocks: Vec<u64> = (5_000..6_000).collect();
+        let got = rpc.block_timestamps(&blocks).await.expect("answered");
+        assert!(blocks.iter().all(|b| got[b] == b * 10));
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.accepted.iter().all(|&s| s <= 100),
+            "{:?}",
+            seen.accepted
+        );
+        assert!(
+            seen.runs.values().all(|&c| c == 1),
+            "a header was fetched twice"
+        );
+        assert_eq!(seen.runs.len(), blocks.len());
+        // Up to the header fan-out (4) of 200-wide chunks were in flight before the first refusal
+        // was learned; none is retried at the same width.
+        assert!(seen.rejected.len() <= 4, "{:?}", seen.rejected);
+        assert!(seen.rejected.iter().all(|&s| s > 100));
+    }
+}

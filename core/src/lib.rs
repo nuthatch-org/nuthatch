@@ -38,6 +38,7 @@ pub mod nest_config;
 pub mod opfs;
 pub mod redb_store;
 pub mod restart;
+pub mod batch_limit;
 pub mod rpc;
 pub mod seal;
 pub mod source;

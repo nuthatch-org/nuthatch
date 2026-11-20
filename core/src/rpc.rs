@@ -941,6 +941,9 @@ pub struct RpcClient<T: Transport> {
     /// Headers per batch: [`MAX_TIMESTAMP_BATCH`], or less where a known endpoint in the pool takes
     /// less ([`Transport::header_batch_cap`], #1570).
     pub header_width: AtomicUsize,
+    /// The batch width each endpoint has shown it takes, learned from its refusals (one per URL,
+    /// shared by every kind of batch). See [`crate::batch_limit`].
+    batch_limits: Vec<crate::batch_limit::BatchLimit>,
     /// [`GETLOGS_BODY_CAP`], or a smaller one a test sets.
     logs_body_cap: usize,
     /// [`BATCH_BODY_CAP`], or a smaller one a test sets.
@@ -990,6 +993,7 @@ impl<T: Transport> RpcClient<T> {
             requests: AtomicU64::new(0),
             timestamps: std::sync::Mutex::new(HashMap::new()),
             header_width: AtomicUsize::new(header_width),
+            batch_limits: (0..n).map(|_| Default::default()).collect(),
             logs_body_cap: GETLOGS_BODY_CAP,
             batch_body_cap: BATCH_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
@@ -1313,17 +1317,24 @@ impl<T: Transport> RpcClient<T> {
         Err(failures.verdict(attempts, rate_limited))
     }
 
-    /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered failover
-    /// as `call`, returning the parsed response. Used for batch requests `call` can't express.
-    async fn post_with_failover(&self, body: &Value) -> Result<Value> {
-        self.post_with_failover_capped(body, None).await
-    }
-
-    /// [`Self::post_with_failover`], refusing a response body past `body_cap` bytes as too large.
+    /// POST a raw JSON-RPC body (single object or a batch array) with the same health-ordered
+    /// failover as `call`, refusing a response body past `body_cap` bytes as too large.
+    ///
+    /// A batch goes out at the width the serving endpoint has shown it takes (see
+    /// [`Self::post_batch_adaptive`]).
     pub async fn post_with_failover_capped(
         &self,
         body: &Value,
         body_cap: Option<usize>,
+    ) -> Result<Value> {
+        self.post_with_failover_inner(body, body_cap, true).await
+    }
+
+    async fn post_with_failover_inner(
+        &self,
+        body: &Value,
+        body_cap: Option<usize>,
+        adaptive: bool,
     ) -> Result<Value> {
         let mut failures = PoolFailures::default();
         let mut attempts = 0usize;
@@ -1358,6 +1369,7 @@ impl<T: Transport> RpcClient<T> {
             attempts += 1;
             let t0 = crate::time::now();
             let answer = match self.admit(j).await {
+                Ok(()) if adaptive => self.post_batch_adaptive(j, url, body, body_cap).await,
                 Ok(()) => self.post_one(url, body, body_cap).await,
                 Err(e) => Err(e),
             };
@@ -1383,6 +1395,103 @@ impl<T: Transport> RpcClient<T> {
         }
         failures.rested(self.resting(&order));
         Err(failures.verdict(attempts, rate_limited))
+    }
+
+    /// POST `body` to endpoint `j`; a JSON array is sent in batches no wider than the endpoint has
+    /// shown it takes, and merged back into one array.
+    ///
+    /// Call ids are the caller's and unique across the whole body, so they pass through unchanged and
+    /// the callers' id-keyed decoding cannot tell the batch was split. When the endpoint refuses a
+    /// batch for its size (HTTP 413, `rpc_batch_too_large`, a "batch ... too large/limit" error, or an
+    /// empty answer) the width is narrowed - straight to the refusal's own maximum if it states one -
+    /// and the *same* calls are re-sent in narrower batches, so none is dropped and each is answered
+    /// once. Such a refusal is a finding about the batch, not the endpoint: it never reaches
+    /// `record_failure`, so no cooldown and no rate-limit backoff.
+    async fn post_batch_adaptive(
+        &self,
+        j: usize,
+        url: &str,
+        body: &Value,
+        body_cap: Option<usize>,
+    ) -> Result<Value> {
+        use crate::batch_limit::batch_too_large;
+        let Value::Array(items) = body else {
+            return self.post_one(url, body, body_cap).await;
+        };
+        if items.len() < 2 {
+            return self.post_one(url, body, body_cap).await;
+        }
+        let limit = &self.batch_limits[j];
+        let mut out: Vec<Value> = Vec::with_capacity(items.len());
+        let mut pending: Vec<&[Value]> = vec![&items[..]];
+        let mut sends = 0usize;
+        while let Some(slice) = pending.pop() {
+            let width = limit.width().max(1);
+            let (now, rest) = slice.split_at(slice.len().min(width));
+            if !rest.is_empty() {
+                pending.push(rest);
+            }
+            if sends > 0 {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                self.http.inc_rpc();
+            }
+            sends += 1;
+            let owned;
+            let chunk_body = if now.len() == items.len() {
+                body
+            } else {
+                owned = Value::Array(now.to_vec());
+                &owned
+            };
+            let answer = self.post_one(url, chunk_body, body_cap).await;
+            // `Some(learn)`: the endpoint could not take this many; `learn` says whether the width is
+            // remembered. An empty answer is the silent limit; a short one may be a transient drop, so
+            // it splits this request only.
+            let refused = match &answer {
+                Err(e) if now.len() > 1 => batch_too_large(e).map(|t| (t.stated_max, true)),
+                Ok(Value::Array(got)) if now.len() > 1 && got.is_empty() => Some((None, true)),
+                Ok(Value::Array(got)) if now.len() > 1 && got.len() < now.len() => {
+                    Some((None, false))
+                }
+                _ => None,
+            };
+            if let Some((stated_max, learn)) = refused {
+                let detail = match &answer {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => "the endpoint answered fewer calls than were sent".to_string(),
+                };
+                if learn {
+                    let n = limit.refused(now.len(), stated_max);
+                    if n.first_time {
+                        tracing::info!(
+                            "rpc endpoint {} refused a batch of {} calls ({}); sending batches of at                              most {} calls to it",
+                            redact_url(url),
+                            now.len(),
+                            detail.chars().take(160).collect::<String>(),
+                            n.width,
+                        );
+                    }
+                    pending.push(now);
+                } else {
+                    let (a, b) = now.split_at(now.len() / 2);
+                    pending.push(b);
+                    pending.push(a);
+                }
+                // The same calls go again, narrower: `now` was never added to `out`.
+                continue;
+            }
+            let resp = answer?;
+            match resp {
+                Value::Array(mut got) => {
+                    limit.answered(now.len());
+                    out.append(&mut got);
+                }
+                // Not an array (a per-request object): only possible for the whole body, unchanged.
+                other if sends == 1 && pending.is_empty() => return Ok(other),
+                other => bail!("batch answered with {other} instead of an array"),
+            }
+        }
+        Ok(Value::Array(out))
     }
 
     /// POST `body` and parse the response, attaching a [`FailureClass`] to any failure (RFC-0028 §3).
@@ -1896,7 +2005,8 @@ impl<T: Transport> RpcClient<T> {
     /// Send a raw JSON-RPC batch and return the raw response. For `doctor` only: measuring the
     /// endpoint's batch ceiling means sending batches of chosen sizes, which no typed helper offers.
     pub async fn raw_batch(&self, body: &Value) -> Result<Value> {
-        self.post_with_failover(body).await
+        // Not adaptive: the point is to see what the endpoint does at exactly this width.
+        self.post_with_failover_inner(body, None, false).await
     }
 
     /// Contract bytecode at `address` as of `block`. `"0x"` (empty) means not yet deployed.
