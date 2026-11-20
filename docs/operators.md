@@ -1300,7 +1300,7 @@ only the series labelled with that mount).
 
 A nest whose `nuthatch.toml` has an `[address_history]` table and no `[[contracts]]` watches accounts
 rather than contracts, for rotki. It is a different service: no SQL engine, no sealing, none of the
-per-nest routes above except `/health`, `/ready`, `/metrics` and `/diff`, and one cursor polling the
+per-nest routes above except `/health`, `/ready`, `/metrics`, `/diff` and `/shape`, and one cursor polling the
 chain head every five minutes unless `poll_interval` in the table or `--poll-interval` says otherwise.
 
 ```toml
@@ -1349,6 +1349,12 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   rotki on the same machine needs no configuration; with it, rotki must send the token. The flag is
   refused off a loopback bind, where those actions are refused to everyone, and on an event nest or
   a runtime.
+- **`GET /api/coverage`** lists each watched account's covered blocks per action and, between
+  `start_block` and the finalized head, the ranges it does not hold, each `pending`, `not_watched` or
+  `never` with why, read from one state of the store and stamped with its `generation`.
+  `?address=` asks for one account, watched or not; on a directory of chains the answer is per chain
+  under `chains`, or one chain with `?chainid=`. `nuthatch mcp` reads it for its `coverage` tool
+  ([recipe](rotki-wallets-with-claude.md)).
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
@@ -2375,7 +2381,9 @@ A runtime hosting several nests serves nothing at its root: point `--url` at one
 `nuthatch mcp` is a thin, fully-offline stdio bridge to the local `dev` HTTP API - it never contends
 with the single writer and nothing phones home. The client launches it; you ask for your contract's
 data in plain English and it writes the SQL. Tool advertisement is adaptive (RFC-0025): a nest only
-advertises the tools it can actually answer.
+advertises the tools it can actually answer. An address-history nest gets `coverage`,
+`wallet_history`, `wallet_status` and `diff` instead of the event-table tools
+([recipe](rotki-wallets-with-claude.md)).
 
 A nest behind a gateway that wants a bearer token: put the token in an environment variable and name
 the variable, so the token never appears in `ps` or in the client's config.

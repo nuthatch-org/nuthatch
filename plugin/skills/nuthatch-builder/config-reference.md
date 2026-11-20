@@ -242,7 +242,7 @@ nest serves answers `NUTHATCH_UNSUPPORTED`. `POST /api/watch` and `/api/unwatch`
 `validator` only Ethereum's), or only the chain a `"chainid": 8453` in the body names, so an account is
 backfilled only where its owner tracks it; a `chainid` no nest serves is refused with 400 and changes
 nothing. A solo nest takes its own `chainid` and refuses another. One chain refusing does not stop the
-others, and the answer, failed if any chain refused, lists each chain's result, so a repeat converges them. `GET /api/watch` lists the union and, under `chains`, each chain's own list, `/ready` lists `chain_ids` and each
+others, and the answer, failed if any chain refused, lists each chain's result, so a repeat converges them. `GET /api/watch` lists the union and, under `chains`, each chain's own list, `GET /api/coverage` each chain's coverage report under `chains` (one with `?chainid=`), `/ready` lists `chain_ids` and each
 chain's state, and `/metrics` labels each sample with `chain_id`. Each chain reads its RPCs from
 `NUTHATCH_RPC_<chain id>` and `NUTHATCH_TRACE_RPC_<chain id>`, else from its nest's `rpc_urls`, which a
 nest reading the environment can leave out; a chain with neither is refused at start, by name.
