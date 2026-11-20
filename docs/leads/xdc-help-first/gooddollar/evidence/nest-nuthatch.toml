@@ -1,0 +1,13 @@
+[nest]
+name = "gooddollar-xdc"
+chain = "xdc"
+chain_id = 50
+rpc_urls = ["<counting proxy or your RPC URL>"]
+schema_version = 1
+
+# GoodDollar UBIScheme proxy on XDC (data-team contracts/deployment_blocks.md).
+[[contracts]]
+alias = "ubi_scheme"
+address = "0x22867567e2d80f2049200e25c6f31cb6ec2f0faf"
+start_block = 95249624
+abi = "abis/UBIScheme.json"

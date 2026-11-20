@@ -44,4 +44,5 @@ npx tsx ../nuthatch/load-rawlogs.ts --nest http://127.0.0.1:8090 --chain-id 50 -
 python3 -I ../nuthatch/reconcile_nest.py http://127.0.0.1:8090 https://rpc.xinfin.network 0x22867567e2d80f2049200e25c6f31cb6ec2f0faf
 ```
 
+<!-- Include the next line only if the hosted nest is live when this is posted; otherwise delete it. -->
 If you only want to query the data, a hosted copy is at NEST_URL (https://nuthatch-indexer.com/nests/gooddollar-xdc).

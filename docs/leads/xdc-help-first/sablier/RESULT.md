@@ -12,9 +12,11 @@ Envio entity API.
 - Rows: 535 decoded events in 69 non-empty tables (202 tables declared).
 - Wall time: first backfill began 18:52:25Z; one restart at 18:56 (resumed from the sealed block, nothing refetched);
   "caught up to tip" at 19:04:58Z. About 12.5 min of run time in total, from an empty directory.
-- RPC calls for the whole backfill plus following: 724 (524 eth_getLogs, 173 eth_getBlockByNumber, 25 eth_blockNumber,
-  2 eth_chainId), 1 error. Counted by `xdc-feasibility/rpcproxy.py`; file `xdc-feasibility/sablier-rpc-count.json`.
-- Ground truth: independent `eth_getLogs` over Lockup v2.0 (`count_logs.py`, 244 getLogs calls): 417 logs. Nest rows
+- RPC calls, from the committed `evidence/sablier-rpc-count.json` (proxy session through 2026-11-20 11:18Z, so it
+  includes hours of following the tip): 1,512 total (676 eth_getLogs, 653 eth_getBlockByNumber, 181 eth_blockNumber,
+  2 eth_chainId), 1 error. Counted by `../evidence-shared/rpcproxy.py`. An earlier reading of 724 calls was taken at
+  catch-up (about 19:05Z) and was not kept, so it is not quoted as a measurement.
+- Ground truth: independent `eth_getLogs` over Lockup v2.0 (`evidence/count_logs.py`, output `evidence/count-lockup-v2.json`, 244 getLogs calls): 417 logs. Nest rows
   for lockup_v2_0 up to the same block: 417. Equal.
 - getLogs limits: no block-range error from rpc.xinfin.network at the window sizes used (50,000 then adaptive 728).
 - Reorg: one shallow reorg seen while following (19:45Z, rolled back to 109,540,078, a few blocks), handled.

@@ -32,6 +32,7 @@ node nuthatch/xdc/sync-abis.mjs
 cd nuthatch/xdc && nuthatch dev --dir . --listen 127.0.0.1:8090 --seal-direct
 ```
 
+<!-- Include the next line only if the hosted nest is live when this is posted; otherwise delete it. -->
 A hosted copy of this nest, if you only want to query it: NEST_URL (https://nuthatch-indexer.com/nests/sablier-xdc).
 
 Not run: `just prettier-check` and `na biome lint` (dependencies not installed on the machine that prepared this). The
