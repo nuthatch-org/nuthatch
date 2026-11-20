@@ -1092,7 +1092,7 @@ mod tests {
 
     /// burrmill keeps a statement's plan for the same text (burrmill#370). Sealing a segment
     /// rebinds the table over the longer file list, and the same statement, text for text, must
-    /// count the new rows. Today burrmill does not keep a plan over a facts table at all (its
+    /// count the new rows. At burrmill 8963974 (`df/session.rs`: `keep_plan`, `forget_plans`) burrmill does not keep a plan over a facts table at all (its
     /// catalogue check compares `Arc`s the view built separately), and where it does keep one
     /// every `register_table` clears it; this holds the answer either way, so a later change to
     /// either cannot serve a stale segment set unnoticed (PR #3079's invalidation question).
