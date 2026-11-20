@@ -309,6 +309,11 @@ function renderSqlBox(cfg) {
     $("#tagline").textContent = e.message + ". Check the ?nest= parameter and that this page is served from the same origin as the nest.";
     return;
   }
+  if (!Array.isArray(tables) || !tables.length) {
+    $("#title").textContent = "No tables yet";
+    $("#tagline").textContent = "This nest reports no tables from /tables. It may still be starting; reload in a minute.";
+    return;
+  }
   const ev = infer(cfg0, tables), cfg = defaults(cfg0, ev, tables);
   document.title = cfg.title + " - Nuthatch nest";
   $("#title").textContent = cfg.title;

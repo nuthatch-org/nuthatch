@@ -39,7 +39,9 @@ rsync -a --exclude serve.py --exclude examples --exclude README.md --exclude che
 # then, in nuthatch-frontend: merge, vercel --prod.  Link: https://nuthatch-indexer.com/showcase/?nest=<name>
 ```
 
-The page asks for 5 or 6 SQL queries on load and one every 15 seconds while "live" is ticked, well inside
-the proxy's 30 a minute per address.
+The page asks for 5 or 6 SQL queries on load for a small nest, plus one more per 25 tables beyond the first 25
+(a 192-table nest makes about 12), and one every 15 seconds while "live" is ticked. The proxy allows 30 a minute
+per address with a burst of 15, so a wide nest can show "Rate limited" on some panels if the page is reloaded
+within about 20 seconds.
 
 `examples/` holds screenshots and the agent-prompt check for the Arc nest.

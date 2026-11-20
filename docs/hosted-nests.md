@@ -130,3 +130,9 @@ started on a real host or run through `test-proxy.sh` in this change.
 - **`/ready` says `ready: true` and `lag_blocks: 0` while `--seal-direct` backfill runs.** Read `sealed_through`
   against the chain tip for progress.
 - The showcase needs `block_timestamp`; a nest with `block_timestamps = false` shows its tables and SQL only.
+- **The XDC shim is a separate host service and the nest units do not order after it.** After a reboot an XDC nest
+  can start before `127.0.0.1:18550` listens and fail its first poll; `Restart=on-failure` brings it back. To avoid
+  the failed first start, add `After=nuthatch-public-xdc-rpc-ua.service` and `Wants=` the same to that nest's unit.
+- **Order for the scrape targets.** `deploy/monitoring/targets/nests.yml` scrapes the public nests on their tailnet
+  address, which only answers once the unit runs with `--local-host 100.82.188.91`. Restart each public unit from the
+  new unit file first, then land the targets; otherwise Prometheus raises TargetDown on a nest that is fine.
