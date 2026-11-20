@@ -1,0 +1,140 @@
+   Compiling nuthatch v0.1.0
+    Finished test profile in 12.3s
+     Running unittests src/lib.rs
+
+running 120 tests
+test mod_a::case_000 ... ok
+test mod_a::case_001 ... ok
+test mod_a::case_002 ... ok
+test mod_a::case_003 ... ok
+test mod_a::case_004 ... ok
+test mod_a::case_005 ... ok
+test mod_a::case_006 ... ok
+test mod_a::case_007 ... ok
+test mod_a::case_008 ... ok
+test mod_a::case_009 ... ok
+test mod_a::case_010 ... ok
+test mod_a::case_011 ... ok
+test mod_a::case_012 ... ok
+test mod_a::case_013 ... ok
+test mod_a::case_014 ... ok
+test mod_a::case_015 ... ok
+test mod_a::case_016 ... ok
+test mod_a::case_017 ... ok
+test mod_a::case_018 ... ok
+test mod_a::case_019 ... ok
+test mod_a::case_020 ... ok
+test mod_a::case_021 ... ok
+test mod_a::case_022 ... ok
+test mod_a::case_023 ... ok
+test mod_a::case_024 ... ok
+test mod_a::case_025 ... ok
+test mod_a::case_026 ... ok
+test mod_a::case_027 ... ok
+test mod_a::case_028 ... ok
+test mod_a::case_029 ... ok
+test mod_a::case_030 ... ok
+test mod_a::case_031 ... ok
+test mod_a::case_032 ... ok
+test mod_a::case_033 ... ok
+test mod_a::case_034 ... ok
+test mod_a::case_035 ... ok
+test mod_a::case_036 ... ok
+test mod_a::case_037 ... ok
+test mod_a::case_038 ... ok
+test mod_a::case_039 ... ok
+test mod_a::case_040 ... ok
+test mod_a::case_041 ... ok
+test mod_a::case_042 ... ok
+test mod_a::case_043 ... ok
+test mod_a::case_044 ... ok
+test mod_a::case_045 ... ok
+test mod_a::case_046 ... ok
+test mod_a::case_047 ... ok
+test mod_a::case_048 ... ok
+test mod_a::case_049 ... ok
+test mod_a::case_050 ... ok
+test mod_a::case_051 ... ok
+test mod_a::case_052 ... ok
+test mod_a::case_053 ... ok
+test mod_a::case_054 ... ok
+test mod_a::case_055 ... ok
+test mod_a::case_056 ... ok
+test mod_a::case_057 ... ok
+test mod_a::case_058 ... ok
+test mod_a::case_059 ... ok
+test reorg::deep_reorg ... FAILED
+test mod_b::case_000 ... ok
+test mod_b::case_001 ... ok
+test mod_b::case_002 ... ok
+test mod_b::case_003 ... ok
+test mod_b::case_004 ... ok
+test mod_b::case_005 ... ok
+test mod_b::case_006 ... ok
+test mod_b::case_007 ... ok
+test mod_b::case_008 ... ok
+test mod_b::case_009 ... ok
+test mod_b::case_010 ... ok
+test mod_b::case_011 ... ok
+test mod_b::case_012 ... ok
+test mod_b::case_013 ... ok
+test mod_b::case_014 ... ok
+test mod_b::case_015 ... ok
+test mod_b::case_016 ... ok
+test mod_b::case_017 ... ok
+test mod_b::case_018 ... ok
+test mod_b::case_019 ... ok
+test mod_b::case_020 ... ok
+test mod_b::case_021 ... ok
+test mod_b::case_022 ... ok
+test mod_b::case_023 ... ok
+test mod_b::case_024 ... ok
+test mod_b::case_025 ... ok
+test mod_b::case_026 ... ok
+test mod_b::case_027 ... ok
+test mod_b::case_028 ... ok
+test mod_b::case_029 ... ok
+test mod_b::case_030 ... ok
+test mod_b::case_031 ... ok
+test mod_b::case_032 ... ok
+test mod_b::case_033 ... ok
+test mod_b::case_034 ... ok
+test mod_b::case_035 ... ok
+test mod_b::case_036 ... ok
+test mod_b::case_037 ... ok
+test mod_b::case_038 ... ok
+test mod_b::case_039 ... ok
+test mod_b::case_040 ... ok
+test mod_b::case_041 ... ok
+test mod_b::case_042 ... ok
+test mod_b::case_043 ... ok
+test mod_b::case_044 ... ok
+test mod_b::case_045 ... ok
+test mod_b::case_046 ... ok
+test mod_b::case_047 ... ok
+test mod_b::case_048 ... ok
+test mod_b::case_049 ... ok
+test mod_b::case_050 ... ok
+test mod_b::case_051 ... ok
+test mod_b::case_052 ... ok
+test mod_b::case_053 ... ok
+test mod_b::case_054 ... ok
+test mod_b::case_055 ... ok
+test mod_b::case_056 ... ok
+test mod_b::case_057 ... ok
+test mod_b::case_058 ... ok
+
+failures:
+
+---- reorg::deep_reorg stdout ----
+thread 'reorg::deep_reorg' panicked at src/reorg.rs:88:9:
+assertion `left == right` failed
+  left: 4
+ right: 5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+failures:
+    reorg::deep_reorg
+
+test result: FAILED. 119 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.21s
+error: test failed, to rerun pass `--lib`

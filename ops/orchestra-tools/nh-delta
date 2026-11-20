@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""nh-delta - compact digest of what changed on GitHub since the last run.
+
+  nh-delta [--since ISO] [--dry] [--json]
+
+State: ~/.cache/nh-delta/state.json (override dir with NH_DELTA_STATE_DIR).
+Needs the `gh` CLI; uses GH_TOKEN from the environment if set.
+Env: NH_DELTA_ORG (default nuthatch-org), NH_DELTA_USER (default cargopete),
+     NH_DELTA_MAX_LINES (default 60).
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+ORG = os.environ.get("NH_DELTA_ORG", "nuthatch-org")
+ME = os.environ.get("NH_DELTA_USER", "cargopete")
+MAX_LINES = int(os.environ.get("NH_DELTA_MAX_LINES", "60"))
+STATE_DIR = os.environ.get("NH_DELTA_STATE_DIR", os.path.expanduser("~/.cache/nh-delta"))
+STATE = os.path.join(STATE_DIR, "state.json")
+BOTS = {"dependabot[bot]", "dependabot", "github-actions[bot]", "github-actions", "nuthatch-jules",
+        "nuthatch-jules[bot]", "app/dependabot", "app/github-actions"}
+ISO = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def now():
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def parse(s):
+    return datetime.strptime(s.replace("+00:00", "Z"), ISO).replace(tzinfo=timezone.utc)
+
+
+def parse_since(v):
+    v = v.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        v += "T00:00:00Z"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", v):
+        v += "Z"
+    m = re.fullmatch(r"(.*T\d{2}:\d{2}:\d{2})([+-])(\d{2}):?(\d{2})", v)
+    if m:
+        base = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+        off = timedelta(hours=int(m.group(3)), minutes=int(m.group(4)))
+        base = base - off if m.group(2) == "+" else base + off
+        return base.replace(tzinfo=timezone.utc)
+    return parse(v)
+
+
+def is_bot(u):
+    return (u or "") in BOTS or (u or "").endswith("[bot]")
+
+
+class ApiError(Exception):
+    def __init__(self, status, msg=""):
+        super().__init__(f"HTTP {status} {msg}".strip())
+        self.status = status
+
+
+def api(path, params=None, etag=None):
+    """GET via gh. Returns (status, json_or_None, etag). 304 -> (304, None, etag). Raises ApiError otherwise."""
+    cmd = ["gh", "api", "-i", "-X", "GET", path]
+    for k, v in (params or {}).items():
+        cmd += ["-f", f"{k}={v}"]
+    if etag:
+        cmd += ["-H", f"If-None-Match: {etag}"]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    head, _, body = p.stdout.partition("\r\n\r\n") if "\r\n\r\n" in p.stdout else p.stdout.partition("\n\n")
+    m = re.match(r"HTTP/\S+\s+(\d+)", head)
+    status = int(m.group(1)) if m else (0 if p.returncode else 200)
+    if status == 304:
+        return 304, None, etag
+    if status >= 400 or not m:
+        msg = ""
+        try:
+            msg = json.loads(body).get("message", "")
+        except Exception:
+            msg = (p.stderr or body or "").strip()[:100]
+        raise ApiError(status or 599, msg)
+    em = re.search(r"(?im)^etag:\s*(\S.*?)\s*$", head)
+    return status, json.loads(body) if body.strip() else None, em.group(1) if em else None
+
+
+def get_all(path, params, max_pages=5):
+    out = []
+    for pg in range(1, max_pages + 1):
+        _, data, _ = api(path, dict(params, per_page=100, page=pg))
+        out += data or []
+        if not data or len(data) < 100:
+            break
+    return out
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def ci_status(repo, sha):
+    try:
+        _, d, _ = api(f"repos/{repo}/commits/{sha}/check-runs", {"per_page": 100})
+    except ApiError:
+        return "unknown"
+    runs = (d or {}).get("check_runs", [])
+    if not runs:
+        return "none"
+    if any(r["conclusion"] in ("failure", "timed_out", "cancelled", "action_required") for r in runs):
+        return "fail"
+    if any(r["status"] != "completed" for r in runs):
+        return "pending"
+    return "pass"
+
+
+def names(xs, n=3):
+    xs = list(dict.fromkeys(xs))
+    return ", ".join("@" + x for x in xs[:n]) + (f" +{len(xs)-n}" if len(xs) > n else "")
+
+
+def analyze_org_item(repo, it, since, prev):
+    """-> (entry|None, new_item_state)"""
+    num, is_pr = it["number"], "pull_request" in it
+    author = it["user"]["login"]
+    changes = []
+    merged = bool((it.get("pull_request") or {}).get("merged_at"))
+    state = "merged" if merged else it["state"]
+    if parse(it["created_at"]) > since:
+        changes.append("opened")
+    elif prev and prev.get("state") != state:
+        changes.append(state)
+    elif not prev and state != "open" and it.get("closed_at") and parse(it["closed_at"]) > since:
+        changes.append(state)
+    if state != "open" and "opened" in changes:
+        changes.append(state)
+    ci = prev.get("ci") if prev else None
+    if is_pr and state == "open":
+        try:
+            _, pr, _ = api(f"repos/{repo}/pulls/{num}")
+            ci_new = ci_status(repo, pr["head"]["sha"])
+        except (ApiError, KeyError, TypeError):
+            ci_new = ci
+        if ci_new and ci_new != ci and not (ci is None and ci_new in ("pass", "none", "pending", "unknown")):
+            changes.append(f"CI {ci or '?'}→{ci_new}")
+        ci = ci_new
+    commenters = []
+    try:
+        for c in get_all(f"repos/{repo}/issues/{num}/comments", {"since": since.strftime(ISO)}, 2):
+            if parse(c["created_at"]) > since and not is_bot(c["user"]["login"]) and c["user"]["login"] != ME:
+                commenters.append(c["user"]["login"])
+    except ApiError:
+        pass
+    if commenters:
+        changes.append(f"{len(commenters)} new comment{'s' if len(commenters) > 1 else ''} by {names(commenters)}")
+    if is_pr:
+        try:
+            latest = {}
+            for r in get_all(f"repos/{repo}/pulls/{num}/reviews", {}, 2):
+                if r.get("submitted_at") and parse(r["submitted_at"]) > since and r["state"] != "PENDING" and not is_bot(r["user"]["login"]):
+                    latest[r["user"]["login"]] = r["state"].lower().replace("_", " ")
+            for u, s in latest.items():
+                changes.append(f"review: {s} by @{u}")
+        except ApiError:
+            pass
+    st = {"state": state, "ci": ci}
+    if not changes:
+        if parse(it["updated_at"]) <= since:  # CI re-check path, nothing changed
+            return None, st
+        changes.append("updated")
+    return {"repo": repo, "number": num, "kind": "PR" if is_pr else "issue", "title": it["title"],
+            "author": author, "url": it["html_url"], "changes": changes, "bot": is_bot(author),
+            "state": state}, st
+
+
+def org_section(since, st, use_etag):
+    entries, notes, new_items = [], [], {}
+    etags = st.setdefault("etags", {})
+    items_state = st.get("items", {})
+    try:
+        key = f"orgs/{ORG}/repos"
+        s, repos, et = api(key, {"per_page": 100, "type": "all"}, etags.get(key, {}).get("etag") if use_etag else None)
+        if s == 304:
+            repos = etags[key]["body"]
+        else:
+            if len(repos) >= 100:  # full first page: fetch the rest
+                repos += get_all(key, {"type": "all"}, 10)[100:]
+            repos = [r["full_name"] for r in repos if not r.get("archived")]
+            etags[key] = {"etag": et, "body": repos}
+    except ApiError as e:
+        return [], [f"org repos: unavailable ({e})"], {}
+    work = []
+    for repo in repos:
+        key = f"repos/{repo}/issues"
+        params = {"state": "all", "sort": "updated", "direction": "desc", "per_page": 30}
+        try:
+            s, data, et = api(key, params, etags.get(key, {}).get("etag") if use_etag else None)
+        except ApiError as e:
+            notes.append(f"{repo}: unavailable ({e})")
+            continue
+        if s == 304:
+            data = []
+        else:
+            etags[key] = {"etag": et}
+            if data and all(parse(d["updated_at"]) > since for d in data) and len(data) == 30:
+                try:
+                    data = get_all(key, {"state": "all", "sort": "updated", "direction": "desc", "since": since.strftime(ISO)}, 5)
+                except ApiError:
+                    pass
+        for it in data or []:
+            if parse(it["updated_at"]) > since:
+                work.append((repo, it))
+    # open PRs also checked for CI flips even if not updated
+    seen = {(r, i["number"]) for r, i in work}
+    for k, v in items_state.items():
+        r, n = k.rsplit("#", 1)
+        if v.get("state") == "open" and v.get("kind") == "PR" and (r, int(n)) not in seen and r in repos:
+            try:
+                _, it, _ = api(f"repos/{r}/issues/{n}")
+                if isinstance(it, dict) and "number" in it:
+                    work.append((r, it))
+            except ApiError:
+                pass
+    with ThreadPoolExecutor(6) as ex:
+        res = list(ex.map(lambda w: analyze_org_item(w[0], w[1], since, items_state.get(f"{w[0]}#{w[1]['number']}")), work))
+    for (repo, it), (entry, s) in zip(work, res):
+        new_items[f"{repo}#{it['number']}"] = dict(s, kind="PR" if "pull_request" in it else "issue")
+        if entry:
+            entries.append(entry)
+    return entries, notes, new_items
+
+
+def outside_section(since, st):
+    d = since.strftime(ISO)
+    found, seen = {}, set()
+    qs = [f"{w}:{ME} updated:>={d} -org:{ORG} is:{t}" for w in ("commenter", "author") for t in ("pr", "issue")]
+    for q in qs:
+        try:
+            _, r, _ = api("search/issues", {"q": q, "sort": "updated", "per_page": 50})
+        except ApiError as e:
+            return [], [f"outside repos: search unavailable (HTTP {e.status})"]
+        for it in r.get("items", []):
+            found[it["html_url"]] = it
+    out = []
+
+    def one(it):
+        repo = "/".join(it["repository_url"].split("/")[-2:])
+        cs = []
+        try:
+            for c in get_all(f"repos/{repo}/issues/{it['number']}/comments", {"since": d}, 2):
+                if parse(c["created_at"]) > since and c["user"]["login"] != ME and not is_bot(c["user"]["login"]):
+                    cs.append(c["user"]["login"])
+        except ApiError:
+            pass
+        return repo, cs
+
+    with ThreadPoolExecutor(6) as ex:
+        res = list(ex.map(one, found.values()))
+    for it, (repo, cs) in zip(found.values(), res):
+        if not cs:
+            continue
+        out.append({"repo": repo, "number": it["number"], "kind": "PR" if "pull_request" in it else "issue",
+                    "title": it["title"], "author": it["user"]["login"], "url": it["html_url"],
+                    "changes": [f"{len(cs)} new comment{'s' if len(cs) > 1 else ''} by {names(cs)}"],
+                    "bot": False, "state": it["state"]})
+    return out, []
+
+
+def notif_section(since, shown):
+    try:
+        data = get_all("notifications", {"since": since.strftime(ISO), "all": "false"}, 2)
+    except ApiError as e:
+        return [], [f"notifications: skipped (HTTP {e.status})"]
+    out = []
+    for n in data:
+        subj = n["subject"]
+        m = re.search(r"/(\d+)$", subj.get("url") or "")
+        if m and (n["repository"]["full_name"], int(m.group(1))) in shown:
+            continue
+        out.append({"repo": n["repository"]["full_name"], "number": int(m.group(1)) if m else 0,
+                    "kind": subj["type"], "title": subj["title"], "reason": n["reason"]})
+    return out, []
+
+
+def fmt(e):
+    ref = f"{e['repo'].split('/')[-1] if e['repo'].startswith(ORG + '/') else e['repo']}#{e['number']}"
+    return f"{ref} {e['kind']} \"{e['title'][:70]}\" @{e['author']} — " + "; ".join(e["changes"])
+
+
+def render(since, until, org, outside, notifs, notes):
+    lines = []
+    humans = [e for e in org if not e["bot"]]
+    bots = [e for e in org if e["bot"]]
+    if humans:
+        room = max(10, MAX_LINES - 4 - len(outside) - len(notifs) - len(notes) - 3)
+        lines.append(f"## {ORG} ({len(humans)})")
+        lines += [fmt(e) for e in humans[:room]]
+        if len(humans) > room:
+            lines.append(f"... +{len(humans) - room} more (use --json)")
+    if bots:
+        by = {}
+        for e in bots:
+            by[e["author"]] = by.get(e["author"], 0) + 1
+        ev = {}
+        for e in bots:
+            for c in e["changes"]:
+                k = "CI-change" if c.startswith("CI") else ("comments" if " new comment" in c else c.split(" ")[0])
+                ev[k] = ev.get(k, 0) + 1
+        lines.append("bots: " + ", ".join(f"{n} {a}" for a, n in by.items()) + " items (" +
+                     ", ".join(f"{n} {k}" for k, n in ev.items()) + ")")
+    if outside:
+        lines.append(f"## outside repos ({len(outside)})")
+        lines += [fmt(e) for e in outside]
+    if notifs:
+        lines.append(f"## notifications ({len(notifs)})")
+        lines += [f"{n['repo']}#{n['number']} {n['kind']} \"{n['title'][:70]}\" ({n['reason']})" for n in notifs]
+    lines += [f"note: {n}" for n in notes]
+    if not (humans or bots or outside or notifs):
+        lines.insert(0, f"nothing new since {since.strftime(ISO)}")
+    else:
+        lines.insert(0, f"since {since.strftime(ISO)} (to {until.strftime(ISO)})")
+    if len(lines) > MAX_LINES:
+        extra = len(lines) - (MAX_LINES - 1)
+        lines = lines[:MAX_LINES - 1] + [f"... +{extra} more lines (use --json)"]
+    return lines
+
+
+def main():
+    ap = argparse.ArgumentParser(description="digest of GitHub changes since last run")
+    ap.add_argument("--since", help="ISO8601 override, e.g. 2026-11-19T00:00:00Z (ignores ETag cache)")
+    ap.add_argument("--dry", action="store_true", help="do not advance state")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    st = load_state()
+    start = now()
+    if a.since:
+        try:
+            since = parse_since(a.since)
+        except ValueError:
+            ap.error(f"--since: cannot parse {a.since!r}; use e.g. 2026-11-19, 2026-11-19T00:00:00Z or an offset like +02:00")
+    elif st.get("last_run"):
+        since = parse(st["last_run"])
+    else:
+        since = start - timedelta(hours=24)
+    use_etag = not a.since
+    org, notes, new_items = org_section(since, st, use_etag)
+    outside, n2 = outside_section(since, st)
+    shown = {(e["repo"], e["number"]) for e in org + outside}
+    notifs, n3 = notif_section(since, shown)
+    notes += n2 + n3
+    if a.json:
+        print(json.dumps({"since": since.strftime(ISO), "until": start.strftime(ISO), "org": org, "outside": outside,
+                          "notifications": notifs, "notes": notes}, indent=1))
+    else:
+        print("\n".join(render(since, start, org, outside, notifs, notes)))
+    if not a.dry:
+        items = st.get("items", {})
+        items.update(new_items)
+        st["items"] = {k: v for k, v in items.items() if v.get("state") == "open" or k in new_items}
+        st["last_run"] = start.strftime(ISO)
+        save_state(st)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
