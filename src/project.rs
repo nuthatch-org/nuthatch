@@ -380,7 +380,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     if let Some(note) = chains::keyless_caveat(
         &chain.name,
         &config.nest.rpc_urls,
-        config.nest.block_timestamps.column(),
+        config.nest.block_timestamps == crate::config::TimestampPolicy::Eager,
     ) {
         say!();
         say!("note:  {note}");
@@ -2741,7 +2741,8 @@ mod tests {
                 chain: config.nest.chain.clone(),
                 chain_id: config.nest.chain_id,
                 rpc_urls: config.nest.rpc_urls.clone(),
-                block_timestamps: config.nest.block_timestamps.column(),
+                block_timestamps: config.nest.block_timestamps
+                    == crate::config::TimestampPolicy::Eager,
                 lazy_timestamps: config.nest.block_timestamps.lazy(),
                 contracts: config
                     .contracts

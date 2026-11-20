@@ -4787,6 +4787,69 @@ mod tests {
             .collect();
         assert_eq!(reachable_tables(conn, dir.path(), &cycle).unwrap(), cycle);
     }
+    /// #3065: a lazy nest's `block_timestamp` is nullable only in a segment that holds a null, so one
+    /// table can have segments that disagree on the column's nullability. They must read as one table,
+    /// with hot rows, and the nulls must stay null.
+    #[test]
+    fn a_lazy_tables_segments_read_together_whatever_their_nullability() {
+        crate::engine::on_bare(a_lazy_tables_segments_read_together_whatever_their_nullability_on);
+    }
+
+    fn a_lazy_tables_segments_read_together_whatever_their_nullability_on(conn: &dyn Session) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("schema.json"),
+            r#"{"tables":[{"table":"t","columns":[{"name":"block_number","storage":"u64"}]}]}"#,
+        )
+        .unwrap();
+        crate::seal::test_set_table_floor(dir.path(), 0);
+        let row = |b: u64, stamped: bool| match stamped {
+            true => serde_json::json!({"table": "t", "block_number": b, "block_timestamp": b * 12}),
+            false => serde_json::json!({"table": "t", "block_number": b, "block_timestamp": null}),
+        };
+        // 1..=10 all stamped (non-nullable segment), 11..=20 half null (nullable segment).
+        for (from, to, all) in [(1u64, 10u64, true), (11, 20, false)] {
+            let rows: Vec<String> = (from..=to)
+                .map(|b| row(b, all || b % 2 == 0).to_string())
+                .collect();
+            crate::seal::seal_range(dir.path(), &rows, from, to).unwrap();
+        }
+        let mut hot = HotRows::new();
+        hot.insert(
+            "t".into(),
+            (21..=24)
+                .map(|b| {
+                    let mut r = row(b, b % 2 == 0);
+                    r.as_object_mut().unwrap().remove("table");
+                    r
+                })
+                .collect(),
+        );
+        define_views_bound(
+            conn,
+            dir.path(),
+            &hot,
+            20,
+            &Default::default(),
+            &[],
+            None,
+            FactWindow {
+                after: None,
+                through: None,
+            },
+            false,
+        )
+        .unwrap();
+        let one = |q: &str| conn.one_value(q).unwrap().as_u64().unwrap();
+        assert_eq!(one("SELECT count(*) FROM t"), 24);
+        assert_eq!(one("SELECT count(block_timestamp) FROM t"), 10 + 5 + 2);
+        assert_eq!(
+            one("SELECT count(*) FROM t WHERE block_timestamp IS NULL"),
+            7
+        );
+        assert_eq!(one("SELECT max(block_timestamp) FROM t"), 24 * 12);
+    }
+
     /// RFC-0059: a two-sided window exposes only `(after, through]`, across sealed and hot, and names
     /// only the segments that overlap it. The count alone cannot tell pruning from the predicate.
     #[test]

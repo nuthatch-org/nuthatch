@@ -2794,7 +2794,7 @@ pub async fn dev(
         let timestamps = group
             .nests
             .iter()
-            .any(|(_, _, c)| c.nest.block_timestamps.column());
+            .any(|(_, _, c)| c.nest.block_timestamps == crate::config::TimestampPolicy::Eager);
         let pool: Vec<String> = rpc_urls
             .iter()
             .chain(rpc_fallback.iter())

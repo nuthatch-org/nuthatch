@@ -95,7 +95,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     if let Some(note) = chains::keyless_caveat(
         &config.nest.chain,
         &pool,
-        config.nest.block_timestamps.column(),
+        config.nest.block_timestamps == crate::config::TimestampPolicy::Eager,
     ) {
         tracing::warn!("{note}");
     }
