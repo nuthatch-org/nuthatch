@@ -327,6 +327,8 @@ impl FactorySet {
                     discovered_block: row.block_number,
                     discovered_log_index: row.log_index,
                     // 0 is this field's "not stamped"; a lazy row's sentinel must not leak here (#3065).
+                    // The `{template}__children` view does not read it: it projects the announcing
+                    // row's `block_timestamp`, which is null for an unstamped lazy row.
                     discovered_timestamp: row.timestamp().unwrap_or(0),
                     parent_address: row.address.clone(),
                     depth: rule.watch_depth + 1,

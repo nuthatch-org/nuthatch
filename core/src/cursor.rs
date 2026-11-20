@@ -710,12 +710,15 @@ pub async fn process_window<E: WindowEntity>(
             blocks.dedup();
             // A log row's timestamp was read by height alone, so it may be another fork's: it must be
             // the one this hash has. Block and call rows took theirs from the header checked here.
+            // A lazy row (#3065) took its timestamp from its log, and is checked the same way when it
+            // has one: the header is fetched for the hash regardless, so the check costs no call. A
+            // lazy row its log left unstamped has nothing to check and stays null.
             let stamped: Vec<_> = rows
                 .iter()
                 .filter(|r| {
                     registry.timestamps()
-                        && !registry.lazy_timestamps()
                         && r.block_number > final_through
+                        && (!registry.lazy_timestamps() || r.timestamp().is_some())
                 })
                 .collect();
             let now = match stamped.is_empty() {
@@ -1771,6 +1774,16 @@ mod tests {
         extra: &dyn ExtraRows,
         registry: DecodeRegistry,
     ) -> (Processed, Mem) {
+        split_logs(source, extra, registry, None)
+    }
+
+    /// [`split_with`], with the window's one log stamped `blockTimestamp = stamp` by the node.
+    fn split_logs(
+        source: &HeadSplit,
+        extra: &dyn ExtraRows,
+        registry: DecodeRegistry,
+        stamp: Option<u64>,
+    ) -> (Processed, Mem) {
         let store = Mem::default();
         store.set(START_BLOCK_KEY, 10);
         let schema = registry.schema();
@@ -1781,7 +1794,10 @@ mod tests {
         let entities: Vec<Recorder> = Vec::new();
         let router = AlertRouter::new(Vec::<alerts::AlertSink>::new());
         let shelf = Shelf::default();
-        let logs = [transfer_log(10, 0, ZERO, ALICE, 100)];
+        let logs = [Log {
+            block_timestamp: stamp,
+            ..transfer_log(10, 0, ZERO, ALICE, 100)
+        }];
         let window = Window {
             nest: Nest {
                 name: "tok",
@@ -1844,6 +1860,26 @@ mod tests {
 
         assert_eq!(processed, Processed::Refused);
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// #3065: a lazy row's timestamp came from its log, so it is held to the header the hash check
+    /// reads anyway. A stamp from another fork refuses the window; the right one commits; a log the
+    /// node left unstamped commits with no timestamp to check.
+    #[test]
+    fn a_lazy_rows_log_stamp_is_checked_against_the_header_its_hash_names() {
+        let lazy = || token().with_timestamps(true).with_lazy_timestamps(true);
+        let source = HeadSplit::default();
+        let none = &crate::extra::NoExtraRows;
+
+        let (processed, store) = split_logs(&source, none, lazy(), Some(stamp_of(10) + 12));
+        assert_eq!(processed, Processed::Refused);
+        assert_eq!(store.count().unwrap(), 0);
+
+        for stamp in [Some(stamp_of(10)), None] {
+            let (processed, store) = split_logs(&source, none, lazy(), stamp);
+            assert_eq!(processed, Processed::Stored(1), "{stamp:?}");
+            assert_eq!(store.get_block_hash(10).unwrap(), Some(hash_of(10)));
+        }
     }
 
     /// One top-level call at block 10, read from a body on fork B.

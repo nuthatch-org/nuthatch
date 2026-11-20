@@ -58,6 +58,7 @@ fn transfer_block(number: u64, variant: u64, ts: u64, from: u64, to: u64, value:
             block_hash: hash.clone(),
             tx_hash: format!("0x{:064x}", number << 20),
             log_index: 0,
+            block_timestamp: None,
         }],
         hash,
         timestamp: ts,

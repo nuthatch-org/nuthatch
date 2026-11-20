@@ -400,6 +400,7 @@ fn transfer_log(block: u64, log_index: u64, from: &str, to: &str, value: u64) ->
         block_hash: hash_of(block),
         tx_hash: hash_of(block),
         log_index,
+        block_timestamp: None,
     }
 }
 

@@ -1011,9 +1011,15 @@ unsure, keep them - the default is on for a reason.
 `eth_getBlockByNumber` per block that holds a matching log, which on a dense history is most of a cold
 start. `nuthatch init --lazy-timestamps` keeps `block_timestamp` on every table but fills it only from
 what each log carried: where the node stamped the log, the row has that value, and where it did not,
-the row is `null`. No header is fetched for any row, and nothing fills a null later - sealed segments
-are immutable, and a fill that touched only unsealed rows would make a row's value depend on when it
-sealed. Query with that in mind (`count(block_timestamp)` counts only stamped rows). Like
+the row is `null`. No header is fetched to *stamp* a row, so a backfill buys none. Tip-following
+still reads one header per unfinalised block that holds a row, as every nest does, to check the
+block's hash against reorgs; a lazy row whose log carried a timestamp is checked against that same
+header at no extra call. Nothing fills a null later - sealed segments are immutable, and a fill that
+touched only unsealed rows would make a row's value depend on when it sealed. Query with that in mind
+(`count(block_timestamp)` counts only stamped rows). Because a row holds what its own `eth_getLogs`
+answer carried, which rows are `null` depends on the endpoints that served the backfill: give a lazy
+nest RPC endpoints that agree on stamping (all stamp, or none do), or two runs of the same nest can
+seal different nulls. Like
 `--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
 refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
 and content addresses are exactly what they were before `"lazy"` existed.

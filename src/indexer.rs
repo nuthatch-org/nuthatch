@@ -23650,7 +23650,10 @@ template="pool"
         async fn tip(&self) -> Result<u64> {
             self.inner.tip().await
         }
+        // Every header path counts: `block_hashes` and `block_records` default to these two, and the
+        // source's other header methods are left at their defaults, which buy nothing.
         async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.block_hash(n).await
         }
         async fn logs(
