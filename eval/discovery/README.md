@@ -151,7 +151,7 @@ indexer" sent the agent to Ponder, which it already knew.
 
 Not run: Codex and Cursor (skipped: not installed or authed; there is no `~/.codex/auth.json`,
 `OPENAI_API_KEY` or `CURSOR_API_KEY`, and no `codex` or `cursor-agent` on the box). The post-Priority-1
-rerun remains, tracked in [#3053](https://github.com/nuthatch-org/nuthatch/issues/3053). Rows are in
+rerun for Claude Code is in the section below; Codex and Cursor remain unrun ([#3053](https://github.com/nuthatch-org/nuthatch/issues/3053)). Rows are in
 [`results/2026-11-18.json`](results/2026-11-18.json), [`results/2026-11-19.json`](results/2026-11-19.json)
 and [`results/table.md`](results/table.md).
 
