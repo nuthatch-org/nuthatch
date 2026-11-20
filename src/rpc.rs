@@ -3763,19 +3763,25 @@ mod batch_width_tests {
     }
 
     #[tokio::test]
-    async fn a_413_that_states_no_maximum_is_halved_to_a_width_it_takes() {
-        // 450 -> 225 -> 112 -> 56: three rejections, learning 56; nothing above 100 is ever sent.
-        check_calls(Refusal::Http413Bare, 100, 450, 3, 56).await;
+    async fn a_413_that_states_no_maximum_is_searched_to_the_width_it_takes() {
+        // 450 -> 225 -> 112 -> 56 ok -> 84 -> 98 -> 105 -> 101 -> 100: a binary search between the
+        // widest width known good and the narrowest known refused, so it lands on the real limit.
+        check_calls(Refusal::Http413Bare, 100, 450, 8, 100).await;
+    }
+
+    #[tokio::test]
+    async fn an_unstated_limit_of_137_is_found_exactly() {
+        check_calls(Refusal::Http413Bare, 137, 1_500, 9, 137).await;
     }
 
     #[tokio::test]
     async fn a_json_rpc_error_about_the_batch_is_handled_the_same_way() {
-        check_calls(Refusal::RpcError, 100, 450, 3, 56).await;
+        check_calls(Refusal::RpcError, 100, 450, 8, 100).await;
     }
 
     #[tokio::test]
     async fn a_silent_empty_answer_is_handled_the_same_way() {
-        check_calls(Refusal::Empty, 100, 450, 3, 56).await;
+        check_calls(Refusal::Empty, 100, 450, 8, 100).await;
     }
 
     #[tokio::test]

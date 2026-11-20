@@ -1464,7 +1464,7 @@ impl<T: Transport> RpcClient<T> {
                     let n = limit.refused(now.len(), stated_max);
                     if n.first_time {
                         tracing::info!(
-                            "rpc endpoint {} refused a batch of {} calls ({}); sending batches of at                              most {} calls to it",
+                            "rpc endpoint {} refused a batch of {} calls ({}); sending batches of at most {} calls to it",
                             redact_url(url),
                             now.len(),
                             detail.chars().take(160).collect::<String>(),
