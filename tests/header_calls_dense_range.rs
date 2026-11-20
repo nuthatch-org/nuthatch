@@ -84,6 +84,12 @@ async fn handler(
     })
 }
 
+/// Both skips live in `core/src/rpc.rs`'s `RpcClient`, which `Source::logs` and `Source::block_timestamps`
+/// delegate to in the indexer: `get_logs` records each log's `blockTimestamp` via
+/// `remember_log_timestamps`, and `block_timestamps` serves cached blocks before fetching (the same
+/// cache, so a block is asked for once). The test drives those two calls, in the order the seal-direct
+/// window does, and fails if either skip regresses (it passes today: 333 / 0 / 0).
+///
 /// Runs the fetch a seal-direct window does: getLogs, then timestamps for the log blocks.
 /// Returns (getLogs calls, header calls, header calls on a repeat ask, timestamps).
 async fn run(stamp: bool) -> (usize, usize, usize, HashMap<u64, u64>) {
