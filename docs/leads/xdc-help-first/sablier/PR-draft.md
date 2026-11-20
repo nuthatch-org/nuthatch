@@ -21,7 +21,7 @@ with SQL. It is not a replacement for the Envio or Graph entity API.
 Numbers from a run on a laptop against the public `https://rpc.xinfin.network`, no API key:
 
 - 24.3M blocks (85,225,620 to the tip), 535 events, caught up to the tip in about 12 minutes from an empty directory.
-- 724 RPC calls in total (524 `eth_getLogs`).
+- 1,512 RPC calls in total (676 `eth_getLogs`), from a counting proxy over the backfill and several hours of following the tip.
 - Lockup v2.0 on XDC: 417 logs by direct `eth_getLogs`, 417 rows in the nest.
 
 Try it:

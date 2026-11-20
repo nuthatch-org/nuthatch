@@ -26,7 +26,7 @@ Numbers from a run on a laptop against the public `https://rpc.xinfin.network`, 
 
 - 14.3M blocks from the first deployment block to the tip, 3.88M events (3.88M claims from 78.7k claimers).
 - From an empty directory to caught up with the tip: 2h22m. It then keeps following.
-- About 2.45M RPC calls, 2,751 of them `eth_getLogs`. The rest are one `eth_getBlockByNumber` per block with a claim,
+- About 2.45M RPC calls (2,452,265 in the committed counter file, which also includes following the tip after catch-up), 2,892 of them `eth_getLogs`. The rest are one `eth_getBlockByNumber` per block with a claim,
   needed because `block_timestamp` is NOT NULL in `RawLogs`.
 - 359 MB of Parquet on disk. Loader dry run over the full history: 3.88M rows in 6 minutes.
 
