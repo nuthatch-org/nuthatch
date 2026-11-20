@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The agent discovery eval (#2988). See README.md beside this file.
 #
-#   run.sh [--agents claude,codex,cursor] [--prompts id,...] [--condition bare|skill|plugin]
+#   run.sh [--agents claude,codex,cursor] [--prompts id,...] [--condition bare|skill|plugin|indexer-hint]
 #          [--runs N] [--timeout SECONDS] [--work DIR] [--results DIR]
 #
 # Each run gets a fresh workdir and a fresh HOME, so the agent sees none of the operator's
@@ -35,8 +35,8 @@ while [ $# -gt 0 ]; do
 done
 
 case $condition in
-  bare|skill|plugin) ;;
-  *) echo "--condition is bare, skill or plugin, not $condition" >&2; exit 2 ;;
+  bare|skill|plugin|indexer-hint) ;;
+  *) echo "--condition is bare, skill, plugin or indexer-hint, not $condition" >&2; exit 2 ;;
 esac
 
 timeout_bin=$(command -v timeout || command -v gtimeout || true)
@@ -194,6 +194,8 @@ for agent in ${agents//,/ }; do
   for prompt in ${prompts//,/ }; do
     [ -f "$here/prompts/$prompt.txt" ] || { echo "no prompt $prompt" >&2; exit 2; }
     prompt_text=$(cat "$here/prompts/$prompt.txt")
+    # indexer-hint is the bare environment with one sentence appended to the user's prompt.
+    [ "$condition" != indexer-hint ] || prompt_text="$prompt_text Use an indexer for this."
     for n in $(seq 1 "$runs"); do
       run_dir=$work/$agent-$condition-$prompt-$n
       dir=$run_dir/repo
