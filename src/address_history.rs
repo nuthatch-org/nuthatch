@@ -481,6 +481,19 @@ pub struct Row {
     pub record: Map<String, Value>,
 }
 
+/// One account's stored coverage, as [`AddressHistory::coverage_report`] reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountCoverage {
+    pub address: String,
+    pub watched: bool,
+    /// The block the account had code from, above which its transactions are refused for good.
+    pub unprovable_from: Option<u64>,
+    /// The block the account joined the sweep at, on a sweeping nest.
+    pub joined: Option<u64>,
+    /// Each action asked for and its covered spans, inclusive, merged.
+    pub spans: Vec<(Action, Vec<(u64, u64)>)>,
+}
+
 /// What a page request comes back as.
 #[derive(Debug, PartialEq)]
 pub enum Answer {
@@ -1887,6 +1900,46 @@ impl AddressHistory {
             action,
         )?);
         Ok(merge(spans))
+    }
+
+    /// Each account's coverage of its actions, whether it is watched and its unprovable marker, read
+    /// in one transaction with the generation it stands at, so the report is one state of the store.
+    pub fn coverage_report(
+        &self,
+        accounts: &[(String, Vec<Action>)],
+    ) -> Result<(u64, Vec<AccountCoverage>)> {
+        let rtx = self.store.database().begin_read()?;
+        let generation = rtx
+            .open_table(META)?
+            .get(GENERATION)?
+            .map_or(0, |v| v.value());
+        let (cov, sweep, joined) = (
+            rtx.open_table(COVERAGE)?,
+            rtx.open_table(SWEEP)?,
+            rtx.open_table(JOINED)?,
+        );
+        let (watched, unprovable) = (rtx.open_table(WATCHED)?, rtx.open_table(UNPROVABLE)?);
+        let mut out = Vec::with_capacity(accounts.len());
+        for (address, actions) in accounts {
+            let a = parse_address(address)?;
+            let mut spans = Vec::with_capacity(actions.len());
+            for &action in actions {
+                let mut s = match cov.get(coverage_key(&a, action).as_slice())? {
+                    Some(v) => decode_spans(v.value())?,
+                    None => Vec::new(),
+                };
+                s.extend(swept_for(&sweep, &joined, &a, action)?);
+                spans.push((action, merge(s)));
+            }
+            out.push(AccountCoverage {
+                address: address_hex(&a),
+                watched: watched.get(a.as_slice())?.is_some(),
+                unprovable_from: unprovable.get(a.as_slice())?.map(|v| v.value()),
+                joined: joined.get(a.as_slice())?.map(|v| v.value()),
+                spans,
+            });
+        }
+        Ok((generation, out))
     }
 
     /// The last feed sequence number the webhook endpoint accepted; 0 before any.

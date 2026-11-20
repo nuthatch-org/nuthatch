@@ -3101,12 +3101,223 @@ pub fn router_for(state: Arc<ModeState>, hosts: Hosts) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/unwatch", post(unwatch))
+        .route("/api/coverage", get(coverage))
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
         .route("/diff", get(diff_route))
         .route("/metrics", get(metrics))
+        .route("/shape", get(shape))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(rule, admit))
+}
+
+/// What `nuthatch mcp` reads to offer the wallet tools instead of the event-nest ones.
+async fn shape() -> Json<Value> {
+    Json(json!({
+        "address_history": true, "transfers": false, "compliance": false,
+        "free_form": false, "queries": 0,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct CoverageQuery {
+    address: Option<String>,
+    chainid: Option<u64>,
+}
+
+/// `GET /api/coverage`: each watched account's covered blocks per action, and what is missing between
+/// `start_block` and the finalized head with why, read from one state of the store. `?address=` asks
+/// for one account, watched or not.
+async fn coverage(
+    State(s): State<Arc<ModeState>>,
+    Query(q): Query<CoverageQuery>,
+) -> (StatusCode, Json<Value>) {
+    if let Some(id) = q.chainid.filter(|id| *id != s.chain_id) {
+        return failed(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "chainid {id} is not served here; this nest serves chain {}",
+                s.chain_id
+            ),
+        );
+    }
+    if let Some(a) = &q.address {
+        if let Err(e) = crate::address_history::parse_address(a) {
+            return failed(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        }
+    }
+    let st = s.clone();
+    match blocking(&s, move |h| coverage_doc(&st, h, q.address)).await {
+        Ok(v) => (StatusCode::OK, Json(v)),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    }
+}
+
+fn coverage_doc(s: &ModeState, h: &AddressHistory, one: Option<String>) -> Result<Value> {
+    use crate::address_discovery::{BLOCK_SCANNED, DISCOVERED};
+    use crate::address_history::Action;
+    let addresses = match one {
+        Some(a) => vec![a],
+        None => h.watched()?,
+    };
+    let bodies = body_accounts(s, h)?;
+    let accounts: Vec<(String, Vec<Action>)> = addresses
+        .into_iter()
+        .map(|a| {
+            let mut actions = DISCOVERED.to_vec();
+            if s.chain_id == 1 && bodies.iter().any(|b| b.eq_ignore_ascii_case(&a)) {
+                actions.extend(BLOCK_SCANNED);
+            }
+            (a, actions)
+        })
+        .collect();
+    let head = h.head()?;
+    let swept = match &s.sweep {
+        Some(_) => h.swept()?,
+        None => None,
+    };
+    let (generation, report) = h.coverage_report(&accounts)?;
+    let hi = head.map(|f| s.end_block.map_or(f, |e| e.min(f)));
+    let accounts: Vec<Value> = report
+        .into_iter()
+        .map(|acc| {
+            let actions: serde_json::Map<String, Value> = acc
+                .spans
+                .iter()
+                .map(|(action, covered)| {
+                    let missing: Vec<Value> = hi
+                        .map(|hi| missing_spans(covered, s.start_block, hi))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flat_map(|gap| gap_reasons(s, &acc, *action, gap, swept))
+                        .collect();
+                    (
+                        action.etherscan().to_string(),
+                        json!({ "covered": covered, "missing": missing }),
+                    )
+                })
+                .collect();
+            json!({
+                "address": acc.address,
+                "watched": acc.watched,
+                "unprovable_from": acc.unprovable_from,
+                "joined": acc.joined,
+                "actions": actions,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "chain_id": s.chain_id,
+        "generation": generation.to_string(),
+        "start_block": s.start_block,
+        "end_block": s.end_block,
+        "finalized_head": head,
+        "tip": h.tip()?,
+        "sweep": s.sweep.is_some(),
+        "accounts": accounts,
+        "note": "missing is counted from start_block to the finalized head; history before \
+            start_block is never fetched, and a request above the finalized head, up to the chain \
+            head, is covered on demand within the request deadline or refused",
+    }))
+}
+
+/// The blocks of `[lo, hi]` no span of `covered` (sorted, merged, inclusive) holds.
+fn missing_spans(covered: &[(u64, u64)], lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut next = lo;
+    for &(f, t) in covered {
+        if next > hi {
+            break;
+        }
+        if t < next {
+            continue;
+        }
+        if f > next {
+            out.push((next, (f - 1).min(hi)));
+        }
+        next = t.saturating_add(1);
+    }
+    if next <= hi {
+        out.push((next, hi));
+    }
+    out
+}
+
+/// One missing span as `{from, to, status, why}` entries, split where the reason changes: `pending`
+/// is owed and coming, `not_watched` is asked for by watching, `never` will not be covered here.
+fn gap_reasons(
+    s: &ModeState,
+    acc: &crate::address_history::AccountCoverage,
+    action: crate::address_history::Action,
+    (from, to): (u64, u64),
+    swept: Option<(u64, u64)>,
+) -> Vec<Value> {
+    use crate::address_history::Action;
+    let entry = |f: u64, t: u64, status: &str, why: String| json!({ "from": f, "to": t, "status": status, "why": why });
+    if !acc.watched {
+        let why = if s.sweep.is_some() {
+            "a sweep covers an account only from the block it joins, after POST /api/watch"
+        } else {
+            "POST /api/watch to start a backfill"
+        };
+        return vec![entry(
+            from,
+            to,
+            "not_watched",
+            format!("{} is not watched: {why}", acc.address),
+        )];
+    }
+    // Split at `at`: blocks under it get `below`, the rest `above`.
+    let split = |at: u64, below: (&str, String), above: (&str, String)| -> Vec<Value> {
+        let mut v = Vec::new();
+        if from < at {
+            v.push(entry(from, to.min(at - 1), below.0, below.1));
+        }
+        if to >= at {
+            v.push(entry(from.max(at), to, above.0, above.1));
+        }
+        v
+    };
+    if let Some(cfg) = &s.sweep {
+        if action == Action::TxListInternal && !cfg.internal {
+            return vec![entry(
+                from,
+                to,
+                "never",
+                "this nest's sweep does not trace, so it serves no internal transactions".into(),
+            )];
+        }
+        let through = swept.map_or(0, |(_, t)| t + 1);
+        return split(
+            through,
+            (
+                "never",
+                "the sweep does not read back, and read these blocks without it".into(),
+            ),
+            (
+                "pending",
+                "the sweep has not reached these blocks yet".into(),
+            ),
+        );
+    }
+    let pending = ("pending", "watched and backfilling".to_string());
+    match acc
+        .unprovable_from
+        .filter(|_| matches!(action, Action::TxList | Action::TxListInternal))
+    {
+        Some(b) => split(
+            b,
+            pending,
+            (
+                "never",
+                format!(
+                    "{} had code from block {b}, so its transactions there are not proved; ask another source",
+                    acc.address
+                ),
+            ),
+        ),
+        None => vec![entry(from, to, pending.0, pending.1)],
+    }
 }
 
 /// Run a store read off the async workers.
@@ -5058,11 +5269,48 @@ pub fn chains_router_for(chains: Chains, hosts: Hosts) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/unwatch", post(chains_unwatch))
+        .route("/api/coverage", get(chains_coverage))
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(chains_ready))
         .route("/metrics", get(chains_metrics))
+        .route("/shape", get(shape))
         .with_state(chains)
         .layer(axum::middleware::from_fn_with_state(rule, admit))
+}
+
+/// Each chain's `/api/coverage`, under `chains`, or the one chain `chainid` names.
+async fn chains_coverage(
+    State(c): State<Chains>,
+    Query(q): Query<CoverageQuery>,
+) -> (StatusCode, Json<Value>) {
+    let picked: Vec<(u64, Arc<ModeState>)> = match q.chainid {
+        Some(id) => match c.get(&id) {
+            Some(s) => vec![(id, s.clone())],
+            None => {
+                return failed(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "chainid {id} is not served here; this endpoint serves chains {}",
+                        chain_list(&c)
+                    ),
+                )
+            }
+        },
+        None => c.iter().map(|(id, s)| (*id, s.clone())).collect(),
+    };
+    let mut per_chain = serde_json::Map::new();
+    for (id, s) in picked {
+        let one = CoverageQuery {
+            address: q.address.clone(),
+            chainid: None,
+        };
+        let (code, Json(v)) = coverage(State(s), Query(one)).await;
+        if code != StatusCode::OK {
+            return (code, Json(v));
+        }
+        per_chain.insert(id.to_string(), v);
+    }
+    (StatusCode::OK, Json(json!({ "chains": per_chain })))
 }
 
 fn chain_list(c: &Chains) -> String {
@@ -7459,6 +7707,133 @@ mod tests {
             "{r}"
         );
         assert_eq!(r["head"], 500, "head is unchanged: {r}");
+    }
+
+    /// `/api/coverage` lists each watched account's covered blocks per action and what is missing up to
+    /// the finalized head, with why: owed, refused for good above an unprovable marker, or unwatched.
+    #[tokio::test]
+    async fn coverage_says_what_each_account_holds_and_why_the_rest_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        s.history.set_head(500).unwrap();
+        let g = s.history.generation().unwrap();
+        s.history
+            .record(
+                crate::address_history::Action::TxList,
+                ALICE,
+                &[],
+                (0, 300),
+                g,
+            )
+            .unwrap();
+        s.history.mark_unprovable(ALICE, 400).unwrap();
+        let (status, r) = call(router(s.clone()), "GET", "/api/coverage", None).await;
+        assert_eq!(status, StatusCode::OK, "{r}");
+        assert_eq!(r["finalized_head"], 500, "{r}");
+        assert!(r["generation"].is_string(), "{r}");
+        let alice = &r["accounts"][0];
+        assert_eq!(alice["watched"], true, "{r}");
+        assert_eq!(alice["unprovable_from"], 400, "{r}");
+        let txlist = &alice["actions"]["txlist"];
+        assert_eq!(txlist["covered"], json!([[0, 300]]), "{r}");
+        let missing: Vec<_> = txlist["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| (m["from"].clone(), m["to"].clone(), m["status"].clone()))
+            .collect();
+        assert_eq!(
+            missing,
+            vec![
+                (json!(301), json!(399), json!("pending")),
+                (json!(400), json!(500), json!("never")),
+            ],
+            "{r}"
+        );
+        // Token transfers are still followed past the marker.
+        assert_eq!(
+            alice["actions"]["tokentx"]["missing"],
+            json!([{"from": 0, "to": 500, "status": "pending", "why": "watched and backfilling"}]),
+            "{r}"
+        );
+
+        let (_, r) = call(
+            router(s.clone()),
+            "GET",
+            &format!("/api/coverage?address={BOB}"),
+            None,
+        )
+        .await;
+        let bob = &r["accounts"][0]["actions"]["txlist"]["missing"][0];
+        assert_eq!(bob["status"], "not_watched", "{r}");
+        assert!(bob["why"].as_str().unwrap().contains("/api/watch"), "{r}");
+
+        let (status, _) = call(router(s), "GET", "/api/coverage?address=0x12", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A sweep that does not trace never covers internal transactions, and says so rather than pending.
+    #[tokio::test]
+    async fn coverage_on_a_sweep_without_tracing_never_owes_internal_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.redb")).unwrap();
+        let history = AddressHistory::open(store, 1, &[ALICE.into()]).unwrap();
+        history.set_head(100).unwrap();
+        let s = ModeState::new(history, 1, Duration::from_secs(300), true).with_sweep(Some(
+            crate::address_history::SweepConfig {
+                from_block: Some(0),
+                internal: false,
+                confirmations: None,
+                webhook: None,
+            },
+        ));
+        let (_, r) = call(router(Arc::new(s)), "GET", "/api/coverage", None).await;
+        let internal = &r["accounts"][0]["actions"]["txlistinternal"]["missing"][0];
+        assert_eq!(internal["status"], "never", "{r}");
+        assert_eq!(r["sweep"], true, "{r}");
+    }
+
+    #[test]
+    fn missing_spans_are_the_complement_within_the_bounds() {
+        assert_eq!(missing_spans(&[], 5, 9), vec![(5, 9)]);
+        assert_eq!(
+            missing_spans(&[(0, 3), (6, 7), (12, 20)], 2, 15),
+            vec![(4, 5), (8, 11)]
+        );
+        assert_eq!(missing_spans(&[(0, 20)], 2, 15), vec![]);
+        assert_eq!(missing_spans(&[(10, 12)], 2, 8), vec![(2, 8)]);
+    }
+
+    /// A directory of chains reports each chain's coverage, or the one `chainid` names, and refuses a
+    /// chain it does not serve.
+    #[tokio::test]
+    async fn a_directory_of_chains_reports_coverage_per_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let chains: Chains = Arc::new(
+            [56, 8453]
+                .into_iter()
+                .map(|id| (id, chain_state(dir.path(), id)))
+                .collect(),
+        );
+        let app = || chains_router(chains.clone());
+        let (_, r) = call(app(), "GET", "/api/coverage", None).await;
+        assert_eq!(r["chains"]["56"]["chain_id"], 56, "{r}");
+        assert_eq!(r["chains"]["8453"]["chain_id"], 8453, "{r}");
+        let (_, r) = call(app(), "GET", "/api/coverage?chainid=8453", None).await;
+        assert!(r["chains"].get("56").is_none(), "{r}");
+        let (code, _) = call(app(), "GET", "/api/coverage?chainid=1", None).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (_, r) = call(app(), "GET", "/shape", None).await;
+        assert_eq!(r["address_history"], true, "{r}");
+    }
+
+    /// The bridge reads `/shape` to offer the wallet tools on this path.
+    #[tokio::test]
+    async fn shape_says_this_is_an_address_history_nest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, r) = call(router(state(dir.path(), true)), "GET", "/shape", None).await;
+        assert_eq!(r["address_history"], true, "{r}");
+        assert_eq!(r["free_form"], false, "{r}");
     }
 
     /// `served_through` is a prefix every watched account is answered under without waiting: a plain
