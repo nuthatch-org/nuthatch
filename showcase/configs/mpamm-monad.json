@@ -1,0 +1,20 @@
+{
+  "title": "Capricorn and Metric pools on Monad",
+  "tagline": "Every pool the Capricorn and Metric v1 factories have created on Monad and every swap in them since the Capricorn factory was deployed, so volume, reserves and pool activity are plain SQL.",
+  "chain": "Monad (143)",
+  "events": { "table": "capricorn_pool__swap", "from": "sender", "to": "recipient", "amount": "amount1", "decimals": 18, "symbol": "token1" },
+  "queries": [
+    { "title": "Latest Capricorn swaps", "sql": "SELECT block_number, block_timestamp, address AS pool, sender, amount0, amount1 FROM capricorn_pool__swap ORDER BY block_number DESC, log_index DESC LIMIT 20" },
+    { "title": "Capricorn pools and their fee", "sql": "SELECT pool, token0, token1, feeBps_dec AS fee_bps, block_number FROM capricorn_factory__pool_created ORDER BY block_number" },
+    { "title": "Swaps per Capricorn pool", "sql": "SELECT address AS pool, count(*) AS swaps, min(block_number) AS first_block, max(block_number) AS last_block FROM capricorn_pool__swap GROUP BY 1 ORDER BY swaps DESC" },
+    { "title": "Capricorn swaps per day", "sql": "SELECT CAST(block_timestamp / 86400 AS BIGINT) AS day_number, count(*) AS swaps FROM capricorn_pool__swap GROUP BY 1 ORDER BY 1 DESC LIMIT 14" },
+    { "title": "Metric v1 pools and swaps", "sql": "SELECT (SELECT count(*) FROM metric_v1_factory__pool_created) AS pools, (SELECT count(*) FROM metric_v1_pool__swap) AS swaps" }
+  ],
+  "prompts": [
+    "How many pools has the Capricorn factory created on Monad, and what is each pool's fee in basis points? Use table capricorn_factory__pool_created.",
+    "How many swaps does each Capricorn pool have (table capricorn_pool__swap), and over which block range?",
+    "Show Capricorn swaps per day for the last 14 days. block_timestamp is unix seconds, so divide by 86400 for a day number.",
+    "What is the latest reserve0 and reserve1 of each Capricorn pool, taken from its most recent swap row?",
+    "List every table in this nest with its row count, then say in two sentences what the data is good for."
+  ]
+}

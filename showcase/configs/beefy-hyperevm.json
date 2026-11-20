@@ -1,0 +1,20 @@
+{
+  "title": "Beefy vaults on HyperEVM",
+  "tagline": "Every vault, reward pool and CLM manager the three Beefy factories on HyperEVM have created, with their share-token transfers, deposits and withdrawals, discovered from the factories and indexed from the block each was created. Block times are not stored in this nest, so use block numbers.",
+  "chain": "HyperEVM (999)",
+  "events": { "table": "clm_manager__transfer", "from": "from", "to": "to", "amount": "value", "decimals": 18, "symbol": "shares" },
+  "queries": [
+    { "title": "Latest CLM share transfers", "sql": "SELECT block_number, address, \"from\", \"to\", value_dec FROM clm_manager__transfer ORDER BY block_number DESC, log_index DESC LIMIT 20" },
+    { "title": "Contracts the factories created", "sql": "SELECT 'classic_vault' AS kind, count(*) AS contracts FROM classic_vault_factory__proxy_created UNION ALL SELECT 'clm_manager', count(*) FROM clm_manager_factory__proxy_created" },
+    { "title": "Most active CLM managers by deposits", "sql": "SELECT address AS clm_manager, count(*) AS deposits FROM clm_manager__deposit GROUP BY 1 ORDER BY deposits DESC LIMIT 10" },
+    { "title": "Deposits and withdrawals per CLM manager", "sql": "SELECT d.address AS clm_manager, d.n AS deposits, coalesce(w.n, 0) AS withdrawals FROM (SELECT address, count(*) AS n FROM clm_manager__deposit GROUP BY 1) d LEFT JOIN (SELECT address, count(*) AS n FROM clm_manager__withdraw GROUP BY 1) w ON d.address = w.address ORDER BY d.n DESC LIMIT 10" },
+    { "title": "Reward pool stakers", "sql": "SELECT address AS reward_pool, count(*) AS stake_events FROM reward_pool__staked GROUP BY 1 ORDER BY stake_events DESC LIMIT 10" }
+  ],
+  "prompts": [
+    "How many classic vaults and CLM managers have the Beefy factories created on HyperEVM? Use tables classic_vault_factory__proxy_created and clm_manager_factory__proxy_created.",
+    "Which 10 CLM managers have the most deposits (table clm_manager__deposit), and how many withdrawals (clm_manager__withdraw) does each have?",
+    "Which reward pools have the most stake events (table reward_pool__staked)? Show the top 10 with their counts.",
+    "Show the 20 most recent share transfers across all CLM managers (table clm_manager__transfer) with block number, from, to and amount.",
+    "List every table in this nest with its row count, then say in two sentences what the data is good for."
+  ]
+}
