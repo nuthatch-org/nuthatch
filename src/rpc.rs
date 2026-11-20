@@ -1087,7 +1087,7 @@ mod tests {
     /// Like [`address_capped_rpc`], refusing `refuse_from` or more addresses and answering after
     /// `delay`, while counting requests and the most that were ever in flight at once.
     async fn slow_capped_rpc(
-        refuse_from: usize,
+        refuse_from: Arc<AtomicUsize>,
         delay: std::time::Duration,
         requests: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
@@ -1099,6 +1099,7 @@ mod tests {
             "/",
             post(move |Json(req): Json<Value>| {
                 let (requests, peak, live) = (requests.clone(), peak.clone(), live.clone());
+                let refuse_from = refuse_from.clone();
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
                     let now = live.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1109,7 +1110,7 @@ mod tests {
                         .as_array()
                         .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
                         .unwrap_or_default();
-                    if addrs.len() >= refuse_from {
+                    if addrs.len() >= refuse_from.load(Ordering::SeqCst) {
                         return (
                             StatusCode::FORBIDDEN,
                             Json(json!({"jsonrpc":"2.0","id":1,
@@ -1155,8 +1156,13 @@ mod tests {
             for fanout in [1usize, 4] {
                 let (requests, peak) =
                     (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-                let (url, server) =
-                    slow_capped_rpc(10, delay, requests.clone(), peak.clone()).await;
+                let (url, server) = slow_capped_rpc(
+                    Arc::new(AtomicUsize::new(10)),
+                    delay,
+                    requests.clone(),
+                    peak.clone(),
+                )
+                .await;
                 let c = super::RpcClient::new(vec![url]).unwrap();
                 c.set_log_group_fanout(fanout);
                 if !learn {
@@ -1210,8 +1216,13 @@ mod tests {
         let mut runs = Vec::new();
         for fanout in [1usize, 3] {
             let (requests, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-            let (url, server) =
-                slow_capped_rpc(2, std::time::Duration::from_millis(5), requests, peak).await;
+            let (url, server) = slow_capped_rpc(
+                Arc::new(AtomicUsize::new(2)),
+                std::time::Duration::from_millis(5),
+                requests,
+                peak,
+            )
+            .await;
             let c = super::RpcClient::new(vec![url]).unwrap();
             c.set_log_group_fanout(fanout);
             let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
@@ -1224,6 +1235,46 @@ mod tests {
         }
         assert_eq!(runs[0].len(), 7);
         assert_eq!(runs[0], runs[1]);
+    }
+
+    /// A cap that tightens after it was learned: the groups already answered are kept, only the
+    /// rest is asked again, and the rows are the one-at-a-time rows.
+    #[tokio::test]
+    async fn a_cap_that_tightens_mid_list_keeps_the_groups_already_answered() {
+        let addrs: Vec<String> = (1..=60u64).map(|i| format!("0x{i:040x}")).collect();
+        let mut runs = Vec::new();
+        for fanout in [1usize, 2] {
+            let (requests, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let refuse = Arc::new(AtomicUsize::new(10));
+            let (url, server) = slow_capped_rpc(
+                refuse.clone(),
+                std::time::Duration::from_millis(5),
+                requests.clone(),
+                peak,
+            )
+            .await;
+            let c = super::RpcClient::new(vec![url]).unwrap();
+            c.set_log_group_fanout(fanout);
+            c.get_logs(&addrs[..12], &[], 100, 102).await.unwrap(); // learns a cap of 6
+            refuse.store(4, Ordering::SeqCst); // the endpoint now takes at most 3
+            requests.store(0, Ordering::SeqCst);
+            let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+            server.abort();
+            runs.push((
+                logs.iter()
+                    .map(|l| (l.block_number, l.log_index))
+                    .collect::<Vec<_>>(),
+                requests.load(Ordering::SeqCst),
+            ));
+        }
+        assert_eq!(runs[0].0.len(), 60);
+        assert_eq!(runs[0].0, runs[1].0);
+        assert!(
+            runs[1].1 <= runs[0].1 + 3,
+            "answered groups are not asked again: {} requests parallel, {} sequential",
+            runs[1].1,
+            runs[0].1
+        );
     }
 
     /// **The guard that makes the timestamp cache sound at all** (RFC-0029 §6d).

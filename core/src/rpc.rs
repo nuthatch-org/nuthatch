@@ -2524,35 +2524,43 @@ impl<T: Transport> RpcClient<T> {
                 .get_logs_once(addresses, topic0s, topics, from, to)
                 .await;
         }
+        let mut logs = Vec::new();
+        let mut groups = 0usize;
+        let mut done = 0usize;
         // Once an endpoint's address cap is known, the groups are independent requests: ask up to
-        // `log_group_fanout` of them at a time. A refusal lowers the cap and starts over at the new
-        // width, so what comes back is what the one-at-a-time loop below would have returned.
+        // `log_group_fanout` of them at a time. A refusal lowers the cap; the groups already
+        // answered are kept and the rest go on at the new width, as in the loop below, so what comes
+        // back is what the one-at-a-time loop would have returned.
         loop {
             let fanout = self.log_group_fanout.load(Ordering::Relaxed);
-            let cap = self.log_address_cap.load(Ordering::Relaxed);
-            if fanout <= 1 || addresses.len() <= cap {
+            let cap = self.log_address_cap.load(Ordering::Relaxed).max(1);
+            let rest = &addresses[done..];
+            if fanout <= 1 || rest.len() <= cap {
                 break;
             }
-            let groups: Vec<&[String]> = addresses.chunks(cap.max(1)).collect();
+            let chunks: Vec<&[String]> = rest.chunks(cap).collect();
             let mut asks: Vec<futures::future::BoxFuture<'_, Result<Vec<Log>>>> =
-                Vec::with_capacity(groups.len());
-            for g in &groups {
+                Vec::with_capacity(chunks.len());
+            for g in &chunks {
                 asks.push(Box::pin(self.get_logs_once(g, topic0s, topics, from, to)));
             }
             let mut answers = futures::StreamExt::buffered(futures::stream::iter(asks), fanout);
-            let mut logs = Vec::new();
             let mut at = 0usize;
             let mut lowered = false;
             while let Some(answer) = futures::StreamExt::next(&mut answers).await {
                 match answer {
-                    Ok(mut l) => logs.append(&mut l),
-                    Err(e) if groups[at].len() > 1 && filter_refused(&e) => {
-                        let half = groups[at].len().div_ceil(2);
+                    Ok(mut l) => {
+                        logs.append(&mut l);
+                        done += chunks[at].len();
+                        groups += 1;
+                    }
+                    Err(e) if chunks[at].len() > 1 && filter_refused(&e) => {
+                        let half = chunks[at].len().div_ceil(2);
                         if self.log_address_cap.fetch_min(half, Ordering::Relaxed) > half {
                             tracing::info!(
                                 "eth_getLogs naming {} addresses was refused ({e:#}); asking in \
                                  groups of at most {half}",
-                                groups[at].len()
+                                chunks[at].len()
                             );
                         }
                         lowered = true;
@@ -2563,13 +2571,9 @@ impl<T: Transport> RpcClient<T> {
                 at += 1;
             }
             if !lowered {
-                logs.sort_by_key(|l| (l.block_number, l.log_index));
-                return Ok(logs);
+                break;
             }
         }
-        let mut logs = Vec::new();
-        let mut groups = 0usize;
-        let mut done = 0usize;
         while done < addresses.len() {
             let cap = self.log_address_cap.load(Ordering::Relaxed);
             let group = &addresses[done..addresses.len().min(done.saturating_add(cap))];
