@@ -168,6 +168,8 @@ mod graph_scaffold_id;
 #[cfg(feature = "graph")]
 #[path = "graph_schema_golden.rs"]
 mod graph_schema_golden;
+#[path = "header_calls_dense_range.rs"]
+mod header_calls_dense_range;
 #[path = "ivm_claims.rs"]
 mod ivm_claims;
 #[path = "launch_copy.rs"]
