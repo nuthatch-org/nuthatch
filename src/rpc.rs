@@ -3764,7 +3764,7 @@ mod batch_width_tests {
 
     #[tokio::test]
     async fn a_413_that_states_no_maximum_is_searched_to_the_width_it_takes() {
-        // 450 -> 225 -> 112 -> 56 ok -> 84 -> 98 -> 105 -> 101 -> 100: a binary search between the
+        // 450 -> 225 -> 112 -> 56 ok -> 84 -> 98 -> 105 -> 101 -> 99 ok -> 100 ok: a binary search between the
         // widest width known good and the narrowest known refused, so it lands on the real limit.
         check_calls(Refusal::Http413Bare, 100, 450, 8, 100).await;
     }

@@ -3,8 +3,8 @@
 //! Providers cap a batch at very different sizes (GraphOps 100 and answers HTTP 413
 //! `rpc_batch_too_large` with *no* call run, Alchemy ~1000, arbitrum.drpc.org 3), and no constant is
 //! right for all of them. One [`BatchLimit`] per endpoint starts unlimited, narrows the moment the
-//! endpoint refuses a batch for its size, and creeps back up after a long run of successes so a raised
-//! limit is noticed. The policy is deterministic: counts only, no clocks, no randomness.
+//! endpoint refuses a batch for its size by binary search, re-tries a known-bad width after a long
+//! run of successes so a raised limit is noticed, and doubles back up once that width is taken. The policy is deterministic: counts only, no clocks, no randomness.
 
 use crate::rpc::{body_capped, class_of, ClassifiedError, FailureClass};
 use std::sync::Mutex;
@@ -160,8 +160,9 @@ impl BatchLimit {
     /// otherwise `sent` becomes the known-bad width and the search moves to the midpoint.
     pub fn refused(&self, sent: usize, stated_max: Option<usize>) -> Narrowed {
         let mut s = self.state();
-        if sent >= s.fail {
-            // A width already known bad was tried again (a backoff probe): wait longer next time.
+        if sent == s.fail {
+            // The known-bad width itself was tried again (a backoff probe; a wider batch already
+            // in flight is not one): wait longer next time.
             s.failed_probes = (s.failed_probes + 1).min(MAX_BACKOFF_SHIFT);
         }
         match stated_max.filter(|m| *m < sent) {

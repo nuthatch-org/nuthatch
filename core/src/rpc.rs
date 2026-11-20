@@ -1405,7 +1405,7 @@ impl<T: Transport> RpcClient<T> {
     /// batch for its size (HTTP 413, `rpc_batch_too_large`, a "batch ... too large/limit" error, or an
     /// empty answer) the width is narrowed - straight to the refusal's own maximum if it states one -
     /// and the *same* calls are re-sent in narrower batches, so none is dropped and each is answered
-    /// once. Such a refusal is a finding about the batch, not the endpoint: it never reaches
+    /// once (a lone call is never split, so its own short answer is returned as before). Such a refusal is a finding about the batch, not the endpoint: it never reaches
     /// `record_failure`, so no cooldown and no rate-limit backoff.
     async fn post_batch_adaptive(
         &self,
