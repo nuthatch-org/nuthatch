@@ -1,0 +1,165 @@
+⠋⠙⠹⠸npm warn deprecated inflight@1.0.6: This module is not supported
+npm warn deprecated glob@7.2.3: Glob versions prior to v9 are no longer supported
+npm http fetch GET 200 https://registry.npmjs.org/pkg-000 20ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-001 21ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-002 22ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-003 23ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-004 24ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-005 25ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-006 26ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-007 27ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-008 28ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-009 29ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-010 30ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-011 31ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-012 32ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-013 33ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-014 34ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-015 35ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-016 36ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-017 37ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-018 38ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-019 39ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-020 40ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-021 41ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-022 42ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-023 43ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-024 44ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-025 45ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-026 46ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-027 47ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-028 48ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-029 49ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-030 50ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-031 51ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-032 52ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-033 53ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-034 54ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-035 55ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-036 56ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-037 57ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-038 58ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-039 59ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-040 20ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-041 21ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-042 22ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-043 23ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-044 24ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-045 25ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-046 26ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-047 27ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-048 28ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-049 29ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-050 30ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-051 31ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-052 32ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-053 33ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-054 34ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-055 35ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-056 36ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-057 37ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-058 38ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-059 39ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-060 40ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-061 41ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-062 42ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-063 43ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-064 44ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-065 45ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-066 46ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-067 47ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-068 48ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-069 49ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-070 50ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-071 51ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-072 52ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-073 53ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-074 54ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-075 55ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-076 56ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-077 57ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-078 58ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-079 59ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-080 20ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-081 21ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-082 22ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-083 23ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-084 24ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-085 25ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-086 26ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-087 27ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-088 28ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-089 29ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-090 30ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-091 31ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-092 32ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-093 33ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-094 34ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-095 35ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-096 36ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-097 37ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-098 38ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-099 39ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-100 40ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-101 41ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-102 42ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-103 43ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-104 44ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-105 45ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-106 46ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-107 47ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-108 48ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-109 49ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-110 50ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-111 51ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-112 52ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-113 53ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-114 54ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-115 55ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-116 56ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-117 57ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-118 58ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-119 59ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-120 20ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-121 21ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-122 22ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-123 23ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-124 24ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-125 25ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-126 26ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-127 27ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-128 28ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-129 29ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-130 30ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-131 31ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-132 32ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-133 33ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-134 34ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-135 35ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-136 36ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-137 37ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-138 38ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-139 39ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-140 40ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-141 41ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-142 42ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-143 43ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-144 44ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-145 45ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-146 46ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-147 47ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-148 48ms
+npm http fetch GET 200 https://registry.npmjs.org/pkg-149 49ms
+[##########..........] \ idealTree:foo: sill placeBep
+[####################] reify:bar
+
+added 612 packages, and audited 613 packages in 14s
+
+98 packages are looking for funding
+  run `npm fund` for details
+
+2 high severity vulnerabilities
+
+npm ERR! code E403
+npm ERR! 403 Forbidden - GET https://registry.npmjs.org/private-pkg
+Authorization: Bearer abcdef1234567890abcdef
