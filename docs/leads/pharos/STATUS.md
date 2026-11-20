@@ -1,4 +1,6 @@
 # pharos: DONE (verdict: feasible)
-Measured: 2 LP tokens, blocks 10,000,000..26,450,931, 7m26s, 109,446 events, 4-way on public Tenderly, supply check passes.
+Measured: 2 LP tokens, blocks 10,000,000..26,450,931, 7m26s, 109,446 events, 4-way on public Tenderly, supply check passes (a mass-conservation check only: it does not catch errors between two non-zero holders; no per-holder balanceOf comparison was run).
+Run that produced the 7m26s: nest-spec/pharos-eth.toml (lusd3crv from 12,240,000, univ2_usdc_usdt from 10,000,000; backfill range starts at 10,000,000). Its log line is in evidence/backfill-log-excerpt.txt. pharos-eth-wide.toml is a different, 10-token run and starts lusd3crv at 12,184,843; the two specs deliberately differ, the first token's supply matched with 12,240,000.
+Known limits of the prepared patch (not fixed in it): re-running with a different token list than the existing nuthatch.toml can map two tokens to the same table alias, and `waitForTip` has no deadline and does not notice the nuthatch child exiting. Fix both before posting.
 Patch: repo branch nuthatch-lp-replay (commit 6246678) + 0001-*.patch. Draft: DISCUSSION-DRAFT.md. Prompts: AGENT-PROMPTS.md.
 Not measured: Dwellir baseline, RPC call count (nest has no counter; ~3300 windows of 5000 blocks plus retries), 10-token run (killed by 429s).

@@ -1,4 +1,6 @@
 {
+  "_note": "backfill_seconds is the duration of this scan-script invocation, not the backfill. The 5 s figure is a re-check against an already sealed nest, so the 7m26s backfill (109,446 events, blocks 10,000,000..26,450,931, spec nest-spec/pharos-eth.toml, 4-way) is not in this file; it is the nest log line in evidence/backfill-log-excerpt.txt. That the 5 s run used --attach is inferred, not recorded.",
+  "run_mode": "recheck_against_sealed_nest",
   "backfill_seconds": 5,
   "tokens": [
     {

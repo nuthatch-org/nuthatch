@@ -40,7 +40,7 @@ index fb8484d..76288e3 100644
 +      ],
 +      "rules": [
 +        "Read-only and opt-in: the script never touches the Worker, D1, the DEX registry or any scoring path.",
-+        "Keep `replay + balanceOf(0x0) == totalSupply` as the acceptance check; a failing token is a failed scan, not a rounding issue."
++        "`replay + balanceOf(0x0) == totalSupply` is a mass-conservation check only: it catches missing mints and burns, not wrong, missing or duplicated transfers between two non-zero holders. A failing token is a failed scan; a passing one is not proof of correct balances."
 +      ]
 +    },
      {

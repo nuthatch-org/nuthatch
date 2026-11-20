@@ -1,0 +1,156 @@
+2026-11-19T18:47:35.914536Z  INFO hyperevm blocks every 980ms; polling every 300s (--poll-interval overrides)
+2026-11-19T18:47:35.914568Z  INFO seal-direct backfill runs 2-way, on one RPC endpoint as on several: a single endpoint is no longer capped to one window at a time
+2026-11-19T18:47:35.926684Z  INFO factory nest: 3 template(s), 4 rule(s) - children discovered at runtime
+2026-11-19T18:47:35.926702Z  INFO indexing nest 'beefy-hyperevm' on hyperevm: 3 contract(s), 34 table(s), 0 anonymous skipped, finality Depth(64), window 160, registry 70aa4fe97086…
+2026-11-19T18:47:35.927190Z  WARN semantic.toml drift: semantic.toml describes table `reward_pool_factory__proxy_created`, which the registry has no decoder for
+2026-11-19T18:47:35.947252Z  INFO API live on http://127.0.0.1:8289  (try GET /  and  /metrics)
+2026-11-19T18:47:36.196899Z  INFO factory backfill runs sequentially (--concurrency 2 ignored until the step-5 filter flip)
+2026-11-19T18:47:36.196913Z  INFO seal-direct factory backfill: 51684717..=51704653 (tip 51704717, sequential two-pass)…
+2026-11-19T18:47:37.953459Z  WARN factory getLogs 51685515..=51685676 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:47:38.204977Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:47:40.890629Z  WARN factory getLogs 51686315..=51686476 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:47:41.142087Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:47:42.149347Z  WARN factory getLogs 51686315..=51686476 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:47:42.651121Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:47:44.425391Z  WARN factory getLogs 51686315..=51686476 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:47:45.426648Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.999s as asked before trying again
+2026-11-19T18:47:48.688575Z  WARN factory getLogs 51686315..=51686476 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:47:50.690138Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:47:56.953905Z  WARN factory getLogs 51686315..=51686476 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:48:00.955134Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.998s as asked before trying again
+2026-11-19T18:48:13.206761Z  INFO sealing history 8.8% - block 51686476 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:48:16.156543Z  WARN factory getLogs 51688075..=51688236 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:48:16.407887Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:48:17.919166Z  WARN factory getLogs 51688235..=51688396 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:48:18.170695Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:48:19.195287Z  WARN factory getLogs 51688235..=51688396 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:48:19.697072Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:48:21.565170Z  WARN factory getLogs 51688235..=51688396 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:48:22.567203Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:48:25.817684Z  WARN factory getLogs 51688235..=51688396 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:48:27.819246Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:48:34.069319Z  WARN factory getLogs 51688235..=51688396 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:48:38.070863Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.999s as asked before trying again
+2026-11-19T18:48:50.323914Z  WARN factory getLogs 51688235..=51688396 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:48:58.325160Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.998s as asked before trying again
+2026-11-19T18:49:20.590978Z  INFO sealing history 18.5% - block 51688396 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:49:23.782963Z  WARN factory getLogs 51689835..=51689996 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:49:24.033293Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:49:25.033267Z  WARN factory getLogs 51689835..=51689996 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:49:25.535045Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:49:27.541825Z  WARN factory getLogs 51689995..=51690156 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:49:27.793297Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:49:28.792915Z  WARN factory getLogs 51689995..=51690156 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:49:29.294120Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:49:31.041605Z  WARN factory getLogs 51689995..=51690156 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:49:32.043224Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:49:35.291848Z  WARN factory getLogs 51689995..=51690156 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:49:37.293004Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:49:43.560679Z  WARN factory getLogs 51689995..=51690156 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:49:47.562069Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.998s as asked before trying again
+2026-11-19T18:49:59.811324Z  WARN factory getLogs 51689995..=51690156 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:50:07.812450Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.999s as asked before trying again
+2026-11-19T18:50:30.068728Z  INFO sealing history 27.3% - block 51690156 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:50:32.468257Z  WARN factory getLogs 51691435..=51691596 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:50:32.719601Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:50:33.730588Z  WARN factory getLogs 51691435..=51691596 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:50:34.232243Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:50:35.981704Z  WARN factory getLogs 51691435..=51691596 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:50:36.983249Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:50:40.230354Z  WARN factory getLogs 51691435..=51691596 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:50:42.232281Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:50:48.491720Z  INFO sealing history 34.5% - block 51691596 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:50:49.284360Z  WARN factory getLogs 51691915..=51692076 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:50:49.535883Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:50:50.546288Z  WARN factory getLogs 51691915..=51692076 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:50:51.048006Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:50:52.806826Z  WARN factory getLogs 51691915..=51692076 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:50:53.808259Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:50:57.092343Z  WARN factory getLogs 51691915..=51692076 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:50:59.094251Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:51:05.365332Z  INFO sealing history 36.9% - block 51692076 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:51:07.784303Z  WARN factory getLogs 51693195..=51693356 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:51:08.035829Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:51:09.036863Z  WARN factory getLogs 51693195..=51693356 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:51:09.538155Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:51:12.563162Z  WARN factory getLogs 51693835..=51693996 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:51:12.814699Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:51:13.913354Z  WARN factory getLogs 51693835..=51693996 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:51:14.415151Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:51:16.164655Z  WARN factory getLogs 51693835..=51693996 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:51:17.166240Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:51:20.415216Z  WARN factory getLogs 51693835..=51693996 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:51:22.417082Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:51:28.664609Z  WARN factory getLogs 51693835..=51693996 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:51:32.666211Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.998s as asked before trying again
+2026-11-19T18:51:44.916983Z  WARN factory getLogs 51693835..=51693996 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:51:52.918198Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.998s as asked before trying again
+2026-11-19T18:52:15.176168Z  INFO sealing history 46.5% - block 51693996 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:52:17.986997Z  WARN factory getLogs 51695275..=51695436 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:52:18.238153Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:52:20.297724Z  WARN factory getLogs 51695755..=51695916 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:52:20.549148Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:52:21.548279Z  WARN factory getLogs 51695755..=51695916 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:52:22.050077Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:52:23.806674Z  WARN factory getLogs 51695755..=51695916 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:52:24.807961Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.999s as asked before trying again
+2026-11-19T18:52:28.056320Z  WARN factory getLogs 51695755..=51695916 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:52:30.057512Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.999s as asked before trying again
+2026-11-19T18:52:36.305546Z  WARN factory getLogs 51695755..=51695916 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:52:40.306921Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.999s as asked before trying again
+2026-11-19T18:52:52.653325Z  WARN factory getLogs 51695755..=51695916 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:53:00.655288Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.998s as asked before trying again
+2026-11-19T18:53:23.192578Z  INFO sealing history 56.2% - block 51695916 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:53:26.183035Z  WARN factory getLogs 51697355..=51697516 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:53:26.433348Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 750ms as asked before trying again
+2026-11-19T18:53:27.433336Z  WARN factory getLogs 51697355..=51697516 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:53:27.935013Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:53:29.937909Z  WARN factory getLogs 51697515..=51697676 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:53:30.189067Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:53:31.496020Z  WARN factory getLogs 51697675..=51697836 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:53:31.746549Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 750ms as asked before trying again
+2026-11-19T18:53:32.749482Z  WARN factory getLogs 51697675..=51697836 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:53:33.251246Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:53:35.239027Z  WARN factory getLogs 51697675..=51697836 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:53:36.239628Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 3s as asked before trying again
+2026-11-19T18:53:39.490867Z  WARN factory getLogs 51697675..=51697836 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:53:41.492263Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.998s as asked before trying again
+2026-11-19T18:53:47.927994Z  WARN factory getLogs 51697675..=51697836 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:53:51.928342Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.999s as asked before trying again
+2026-11-19T18:54:04.212732Z  INFO sealing history 65.8% - block 51697836 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:54:07.461432Z  WARN factory getLogs 51699275..=51699436 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:54:07.712830Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 749ms as asked before trying again
+2026-11-19T18:54:08.718080Z  WARN factory getLogs 51699275..=51699436 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:54:09.218766Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.5s as asked before trying again
+2026-11-19T18:54:10.968678Z  WARN factory getLogs 51699275..=51699436 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:54:11.969852Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.999s as asked before trying again
+2026-11-19T18:54:16.131080Z  WARN factory getLogs 51699595..=51699756 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:54:16.381471Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 750ms as asked before trying again
+2026-11-19T18:54:17.401146Z  WARN factory getLogs 51699595..=51699756 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:54:17.901905Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.5s as asked before trying again
+2026-11-19T18:54:19.650581Z  WARN factory getLogs 51699595..=51699756 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:54:20.651424Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.999s as asked before trying again
+2026-11-19T18:54:23.900004Z  WARN factory getLogs 51699595..=51699756 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:54:25.900384Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.999s as asked before trying again
+2026-11-19T18:54:32.149695Z  WARN factory getLogs 51699595..=51699756 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:54:36.150655Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.999s as asked before trying again
+2026-11-19T18:54:48.400462Z  WARN factory getLogs 51699595..=51699756 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:54:56.401357Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.999s as asked before trying again
+2026-11-19T18:55:18.680391Z  INFO sealing history 75.4% - block 51699756 of 51704653, 0 events, 0 ev/s
+2026-11-19T18:55:21.300565Z  WARN factory getLogs 51701035..=51701196 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:55:21.552066Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:55:22.549725Z  WARN factory getLogs 51701035..=51701196 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:55:23.051252Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.498s as asked before trying again
+2026-11-19T18:55:25.647863Z  WARN factory getLogs 51701515..=51701676 failed (attempt 1): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 250ms
+2026-11-19T18:55:25.899270Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 748ms as asked before trying again
+2026-11-19T18:55:26.897063Z  WARN factory getLogs 51701515..=51701676 failed (attempt 2): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 500ms
+2026-11-19T18:55:27.397780Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 1.5s as asked before trying again
+2026-11-19T18:55:29.147839Z  WARN factory getLogs 51701515..=51701676 failed (attempt 3): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 1s
+2026-11-19T18:55:30.149094Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 2.998s as asked before trying again
+2026-11-19T18:55:33.412182Z  WARN factory getLogs 51701515..=51701676 failed (attempt 4): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 2s
+2026-11-19T18:55:35.413303Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 5.999s as asked before trying again
+2026-11-19T18:55:41.663805Z  WARN factory getLogs 51701515..=51701676 failed (attempt 5): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 4s
+2026-11-19T18:55:45.665241Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 11.998s as asked before trying again
+2026-11-19T18:55:57.917221Z  WARN factory getLogs 51701515..=51701676 failed (attempt 6): rpc error: {"code":-32005,"message":"rate limited"}; retrying in 8s
+2026-11-19T18:56:05.919076Z  WARN every RPC endpoint (1) is rate-limiting us; waiting 21.998s as asked before trying again
+2026-11-19T18:56:23.280913Z  INFO shutdown signal received; API stopped
