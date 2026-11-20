@@ -109,6 +109,12 @@ model, the prompt-set hash, seconds, exit code and, for Claude, cost) and one li
 with the same `prompt_set_sha256`: a changed prompt or fixture is a different eval. One run per cell
 is an anecdote; `--runs 3` or more before reading a change into it.
 
+Provenance note for `results/2026-11-19.json`: the 15 indexer-hint rows record `6aa575cf-dirty`. They
+were produced by this branch's `run.sh` (the one that accepts `--condition indexer-hint`) run from a
+working tree whose HEAD was 6aa575cf, with the script change not yet committed. The `run.sh` at
+6aa575cf itself rejects that condition, so the cited commit alone cannot reproduce them; the script
+that did is the one in the commit that adds these rows. They have not been rerun from a clean checkout.
+
 ## 5.23.0 run (#3023), Claude Code only
 
 Claude Code 2.1.327, `claude-sonnet-5-5`, all 5 prompts, 3 runs each, 600 s, one condition at a time (the

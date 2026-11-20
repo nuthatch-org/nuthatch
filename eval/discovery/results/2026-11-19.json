@@ -4,7 +4,7 @@
   "runs": [
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -32,7 +32,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -60,7 +60,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -88,7 +88,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -117,7 +117,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -145,7 +145,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -173,7 +173,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -201,7 +201,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -229,7 +229,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -257,7 +257,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -285,7 +285,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -313,7 +313,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -341,7 +341,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -369,7 +369,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
@@ -397,7 +397,7 @@
     },
     {
       "date": "2026-11-19",
-      "commit": "6aa575cf",
+      "commit": "6aa575cf-dirty",
       "prompt_set_sha256": "53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c",
       "agent": "claude",
       "agent_version": "2.1.327",
