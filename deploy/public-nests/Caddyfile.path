@@ -75,3 +75,86 @@ base-usdc.89.167.109.4.sslip.io {
 		}
 	}
 }
+
+# The lead nests (docs/hosted-nests.md, deploy/hosted-nest/new-nest.sh): /nests/{gooddollar-xdc,sablier-xdc,pharos-eth}.
+# BEGIN nuthatch-public gooddollar-xdc
+gooddollar-xdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8484 {
+			header_up Host gooddollar-xdc.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8484 {
+			header_up Host gooddollar-xdc.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public gooddollar-xdc
+# BEGIN nuthatch-public sablier-xdc
+sablier-xdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8485 {
+			header_up Host sablier-xdc.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8485 {
+			header_up Host sablier-xdc.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public sablier-xdc
+# BEGIN nuthatch-public pharos-eth
+pharos-eth.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8486 {
+			header_up Host pharos-eth.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8486 {
+			header_up Host pharos-eth.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public pharos-eth

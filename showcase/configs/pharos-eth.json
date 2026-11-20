@@ -1,0 +1,20 @@
+{
+  "title": "LP token holders on Ethereum",
+  "tagline": "Two liquidity-pool tokens, every Transfer since launch, so balances, holder concentration and supply can be replayed with plain SQL. Block times are not stored in this nest, so use block numbers.",
+  "chain": "Ethereum (1)",
+  "events": { "table": "lusd3crv__transfer", "from": "from", "to": "to", "amount": "value", "decimals": 18, "symbol": "LUSD3CRV" },
+  "queries": [
+    { "title": "Latest LUSD3CRV transfers", "sql": "SELECT block_number, \"from\", \"to\", value_dec FROM lusd3crv__transfer ORDER BY block_number DESC, log_index DESC LIMIT 20" },
+    { "title": "Top 10 LUSD3CRV holders", "sql": "WITH m AS (SELECT \"to\" AS a, value_dec AS v FROM lusd3crv__transfer UNION ALL SELECT \"from\", -value_dec FROM lusd3crv__transfer) SELECT a AS holder, sum(v) AS balance_base_units FROM m GROUP BY 1 ORDER BY 2 DESC LIMIT 10" },
+    { "title": "Mints and burns per 2.6M-block bucket", "sql": "SELECT floor(block_number / 2600000) AS epoch, sum(CASE WHEN \"from\" = '0x0000000000000000000000000000000000000000' THEN value_dec ELSE 0 END) AS minted, sum(CASE WHEN \"to\" = '0x0000000000000000000000000000000000000000' THEN value_dec ELSE 0 END) AS burned FROM lusd3crv__transfer GROUP BY 1 ORDER BY 1" },
+    { "title": "Rows per token", "sql": "SELECT 'lusd3crv' AS token, count(*) AS transfers, min(block_number) AS first_block, max(block_number) AS last_block FROM lusd3crv__transfer UNION ALL SELECT 'univ2_usdc_usdt', count(*), min(block_number), max(block_number) FROM univ2_usdc_usdt__transfer" },
+    { "title": "Uniswap V2 USDC/USDT LP: busiest addresses", "sql": "SELECT \"to\" AS address, count(*) AS received FROM univ2_usdc_usdt__transfer GROUP BY 1 ORDER BY received DESC LIMIT 10" }
+  ],
+  "prompts": [
+    "List the top 10 holders of LP token 0xed279fdd11ca84beef15af5d39bb4d4bee23f0ca (table lusd3crv__transfer) by balance, each with its percent of total supply. Flag any holder above 5 percent.",
+    "Replay all Transfer rows of LP token 0x3041cbd36888becc7bbcbc0045e3b1f144466f5f (table univ2_usdc_usdt__transfer): sum received minus sum sent per address. Show the non-zero balances plus the 0x0 balance sum to zero.",
+    "Show how many LUSD3CRV tokens were minted (from = 0x0) and burned (to = 0x0) per block bucket of 2,600,000 blocks, and the bucket with the largest net change.",
+    "How many transfers does each of the two tokens have, and what block range does each cover?",
+    "List every table in this nest with its row count, then say in two sentences what the data is good for."
+  ]
+}

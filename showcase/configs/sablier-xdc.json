@@ -1,0 +1,20 @@
+{
+  "title": "Sablier on XDC",
+  "tagline": "Sablier Lockup, Flow and Airdrops on XDC as event tables, indexed from a public RPC with no HyperSync. The Stream, Action and Campaign entities are not built here.",
+  "chain": "XDC (50)",
+  "events": { "table": "lockup_v2_0__create_lockup_linear_stream", "from": "", "decimals": 18, "symbol": "" },
+  "queries": [
+    { "title": "Lockup streams created, per contract version and kind", "sql": "SELECT 'v2.0 linear' AS kind, count(*) AS streams FROM lockup_v2_0__create_lockup_linear_stream UNION ALL SELECT 'v2.0 dynamic', count(*) FROM lockup_v2_0__create_lockup_dynamic_stream UNION ALL SELECT 'v2.0 tranched', count(*) FROM lockup_v2_0__create_lockup_tranched_stream UNION ALL SELECT 'v4.0 linear', count(*) FROM lockup_v4_0__create_lockup_linear_stream UNION ALL SELECT 'v4.0 dynamic', count(*) FROM lockup_v4_0__create_lockup_dynamic_stream UNION ALL SELECT 'v4.0 tranched', count(*) FROM lockup_v4_0__create_lockup_tranched_stream" },
+    { "title": "Most recent v2.0 linear streams", "sql": "SELECT \"streamId_dec\", block_number, block_timestamp, tx_hash FROM lockup_v2_0__create_lockup_linear_stream ORDER BY block_number DESC LIMIT 5" },
+    { "title": "Lockup withdrawals and cancels", "sql": "SELECT 'withdraw' AS kind, count(*) AS n FROM lockup_v2_0__withdraw_from_lockup_stream UNION ALL SELECT 'cancel', count(*) FROM lockup_v2_0__cancel_lockup_stream" },
+    { "title": "Flow streams created, paused, voided", "sql": "SELECT 'created' AS kind, count(*) AS n, min(block_timestamp) AS first_ts, max(block_timestamp) AS last_ts FROM flow_v1_1__create_flow_stream UNION ALL SELECT 'paused', count(*), min(block_timestamp), max(block_timestamp) FROM flow_v1_1__pause_flow_stream UNION ALL SELECT 'voided', count(*), min(block_timestamp), max(block_timestamp) FROM flow_v1_1__void_flow_stream" },
+    { "title": "Airdrop campaigns created by the v3.0 factories", "sql": "SELECT 'instant' AS kind, count(*) AS campaigns FROM factory_merkle_instant_v3_0__create_merkle_instant UNION ALL SELECT 'linear', count(*) FROM factory_merkle_ll_v3_0__create_merkle_l_l UNION ALL SELECT 'tranched', count(*) FROM factory_merkle_lt_v3_0__create_merkle_l_t UNION ALL SELECT 'vca', count(*) FROM factory_merkle_vca_v3_0__create_merkle_v_c_a" }
+  ],
+  "prompts": [
+    "List the Sablier Lockup streams created on XDC: a count per contract version (lockup_v2_0, lockup_v3_0, lockup_v4_0 create_lockup_* tables) and the 5 most recent streams with streamId_dec, block_timestamp and tx_hash. Use the _dec columns.",
+    "How many Flow streams were created on XDC, how many were paused, voided or refunded, and what are the first and last block_timestamp of any Flow event? Tables are flow_v1_1__*, flow_v2_0__*, flow_v3_0__*.",
+    "List every Sablier Airdrops campaign created on XDC (tables factory_merkle_*__create_* and merkle_factory_v1_3__create_*): campaign address, creation block and factory version. Which have emitted events in the merkle_* child tables?",
+    "What is the highest block this nest has indexed, and when was the newest Sablier event on XDC?",
+    "List every non-empty table in this nest with its row count and say in two sentences what the data is good for."
+  ]
+}

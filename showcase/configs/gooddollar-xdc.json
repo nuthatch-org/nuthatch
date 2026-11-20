@@ -1,0 +1,20 @@
+{
+  "title": "GoodDollar UBI claims on XDC",
+  "tagline": "Every UBIScheme event on XDC since the contract was deployed, indexed from a public RPC by one Rust binary. No HyperSync, no hosted indexer.",
+  "chain": "XDC (50)",
+  "events": { "table": "ubi_scheme__u_b_i_claimed", "from": "claimer", "amount": "amount", "decimals": 18, "symbol": "G$" },
+  "queries": [
+    { "title": "Latest claims", "sql": "SELECT block_number, block_timestamp, claimer, amount_dec FROM ubi_scheme__u_b_i_claimed ORDER BY block_number DESC, log_index DESC LIMIT 20" },
+    { "title": "Claims per day, last 14 days of data", "sql": "SELECT date_trunc('day', to_timestamp(block_timestamp)) AS day, count(*) AS claims, sum(amount_dec) AS total_base_units FROM ubi_scheme__u_b_i_claimed WHERE block_timestamp > (SELECT max(block_timestamp) FROM ubi_scheme__u_b_i_claimed) - 14 * 86400 GROUP BY 1 ORDER BY 1" },
+    { "title": "Distinct claimers, ever", "sql": "SELECT count(DISTINCT claimer) AS claimers, count(*) AS claims FROM ubi_scheme__u_b_i_claimed" },
+    { "title": "Top 10 claimers by number of claims", "sql": "SELECT claimer, count(*) AS claims, min(block_timestamp) AS first_claim, max(block_timestamp) AS last_claim FROM ubi_scheme__u_b_i_claimed GROUP BY 1 ORDER BY claims DESC LIMIT 10" },
+    { "title": "Daily UBI per claimer, latest protocol days", "sql": "SELECT \"day\", \"dailyUbi_dec\", \"blockNumber\" FROM ubi_scheme__u_b_i_calculated ORDER BY block_number DESC LIMIT 20" }
+  ],
+  "prompts": [
+    "Count UBIClaimed events per UTC day for the last 14 days of data on this nest and give the total G$ claimed per day. Amounts are in the amount_dec column with 18 decimals.",
+    "How many distinct addresses have ever claimed UBI on XDC, and how many claimed in the most recent 30 days of data?",
+    "List the top 10 claimers by number of claims with their first and last claim time.",
+    "Join UBICalculated (day, dailyUbi_dec) with the claim count per day. Which protocol days changed the daily UBI per claimer by more than 20 percent from the previous day?",
+    "What is the highest block this nest has indexed and what is the timestamp of the newest claim? Then list every table with its row count."
+  ]
+}

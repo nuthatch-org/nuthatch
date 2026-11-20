@@ -86,6 +86,7 @@ function infer(cfg, tables) {
   ev.decimals = ev.decimals ?? 0;
   ev.symbol = ev.symbol || "";
   ev.userCols = user;
+  ev.hasTs = t.columns.some((c) => c.name === "block_timestamp"); // a nest with block_timestamps = false has none
   return ev;
 }
 
@@ -226,7 +227,9 @@ async function renderStatus() {
 
 async function renderTables(tables) {
   const parts = tables.map((t) => `SELECT '${t.table}' AS t, count(*) AS n, min(block_number) AS a, max(block_number) AS b FROM ${qi(t.table)}`);
-  const res = await sql(parts.join(" UNION ALL "));
+  // 25 tables a statement: one UNION over a 200-table nest is over the proxy's URL limit
+  const res = { rows: [] };
+  for (let i = 0; i < parts.length; i += 25) res.rows.push(...(await sql(parts.slice(i, i + 25).join(" UNION ALL "))).rows);
   const by = Object.fromEntries(res.rows.map((r) => [r.t, r]));
   const rows = tables.map((t) => Object.assign({ table: t.table, event: t.event }, by[t.table] || {}));
   renderTable($("#tables"), ["table", "event", "n", "a", "b"], rows, {
@@ -239,6 +242,11 @@ async function renderTables(tables) {
 
 async function renderCharts(ev) {
   const T = qi(ev.table);
+  if (!ev.hasTs) {
+    $("#chart-activity").textContent = "This nest does not store block times, so there is no time series.";
+    $("#chart-top").textContent = "";
+    return;
+  }
   const act = await sql(`SELECT date_trunc('hour', to_timestamp(block_timestamp)) AS t, count(*) AS n FROM ${T} WHERE block_timestamp > extract(epoch from now()) - 86400 GROUP BY 1 ORDER BY 1`);
   $("#activity-sub").textContent = `${ev.table} events per hour (UTC)`;
   barChart($("#chart-activity"), act.rows.map((r) => ({ t: r.t.replace("T", " ").replace(":00:00Z", ":00 UTC"), x: r.t.slice(11, 13) + "h", v: Number(r.n) })), "Events per hour");
@@ -255,7 +263,7 @@ async function renderCharts(ev) {
 }
 
 async function renderEvents(ev) {
-  const cols = ["block_number", "block_timestamp"].concat(ev.userCols.map((c) => c.name), ["tx_hash"]);
+  const cols = ["block_number"].concat(ev.hasTs ? ["block_timestamp"] : []).concat(ev.userCols.map((c) => c.name), ["tx_hash"]);
   const sel = cols.map((c) => {
     const uc = ev.userCols.find((u) => u.name === c);
     return uc && /^u?int/.test(uc.sol_type) ? qi(c + "_dec") + " AS " + qi(c) : qi(c);

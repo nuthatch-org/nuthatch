@@ -118,3 +118,15 @@ service with an uptime promise.
 `new-nest.sh` and `remove-nest.sh` were run against a scratch `NEST_ROOT` (dry run, apply, apply again,
 remove). The generated units and nginx config come from the Base USDC files by substitution, and were not
 started on a real host or run through `test-proxy.sh` in this change.
+
+## Notes from hosting the lead nests (gooddollar-xdc, sablier-xdc, pharos-eth)
+
+- **XDC needs a User-Agent.** `rpc.xinfin.network`, `erpc.` and `rpc1.` sit behind Cloudflare, which answers 403 to a
+  request with no `User-Agent`, and nuthatch sends none (nuthatch#3068). From the host the nest never starts
+  (`initial_poll_failed`). `deploy/hosted-nest/xdc-rpc-ua/` is a loopback nginx that adds one; set the nest's
+  `rpc_urls = ["http://127.0.0.1:18550"]`. Not needed once #3068 is fixed.
+- **A finished nest is copied without its data.** Copy `nuthatch.toml`, `abis/`, `views/` and `semantic.toml`, point
+  `rpc_urls` at keyless endpoints (a measured config often points at a local counting proxy), and let the unit backfill.
+- **`/ready` says `ready: true` and `lag_blocks: 0` while `--seal-direct` backfill runs.** Read `sealed_through`
+  against the chain tip for progress.
+- The showcase needs `block_timestamp`; a nest with `block_timestamps = false` shows its tables and SQL only.
