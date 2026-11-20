@@ -136,3 +136,8 @@ started on a real host or run through `test-proxy.sh` in this change.
 - **Order for the scrape targets.** `deploy/monitoring/targets/nests.yml` scrapes the public nests on their tailnet
   address, which only answers once the unit runs with `--local-host 100.82.188.91`. Restart each public unit from the
   new unit file first, then land the targets; otherwise Prometheus raises TargetDown on a nest that is fine.
+- **CORS is on every public nest (nginx, 2026-11-20).** `nginx.conf` and `nginx-base-usdc.conf` answer a preflight on
+  `/sql`, `/explain` and `/mcp` with a 204 and send `Access-Control-Allow-Origin: *` on every response, so the showcase
+  page and agents can call from any origin. `OPTIONS` is named in each `limit_except` on purpose: `limit_except` is its own
+  block and would otherwise answer the preflight with a 403 before the `if` is reached. Existing hosts need the same edit in
+  their `/etc/nuthatch-public/nginx*.conf` and a restart of each proxy unit.
