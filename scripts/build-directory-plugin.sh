@@ -100,12 +100,13 @@ fi
 bad=$(find "$dir" -type f ! \( -iname '*.md' -o -iname '*.txt' -o -iname '*.json' -o -iname '*.yaml' -o -iname '*.yml' \
   -o -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.ico' \))
 [ -z "$bad" ] || { echo "file types the plugin directory refuses:" >&2; echo "$bad" >&2; exit 1; }
-# Piping a download into a shell, or running its substitution: `| sh`, `| sudo bash`, `| /bin/sh`, `sh -c "$(curl`, `<(curl`.
+# Piping a download into a shell, or running its substitution: `| sh`, `| sudo bash`, `| /bin/sh`, `sh -c "$(curl`, `<(curl`, `eval "$(curl`, `curl | tee f | sh`.
+# A download written to a file and run on a later line is not caught: this is a tripwire, review still reads the diff.
 # The shell name ends at a word boundary, so `| shasum` is fine.
 dl='(curl|wget)'
 shell='(/[a-z/]*/)?(ba|z|da|k)?sh([^[:alnum:]_.-]|$)'
-gate="$dl[^|]*\\|[[:space:]]*(sudo[[:space:]]+(-[A-Za-z-]+[[:space:]]+)*)?$shell"
-gate="$gate|(ba|z|da|k)?sh[[:space:]]+-c[[:space:]]+[\"']?\\\$\\([[:space:]]*$dl|<\\([[:space:]]*$dl"
+gate="$dl[^|]*(\\|[^|]*)*\\|[[:space:]]*(sudo[[:space:]]+(-[A-Za-z-]+[[:space:]]+)*)?$shell"
+gate="$gate|(ba|z|da|k)?sh[[:space:]]+-c[[:space:]]+[\"']?\\\$\\([[:space:]]*$dl|<\\([[:space:]]*$dl|eval[[:space:]]+[\"']?\\\$\\([[:space:]]*$dl"
 if grep -rEn "$gate" "$dir" >&2; then
   echo "download-and-execute pattern in plugin-directory/" >&2; exit 1
 fi
