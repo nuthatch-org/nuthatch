@@ -122,6 +122,7 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "bool_and",
     "bool_or",
     "btrim",
+    "burrmill_asof",
     "burrmill_hugeint",
     "burrmill_intdiv",
     "burrmill_round_int",
@@ -162,6 +163,7 @@ pub const ALLOWED_FUNCTIONS: &[&str] = &[
     "decode",
     "degrees",
     "dense_rank",
+    "div",
     "dot_product",
     "element_at",
     "empty",
@@ -577,6 +579,10 @@ mod tests {
             "WITH c AS (SELECT coalesce(x, 0) AS x FROM t) SELECT avg(x) FROM c",
             "SELECT last_value(x IGNORE NULLS) OVER (ORDER BY y) FROM t WHERE s ^@ 'a'",
             "SELECT COUNT(*), Sum(x), \"UPPER\"(s) FROM t",
+            "SELECT div(sum(value_dec), count(*), 4, 'half_even') FROM usdc__transfer",
+            "SELECT a.x, b.y FROM a ASOF JOIN b ON a.k = b.k AND a.ts >= b.ts",
+            // The marker an ASOF join becomes: called alone it is the constant true.
+            "SELECT burrmill_asof()",
         ] {
             refuse_unlisted_functions(sql).unwrap_or_else(|e| panic!("{sql}: {e:#}"));
         }

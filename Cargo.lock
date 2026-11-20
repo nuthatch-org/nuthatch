@@ -1644,18 +1644,18 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burrmill"
-version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=24cc93e1179ab80ea9fbbb0aed10574e6866b65c#24cc93e1179ab80ea9fbbb0aed10574e6866b65c"
+version = "0.1.0"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=d98222e44aa2a94e5ee4f988f781c46c55293ca0#d98222e44aa2a94e5ee4f988f781c46c55293ca0"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
  "async-trait",
+ "burrmill-parquet-source",
  "bytes",
  "chrono",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-datasource",
- "datafusion-datasource-parquet",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
@@ -1683,9 +1683,41 @@ dependencies = [
  "regex",
  "rustc-hash",
  "serde_json",
+ "sha2 0.11.0",
  "sqlparser",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "burrmill-parquet-source"
+version = "55.2.0"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=d98222e44aa2a94e5ee4f988f781c46c55293ca0#d98222e44aa2a94e5ee4f988f781c46c55293ca0"
+dependencies = [
+ "arrow",
+ "arrow-schema 59.3.0",
+ "async-trait",
+ "bytes",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions",
+ "datafusion-functions-aggregate-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-adapter",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-plan",
+ "datafusion-pruning",
+ "datafusion-session",
+ "futures",
+ "itertools 0.15.0",
+ "log",
+ "object_store 0.13.2",
+ "parking_lot",
+ "parquet",
+ "tokio",
 ]
 
 [[package]]
@@ -2500,37 +2532,6 @@ dependencies = [
  "rand 0.9.5",
  "tokio",
  "url",
-]
-
-[[package]]
-name = "datafusion-datasource-parquet"
-version = "55.2.0"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=24cc93e1179ab80ea9fbbb0aed10574e6866b65c#24cc93e1179ab80ea9fbbb0aed10574e6866b65c"
-dependencies = [
- "arrow",
- "arrow-schema 59.3.0",
- "async-trait",
- "bytes",
- "datafusion-common",
- "datafusion-common-runtime",
- "datafusion-datasource",
- "datafusion-execution",
- "datafusion-expr",
- "datafusion-functions",
- "datafusion-functions-aggregate-common",
- "datafusion-physical-expr",
- "datafusion-physical-expr-adapter",
- "datafusion-physical-expr-common",
- "datafusion-physical-plan",
- "datafusion-pruning",
- "datafusion-session",
- "futures",
- "itertools 0.15.0",
- "log",
- "object_store 0.13.2",
- "parking_lot",
- "parquet",
- "tokio",
 ]
 
 [[package]]
