@@ -361,7 +361,7 @@ Everything above applies; this is what differs, and the files are `*-base-usdc*`
   ignores the flag on restart. The 7.6 M block the implementation contract was deployed at is long behind it, so
   the vendored ABI decodes everything in range.
 - **GraphOps answers at most 20,000 logs a call** (`-32012`, "query exceeds max results 20000"). USDC on Base
-  is about 9 Transfers and 13 events of any kind a block (28.0 M Transfers over 3.02 M blocks is 9.3 a block). The 20,000 cap counts every log the `eth_getLogs` filter matches, and the filter is the USDC address with no topic restriction, so the 13 a block is the one that applies: 20,000 / 13 is about 1,540 blocks, and a window over that is refused (the 2,250 that 9 Transfers a block would give is not the limit);
+  is about 9 Transfers and 13 events of any kind a block (28.0 M Transfers over 3.02 M blocks is 9.3 a block). The cap counts every log the `eth_getLogs` filter matches: the USDC address and the topic0s of the events in the nest's ABI. That includes more than `Transfer`, so the ceiling lies between 20,000 / 13 (about 1,540 blocks, if all 13 events match) and 20,000 / 9 (about 2,200 blocks, Transfers only); the figures here do not say how many of the 13 the ABI's topic0 list matches. `--window 1500` is under the lower of the two, so it is safe either way, and a window over about 1,540 blocks may be refused;
   the unit sets `--window 1500` rather than finding that out by refusals. `--seal-direct --concurrency 4`
   backfills straight to sealed segments, four windows at a time.
 - **The key stays out of error responses.** Checked on 2026-11-20 with nuthatch 5.23.0: `NUTHATCH_RPC` pointed at
