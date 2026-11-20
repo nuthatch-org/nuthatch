@@ -7,6 +7,7 @@
 //! indexer for the single-writer store, and it automatically reflects the live IVM views.
 
 mod authoring;
+mod wallet;
 
 use crate::cli::McpClient;
 use crate::sql_errors;
@@ -668,8 +669,9 @@ fn initialize_result() -> Value {
 const INSTRUCTIONS: &str = "nuthatch indexes an EVM smart contract's onchain events (logs) into SQL \
     tables, one per event, decoded from the contract's ABI. Use these tools for questions about a \
     contract's onchain history: transfers, swaps, holders, balances, who called what and when. Call \
-    `schema` first, then answer with `sql`; a `sql` answer carries the block it is as of. When the \
-    server was started with --authoring and no nest exists yet, `init_nest` and then \
+    `schema` first, then answer with `sql`; a `sql` answer carries the block it is as of. On an \
+    address-history nest, which watches accounts instead of contracts, call `coverage` first, then \
+    `wallet_history`. When the server was started with --authoring and no nest exists yet, `init_nest` and then \
     `start_indexing` create and index one.";
 
 /// The resources a client may preload (RFC-0016 §6). Stable `nuthatch://…` URIs backed by the running
@@ -710,6 +712,8 @@ struct Shape {
     queries: bool,
     /// The URL is a runtime's root: it serves the roster and no data, so no data tool can answer.
     runtime_root: bool,
+    /// An address-history nest (RFC-0063): watched accounts, no event tables.
+    address_history: bool,
 }
 
 /// Fetch the nest's shape from `GET /shape`. If the endpoint is missing (an older nest) or unreachable,
@@ -723,6 +727,7 @@ async fn fetch_shape(session: &Session<'_>) -> Shape {
         free_form: true,
         queries: false,
         runtime_root: false,
+        address_history: false,
     };
     let Ok(body) = get(client, &format!("{base}/shape")).await else {
         // A runtime's root has no `/shape` either, and nothing it could offer would answer.
@@ -741,6 +746,7 @@ async fn fetch_shape(session: &Session<'_>) -> Shape {
         free_form: v.get("free_form").and_then(Value::as_bool).unwrap_or(true),
         queries: v.get("queries").and_then(Value::as_u64).unwrap_or(0) > 0,
         runtime_root: false,
+        address_history: v.get("address_history").and_then(Value::as_bool) == Some(true),
     }
 }
 
@@ -751,6 +757,9 @@ async fn fetch_shape(session: &Session<'_>) -> Shape {
 fn prompt_specs(shape: &Shape) -> Value {
     if shape.runtime_root {
         return json!([]);
+    }
+    if shape.address_history {
+        return Value::Array(wallet::prompt_specs());
     }
     let mut prompts = Vec::new();
     if shape.free_form {
@@ -773,6 +782,12 @@ fn prompt_specs(shape: &Shape) -> Value {
 fn render_prompt(name: &str, args: &Value, shape: &Shape) -> Option<Value> {
     if shape.runtime_root {
         return None;
+    }
+    if shape.address_history {
+        let text = wallet::render_prompt(name, args)?;
+        return Some(json!({
+            "messages": [ { "role": "user", "content": { "type": "text", "text": text } } ]
+        }));
     }
     // The analysis flows below tell the agent to run SQL, which a declared-queries mount refuses.
     if !shape.free_form && matches!(name, "profile-contract" | "verify-a-number") {
@@ -820,10 +835,31 @@ fn tool_specs(shape: &Shape) -> Value {
             json!({ "name": "mounts", "title": "Runtime mounts", "description": "This URL is a nuthatch runtime's root, which serves no EVM contract event data itself. Lists the mounts to point `nuthatch mcp --url` at instead.",
           "inputSchema": { "type": "object", "properties": {} } }),
         ]
+    } else if shape.address_history {
+        wallet_tools()
     } else {
         query_tools(shape)
     };
     Value::Array(tools.into_iter().map(annotated).collect())
+}
+
+/// An address-history nest serves `/api`, `/ready` and `/diff`, not the event routes, so it is offered
+/// the wallet tools and `diff` only.
+fn wallet_tools() -> Vec<Value> {
+    let mut tools = wallet::tool_specs();
+    tools.extend(
+        query_tools(&Shape {
+            transfers: false,
+            compliance: false,
+            free_form: false,
+            queries: false,
+            runtime_root: false,
+            address_history: true,
+        })
+        .into_iter()
+        .filter(|t| t["name"] == "diff"),
+    );
+    tools
 }
 
 /// Every query tool reads a nest and changes nothing, and none reaches past the nest it is pointed at.
@@ -974,6 +1010,9 @@ async fn call_tool(params: &Value, client: Link<'_>, base: &str) -> Result<Strin
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    if let Some(answer) = wallet::call(name, &args, client, base).await {
+        return answer;
+    }
     match name {
         "status" => get(client, &format!("{base}/")).await,
         // The enriched, per-nest schema (RFC-0016 §2): structure + meaning + footguns + coverage,
@@ -2036,6 +2075,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         let t = names(&tool_specs(&bare));
         assert_eq!(t.len(), 9);
@@ -2056,6 +2096,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         let t = names(&tool_specs(&token));
         assert_eq!(t.len(), 11);
@@ -2069,6 +2110,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         assert_eq!(names(&tool_specs(&full)).len(), 13);
         assert!(names(&prompt_specs(&full)).contains(&"investigate-address".to_string()));
@@ -2082,6 +2124,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         let specs = tool_specs(&token);
         for name in ["balance", "top_balances"] {
@@ -2719,9 +2762,11 @@ mod tests {
             free_form: true,
             queries: true,
             runtime_root: false,
+            address_history: false,
         };
         let root = Shape {
             runtime_root: true,
+            address_history: false,
             ..all
         };
         let mut tools = if authoring {
@@ -2896,6 +2941,7 @@ mod tests {
             free_form: false,
             queries: true,
             runtime_root: false,
+            address_history: false,
         };
         let t = names(&bounded);
         assert!(
@@ -2912,6 +2958,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         let t = names(&open);
         assert!(
@@ -3307,6 +3354,7 @@ mod tests {
             free_form: false,
             queries: true,
             runtime_root: false,
+            address_history: false,
         };
         let names = |s: &Shape| {
             prompt_specs(s)
@@ -3335,6 +3383,7 @@ mod tests {
             free_form: true,
             queries: false,
             runtime_root: false,
+            address_history: false,
         };
         let p = render_prompt("investigate-address", &json!({ "address": "0xa" }), &shape).unwrap();
         let text = p["messages"][0]["content"]["text"].as_str().unwrap();
@@ -3342,5 +3391,152 @@ mod tests {
             text.contains("complete_history") && text.contains("net flow"),
             "{text}"
         );
+    }
+
+    /// A fake address-history nest: `/shape`, `/ready`, and `/api` answering by action as the rotki
+    /// path does, with `txlistinternal` refused as a pending range is.
+    async fn fake_wallet_nest() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use std::collections::HashMap;
+        let app = Router::new()
+            .route(
+                "/shape",
+                get(|| async { Json(json!({"address_history": true, "free_form": false})) }),
+            )
+            .route(
+                "/ready",
+                get(|| async {
+                    Json(json!({"mode": "address_history", "ready": true, "chain_id": 1,
+                        "head": 900, "tip": 950, "served_through": {"transactions": 800}}))
+                }),
+            )
+            .route(
+                "/api",
+                get(|Query(q): Query<HashMap<String, String>>| async move {
+                    let g = |k: &str| q.get(k).cloned().unwrap_or_default();
+                    Json(match g("action").as_str() {
+                        "getblocknobytime" if g("closest") == "after" => {
+                            json!({"status": "1", "message": "OK", "result": "100"})
+                        }
+                        "getblocknobytime" => json!({"status": "1", "message": "OK", "result": "200"}),
+                        "txlist" => json!({"status": "1", "message": "OK", "generation": "7",
+                            "result": [{"blockNumber": g("startblock"), "endBlock": g("endblock"),
+                                "value": "1500000000000000000"}]}),
+                        "tokentx" => json!({"status": "1", "message": "OK", "generation": "7",
+                            "result": [
+                                {"value": "2500000", "tokenName": "USD Coin", "tokenSymbol": "USDC", "tokenDecimal": "6"},
+                                {"value": "42", "tokenName": "", "tokenSymbol": "", "tokenDecimal": "0"}]}),
+                        _ => json!({"status": "0", "message": "NOTOK",
+                            "result": "NUTHATCH_INCOMPLETE: txlistinternal for 0xabc is not indexed at block 100; pending"}),
+                    })
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// An address-history nest is offered the wallet tools, `diff` and the wallet prompts, and none of
+    /// the event-table tools its routes would 404.
+    #[tokio::test]
+    async fn an_address_history_nest_gets_the_wallet_surface() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_wallet_nest().await;
+        let session = Session::new(&client, &base);
+        let shape = fetch_shape(&session).await;
+        assert!(shape.address_history);
+        let tools: Vec<String> = tool_specs(&shape)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            tools,
+            ["wallet_status", "coverage", "wallet_history", "diff"]
+        );
+        let prompts: Vec<Value> = prompt_specs(&shape).as_array().unwrap().clone();
+        let names: Vec<&str> = prompts.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert_eq!(names, ["wallet-history", "coverage-gaps"]);
+        assert!(render_prompt("profile-contract", &json!({}), &shape).is_none());
+        let p = render_prompt("wallet-history", &json!({"address": "0xabc"}), &shape).unwrap();
+        let text = p["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(
+            text.contains("0xabc") && text.contains("`coverage`"),
+            "{text}"
+        );
+        h.abort();
+    }
+
+    /// `wallet_history` places a time window by the nest's own block-by-time, applies decimals to the
+    /// integers served, relays a refused kind as the nest gave it, and stamps the answer.
+    #[tokio::test]
+    async fn wallet_history_applies_decimals_and_keeps_refusals_and_provenance() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_wallet_nest().await;
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc", "from_time": 1_700_000_000u64, "to_time": 1_700_100_000u64}),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let v: Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(
+            (v["from_block"].clone(), v["to_block"].clone()),
+            (json!(100), json!(200))
+        );
+        let normal = &v["normal"]["rows"][0];
+        assert_eq!(normal["blockNumber"], "100", "{v}");
+        assert_eq!(normal["endBlock"], "200", "{v}");
+        assert_eq!(normal["value_native"], "1.5", "{v}");
+        assert_eq!(v["normal"]["generation"], "7");
+        assert_eq!(v["token"]["rows"][0]["value_formatted"], "2.5", "{v}");
+        assert!(
+            v["token"]["rows"][1]["value_formatted"].is_null(),
+            "a token that answered nothing is not formatted: {v}"
+        );
+        assert!(v["internal"]["refused"]
+            .as_str()
+            .unwrap()
+            .starts_with("NUTHATCH_INCOMPLETE"));
+        assert_eq!(v["provenance"]["finalized_head"], 900, "{v}");
+        assert_eq!(v["provenance"]["chain_id"], 1, "{v}");
+        assert!(!v["not_seen"].as_array().unwrap().is_empty());
+
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc"}),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], true, "a window is required: {r}");
+        h.abort();
+    }
+
+    #[test]
+    fn decimals_are_applied_exactly() {
+        assert_eq!(
+            wallet::scaled("1500000000000000000", 18).as_deref(),
+            Some("1.5")
+        );
+        assert_eq!(wallet::scaled("0", 18).as_deref(), Some("0"));
+        assert_eq!(wallet::scaled("1", 6).as_deref(), Some("0.000001"));
+        assert_eq!(wallet::scaled("123000", 0).as_deref(), Some("123000"));
+        assert_eq!(
+            wallet::scaled(
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+                18
+            )
+            .as_deref(),
+            Some("115792089237316195423570985008687907853269984665640564039457.584007913129639935")
+        );
+        assert_eq!(wallet::scaled("-5", 2), None);
+        assert_eq!(wallet::scaled("", 2), None);
     }
 }
