@@ -2791,7 +2791,10 @@ pub async fn dev(
                 group.endpoint.chain
             );
         }
-        let timestamps = group.nests.iter().any(|(_, _, c)| c.nest.block_timestamps);
+        let timestamps = group
+            .nests
+            .iter()
+            .any(|(_, _, c)| c.nest.block_timestamps.column());
         let pool: Vec<String> = rpc_urls
             .iter()
             .chain(rpc_fallback.iter())

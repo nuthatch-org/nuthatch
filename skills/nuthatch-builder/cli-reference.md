@@ -234,6 +234,7 @@ Scaffold an indexer for a contract: resolve its ABI and write a project here
 - `--dir <DIR>` - Directory to scaffold into. Defaults to the current directory; for `--from`, to the nest's own name; and in a git repository that already has an `AGENTS.md` or `.gitignore`, to `./nest` (`init` says so), so the repository's own files are not skipped. `--dir .` scaffolds in place
 - `--start-block <START_BLOCK>` - Deployment start block per address, in the same order as the addresses (comma-separated). Skips the RPC probe for that address. An empty entry still probes
 - `--no-timestamps` - Don't index block timestamps: drop the implicit `block_timestamp` column from every table
+- `--lazy-timestamps` - Keep `block_timestamp` on every row, but never buy a block header for it: a row carries the `blockTimestamp` its log carried and is null where the node stamps none (#3065)
 - `--json` - Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias, deployment block, proxy warning), `tables`, `files_written`, `files_skipped` (scaffold files that were already there and kept), `files_appended` (existing files given a nuthatch section), `dir_defaulted` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there
 
 ## `nuthatch labels`

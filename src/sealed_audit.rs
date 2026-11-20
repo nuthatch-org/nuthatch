@@ -664,6 +664,7 @@ events = ["Transfer"]
     fn transfer_at(auditor: &Auditor, block: u64) -> crate::rpc::Log {
         let word = |n: u64| format!("0x{n:064x}");
         crate::rpc::Log {
+            block_timestamp: None,
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
             topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
             data: word(5),
@@ -856,6 +857,7 @@ events = ["Transfer"]
         let auditor = nest(d, "");
         let word = |n: u64| format!("0x{n:064x}");
         let log = crate::rpc::Log {
+            block_timestamp: None,
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
             topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
             data: word(5),

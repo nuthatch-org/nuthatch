@@ -328,7 +328,10 @@ impl Binding {
         Ok(match extract {
             Extract::BlockNumber => Scalar::Int(i128::from(row.block_number)),
             Extract::BlockHash => Scalar::Str(row.block_hash.clone()),
-            Extract::BlockTimestamp => Scalar::Int(i128::from(row.block_timestamp)),
+            // A lazy row whose log carried no timestamp is NULL, never the in-memory sentinel (#3065).
+            Extract::BlockTimestamp => row
+                .timestamp()
+                .map_or(Scalar::Null, |t| Scalar::Int(i128::from(t))),
             Extract::TxHash => Scalar::Str(row.tx_hash.clone()),
             Extract::LogIndex => Scalar::Int(i128::from(row.log_index)),
             Extract::Address => Scalar::Str(row.address.clone()),
@@ -615,6 +618,7 @@ mod tests {
 
     fn transfer(from: &str, to: &str, value: &str, block: u64, li: u64) -> Log {
         Log {
+            block_timestamp: None,
             address: TOKEN.into(),
             topics: vec![TRANSFER_TOPIC0.into(), topic_addr(from), topic_addr(to)],
             data: word(value),
@@ -627,6 +631,7 @@ mod tests {
 
     fn approval(owner: &str, spender: &str, value: &str, block: u64, li: u64) -> Log {
         Log {
+            block_timestamp: None,
             address: TOKEN.into(),
             topics: vec![
                 APPROVAL_TOPIC0.into(),

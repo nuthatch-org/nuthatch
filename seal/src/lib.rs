@@ -40,7 +40,8 @@ pub fn seal_rows(rows: &mut [Value]) -> Result<Vec<u8>> {
 /// can be folded by re-sealing (#1150). The inverse of `rows_to_batch` exactly: a `UInt64` column
 /// becomes a number, a `Utf8` value a string, and a null is an absent key - which is what
 /// `rows_to_batch` maps an absent key *to*, so a fold round-trips to the bytes a single seal of the
-/// same rows produces.
+/// same rows produces. The exception is a null `block_timestamp` (a lazy nest's, #3065), which
+/// `rows_to_batch` was given as an explicit `null` and so gets back as one.
 pub fn segment_rows(bytes: bytes::Bytes) -> Result<Vec<Value>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .context("reading segment metadata")?
@@ -55,6 +56,12 @@ pub fn segment_rows(bytes: bytes::Bytes) -> Result<Vec<Value>> {
             for (c, field) in schema.fields().iter().enumerate() {
                 let col = batch.column(c);
                 if col.is_null(i) {
+                    // A lazy nest's unknown `block_timestamp` (#3065) is the one null `rows_to_batch`
+                    // was given as a value rather than an absent key, and the only one that makes
+                    // the column nullable; it comes back as it went in, or a fold would seal it as 0.
+                    if field.name() == "block_timestamp" {
+                        obj.insert(field.name().clone(), Value::Null);
+                    }
                     continue;
                 }
                 let v = match field.data_type() {
@@ -101,6 +108,18 @@ pub fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
     for col in &columns {
         if col == "block_number" || col == "log_index" || col == "_seq" || col == "block_timestamp"
         {
+            // A lazy nest's `block_timestamp` is `null` where its log carried none (#3065). The
+            // column is nullable only when a row in this batch is, so every batch an eager nest
+            // writes - none of whose rows can be null - has the schema and bytes it always had.
+            if col == "block_timestamp" && rows.iter().any(|r| r.get(col) == Some(&Value::Null)) {
+                let vals: Vec<Option<u64>> = rows
+                    .iter()
+                    .map(|r| r.get(col).and_then(Value::as_u64))
+                    .collect();
+                fields.push(Field::new(col, DataType::UInt64, true));
+                arrays.push(Arc::new(UInt64Array::from(vals)));
+                continue;
+            }
             let vals: Vec<u64> = rows
                 .iter()
                 .map(|r| r.get(col).and_then(Value::as_u64).unwrap_or(0))
@@ -213,6 +232,36 @@ mod tests {
         ];
         let bytes = seal_rows(&mut rows).unwrap();
         assert_eq!(segment_rows(bytes.into()).unwrap(), rows);
+    }
+
+    /// #3065: `block_timestamp` is nullable only in a batch that holds a null, so every batch an eager
+    /// nest seals keeps the non-nullable schema (and bytes) it always had.
+    #[test]
+    fn block_timestamp_is_nullable_only_where_a_row_is_null() {
+        let eager = vec![
+            serde_json::json!({"block_number": 1, "log_index": 0, "block_timestamp": 100}),
+            serde_json::json!({"block_number": 2, "log_index": 0, "block_timestamp": 200}),
+        ];
+        let batch = rows_to_batch(&eager).unwrap();
+        let schema = batch.schema();
+        let field = schema.field_with_name("block_timestamp").unwrap();
+        assert!(!field.is_nullable());
+
+        let mut lazy = vec![
+            serde_json::json!({"block_number": 1, "log_index": 0, "block_timestamp": 100}),
+            serde_json::json!({"block_number": 2, "log_index": 0, "block_timestamp": null}),
+        ];
+        let batch = rows_to_batch(&lazy).unwrap();
+        let schema = batch.schema();
+        assert!(schema
+            .field_with_name("block_timestamp")
+            .unwrap()
+            .is_nullable());
+        let bytes = seal_rows(&mut lazy).unwrap();
+        let mut back = segment_rows(bytes.clone().into()).unwrap();
+        assert_eq!(back, lazy);
+        // A fold re-seals what it read back; the null must not become 0 on the way.
+        assert_eq!(seal_rows(&mut back).unwrap(), bytes);
     }
 
     /// A named tuple seals in the ABI's key order in every build, this crate's alone included (#2224).

@@ -279,6 +279,7 @@ mod log_filter_tests {
     #[test]
     fn a_log_matches_only_the_topics_a_filter_names() {
         let log = |t1: &str| super::Log {
+            block_timestamp: None,
             address: "0xABC".into(),
             topics: vec!["0xddf2".into(), t1.into()],
             data: "0x".into(),

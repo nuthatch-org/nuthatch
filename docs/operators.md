@@ -1006,6 +1006,18 @@ you are standing up a new nest over a long history. **When it is clearly wrong:*
 "per day" or "per hour" later. Blocks give you ordering; only timestamps give you time. If you are
 unsure, keep them - the default is on for a reason.
 
+**`block_timestamps = "lazy"` - keep the column, never buy a header for it (#3065).** On a node whose
+`eth_getLogs` carries no `blockTimestamp` (XDC's public RPC, for one), the default costs one
+`eth_getBlockByNumber` per block that holds a matching log, which on a dense history is most of a cold
+start. `nuthatch init --lazy-timestamps` keeps `block_timestamp` on every table but fills it only from
+what each log carried: where the node stamped the log, the row has that value, and where it did not,
+the row is `null`. No header is fetched for any row, and nothing fills a null later - sealed segments
+are immutable, and a fill that touched only unsealed rows would make a row's value depend on when it
+sealed. Query with that in mind (`count(block_timestamp)` counts only stamped rows). Like
+`--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
+refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
+and content addresses are exactly what they were before `"lazy"` existed.
+
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
 (RFC-0019 §4) is that secrets never go into a published bundle - so keep the directory `0700` and
 owned by the service user, and never publish a bundle built from a config carrying a credential.

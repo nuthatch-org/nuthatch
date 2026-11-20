@@ -361,7 +361,10 @@ fn config_written_for_4_0_keeps_its_meaning() {
         ["https://arb1.arbitrum.io/rpc", "https://arbitrum.drpc.org"]
     );
     assert_eq!(cfg.nest.schema_version, 2);
-    assert!(cfg.nest.block_timestamps);
+    assert_eq!(
+        cfg.nest.block_timestamps,
+        nuthatch::config::TimestampPolicy::Eager
+    );
     let contracts: Vec<_> = cfg
         .contracts
         .iter()

@@ -593,7 +593,7 @@ pub async fn process_window<E: WindowEntity>(
             }
         };
         let timestamps = &block_data.timestamps;
-        apply_row_timestamps(&mut rows, timestamps);
+        apply_row_timestamps(registry, &mut rows, timestamps);
         found.apply_timestamps(timestamps);
         // The logs and this hash are two calls. A tip that moved between them would commit the
         // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
@@ -712,7 +712,11 @@ pub async fn process_window<E: WindowEntity>(
             // the one this hash has. Block and call rows took theirs from the header checked here.
             let stamped: Vec<_> = rows
                 .iter()
-                .filter(|r| registry.timestamps() && r.block_number > final_through)
+                .filter(|r| {
+                    registry.timestamps()
+                        && !registry.lazy_timestamps()
+                        && r.block_number > final_through
+                })
                 .collect();
             let now = match stamped.is_empty() {
                 true => source.block_hashes(&blocks).await.map(|now| {
@@ -1551,6 +1555,7 @@ mod tests {
     fn transfer_log(block: u64, log_index: u64, from: &str, to: &str, value: u64) -> Log {
         let topic = |a: &str| format!("0x{:0>64}", &a[2..]);
         Log {
+            block_timestamp: None,
             address: TOKEN.into(),
             topics: vec![TRANSFER.into(), topic(from), topic(to)],
             data: format!("0x{value:064x}"),

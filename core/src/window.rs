@@ -51,7 +51,8 @@ pub async fn fetch_timestamps(
     registry: &DecodeRegistry,
     blocks: &[u64],
 ) -> Result<HashMap<u64, u64>> {
-    if !registry.timestamps() {
+    // A lazy nest's rows already hold what their logs carried (#3065); a header is never bought.
+    if !registry.timestamps() || registry.lazy_timestamps() {
         return Ok(HashMap::new());
     }
     source.block_timestamps(blocks).await
@@ -64,7 +65,7 @@ pub fn refuse_unstamped(
     blocks: &[u64],
     timestamps: &HashMap<u64, u64>,
 ) -> Result<()> {
-    if !registry.timestamps() {
+    if !registry.timestamps() || registry.lazy_timestamps() {
         return Ok(());
     }
     match blocks
@@ -182,7 +183,17 @@ pub fn blocks_needing_timestamps(
     blocks
 }
 
-pub fn apply_row_timestamps(rows: &mut [DecodedRow], ts: &HashMap<u64, u64>) {
+/// Stamp rows from `ts`. A lazy nest's rows keep what decode gave them from their own logs (#3065), so
+/// a header fetched for another reason (canonical calls, `l1_blocks`) never fills one row and not
+/// the next: a lazy row's timestamp depends on its log alone.
+pub fn apply_row_timestamps(
+    registry: &DecodeRegistry,
+    rows: &mut [DecodedRow],
+    ts: &HashMap<u64, u64>,
+) {
+    if registry.lazy_timestamps() {
+        return;
+    }
     for r in rows {
         r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
     }
@@ -334,7 +345,9 @@ pub fn decode_window(
                     }
                 };
                 if let Some(mut r) = decoded {
-                    r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
+                    if !registry.lazy_timestamps() {
+                        r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
+                    }
                     if let Some(fs) = factory {
                         // Every child this event announces, not just the first (issue #241).
                         for child in fs.discover(&r) {

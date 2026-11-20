@@ -1350,9 +1350,7 @@ async fn hot_store_backfill(
             .block_timestamps(&blocks)
             .await
             .with_context(|| format!("block timestamps for {next}..={chunk_to}"))?;
-        for r in &mut rows {
-            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-        }
+        nuthatch_core::window::apply_row_timestamps(registry, &mut rows, &ts);
         // RFC-0023 tier 3, shared with the seal-direct arms rather than reimplemented (#743): the
         // resolution loop lives in `indexer.rs` and both arms call it, so this harness cannot drift
         // from the path it is meant to be measuring for a third time.
@@ -1368,6 +1366,7 @@ async fn hot_store_backfill(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                registry.lazy_timestamps(),
                 None,
             )
             .await?;
