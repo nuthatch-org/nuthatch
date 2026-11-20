@@ -9,8 +9,11 @@ const el = (tag, props = {}, ...kids) => {
   return e;
 };
 const q = new URLSearchParams(location.search);
-const nestParam = (q.get("nest") || "arc-usdc").replace(/\/+$/, "");
-const base = /^(https?:)?\/\//.test(nestParam) || nestParam.startsWith("/") ? nestParam : "/nests/" + nestParam;
+// Same-origin only: a bare name (-> /nests/NAME) or a relative path starting with a single "/". Anything else
+// (absolute, protocol-relative, backslashes) falls back to the default nest.
+const rawNest = (q.get("nest") || "arc-usdc").replace(/\/+$/, "");
+const nestParam = /^[A-Za-z0-9._-]+$/.test(rawNest) || /^\/(?!\/)[A-Za-z0-9._\/-]*$/.test(rawNest) ? rawNest : "arc-usdc";
+const base = nestParam.startsWith("/") ? nestParam : "/nests/" + nestParam;
 const nestName = base.split("/").pop();
 const absBase = new URL(base, location.href).href;
 const qi = (id) => '"' + id.replace(/"/g, '""') + '"';
@@ -245,7 +248,8 @@ async function renderCharts(ev) {
   $("#top-sub").textContent = dec ? `by total ${ev.symbol || "amount"} sent` : "by number of events";
   hbars($("#chart-top"), top.rows.map((r) => {
     const zero = /^0x0+$/.test(r.a);
-    const v = dec ? Number(BigInt(String(r.v).split(".")[0]) / 10n ** BigInt(Math.max(0, ev.decimals - 2))) / 100 : Number(r.n);
+    const sum = BigInt(String(r.v).split(".")[0]);
+    const v = dec ? (ev.decimals >= 2 ? Number(sum / 10n ** BigInt(ev.decimals - 2)) / 100 : Number(sum) / 10 ** ev.decimals) : Number(r.n);
     return { label: zero ? "mint (0x0)" : shortHex(r.a), full: r.a, v, text: dec ? fmtCompact(v) + " " + ev.symbol : fmtInt(v) };
   }), "Top senders");
 }

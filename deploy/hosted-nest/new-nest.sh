@@ -20,7 +20,9 @@
 #
 # Environment: NEST_ROOT (prefix for every host path, for tests), HOST_IP (the sslip.io address, default
 # the Helsinki host), NUTHATCH_BIN (default /usr/local/bin/nuthatch-5.23.0), SERVICE_USER (nests-public),
-# NEST_DEV_ARGS (extra `nuthatch dev` flags, default "--poll-interval 3s --seal-direct --concurrency 4").
+# NEST_DEV_ARGS (extra `nuthatch dev` flags, default "--poll-interval 3s --seal-direct --concurrency 4"; add
+# "--window N" for a provider that caps eth_getLogs results, as the Base USDC unit does with --window 1500),
+# NEST_LOCAL_HOST (the tailnet address Prometheus scrapes /metrics through; adds --local-host, default none).
 set -euo pipefail
 
 apply=0
@@ -44,6 +46,9 @@ HOST_IP=${HOST_IP:-89.167.109.4}
 NUTHATCH_BIN=${NUTHATCH_BIN:-/usr/local/bin/nuthatch-5.23.0}
 SVC_USER=${SERVICE_USER:-nests-public}
 DEV_ARGS=${NEST_DEV_ARGS:---poll-interval 3s --seal-direct --concurrency 4}
+LOCAL_HOST=${NEST_LOCAL_HOST:-}
+local_host_line=
+[ -z "$LOCAL_HOST" ] || { [[ $LOCAL_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || die "bad NEST_LOCAL_HOST: $LOCAL_HOST"; local_host_line="    --local-host $LOCAL_HOST \\"$'\n'; }
 under=${name//-/_}
 public_host=$name.nuthatch-indexer.com          # only ever sent as a Host header; never needs DNS
 site=$name.$HOST_IP.sslip.io
@@ -110,7 +115,9 @@ render_nest_unit() {
   cat <<EOT
 # /etc/systemd/system/$unit.service  Made by deploy/hosted-nest/new-nest.sh; docs/hosted-nests.md.
 # $name on $chain, public and read-only: --no-admin removes the admin routes, --public-host names the Host the
-# nest answers to (#3002). Backfill flags as the Base USDC unit; see deploy/public-nests/nuthatch-public-base-usdc.service.
+# nest answers to (#3002). The backfill flags are NEST_DEV_ARGS, not the Base USDC unit's: that unit also sets --window 1500
+# (a GraphOps log cap) and --local-host (the tailnet scrape); see deploy/public-nests/nuthatch-public-base-usdc.service.
+# Without --local-host a loopback nest refuses the Host Prometheus sends, so set NEST_LOCAL_HOST to be scraped.
 [Unit]
 Description=nuthatch public read-only nest: $name ($chain)
 Documentation=https://github.com/nuthatch-org/nuthatch/blob/main/docs/hosted-nests.md
@@ -128,7 +135,7 @@ ExecStart=$NUTHATCH_BIN dev \\
     --listen 127.0.0.1:$port \\
     --no-admin \\
     --public-host \${PUBLIC_HOST} \\
-    $DEV_ARGS
+${local_host_line}    $DEV_ARGS
 Restart=on-failure
 RestartSec=5
 # The 2 GB per-cursor budget (CLAUDE.md non-negotiable 2).
@@ -208,7 +215,7 @@ render_nginx      | emit "$nginxconf" 0644 root
 if [ $apply = 0 ]; then
   echo; echo "===== $caddyfile (append; also add to deploy/public-nests/Caddyfile.path)"; render_caddy
 else
-  if [ -f "$ROOT$caddyfile" ] && grep -qF "# BEGIN nuthatch-public $name" "$ROOT$caddyfile"; then
+  if [ -f "$ROOT$caddyfile" ] && grep -qx "# BEGIN nuthatch-public $name" "$ROOT$caddyfile"; then
     existing_block=$(sed -n "/# BEGIN nuthatch-public $name\$/,/# END nuthatch-public $name\$/p" "$ROOT$caddyfile")
     if [ "$existing_block" = "$(render_caddy)" ]; then echo "unchanged  $caddyfile (block present)"; else echo "DIFFERS    $caddyfile (block for $name differs; left as is)"; differs=1; fi
   else
@@ -240,7 +247,8 @@ cat <<EOT
   },
 
 ===== checklist (docs/hosted-nests.md has the detail)
-  [ ] 1. nest dir:   sudo -u $SVC_USER -H $nest_cmd
+  [ ] 1. nest dir:   sudo install -d -o $SVC_USER -g $SVC_USER -m 0700 /var/lib/nuthatch-public   # once; skip if it exists
+                     sudo -u $SVC_USER -H $nest_cmd
                      (then: sudo chmod 0700 $nestdir)
   [ ] 2. review the files above$([ $apply = 1 ] && echo ' (now on disk)'), then:  sudo systemd-analyze verify /etc/systemd/system/$unit*.service
   [ ] 3. sudo caddy validate --config $caddyfile && sudo systemctl reload caddy

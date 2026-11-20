@@ -20,7 +20,7 @@ rmf /etc/systemd/system/$unit.service
 rmf /etc/nuthatch-public/nginx-$name.conf
 rmf /etc/nuthatch-public/$name.env
 cf=$ROOT/etc/caddy/Caddyfile
-if [ -f "$cf" ] && grep -qF "# BEGIN nuthatch-public $name" "$cf"; then
+if [ -f "$cf" ] && grep -qx "# BEGIN nuthatch-public $name" "$cf"; then
   if [ $apply = 1 ]; then
     cp -p "$cf" "$cf.bak-remove-nest-$(date +%Y%m%d%H%M%S)"
     sed -i "/^# BEGIN nuthatch-public $name\$/,/^# END nuthatch-public $name\$/d" "$cf"
