@@ -299,6 +299,9 @@ impl<S: Source> Source for RecordingSource<S> {
         // source holds no cache to forget.
         self.inner.forget_cached_above(block)
     }
+    fn set_log_group_fanout(&self, n: usize) {
+        self.inner.set_log_group_fanout(n)
+    }
     fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
         self.inner.refuses_topic0_only(err)
     }

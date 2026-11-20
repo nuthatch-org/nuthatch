@@ -7442,15 +7442,19 @@ impl NestIngest {
                     (Some(_), None) => ", no ipfs window deadline".to_string(),
                 };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
+                    // The windows stay in order (the child registry is built along them), but one
+                    // window's address list, once an endpoint's cap splits it, is asked
+                    // `--concurrency` groups at a time (#3066). The rows are the same.
+                    source.set_log_group_fanout(concurrency);
                     if concurrency > 1 {
                         tracing::info!(
-                            "factory backfill runs sequentially (--concurrency {concurrency} ignored until the step-5 filter flip)"
+                            "factory backfill keeps its windows in order; an address list split by the endpoint's cap is asked {concurrency} groups at a time"
                         );
                     }
                     tracing::info!(
                         "seal-direct factory backfill: {resume_from}..={finalized_through} (tip {tip}, sequential two-pass{deadline})…"
                     );
-                    backfill_direct_factory_with(
+                    let backfilled = backfill_direct_factory_with(
                         source,
                         &self.registry,
                         fs,
@@ -7472,7 +7476,10 @@ impl NestIngest {
                             prog.tick(blk, n);
                         },
                     )
-                    .await?
+                    .await;
+                    // The fanout is for this backfill alone: the tip loop asks one request at a time.
+                    source.set_log_group_fanout(1);
+                    backfilled?
                 } else {
                     let capped = match self.metrics.seal_direct_concurrency() {
                         Some((requested, effective)) if effective < requested => {

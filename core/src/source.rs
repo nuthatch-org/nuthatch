@@ -223,6 +223,10 @@ pub trait Source: Send + Sync {
     /// silently getting it wrong.
     fn forget_cached_above(&self, _block: u64) {}
 
+    /// Let a getLogs naming more addresses than the endpoint takes ask its groups `n` at a time.
+    /// Default: no effect (a source that is not an RPC client asks one request per call anyway).
+    fn set_log_group_fanout(&self, _n: usize) {}
+
     /// Logs matching `filter` over the inclusive range `[from, to]`.
     ///
     /// Takes a [`LogFilter`] rather than two slices so that "match everything" is not expressible
