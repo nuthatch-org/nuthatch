@@ -12,6 +12,11 @@ use std::time::Duration;
 
 pub type RpcClient = nuthatch_core::rpc::RpcClient<Http>;
 
+/// Sent on every RPC request. Cloudflare-fronted public RPCs (rpc.xinfin.network) answer 403 to a
+/// request with no `User-Agent` at all. Fixed and version-only: it names the software, never the
+/// operator, so non-negotiable 3 holds.
+const USER_AGENT: &str = concat!("nuthatch/", env!("CARGO_PKG_VERSION"));
+
 /// reqwest, counting into the process's Prometheus series.
 pub struct Http(reqwest::Client);
 
@@ -29,7 +34,12 @@ impl Transport for Http {
     type Reply = HttpReply;
 
     fn build(timeout: Duration) -> anyhow::Result<Self> {
-        Ok(Self(reqwest::Client::builder().timeout(timeout).build()?))
+        Ok(Self(
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .user_agent(USER_AGENT)
+                .build()?,
+        ))
     }
 
     async fn post(&self, url: &str, body: &Value) -> Result<HttpReply, TransportError> {
@@ -141,6 +151,45 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// Cloudflare-fronted public RPCs refuse a request with no `User-Agent` (#3068). Every RPC
+    /// request carries exactly `nuthatch/<version>` and nothing that names the operator.
+    #[tokio::test]
+    async fn every_rpc_request_sends_the_fixed_user_agent() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use nuthatch_core::rpc::Transport;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |h: HeaderMap| {
+                let s2 = s2.clone();
+                async move {
+                    let ua = h.get("user-agent").and_then(|v| v.to_str().ok());
+                    s2.lock().unwrap().push(ua.unwrap_or("<none>").to_string());
+                    Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":"0x1"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let http = <super::Http as Transport>::build(std::time::Duration::from_secs(5)).unwrap();
+        http.post(
+            &format!("http://{addr}/"),
+            &serde_json::json!({"method":"eth_blockNumber"}),
+        )
+        .await
+        .map_err(|e| e.error)
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![concat!("nuthatch/", env!("CARGO_PKG_VERSION")).to_string()]
+        );
     }
 
     /// An endpoint that answers every request with `body`.
