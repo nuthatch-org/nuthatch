@@ -1090,6 +1090,93 @@ mod tests {
         super::pools().by_dir.get(dir).copied().unwrap_or_default()
     }
 
+    /// burrmill keeps a statement's plan for the same text (burrmill#370). Sealing a segment
+    /// rebinds the table over the longer file list, and the same statement, text for text, must
+    /// count the new rows. Today burrmill does not keep a plan over a facts table at all (its
+    /// catalogue check compares `Arc`s the view built separately), and where it does keep one
+    /// every `register_table` clears it; this holds the answer either way, so a later change to
+    /// either cannot serve a stale segment set unnoticed (PR #3079's invalidation question).
+    #[test]
+    fn a_statement_run_again_after_a_seal_sees_the_new_segment() {
+        use crate::engine::{FactWindow, Session};
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = super::BurrmillSession::new(Some((dir.path(), None))).unwrap();
+        let seal =
+            |name: &str, blocks: std::ops::RangeInclusive<u64>| -> (std::path::PathBuf, u64) {
+                let rows: Vec<serde_json::Value> = blocks
+                    .map(|b| serde_json::json!({ "block_number": b, "n": b * 2 }))
+                    .collect();
+                let refs: Vec<&serde_json::Value> = rows.iter().collect();
+                let table = format!("src_{name}");
+                scratch.load_hot(&table, &refs).unwrap();
+                assert!(scratch
+                    .bind_facts(&table, &[], &[], true, FactWindow::default())
+                    .unwrap());
+                let path = dir.path().join(format!("{name}.parquet"));
+                scratch.write_parquet(&table, &path).unwrap();
+                let size = std::fs::metadata(&path).unwrap().len();
+                (path, size)
+            };
+        let first = seal("a", 1..=10);
+        let second = seal("b", 11..=25);
+
+        let s = super::BurrmillSession::new(Some((dir.path(), None))).unwrap();
+        const SQL: &str = "SELECT count(*) AS c, max(block_number) AS m FROM seg";
+        let answer = |s: &super::BurrmillSession| {
+            let c = s.collect(SQL, None).map_err(|_| "died").unwrap();
+            (c.rows[0]["c"].clone(), c.rows[0]["m"].clone())
+        };
+        assert!(s
+            .bind_facts(
+                "seg",
+                &[],
+                std::slice::from_ref(&first),
+                false,
+                FactWindow::default()
+            )
+            .unwrap());
+        // Twice, so the second is the one planned from what the first kept.
+        assert_eq!(answer(&s), (10.into(), 10.into()));
+        assert_eq!(answer(&s), (10.into(), 10.into()));
+
+        // The nest seals a segment and rebinds the table over both, as `analytics` does.
+        assert!(s
+            .bind_facts("seg", &[], &[first, second], false, FactWindow::default())
+            .unwrap());
+        assert_eq!(
+            answer(&s),
+            (25.into(), 25.into()),
+            "the second run read the old segment set"
+        );
+        assert_eq!(answer(&s), (25.into(), 25.into()));
+
+        // The same over the hot tail: rows arrive, the table is rebound, the text is unchanged.
+        let hot = |blocks: std::ops::RangeInclusive<u64>| {
+            let rows: Vec<serde_json::Value> = blocks
+                .map(|b| serde_json::json!({ "block_number": b, "n": b }))
+                .collect();
+            let refs: Vec<&serde_json::Value> = rows.iter().collect();
+            s.load_hot("tail", &refs).unwrap();
+            assert!(s
+                .bind_facts("tail", &[], &[], true, FactWindow::default())
+                .unwrap());
+        };
+        const TAIL: &str = "SELECT count(*) AS c, max(block_number) AS m FROM tail";
+        let tail = |s: &super::BurrmillSession| {
+            let c = s.collect(TAIL, None).map_err(|_| "died").unwrap();
+            (c.rows[0]["c"].clone(), c.rows[0]["m"].clone())
+        };
+        hot(1..=5);
+        assert_eq!(tail(&s), (5.into(), 5.into()));
+        assert_eq!(tail(&s), (5.into(), 5.into()));
+        hot(1..=9);
+        assert_eq!(
+            tail(&s),
+            (9.into(), 9.into()),
+            "the second run read the old hot rows"
+        );
+    }
+
     /// #1778: a scrape during a statement reads what it holds, and a peak no scrape saw survives
     /// the session.
     #[test]
