@@ -64,6 +64,7 @@ echo "== refused: admin and operator surface"
 # Against the host itself nginx answers these, so they are held to its exact answers. Behind the path URL on
 # nuthatch-indexer.com (a /nests/ URL) Vercel answers first: a trailing-slash /_admin/ is a 404 and a double
 # slash a 308 before either reaches the host. Both are refusals, so only that URL is let off the exact answer.
+# That also means a run against the path URL does not exercise nginx's own refusal: run it against the host too.
 admin_slash=403; dslash='403|404'
 if [[ $base == */nests/* ]]; then admin_slash='403|404'; dslash='403|404|308'; fi
 expect "GET /_admin/"                "$admin_slash" "$base/_admin/"

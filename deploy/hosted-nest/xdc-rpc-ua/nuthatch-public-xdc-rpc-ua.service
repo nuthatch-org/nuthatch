@@ -1,0 +1,29 @@
+# Adds a User-Agent to XDC RPC calls (Cloudflare 403s a request without one). See nginx.conf beside this file.
+[Unit]
+Description=nuthatch public nests: XDC RPC User-Agent shim (127.0.0.1:18550)
+After=network-online.target
+
+[Service]
+Type=simple
+User=nests-public
+Group=nests-public
+RuntimeDirectory=nuthatch-public-xdc
+ExecStartPre=/usr/bin/mkdir -p /run/nuthatch-public-xdc/tmp
+ExecStartPre=/usr/sbin/nginx -t -c /etc/nuthatch-public/nginx-xdc-rpc.conf -e stderr
+ExecStart=/usr/sbin/nginx -c /etc/nuthatch-public/nginx-xdc-rpc.conf -e stderr
+Restart=on-failure
+RestartSec=2
+MemoryMax=128M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+
+[Install]
+WantedBy=multi-user.target
