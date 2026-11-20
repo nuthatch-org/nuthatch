@@ -7,6 +7,7 @@ pub mod alerts;
 pub mod answer;
 pub mod arrow_slice;
 pub mod backend;
+pub mod batch_limit;
 pub mod bind;
 pub mod chains;
 pub mod cursor;
