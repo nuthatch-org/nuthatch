@@ -7442,9 +7442,13 @@ impl NestIngest {
                     (Some(_), None) => ", no ipfs window deadline".to_string(),
                 };
                 let sealed = if let Some(fs) = self.factory.as_deref() {
+                    // The windows stay in order (the child registry is built along them), but one
+                    // window's address list, once an endpoint's cap splits it, is asked
+                    // `--concurrency` groups at a time (#3066). The rows are the same.
+                    source.set_log_group_fanout(concurrency);
                     if concurrency > 1 {
                         tracing::info!(
-                            "factory backfill runs sequentially (--concurrency {concurrency} ignored until the step-5 filter flip)"
+                            "factory backfill keeps its windows in order; an address list split by the endpoint's cap is asked {concurrency} groups at a time"
                         );
                     }
                     tracing::info!(

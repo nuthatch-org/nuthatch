@@ -948,6 +948,10 @@ pub struct RpcClient<T: Transport> {
     /// The most addresses one getLogs names, lowered when an endpoint refuses a list (#1941). One
     /// value for the pool: the strictest endpoint sets it, at the cost of extra requests elsewhere.
     log_address_cap: AtomicUsize,
+    /// How many address groups one getLogs list split by [`Self::log_address_cap`] may have in
+    /// flight at once. 1 (the default) asks them one after another; a backfill sets it from
+    /// `--concurrency`. The answer is the same either way, in the same order.
+    log_group_fanout: AtomicUsize,
     /// The most topic0 values one getLogs names, lowered when a single block is refused for a list
     /// (#2992: Arc testnet refuses more than 10 at any width).
     log_topic_cap: AtomicUsize,
@@ -993,10 +997,16 @@ impl<T: Transport> RpcClient<T> {
             logs_body_cap: GETLOGS_BODY_CAP,
             batch_body_cap: BATCH_BODY_CAP,
             log_address_cap: AtomicUsize::new(usize::MAX),
+            log_group_fanout: AtomicUsize::new(1),
             log_topic_cap: AtomicUsize::new(usize::MAX),
             unverified: (0..n).map(|_| AtomicBool::new(false)).collect(),
             chain: AtomicU64::new(0),
         })
+    }
+
+    /// Ask up to `n` address groups of one getLogs at a time (see `log_group_fanout`).
+    pub fn set_log_group_fanout(&self, n: usize) {
+        self.log_group_fanout.store(n.max(1), Ordering::Relaxed);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2514,6 +2524,49 @@ impl<T: Transport> RpcClient<T> {
                 .get_logs_once(addresses, topic0s, topics, from, to)
                 .await;
         }
+        // Once an endpoint's address cap is known, the groups are independent requests: ask up to
+        // `log_group_fanout` of them at a time. A refusal lowers the cap and starts over at the new
+        // width, so what comes back is what the one-at-a-time loop below would have returned.
+        loop {
+            let fanout = self.log_group_fanout.load(Ordering::Relaxed);
+            let cap = self.log_address_cap.load(Ordering::Relaxed);
+            if fanout <= 1 || addresses.len() <= cap {
+                break;
+            }
+            let groups: Vec<&[String]> = addresses.chunks(cap.max(1)).collect();
+            let mut asks: Vec<futures::future::BoxFuture<'_, Result<Vec<Log>>>> =
+                Vec::with_capacity(groups.len());
+            for g in &groups {
+                asks.push(Box::pin(self.get_logs_once(g, topic0s, topics, from, to)));
+            }
+            let mut answers = futures::StreamExt::buffered(futures::stream::iter(asks), fanout);
+            let mut logs = Vec::new();
+            let mut at = 0usize;
+            let mut lowered = false;
+            while let Some(answer) = futures::StreamExt::next(&mut answers).await {
+                match answer {
+                    Ok(mut l) => logs.append(&mut l),
+                    Err(e) if groups[at].len() > 1 && filter_refused(&e) => {
+                        let half = groups[at].len().div_ceil(2);
+                        if self.log_address_cap.fetch_min(half, Ordering::Relaxed) > half {
+                            tracing::info!(
+                                "eth_getLogs naming {} addresses was refused ({e:#}); asking in \
+                                 groups of at most {half}",
+                                groups[at].len()
+                            );
+                        }
+                        lowered = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+                at += 1;
+            }
+            if !lowered {
+                logs.sort_by_key(|l| (l.block_number, l.log_index));
+                return Ok(logs);
+            }
+        }
         let mut logs = Vec::new();
         let mut groups = 0usize;
         let mut done = 0usize;
@@ -2754,6 +2807,10 @@ impl<T: Transport> crate::source::Source for RpcClient<T> {
 
     fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
         filter_refused(err)
+    }
+
+    fn set_log_group_fanout(&self, n: usize) {
+        RpcClient::set_log_group_fanout(self, n);
     }
 
     async fn tip(&self) -> Result<u64> {

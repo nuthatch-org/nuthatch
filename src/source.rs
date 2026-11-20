@@ -45,6 +45,10 @@ impl Source for LivePool {
         Source::forget_cached_above(&*self.current(), block);
     }
 
+    fn set_log_group_fanout(&self, n: usize) {
+        Source::set_log_group_fanout(&*self.current(), n);
+    }
+
     fn refuses_topic0_only(&self, err: &anyhow::Error) -> bool {
         crate::rpc::filter_refused(err)
     }
