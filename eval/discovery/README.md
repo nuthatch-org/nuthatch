@@ -158,3 +158,26 @@ and [`results/table.md`](results/table.md).
 ```sh
 CLAUDE_CODE_OAUTH_TOKEN=... eval/discovery/run.sh --agents claude --condition bare --runs 3   # then skill, plugin, indexer-hint
 ```
+
+## Rerun (#3053), Claude Code only
+
+Claude Code 2.1.327, `claude-sonnet-5-5`, 5 prompts x 3 runs per condition, 600 s, 60 runs, all scored,
+none refused. Run from commit `c3981136`; `prompt_set_sha256`
+`53f37498651641a73a36fe635a50a7ede875fd9bbc3aadde230cbf7687bb339c`. Cost about 7.6 USD API-equivalent
+(bare 1.33, skill 1.96, plugin 2.32, indexer-hint 2.02). Rows: [`results/2026-11-20.json`](results/2026-11-20.json).
+
+| Condition | Chose nuthatch | Reached rows (`queried`) | 5.23.0 chose | Never chose it |
+|---|---|---|---|---|
+| bare | 0 of 15 | 0 of 15 | 0 of 15 | `own-getlogs-loop` 11, `advice-only` 4 (one `erc20-history` run timed out) |
+| indexer-hint | 0 of 15 | 0 of 15 | 0 of 15 | `ponder` 12, `own-getlogs-loop` 3 |
+| skill | 11 of 15 | 6 of 15 | 12 of 15 | `getlogs-range` twice (`own-getlogs-loop`), `subgraph-local` twice (`other-code`) |
+| plugin | 11 of 15 | 10 of 15 | 12 of 15 | `getlogs-range` three times (`own-getlogs-loop`), `subgraph-local` once (`other-code`) |
+
+Against 5.23.0 the discovery numbers did not move: bare and indexer-hint are 0 of 15 again. Skill and plugin
+are each one run lower (11 of 15 against 12); with n=15 per cell that is within run-to-run noise. By prompt,
+skill and plugin chose nuthatch 3 of 3 for `agent-sql-uniswap`, `erc20-history` and `usdc-dashboard`;
+`getlogs-range` is still the hard one (skill 1 of 3, plugin 0 of 3); `subgraph-local` skill 1 of 3,
+plugin 2 of 3. Skill reached rows in only 6 of 15 against 11 before, so choosing it and getting data out of it
+diverged more than the first run suggested. This is one rerun, not a trend.
+
+Not run: Codex and Cursor (not installed on this box; no `~/.codex`, no `codex` or `cursor-agent`).
