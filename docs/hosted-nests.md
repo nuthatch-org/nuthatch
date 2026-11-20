@@ -141,3 +141,20 @@ started on a real host or run through `test-proxy.sh` in this change.
   page and agents can call from any origin. `OPTIONS` is named in each `limit_except` on purpose: `limit_except` is its own
   block and would otherwise answer the preflight with a 403 before the `if` is reached. Existing hosts need the same edit in
   their `/etc/nuthatch-public/nginx*.conf` and a restart of each proxy unit.
+
+## Notes from moving the lead nests to keyed RPC (beefy-hyperevm, mpamm-monad, pharos-eth; 2026-11-20)
+
+- **Rule: GraphOps or Alchemy, never a public RPC, polled at 60 s or slower.** The key is `NUTHATCH_RPC` in
+  `/etc/nuthatch-public/<name>.env`, owned by `nests-public`, mode 0600 (systemd reads it as root). Pass the file to
+  `new-nest.sh`; the key is never printed. Alchemy URLs: `https://<network>-mainnet.g.alchemy.com/v2/<key>`
+  (`eth-mainnet`, `hyperliquid-mainnet`, `monad-mainnet`).
+- **`new-nest.sh --apply` under `sudo` drops `NEST_DEV_ARGS`** (sudo strips the environment, and `-E` is refused on this
+  host), so the unit is written with the 3 s default. Edit `--poll-interval` in the unit afterwards, or pass the variable
+  as `sudo env NEST_DEV_ARGS=... new-nest.sh`.
+- **A synced nest can be copied whole.** Beefy (HyperEVM, 40k events) and mpamm (Monad, 25k events) were backfilled on a
+  laptop through a call-counting proxy (37k and 45k Alchemy compute units), then their directories were copied to
+  `/var/lib/nuthatch-public/<name>` (not `.admin-token`, `.claude` or logs) and started with the stock 5.23.0 binary,
+  which caught up and followed. Stop the source nest first: a live redb is not safe to copy.
+- **XDC is on neither provider for this account.** Alchemy has `XDC_MAINNET` but it is not enabled for the app
+  (`-32600: XDC_MAINNET is not enabled for this app`; enabling is a dashboard step). The stored GraphOps session has no RPC
+  API key, so GraphOps was not probed. Until then gooddollar-xdc and sablier-xdc poll the public endpoint every 120 s.
