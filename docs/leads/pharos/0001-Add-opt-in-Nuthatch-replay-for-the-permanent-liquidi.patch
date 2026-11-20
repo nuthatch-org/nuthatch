@@ -1,0 +1,368 @@
+From 624667881bf32d9cc77823e49876d3b5ebf20e4e Mon Sep 17 00:00:00 2001
+From: Nuthatch worker <noreply@example.invalid>
+Date: Thu, 19 Nov 2026 22:38:33 +0200
+Subject: [PATCH] Add opt-in Nuthatch replay for the permanent-liquidity scan
+ (#2048)
+
+---
+ docs/doc-ownership.json                       |  19 ++
+ docs/permanent-liquidity-nuthatch.md          |  24 +++
+ package.json                                  |   1 +
+ scripts/lib/cli-argv-policy.mjs               |   1 +
+ .../permanent-liquidity-nuthatch.test.ts      |  58 ++++++
+ .../permanent-liquidity-nuthatch.mjs          | 193 ++++++++++++++++++
+ 6 files changed, 296 insertions(+)
+ create mode 100644 docs/permanent-liquidity-nuthatch.md
+ create mode 100644 scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts
+ create mode 100644 scripts/maintenance/permanent-liquidity-nuthatch.mjs
+
+diff --git a/docs/doc-ownership.json b/docs/doc-ownership.json
+index fb8484d..76288e3 100644
+--- a/docs/doc-ownership.json
++++ b/docs/doc-ownership.json
+@@ -29,6 +29,25 @@
+         "Keep the dated manifest immutable."
+       ]
+     },
++    {
++      "id": "permanent-liquidity-nuthatch-replay",
++      "label": "Opt-in Nuthatch replay of fungible LP Transfers for the permanent-liquidity scan (#2048)",
++      "risk": "low",
++      "sources": [
++        "scripts/maintenance/permanent-liquidity-nuthatch.mjs",
++        "scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts",
++        "docs/permanent-liquidity-nuthatch.md"
++      ],
++      "docs": ["docs/permanent-liquidity-nuthatch.md"],
++      "checks": [
++        "npx vitest run scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts",
++        "npm run check:cli-args-policy"
++      ],
++      "rules": [
++        "Read-only and opt-in: the script never touches the Worker, D1, the DEX registry or any scoring path.",
++        "`replay + balanceOf(0x0) == totalSupply` is a mass-conservation check only: it catches missing mints and burns, not wrong, missing or duplicated transfers between two non-zero holders. A failing token is a failed scan; a passing one is not proof of correct balances."
++      ]
++    },
+     {
+       "id": "scene-kit",
+       "label": "Isometric scene kit (Cemetery, Harbor, PSI beacon)",
+diff --git a/docs/permanent-liquidity-nuthatch.md b/docs/permanent-liquidity-nuthatch.md
+new file mode 100644
+index 0000000..d611b70
+--- /dev/null
++++ b/docs/permanent-liquidity-nuthatch.md
+@@ -0,0 +1,24 @@
++# Permanent-liquidity scan with Nuthatch (opt-in)
++
++Issue #2048 replays every Transfer of a fungible LP token from genesis through `eth_getLogs`. This
++script is an optional way to do that replay locally with [Nuthatch](https://github.com/nuthatch-org/nuthatch),
++a single-binary indexer. Nothing in the Worker, D1, the DEX registry or scoring uses it.
++
++## Run it
++
++```
++npm run scan:permanent-liquidity -- --rpc <archive eth_getLogs URL> --dir ~/lp-scan \
++  0xLpToken:firstBlock [0xOtherLp:firstBlock ...]
++```
++
++It writes a nest (one ERC-20 Transfer ABI, one contract entry per token) into `--dir`, runs
++`nuthatch dev --seal-direct` until the history is sealed, rebuilds balances, and checks
++`replay(non-zero holders) + balanceOf(0x0) == totalSupply()` at the tip. A token that fails the check
++is a failed scan. Re-running in the same `--dir` resumes; it never starts over.
++
++Needs Node 20+, the `nuthatch` binary on PATH (or `--nuthatch <path>`) and an archive RPC.
++
++## Measured
++
++Two LP tokens from block 10,000,000 to 26,450,931, one public RPC (Tenderly gateway), 4 parallel
++windows of 5,000 blocks, one laptop: 7m26s, 109,446 Transfer events, both supply checks pass.
+diff --git a/package.json b/package.json
+index 3f00db6..4c95f35 100644
+--- a/package.json
++++ b/package.json
+@@ -24,6 +24,7 @@
+     "dev": "node --import tsx scripts/maintenance/dev.ts",
+     "dev:next": "next dev --webpack",
+     "dev:proxy": "node --import tsx scripts/maintenance/dev-api-proxy.ts",
++    "scan:permanent-liquidity": "node scripts/maintenance/permanent-liquidity-nuthatch.mjs",
+     "ci:census": "node --import tsx scripts/maintenance/ci-failure-census.ts",
+     "bootstrap:generated": "node --import tsx scripts/maintenance/run-generated-artifacts.ts --bootstrap",
+     "bootstrap:generated:history": "node --import tsx scripts/maintenance/run-generated-artifacts.ts --only=docs-metadata & docs_pid=$!; node --import tsx scripts/maintenance/run-generated-artifacts.ts --only=sitemap-dates & sitemap_pid=$!; wait \"$docs_pid\"; docs_status=$?; wait \"$sitemap_pid\"; sitemap_status=$?; [ \"$docs_status\" -eq 0 ] && [ \"$sitemap_status\" -eq 0 ]",
+diff --git a/scripts/lib/cli-argv-policy.mjs b/scripts/lib/cli-argv-policy.mjs
+index cb46bd7..9ac7205 100644
+--- a/scripts/lib/cli-argv-policy.mjs
++++ b/scripts/lib/cli-argv-policy.mjs
+@@ -78,6 +78,7 @@ export const CLI_ARGV_POLICY = Object.freeze({
+     strict("scripts/maintenance/migrate-stablecoin-sidecar.ts"),
+     strict("scripts/maintenance/monitor-worker-memory.ts"),
+     strict("scripts/maintenance/night-watch-worker.mjs"),
++    strict("scripts/maintenance/permanent-liquidity-nuthatch.mjs"),
+     strict("scripts/maintenance/probe-page-performance.mjs"),
+     strict("scripts/maintenance/publish-daily-social.ts"),
+     strict("scripts/maintenance/publish-safety-score-map.ts"),
+diff --git a/scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts b/scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts
+new file mode 100644
+index 0000000..05902f3
+--- /dev/null
++++ b/scripts/maintenance/__tests__/permanent-liquidity-nuthatch.test.ts
+@@ -0,0 +1,58 @@
++import { describe, expect, it } from "vitest";
++import {
++  balancesFromRows,
++  balancesSql,
++  checkReplay,
++  firstWord,
++  parseLpNestArgs,
++  parseTokenSpec,
++  renderNestToml,
++} from "../permanent-liquidity-nuthatch.mjs";
++
++const LUSD3CRV = "0xEd279fDD11cA84bEef15AF5D39BB4d4bEE23F0cA";
++const ZERO = "0x0000000000000000000000000000000000000000";
++
++describe("permanent-liquidity Nuthatch replay", () => {
++  it("parses LP specs with an optional start block and rejects anything else", () => {
++    expect(parseTokenSpec(`${LUSD3CRV}:12184843`)).toEqual({ address: LUSD3CRV.toLowerCase(), startBlock: 12184843 });
++    expect(parseTokenSpec(LUSD3CRV).startBlock).toBe(0);
++    expect(() => parseTokenSpec("0x123")).toThrow(/LP token must be/);
++    expect(() => parseTokenSpec(`${LUSD3CRV}:1:2`)).toThrow(/LP token must be/);
++  });
++
++  it("requires --rpc, --dir and a token, and rejects unknown options", () => {
++    expect(() => parseLpNestArgs([LUSD3CRV])).toThrow(/--rpc/);
++    expect(() => parseLpNestArgs(["--rpc", "http://x", LUSD3CRV])).toThrow(/--dir/);
++    expect(() => parseLpNestArgs(["--rpc", "http://x", "--dir", "d"])).toThrow(/at least one LP token/);
++    expect(() => parseLpNestArgs(["--rpc", "http://x", "--dir", "d", "--bogus", LUSD3CRV])).toThrow();
++  });
++
++  it("renders one contract entry per LP token", () => {
++    const options = parseLpNestArgs(["--rpc", "http://x", "--dir", "d", `${LUSD3CRV}:12184843`, "0x3041CbD36888bECc7bbCBc0045E3B1f144466f5f"]);
++    const toml = renderNestToml(options);
++    expect(toml.match(/\[\[contracts\]\]/g)).toHaveLength(2);
++    expect(toml).toContain('alias = "lp1"');
++    expect(toml).toContain("start_block = 12184843");
++    expect(toml).toContain("block_timestamps = false");
++  });
++
++  it("builds the replay query over the alias table", () => {
++    expect(balancesSql("lp0__transfer")).toContain("FROM lp0__transfer");
++  });
++
++  it("passes when non-zero holders plus balanceOf(0x0) equal totalSupply", () => {
++    // A Uniswap V2 style pair: 1000 LP minted to 0x0 stays there, the rest is held by two holders.
++    const balances = balancesFromRows([
++      { addr: ZERO, bal: "-1000000" },
++      { addr: "0xAA", bal: "600000" },
++      { addr: "0xBB", bal: "399000" },
++    ]);
++    expect(checkReplay(balances, { totalSupply: 1_000_000n, balanceOfZero: 1000n })).toEqual({ replaySupply: 999_000n, ok: true });
++    expect(checkReplay(balances, { totalSupply: 1_000_000n, balanceOfZero: 0n }).ok).toBe(false);
++  });
++
++  it("reads the first word of a padded eth_call result", () => {
++    const word = `0x${"0".repeat(63)}a`;
++    expect(firstWord(`${word}${"0".repeat(128)}`)).toBe(10n);
++  });
++});
+diff --git a/scripts/maintenance/permanent-liquidity-nuthatch.mjs b/scripts/maintenance/permanent-liquidity-nuthatch.mjs
+new file mode 100644
+index 0000000..5adea27
+--- /dev/null
++++ b/scripts/maintenance/permanent-liquidity-nuthatch.mjs
+@@ -0,0 +1,193 @@
++#!/usr/bin/env node
++
++// Opt-in alternative to the fungible-LP Transfer replay in issue #2048: let a local Nuthatch nest
++// (https://github.com/nuthatch-org/nuthatch) fetch and seal every Transfer of the given LP tokens,
++// then rebuild balances from it and run `replay + balanceOf(0x0) == totalSupply`.
++// Read-only: no Worker, D1, registry or scoring path is touched. Docs: docs/permanent-liquidity-nuthatch.md
++
++import { spawn } from "node:child_process";
++import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { setTimeout as sleep } from "node:timers/promises";
++import { CliUsageError, parseCliInteger, parseStrictCliArgs, runDirectCli } from "../lib/cli-args.mjs";
++
++const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
++const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
++const TOTAL_SUPPLY_SELECTOR = "0x18160ddd";
++const BALANCE_OF_SELECTOR = "0x70a08231";
++
++const TRANSFER_ABI = [
++  {
++    type: "event",
++    name: "Transfer",
++    anonymous: false,
++    inputs: [
++      { name: "from", type: "address", indexed: true },
++      { name: "to", type: "address", indexed: true },
++      { name: "value", type: "uint256", indexed: false },
++    ],
++  },
++];
++
++/** `0xLP` or `0xLP:startBlock`. The start block is the first block that may hold a Transfer; default 0. */
++export function parseTokenSpec(spec) {
++  const [address, start = "0", ...rest] = String(spec).split(":");
++  if (rest.length > 0 || !ADDRESS_PATTERN.test(address) || !/^\d+$/.test(start)) {
++    throw new CliUsageError(`LP token must be 0xAddress or 0xAddress:startBlock, got ${spec}`);
++  }
++  return { address: address.toLowerCase(), startBlock: Number(start) };
++}
++
++export function parseLpNestArgs(argv) {
++  const { values, positionals } = parseStrictCliArgs(argv, {
++    allowPositionals: true,
++    options: {
++      rpc: { type: "string" },
++      dir: { type: "string" },
++      "chain-id": { type: "string", default: "1" },
++      chain: { type: "string", default: "mainnet" },
++      window: { type: "string", default: "5000" },
++      concurrency: { type: "string", default: "4" },
++      nuthatch: { type: "string", default: "nuthatch" },
++      port: { type: "string", default: "8288" },
++      "min-pct": { type: "string", default: "0.1" },
++      attach: { type: "boolean" },
++    },
++  });
++  if (!values.rpc) throw new CliUsageError("--rpc <archive eth_getLogs URL> is required");
++  if (!values.dir) throw new CliUsageError("--dir <nest directory> is required");
++  if (positionals.length === 0) throw new CliUsageError("Pass at least one LP token: 0xAddress[:startBlock]");
++  return {
++    rpc: values.rpc,
++    dir: values.dir,
++    chainId: parseCliInteger(values["chain-id"], { name: "--chain-id", min: 1 }),
++    chain: values.chain,
++    window: parseCliInteger(values.window, { name: "--window", min: 1 }),
++    concurrency: parseCliInteger(values.concurrency, { name: "--concurrency", min: 1, max: 32 }),
++    nuthatch: values.nuthatch,
++    port: parseCliInteger(values.port, { name: "--port", min: 1, max: 65535 }),
++    minPct: Number(values["min-pct"]),
++    attach: Boolean(values.attach),
++    tokens: positionals.map(parseTokenSpec).map((token, index) => ({ ...token, alias: `lp${index}` })),
++  };
++}
++
++/** One [[contracts]] entry per LP token over a shared ERC-20 Transfer ABI. Timestamps are not needed. */
++export function renderNestToml({ chain, chainId, rpc, tokens }) {
++  const header = `[nest]\nname = "pharos-lp-scan"\nchain = "${chain}"\nchain_id = ${chainId}\nrpc_urls = ["${rpc}"]\nschema_version = 2\nblock_timestamps = false\n`;
++  const contracts = tokens.map(
++    ({ alias, address, startBlock }) =>
++      `\n[[contracts]]\nalias = "${alias}"\naddress = "${address}"\nstart_block = ${startBlock}\nabi = "abis/erc20_transfer.json"\n`,
++  );
++  return header + contracts.join("");
++}
++
++/** The replay, in SQL over the nest's `<alias>__transfer` table: signed balance per address, zero dropped. */
++export function balancesSql(table) {
++  return `SELECT addr, CAST(sum(d) AS VARCHAR) AS bal FROM (SELECT "to" AS addr, value_dec AS d FROM ${table} UNION ALL SELECT "from", -value_dec FROM ${table}) GROUP BY addr HAVING sum(d) <> 0`;
++}
++
++/** `/sql` rows of {addr, bal} into a map of lower-cased address to signed balance. */
++export function balancesFromRows(rows) {
++  return new Map(rows.map(({ addr, bal }) => [String(addr).toLowerCase(), BigInt(bal)]));
++}
++
++/**
++ * The #2048 check. Mints are Transfers from 0x0 and burns are Transfers to it, so the replayed 0x0 balance is
++ * not the chain's: compare the non-zero holders' sum, plus the real `balanceOf(0x0)`, with `totalSupply()`.
++ */
++export function checkReplay(balances, { totalSupply, balanceOfZero }) {
++  const replaySupply = [...balances].filter(([address]) => address !== ZERO_ADDRESS).reduce((sum, [, balance]) => sum + balance, 0n);
++  return { replaySupply, ok: replaySupply + balanceOfZero === totalSupply };
++}
++
++/** Some gateways pad `eth_call` results past 32 bytes; read the first word. */
++export function firstWord(hex) {
++  return BigInt(String(hex).slice(0, 66));
++}
++
++async function jsonRpc(url, method, params) {
++  const response = await fetch(url, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
++  });
++  const body = await response.json();
++  if (body.error) throw new Error(`${method}: ${body.error.message}`);
++  return body.result;
++}
++
++function prepareNest(options) {
++  mkdirSync(join(options.dir, "abis"), { recursive: true });
++  writeFileSync(join(options.dir, "abis", "erc20_transfer.json"), `${JSON.stringify(TRANSFER_ABI, null, 2)}\n`);
++  const tomlPath = join(options.dir, "nuthatch.toml");
++  if (!existsSync(tomlPath)) writeFileSync(tomlPath, renderNestToml(options));
++  // A nest that already exists keeps its own aliases, which name its tables.
++  for (const match of readFileSync(tomlPath, "utf8").matchAll(/alias = "([^"]+)"\naddress = "(0x[0-9a-f]{40})"/g)) {
++    const token = options.tokens.find(({ address }) => address === match[2]);
++    if (token) token.alias = match[1];
++  }
++}
++
++async function waitForTip(options, base) {
++  for (;;) {
++    await sleep(5000);
++    try {
++      const root = await (await fetch(`${base}/`)).json();
++      const tip = Number.parseInt(await jsonRpc(options.rpc, "eth_blockNumber", []), 16);
++      if (root.last_block && tip - Number(root.last_block) < 100) return;
++    } catch {
++      // still starting
++    }
++  }
++}
++
++export async function runLpNestScan(argv = process.argv.slice(2)) {
++  const options = parseLpNestArgs(argv);
++  prepareNest(options);
++  const base = `http://127.0.0.1:${options.port}`;
++  const startedAt = Date.now();
++  const nest = options.attach
++    ? null
++    : spawn(
++        options.nuthatch,
++        ["dev", "--seal-direct", "--concurrency", String(options.concurrency), "--window", String(options.window), "--no-admin", "--listen", `127.0.0.1:${options.port}`],
++        { cwd: options.dir, stdio: ["ignore", "inherit", "inherit"] },
++      );
++  try {
++    await waitForTip(options, base);
++    const backfillSeconds = Math.round((Date.now() - startedAt) / 1000);
++    const tokens = [];
++    for (const { address, alias } of options.tokens) {
++      const table = `${alias}__transfer`;
++      const sqlResponse = await fetch(`${base}/sql?q=${encodeURIComponent(balancesSql(table))}`);
++      const answer = await sqlResponse.json();
++      if (!Array.isArray(answer.rows) || answer.truncated) throw new Error(`/sql did not return every holder of ${address}: ${JSON.stringify(answer).slice(0, 200)}`);
++      const balances = balancesFromRows(answer.rows);
++      const totalSupply = firstWord(await jsonRpc(options.rpc, "eth_call", [{ to: address, data: TOTAL_SUPPLY_SELECTOR }, "latest"]));
++      const balanceOfZero = firstWord(
++        await jsonRpc(options.rpc, "eth_call", [{ to: address, data: BALANCE_OF_SELECTOR + ZERO_ADDRESS.slice(2).padStart(64, "0") }, "latest"]),
++      );
++      const { replaySupply, ok } = checkReplay(balances, { totalSupply, balanceOfZero });
++      const holders = [...balances]
++        .filter(([holder, balance]) => holder !== ZERO_ADDRESS && totalSupply > 0n && Number((balance * 1_000_000n) / totalSupply) / 10_000 >= options.minPct)
++        .sort((a, b) => (b[1] > a[1] ? 1 : -1))
++        .map(([holder, balance]) => ({ address: holder, balance: balance.toString(), pct: Number((balance * 1_000_000n) / totalSupply) / 10_000 }));
++      tokens.push({
++        lp: address,
++        holders: balances.size - (balances.has(ZERO_ADDRESS) ? 1 : 0),
++        replaySupply: replaySupply.toString(),
++        totalSupply: totalSupply.toString(),
++        balanceOfZero: balanceOfZero.toString(),
++        ok,
++        holdersOverMinPct: holders,
++      });
++    }
++    console.log(JSON.stringify({ backfillSeconds, tokens }, null, 2));
++    if (tokens.some(({ ok }) => !ok)) process.exitCode = 1;
++  } finally {
++    nest?.kill("SIGTERM");
++  }
++}
++
++runDirectCli(import.meta.url, runLpNestScan);
+-- 
+2.47.3
+

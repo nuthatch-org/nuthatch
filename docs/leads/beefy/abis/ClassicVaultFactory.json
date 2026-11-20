@@ -1,0 +1,34 @@
+[
+  {
+    "inputs": [{ "internalType": "address", "name": "_instance", "type": "address" }],
+    "stateMutability": "nonpayable",
+    "type": "constructor"
+  },
+  {
+    "anonymous": false,
+    "inputs": [{ "indexed": false, "internalType": "address", "name": "proxy", "type": "address" }],
+    "name": "ProxyCreated",
+    "type": "event"
+  },
+  {
+    "inputs": [{ "internalType": "address", "name": "implementation", "type": "address" }],
+    "name": "cloneContract",
+    "outputs": [{ "internalType": "address", "name": "", "type": "address" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "cloneVault",
+    "outputs": [{ "internalType": "contract BeefyVaultV7", "name": "", "type": "address" }],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "instance",
+    "outputs": [{ "internalType": "contract BeefyVaultV7", "name": "", "type": "address" }],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]
