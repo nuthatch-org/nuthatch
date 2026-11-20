@@ -498,6 +498,14 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
             let name = params["name"].as_str().unwrap_or_default().to_string();
             let answer = match session.authoring {
                 Some(a) if authoring::is_tool(&name) => a.call(&name, &params["arguments"]).await,
+                // Offered only on an address-history nest, so accepted only there.
+                _ if wallet::is_tool(&name) => {
+                    if fetch_shape(session).await.address_history {
+                        wallet::call(&name, &params["arguments"], client, base).await
+                    } else {
+                        Err(anyhow!("unknown tool `{name}`"))
+                    }
+                }
                 _ => call_tool(&params, client, base).await,
             };
             match answer {
@@ -1010,9 +1018,6 @@ async fn call_tool(params: &Value, client: Link<'_>, base: &str) -> Result<Strin
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    if let Some(answer) = wallet::call(name, &args, client, base).await {
-        return answer;
-    }
     match name {
         "status" => get(client, &format!("{base}/")).await,
         // The enriched, per-nest schema (RFC-0016 §2): structure + meaning + footguns + coverage,
@@ -3419,6 +3424,7 @@ mod tests {
                             json!({"status": "1", "message": "OK", "result": "100"})
                         }
                         "getblocknobytime" => json!({"status": "1", "message": "OK", "result": "200"}),
+                        "tokennfttx" => json!({"status": "0", "message": "No transactions found", "result": []}),
                         "txlist" => json!({"status": "1", "message": "OK", "generation": "7",
                             "result": [{"blockNumber": g("startblock"), "endBlock": g("endblock"),
                                 "value": "1500000000000000000"}]}),
@@ -3516,6 +3522,32 @@ mod tests {
         )
         .await;
         assert_eq!(r["result"]["isError"], true, "a window is required: {r}");
+
+        // Etherscan's shape for a window with no rows is an empty answer, not a refusal.
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc", "from_block": 1, "to_block": 2, "kinds": ["nft"]}),
+        )
+        .await;
+        let v: Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["nft"]["count"], 0, "{v}");
+        assert!(v["nft"].get("refused").is_none(), "{v}");
+        h.abort();
+    }
+
+    /// The wallet tools are accepted only where they are offered: an event nest answers unknown tool
+    /// and sends nothing to `/api`.
+    #[tokio::test]
+    async fn an_event_nest_refuses_the_wallet_tools_by_name() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_serving_nest().await;
+        for name in ["coverage", "wallet_status", "wallet_history"] {
+            let r = call_named(&client, &base, name, json!({"address": "0xabc"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(tool_text(&r).contains("unknown tool"), "{r}");
+        }
         h.abort();
     }
 

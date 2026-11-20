@@ -3155,46 +3155,50 @@ async fn coverage(
 
 fn coverage_doc(s: &ModeState, h: &AddressHistory, one: Option<String>) -> Result<Value> {
     use crate::address_discovery::{BLOCK_SCANNED, DISCOVERED};
-    use crate::address_history::Action;
-    let addresses = match one {
-        Some(a) => vec![a],
-        None => h.watched()?,
-    };
     let bodies = body_accounts(s, h)?;
-    let accounts: Vec<(String, Vec<Action>)> = addresses
-        .into_iter()
-        .map(|a| {
-            let mut actions = DISCOVERED.to_vec();
-            if s.chain_id == 1 && bodies.iter().any(|b| b.eq_ignore_ascii_case(&a)) {
-                actions.extend(BLOCK_SCANNED);
-            }
-            (a, actions)
-        })
-        .collect();
-    let head = h.head()?;
-    let swept = match &s.sweep {
-        Some(_) => h.swept()?,
-        None => None,
-    };
-    let (generation, report) = h.coverage_report(&accounts)?;
-    let hi = head.map(|f| s.end_block.map_or(f, |e| e.min(f)));
-    let accounts: Vec<Value> = report
-        .into_iter()
+    let snap = h.coverage_report(one.as_deref(), |a| {
+        let mut actions = DISCOVERED.to_vec();
+        if s.chain_id == 1 && bodies.iter().any(|b| b.eq_ignore_ascii_case(a)) {
+            actions.extend(BLOCK_SCANNED);
+        }
+        actions
+    })?;
+    let swept = snap.swept.filter(|_| s.sweep.is_some());
+    let hi = snap.head.map(|f| s.end_block.map_or(f, |e| e.min(f)));
+    let failing = s.stalled_backfill();
+    let stalled = s.stalled();
+    let accounts: Vec<Value> = snap
+        .accounts
+        .iter()
         .map(|acc| {
+            let stall = stall_reason(stalled, &failing, &acc.address);
             let actions: serde_json::Map<String, Value> = acc
                 .spans
                 .iter()
                 .map(|(action, covered)| {
-                    let missing: Vec<Value> = hi
-                        .map(|hi| missing_spans(covered, s.start_block, hi))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .flat_map(|gap| gap_reasons(s, &acc, *action, gap, swept))
-                        .collect();
-                    (
-                        action.etherscan().to_string(),
-                        json!({ "covered": covered, "missing": missing }),
-                    )
+                    let mut doc = json!({ "covered": covered });
+                    match hi {
+                        Some(hi) => {
+                            let missing: Vec<Value> = missing_spans(covered, s.start_block, hi)
+                                .into_iter()
+                                .flat_map(|gap| gap_reasons(s, acc, *action, gap, swept))
+                                .map(|mut g| {
+                                    if let (Some(why), "pending") = (&stall, g["status"].as_str().unwrap_or("")) {
+                                        g["status"] = json!("stalled");
+                                        g["why"] = json!(why);
+                                    }
+                                    g
+                                })
+                                .collect();
+                            doc["missing"] = json!(missing);
+                        }
+                        None => {
+                            doc["missing_unknown"] = json!(
+                                "the finalized head has not been read yet, so what is missing cannot be counted"
+                            );
+                        }
+                    }
+                    (action.etherscan().to_string(), doc)
                 })
                 .collect();
             json!({
@@ -3208,17 +3212,39 @@ fn coverage_doc(s: &ModeState, h: &AddressHistory, one: Option<String>) -> Resul
         .collect();
     Ok(json!({
         "chain_id": s.chain_id,
-        "generation": generation.to_string(),
+        "generation": snap.generation.to_string(),
         "start_block": s.start_block,
         "end_block": s.end_block,
-        "finalized_head": head,
-        "tip": h.tip()?,
+        "finalized_head": snap.head,
+        "tip": snap.tip,
         "sweep": s.sweep.is_some(),
         "accounts": accounts,
         "note": "missing is counted from start_block to the finalized head; history before \
             start_block is never fetched, and a request above the finalized head, up to the chain \
             head, is covered on demand within the request deadline or refused",
     }))
+}
+
+/// Why a watched account's owed blocks are not coming now, if they are not: its own backfill windows
+/// failing, or the cursor as a whole stalled, as `/ready` reports them.
+fn stall_reason(stalled: bool, failing: &[Value], address: &str) -> Option<String> {
+    if let Some(f) = failing.iter().find(|f| {
+        f["address"]
+            .as_str()
+            .is_some_and(|a| a.eq_ignore_ascii_case(address))
+    }) {
+        return Some(format!(
+            "backfill windows for {address} are failing ({} failures, next try in {} polls): {}",
+            f["failures"],
+            f["retry_in_polls"],
+            f["error"].as_str().unwrap_or("unknown error")
+        ));
+    }
+    stalled.then(|| {
+        "the cursor is stalled: it has not polled for three intervals, or its RPC or trace endpoint \
+         is failing; see /ready"
+            .to_string()
+    })
 }
 
 /// The blocks of `[lo, hi]` no span of `covered` (sorted, merged, inclusive) holds.
@@ -7770,6 +7796,26 @@ mod tests {
 
         let (status, _) = call(router(s), "GET", "/api/coverage?address=0x12", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Owed blocks the cursor is failing to fetch are `stalled`, not `pending`, and before the first
+    /// finalized head nothing is counted as missing, rather than everything reading as covered.
+    #[tokio::test]
+    async fn coverage_says_stalled_and_does_not_count_missing_without_a_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state(dir.path(), true);
+        let (_, r) = call(router(s.clone()), "GET", "/api/coverage", None).await;
+        let txlist = &r["accounts"][0]["actions"]["txlist"];
+        assert!(txlist.get("missing").is_none(), "{r}");
+        assert!(txlist["missing_unknown"].is_string(), "{r}");
+        assert!(r["finalized_head"].is_null(), "{r}");
+
+        s.history.set_head(500).unwrap();
+        s.backfill_failing.store(true, Ordering::Relaxed);
+        let (_, r) = call(router(s), "GET", "/api/coverage", None).await;
+        let gap = &r["accounts"][0]["actions"]["txlist"]["missing"][0];
+        assert_eq!(gap["status"], "stalled", "{r}");
+        assert!(gap["why"].as_str().unwrap().contains("stalled"), "{r}");
     }
 
     /// A sweep that does not trace never covers internal transactions, and says so rather than pending.

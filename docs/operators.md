@@ -1350,8 +1350,10 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   refused off a loopback bind, where those actions are refused to everyone, and on an event nest or
   a runtime.
 - **`GET /api/coverage`** lists each watched account's covered blocks per action and, between
-  `start_block` and the finalized head, the ranges it does not hold, each `pending`, `not_watched` or
-  `never` with why, read from one state of the store and stamped with its `generation`.
+  `start_block` and the finalized head, the ranges it does not hold, each `pending`, `stalled` (owed, but the account's backfill windows
+  or the cursor are failing, with the error), `not_watched` or `never` with why, read in one store
+  transaction with its `generation`, finalized head and tip. Before the first finalized head there is
+  no `missing`, and `missing_unknown` says why.
   `?address=` asks for one account, watched or not; on a directory of chains the answer is per chain
   under `chains`, or one chain with `?chainid=`. `nuthatch mcp` reads it for its `coverage` tool
   ([recipe](rotki-wallets-with-claude.md)).

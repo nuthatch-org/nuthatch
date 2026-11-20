@@ -57,9 +57,10 @@ no SQL tables. Address-history nests do not serve `/mcp` over HTTP, so use the s
 ## 3. Ask
 
 - "Which of my addresses does the nest cover, and which blocks is it still missing?"
-  Claude calls `coverage`. Each missing range is `pending` (watched and backfilling), `not_watched`
-  or `never` (this nest will not hold it, for example a contract's transactions where they cannot be
-  proved), counted from `start_block` to the finalized head.
+  Claude calls `coverage`. Each missing range is `pending` (watched and backfilling), `stalled`
+  (owed, but the backfill is failing, with the error), `not_watched` or `never` (this nest will not
+  hold it, for example a contract's transactions where they cannot be proved), counted from
+  `start_block` to the finalized head.
 - "What did 0xYourFirstAddress send and receive in March 2026?"
   Claude calls `wallet_history` with `from_time` and `to_time`. The nest places the times on blocks
   itself. Native amounts come back as `value_native`, token amounts as `value_formatted` with the

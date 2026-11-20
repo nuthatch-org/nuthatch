@@ -43,7 +43,7 @@ pub(super) fn tool_specs() -> Vec<Value> {
     vec![
         json!({ "name": "wallet_status", "title": "Address-history nest status", "description": "Status of this address-history nest (watched EVM accounts' history, RFC-0063): chain, finalized head, tip, how many accounts are watched, and `served_through`, the block each family of history is answered through without waiting. Answers an HTTP 503 with the reason while the nest is not ready.",
           "inputSchema": { "type": "object", "properties": {} } }),
-        json!({ "name": "coverage", "title": "Watched accounts and coverage", "description": "The EVM accounts this nest watches and, per account and per action (txlist, txlistinternal, tokentx, tokennfttx, token1155tx), the block ranges it holds (`covered`) and the ranges between `start_block` and the finalized head it does not (`missing`), each with a status: `pending` (watched, backfilling), `not_watched` (watching it would backfill it) or `never` (this nest will not cover it, with why). Read from one state of the store, stamped with its `generation`. Give `address` for one account, watched or not.",
+        json!({ "name": "coverage", "title": "Watched accounts and coverage", "description": "The EVM accounts this nest watches and, per account and per action (txlist, txlistinternal, tokentx, tokennfttx, token1155tx), the block ranges it holds (`covered`) and the ranges between `start_block` and the finalized head it does not (`missing`), each with a status: `pending` (watched, owed, backfill running), `stalled` (owed, but the account's backfill windows are failing or the cursor is stalled, with the error), `not_watched` (watching it would backfill it) or `never` (this nest will not cover it, with why). Before the first finalized head `missing` is absent and `missing_unknown` says why. Read from one store transaction with its `generation`, finalized head and tip. Give `address` for one account, watched or not.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string", "description": "One 0x address; omitted, every watched account." }, "chainid": { "type": "integer", "description": "The chain, where one URL serves a directory of chains." } } } }),
         json!({ "name": "wallet_history", "title": "One account's history", "description": "One EVM account's normal transactions, internal transactions and token transfers over a block or time window, as this address-history nest serves them to rotki at `/api`, with decimals applied: `value_native` on normal and internal rows (wei at 18 decimals), `value_formatted` on token rows (by the row's `tokenDecimal`). Each kind is answered whole for the window or refused with the nest's reason (not indexed, pending, not watched), never shortened. A window above the finalized head, up to the chain head, is covered on demand through the nest's RPC within its request deadline. The answer carries a provenance stamp (generation, finalized head, tip) and `not_seen`. Give `from_block` or `from_time`, and `to_block` or `to_time`.",
           "inputSchema": { "type": "object", "properties": {
@@ -90,22 +90,23 @@ pub(super) fn render_prompt(name: &str, args: &Value) -> Option<String> {
         }
         "coverage-gaps" => "Tell me which parts of my accounts' history this nest does not hold. Call \
             `coverage`, then for each account and action list the `missing` ranges with their status \
-            and why, grouped as pending (coming), not watched (watching would fetch it) and never (this \
-            nest will not hold it). Say the finalized head and `start_block` the ranges are counted \
+            and why, grouped as pending (coming), stalled (owed but failing, with the error), not watched \
+            (watching would fetch it) and never (this nest will not hold it). Say the finalized head and `start_block` the ranges are counted \
             between, and the generation the report was read at. Infer nothing beyond what it says."
             .to_string(),
         _ => return None,
     })
 }
 
-/// A wallet tool's answer, or `None` when `name` is not one.
-pub(super) async fn call(
-    name: &str,
-    args: &Value,
-    link: Link<'_>,
-    base: &str,
-) -> Option<Result<String>> {
-    Some(match name {
+const TOOLS: [&str; 3] = ["wallet_status", "coverage", "wallet_history"];
+
+pub(super) fn is_tool(name: &str) -> bool {
+    TOOLS.contains(&name)
+}
+
+/// A wallet tool's answer.
+pub(super) async fn call(name: &str, args: &Value, link: Link<'_>, base: &str) -> Result<String> {
+    match name {
         "wallet_status" => get(link, &format!("{base}/ready")).await,
         "coverage" => {
             let chain = args["chainid"].as_u64().map(|c| c.to_string());
@@ -119,8 +120,8 @@ pub(super) async fn call(
             get_query(link, &format!("{base}/api/coverage"), &q).await
         }
         "wallet_history" => history(args, link, base).await.map(|v| v.to_string()),
-        _ => return None,
-    })
+        other => bail!("unknown tool `{other}`"),
+    }
 }
 
 async fn history(args: &Value, link: Link<'_>, base: &str) -> Result<Value> {
@@ -187,11 +188,9 @@ async fn history(args: &Value, link: Link<'_>, base: &str) -> Result<Value> {
 
 /// One kind's `/api` answer: its rows with decimals applied, or the nest's refusal as it was given.
 fn section(body: Value, scale: Scale, limit: u64, page: u64) -> Value {
-    let Some(Value::Array(mut rows)) = body
-        .get("result")
-        .cloned()
-        .filter(|_| body["status"] == "1")
-    else {
+    // Etherscan answers a window with no rows `status: "0"`, "No transactions found", `result: []`;
+    // a refusal's `result` is a string.
+    let Some(Value::Array(mut rows)) = body.get("result").cloned() else {
         return json!({ "refused": body["result"] });
     };
     for row in rows.iter_mut().filter_map(Value::as_object_mut) {

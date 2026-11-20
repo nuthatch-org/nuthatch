@@ -494,6 +494,18 @@ pub struct AccountCoverage {
     pub spans: Vec<(Action, Vec<(u64, u64)>)>,
 }
 
+/// [`AddressHistory::coverage_report`]'s answer: the accounts and the store state they stand at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageSnapshot {
+    pub generation: u64,
+    /// The finalized head, `None` before the first poll.
+    pub head: Option<u64>,
+    pub tip: Option<u64>,
+    /// The span the sweep has read, on a sweeping nest.
+    pub swept: Option<(u64, u64)>,
+    pub accounts: Vec<AccountCoverage>,
+}
+
 /// What a page request comes back as.
 #[derive(Debug, PartialEq)]
 pub enum Answer {
@@ -1902,28 +1914,47 @@ impl AddressHistory {
         Ok(merge(spans))
     }
 
-    /// Each account's coverage of its actions, whether it is watched and its unprovable marker, read
-    /// in one transaction with the generation it stands at, so the report is one state of the store.
+    /// The coverage of `one` account, or of every watched account, with the actions `actions_for`
+    /// names for each, read in one transaction with the generation, finalized head, tip and sweep it
+    /// stands at, so the report is one state of the store.
     pub fn coverage_report(
         &self,
-        accounts: &[(String, Vec<Action>)],
-    ) -> Result<(u64, Vec<AccountCoverage>)> {
+        one: Option<&str>,
+        actions_for: impl Fn(&str) -> Vec<Action>,
+    ) -> Result<CoverageSnapshot> {
         let rtx = self.store.database().begin_read()?;
-        let generation = rtx
-            .open_table(META)?
-            .get(GENERATION)?
-            .map_or(0, |v| v.value());
+        let meta = rtx.open_table(META)?;
+        let read = |k: &str| -> Result<Option<u64>> { Ok(meta.get(k)?.map(|v| v.value())) };
+        let (generation, head, tip) = (read(GENERATION)?.unwrap_or(0), read(HEAD)?, read(TIP)?);
         let (cov, sweep, joined) = (
             rtx.open_table(COVERAGE)?,
             rtx.open_table(SWEEP)?,
             rtx.open_table(JOINED)?,
         );
+        let swept = match sweep.get(SWEPT)? {
+            Some(v) => {
+                let spans = decode_spans(v.value())?;
+                spans.last().map(|(_, t)| (spans[0].0, *t))
+            }
+            None => None,
+        };
         let (watched, unprovable) = (rtx.open_table(WATCHED)?, rtx.open_table(UNPROVABLE)?);
-        let mut out = Vec::with_capacity(accounts.len());
-        for (address, actions) in accounts {
-            let a = parse_address(address)?;
+        let addresses: Vec<Address> = match one {
+            Some(a) => vec![parse_address(a)?],
+            None => watched
+                .iter()?
+                .map(|e| {
+                    let (k, _) = e?;
+                    k.value().try_into().context("watched key is not 20 bytes")
+                })
+                .collect::<Result<_>>()?,
+        };
+        let mut accounts = Vec::with_capacity(addresses.len());
+        for a in addresses {
+            let address = address_hex(&a);
+            let actions = actions_for(&address);
             let mut spans = Vec::with_capacity(actions.len());
-            for &action in actions {
+            for action in actions {
                 let mut s = match cov.get(coverage_key(&a, action).as_slice())? {
                     Some(v) => decode_spans(v.value())?,
                     None => Vec::new(),
@@ -1931,15 +1962,21 @@ impl AddressHistory {
                 s.extend(swept_for(&sweep, &joined, &a, action)?);
                 spans.push((action, merge(s)));
             }
-            out.push(AccountCoverage {
-                address: address_hex(&a),
+            accounts.push(AccountCoverage {
+                address,
                 watched: watched.get(a.as_slice())?.is_some(),
                 unprovable_from: unprovable.get(a.as_slice())?.map(|v| v.value()),
                 joined: joined.get(a.as_slice())?.map(|v| v.value()),
                 spans,
             });
         }
-        Ok((generation, out))
+        Ok(CoverageSnapshot {
+            generation,
+            head,
+            tip,
+            swept,
+            accounts,
+        })
     }
 
     /// The last feed sequence number the webhook endpoint accepted; 0 before any.
