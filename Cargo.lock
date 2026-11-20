@@ -1645,7 +1645,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "burrmill"
 version = "0.1.0"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=d98222e44aa2a94e5ee4f988f781c46c55293ca0#d98222e44aa2a94e5ee4f988f781c46c55293ca0"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=8963974db013235a8f29d812f03a4c85ffada325#8963974db013235a8f29d812f03a4c85ffada325"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
@@ -1692,7 +1692,7 @@ dependencies = [
 [[package]]
 name = "burrmill-parquet-source"
 version = "55.2.0"
-source = "git+https://github.com/nuthatch-org/burrmill?rev=d98222e44aa2a94e5ee4f988f781c46c55293ca0#d98222e44aa2a94e5ee4f988f781c46c55293ca0"
+source = "git+https://github.com/nuthatch-org/burrmill?rev=8963974db013235a8f29d812f03a4c85ffada325#8963974db013235a8f29d812f03a4c85ffada325"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.0",
