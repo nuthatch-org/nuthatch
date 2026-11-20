@@ -23,6 +23,10 @@ class T(unittest.TestCase):
             self.assertLessEqual(len(out.splitlines()), 152)
             self.assertIn("[squeeze] lines in=", out)
 
+    def test_error_before_cr_erase_kept(self):
+        out = run(text="error: could not compile\r\x1b[K\nfatal: x\rdone\nok\n")
+        self.assertIn("error: could not compile", out); self.assertIn("fatal: x", out)
+
     def test_collapse_counts(self):
         out = run("cargo_build.log")
         self.assertIn("[x100", out); self.assertIn("[x140", out); self.assertIn("[x30", out)

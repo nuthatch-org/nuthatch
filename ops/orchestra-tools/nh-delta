@@ -35,6 +35,21 @@ def parse(s):
     return datetime.strptime(s.replace("+00:00", "Z"), ISO).replace(tzinfo=timezone.utc)
 
 
+def parse_since(v):
+    v = v.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        v += "T00:00:00Z"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", v):
+        v += "Z"
+    m = re.fullmatch(r"(.*T\d{2}:\d{2}:\d{2})([+-])(\d{2}):?(\d{2})", v)
+    if m:
+        base = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+        off = timedelta(hours=int(m.group(3)), minutes=int(m.group(4)))
+        base = base - off if m.group(2) == "+" else base + off
+        return base.replace(tzinfo=timezone.utc)
+    return parse(v)
+
+
 def is_bot(u):
     return (u or "") in BOTS or (u or "").endswith("[bot]")
 
@@ -179,6 +194,8 @@ def org_section(since, st, use_etag):
         if s == 304:
             repos = etags[key]["body"]
         else:
+            if len(repos) >= 100:  # full first page: fetch the rest
+                repos += get_all(key, {"type": "all"}, 10)[100:]
             repos = [r["full_name"] for r in repos if not r.get("archived")]
             etags[key] = {"etag": et, "body": repos}
     except ApiError as e:
@@ -298,7 +315,7 @@ def render(since, until, org, outside, notifs, notes):
         ev = {}
         for e in bots:
             for c in e["changes"]:
-                k = "CI-change" if c.startswith("CI") else c.split(" ")[0]
+                k = "CI-change" if c.startswith("CI") else ("comments" if " new comment" in c else c.split(" ")[0])
                 ev[k] = ev.get(k, 0) + 1
         lines.append("bots: " + ", ".join(f"{n} {a}" for a, n in by.items()) + " items (" +
                      ", ".join(f"{n} {k}" for k, n in ev.items()) + ")")
@@ -328,7 +345,10 @@ def main():
     st = load_state()
     start = now()
     if a.since:
-        since = parse(a.since if a.since.endswith("Z") or "+" in a.since else a.since + "Z")
+        try:
+            since = parse_since(a.since)
+        except ValueError:
+            ap.error(f"--since: cannot parse {a.since!r}; use e.g. 2026-11-19, 2026-11-19T00:00:00Z or an offset like +02:00")
     elif st.get("last_run"):
         since = parse(st["last_run"])
     else:

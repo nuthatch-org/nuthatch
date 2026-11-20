@@ -43,8 +43,11 @@ def clean(raw):
     """Raw text -> list of cleaned lines (ANSI/progress/spinners removed, secrets redacted)."""
     out = []
     for line in raw.split("\n"):
-        if "\r" in line:  # progress redraws: keep the final state only
-            parts = [p for p in line.split("\r") if p.strip()]
+        if "\r" in line:  # progress redraws: keep the final state, plus any earlier segment that matters
+            parts = [p for p in line.split("\r") if ANSI.sub("", p).strip()]
+            for p in parts[:-1]:
+                if IMPORTANT.search(ANSI.sub("", p)):
+                    out.append(redact(ANSI.sub("", p)).rstrip())
             line = parts[-1] if parts else ""
         line = ANSI.sub("", line)
         line = redact(line).rstrip()
