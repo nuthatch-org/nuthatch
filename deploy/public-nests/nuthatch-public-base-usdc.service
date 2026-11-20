@@ -7,8 +7,9 @@
 # --backfill 3000000, not genesis: usdc-base-nest declares start_block 2,797,221 (the proxy's deployment), which
 #   is ~56.7 M blocks on a chain that now makes a block every 200 ms. --backfill overrides it on the first run
 #   only and starts 3 M blocks (about seven days) behind the tip; a store that has indexed a block ignores it.
-# --window 1500: GraphOps answers an eth_getLogs with at most 20,000 results (about 2,250 blocks of USDC
-#   Transfers on 2026-11-19, fewer with every event), so the range is kept under that rather than found by refusals.
+# --window 1500: GraphOps answers an eth_getLogs with at most 20,000 results (about 1,540 blocks: the filter
+#   is the USDC address with no topic restriction, so all ~13 logs a block count, 20,000 / 13, on 2026-11-19), so the
+#   range is kept under that rather than found by refusals.
 # --seal-direct --concurrency 4: the backfill goes straight to sealed segments, four windows at a time.
 # --local-host 100.82.188.91: Prometheus scrapes /metrics and /ready through the tailnet-only Caddy site on :9180, which
 #   forwards that Host; a loopback-bound nest refuses a Host it was not told (#3002).

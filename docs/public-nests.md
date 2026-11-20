@@ -361,9 +361,14 @@ Everything above applies; this is what differs, and the files are `*-base-usdc*`
   ignores the flag on restart. The 7.6 M block the implementation contract was deployed at is long behind it, so
   the vendored ABI decodes everything in range.
 - **GraphOps answers at most 20,000 logs a call** (`-32012`, "query exceeds max results 20000"). USDC on Base
-  is about 9 Transfers and 13 events of any kind a block, so a window over about 1,500 blocks is refused;
+  is about 9 Transfers and 13 events of any kind a block (28.0 M Transfers over 3.02 M blocks is 9.3 a block). The 20,000 cap counts every log the `eth_getLogs` filter matches, and the filter is the USDC address with no topic restriction, so the 13 a block is the one that applies: 20,000 / 13 is about 1,540 blocks, and a window over that is refused (the 2,250 that 9 Transfers a block would give is not the limit);
   the unit sets `--window 1500` rather than finding that out by refusals. `--seal-direct --concurrency 4`
   backfills straight to sealed segments, four windows at a time.
+- **The key stays out of error responses.** Checked on 2026-11-20 with nuthatch 5.23.0: `NUTHATCH_RPC` pointed at
+  a closed local port, and at a local server answering every POST with HTTP 500, each with the dummy path segment
+  `SECRETKEYSEG123`. `/ready`, `/health`, `/nest`, `/metrics`, `/status` and `/` and the process log were searched for it
+  and it appeared in none: the endpoint is logged as scheme, host and port only (`redact_url`). That is a test of
+  those two failure shapes, not of every upstream error body.
 - **What it costs in credits.** GraphOps prices `eth_getLogs` and `eth_call` at 2 credits and a block header at 1
   (docs/lodestar-rpc-cost-graphops.md). The backfill is the log calls, about 9,300 of them, so about 19,000
   credits. Following the tip is a tip call, one log call and a header for each block since the last poll
@@ -383,7 +388,7 @@ Read from the nest's own `/metrics` and `/ready` on 2026-11-19, nuthatch 5.23.0,
 |---|---|
 | Range indexed | blocks 56,516,981 to the tip (59,537,520 at the check), 6.99 days |
 | Backfill time | 65 min (13:09:32 to 14:15:31 UTC), 28.0 M `Transfer` rows, about 7,100 a second |
-| Backfill RPC | 9,261 `eth_getLogs`, 0 retries, 2 failures that nuthatch retried; about 19,000 credits. 3.02 M blocks over 9,261 calls is about 330 blocks a call, not the 1,500 of `--window`: that is a ceiling, and nuthatch narrows the range it asks for to stay under the 20,000-log answer (`fetch_window_blocks` read 332 at the check) |
+| Backfill RPC | 9,261 `eth_getLogs`, 0 failover retries (`nuthatch_rpc_endpoint_retries_total` counts only retries onto another endpoint, and there is one), 2 failed calls that nuthatch retried against the same endpoint; about 19,000 credits. 3.02 M blocks over 9,261 calls is about 330 blocks a call, not the 1,500 of `--window`: that is a ceiling, and nuthatch narrows the range it asks for to stay under the 20,000-log answer (`fetch_window_blocks` read 332 at the check) |
 | Disk | 1.8 GB for the nest directory |
 | Memory | 436 MB resident when following; the cgroup's 2 GB limit counts 1.3 GB of page cache, which the kernel gives back |
 | Following the tip | `lag_blocks` 0 at a 6 s poll. A poll is one tip call, one `eth_getLogs` and one `eth_getBlockByNumber` per block since the last poll (about 37, sent as batches). Re-read on 2026-11-19 over 63 s from `/metrics`: 9 polls, 9 `eth_getLogs`, 9 tip calls and 335 headers, so 362 credits, **about 5.7 credits a second** (0.5 M a day). The earlier "36 of each in 4 minutes" counted polls, not headers |
