@@ -23,7 +23,7 @@ land: repeat the `sql` line every few seconds until it is above zero. Stop it wi
 
 To install instead of using `npx`: download the release archive for your platform from
 https://github.com/nuthatch-org/nuthatch/releases, check it against the `.sha256` file beside it
-(and with `gh attestation verify`, as docs/install.md in the repository describes), unpack it and put
+(and with `gh attestation verify nuthatch-<target>.tar.gz --repo nuthatch-org/nuthatch`, as https://github.com/nuthatch-org/nuthatch/blob/main/docs/install.md describes), unpack it and put
 `nuthatch` on your `PATH`. Or build it with `rustup toolchain install 1.95.0` and
 `cargo +1.95.0 install --git https://github.com/nuthatch-org/nuthatch nuthatch`. Then drop the
 `npx -y nuthatch-indexer` prefix.
