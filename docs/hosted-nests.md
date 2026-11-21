@@ -151,6 +151,7 @@ started on a real host or run through `test-proxy.sh` in this change.
 - **`new-nest.sh --apply` under `sudo` drops `NEST_DEV_ARGS`** (sudo strips the environment, and `-E` is refused on this
   host), so the unit is written with the 3 s default. Edit `--poll-interval` in the unit afterwards, or pass the variable
   as `sudo env NEST_DEV_ARGS=... new-nest.sh`.
+- **Following the tip costs Alchemy credits for as long as it runs.** At a 60 s poll, a followed nest on HyperEVM or Monad measured about 8-9k compute units an hour (about 200k a day), so a per-nest cap meant for the backfill is reached within a day of following. Pick the poll interval for the budget, not only for freshness.
 - **A synced nest can be copied whole.** Beefy (HyperEVM, 40k events) and mpamm (Monad, 25k events) were backfilled on a
   laptop through a call-counting proxy (37k and 45k Alchemy compute units), then their directories were copied to
   `/var/lib/nuthatch-public/<name>` (not `.admin-token`, `.claude` or logs) and started with the stock 5.23.0 binary,
