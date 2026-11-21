@@ -92,9 +92,11 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     // touching the nest's config on disk.
     let rpc_urls = crate::rpc::select_rpcs(&args.rpc, config.nest.rpc_urls.clone());
     let pool: Vec<String> = rpc_urls.iter().chain(&args.rpc_fallback).cloned().collect();
-    if let Some(note) =
-        chains::keyless_caveat(&config.nest.chain, &pool, config.nest.block_timestamps)
-    {
+    if let Some(note) = chains::keyless_caveat(
+        &config.nest.chain,
+        &pool,
+        config.nest.block_timestamps == crate::config::TimestampPolicy::Eager,
+    ) {
         tracing::warn!("{note}");
     }
     let rpc = RpcClient::with_fallbacks(rpc_urls, args.rpc_fallback.clone())?;
@@ -4715,45 +4717,63 @@ pub(crate) fn stamp_fresh_store(
 
 fn guard_timestamp_policy(
     store: &dyn crate::store::HotStore,
-    declared: bool,
+    declared: crate::config::TimestampPolicy,
     owner: bool,
 ) -> Result<()> {
-    let want = if declared { "1" } else { "0" };
+    use crate::config::TimestampPolicy;
+    // "1" and "0" are what every nest before `"null"` recorded, and stay what eager and timestamp-free
+    // nests record; a null-mode nest records its own value, so no pair of policies can share a store.
+    let recorded = |p: TimestampPolicy| match p {
+        TimestampPolicy::Eager => "1",
+        TimestampPolicy::Omitted => "0",
+        TimestampPolicy::Null => "null",
+    };
+    let want = recorded(declared);
     match store.get_meta(TIMESTAMPS_KEY)? {
         Some(found) if found != want => {
-            let (was, now) = if declared {
-                ("without", "with")
-            } else {
-                ("with", "without")
+            let was = match found.as_str() {
+                "1" => TimestampPolicy::Eager,
+                "0" => TimestampPolicy::Omitted,
+                "null" => TimestampPolicy::Null,
+                other => anyhow::bail!(
+                    "this nest recorded `block_timestamps` policy {other:?}, which this nuthatch \
+                     does not know; it was indexed by a newer build"
+                ),
+            };
+            let effect = match (was.column(), declared.column()) {
+                (true, false) => "removes the column from every table",
+                (false, true) => "adds the column to every table",
+                // Null and eager share the column; what differs is whether it may be null.
+                _ => "changes whether the column may be null",
             };
             anyhow::bail!(
-                "this nest indexed its stored data {was} `block_timestamp`, but nuthatch.toml now \
-                 declares it {now} it (`[nest] block_timestamps = {declared}`).\n\n\
-                 That is a breaking schema change, not a setting: it {} the column on every table, \
-                 and it changes the bytes of every sealed segment - so this nest's existing segments \
-                 cannot be reused and the data would have to be re-indexed from scratch.\n\n\
-                 Restore `block_timestamps = {}` to start, or `nuthatch init` a new nest with the \
+                "this nest indexed its stored data with `block_timestamps = {was}`, but nuthatch.toml \
+                 now declares `[nest] block_timestamps = {declared}`.\n\n\
+                 That is a breaking schema change, not a setting: it {effect}, and it changes the \
+                 bytes of every sealed segment - so this nest's existing segments cannot be reused \
+                 and the data would have to be re-indexed from scratch.\n\n\
+                 Restore `block_timestamps = {was}` to start, or `nuthatch init` a new nest with the \
                  declaration you want and serve it alongside this one until its consumers move \
-                 (RFC-0020 slice 3).",
-                if declared { "adds" } else { "removes" },
-                !declared
+                 (RFC-0020 slice 3)."
             );
         }
         Some(_) => Ok(()),
         None => {
             // An untouched nest adopts the declaration; one with rows already in it does not get to
             // change its mind silently, so record what it actually has rather than what it now says.
+            // Before this key existed every nest indexed eagerly.
             let has_indexed = store.get_meta(LAST_BLOCK_KEY)?.is_some();
-            let actual = if has_indexed && !declared { "1" } else { want };
+            let actual = if has_indexed { "1" } else { want };
             if owner {
                 store.set_meta(TIMESTAMPS_KEY, actual)?;
             }
             if actual != want {
                 anyhow::bail!(
                     "this nest has already indexed with `block_timestamp`, so it cannot switch to \
-                     `block_timestamps = false` in place - that removes a column from every table \
-                     and invalidates every sealed segment. `nuthatch init --no-timestamps` a new \
-                     nest instead, and serve it alongside this one (RFC-0020 slice 3)."
+                     `block_timestamps = {declared}` in place - that changes the column on every \
+                     table and invalidates every sealed segment. `nuthatch init` a new nest instead \
+                     (`--no-timestamps` or `--null-timestamps`), and serve it alongside this one \
+                     (RFC-0020 slice 3)."
                 );
             }
             Ok(())
@@ -5110,6 +5130,7 @@ pub(crate) async fn resolve_calls_for_window(
     to: u64,
     timestamps: &std::collections::HashMap<u64, u64>,
     with_timestamps: bool,
+    null: bool,
     window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
     resolve_calls_for_window_upto(
@@ -5122,6 +5143,7 @@ pub(crate) async fn resolve_calls_for_window(
         to,
         timestamps,
         with_timestamps,
+        null,
         window_headers,
         None,
     )
@@ -5140,6 +5162,7 @@ async fn resolve_calls_for_window_upto(
     to: u64,
     timestamps: &std::collections::HashMap<u64, u64>,
     with_timestamps: bool,
+    null: bool,
     window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
     attempts: Option<usize>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
@@ -5224,7 +5247,8 @@ async fn resolve_calls_for_window_upto(
             {
                 anyhow::bail!("canonical call source has no valid block hash at {block}");
             }
-            if with_timestamps {
+            // A null-mode nest bought no header for its rows' timestamps, so there is nothing to agree.
+            if with_timestamps && !null {
                 let timestamp = headers
                     .get(&block)
                     .and_then(|h| h.get("timestamp"))
@@ -5256,7 +5280,12 @@ async fn resolve_calls_for_window_upto(
                 }
             }
         }
-        let ts = timestamps.get(&block).copied().unwrap_or(0);
+        // A null-mode nest's call row has no log to carry a timestamp: null, never a header bought for it.
+        let ts = if null {
+            crate::registry::UNKNOWN_TIMESTAMP
+        } else {
+            timestamps.get(&block).copied().unwrap_or(0)
+        };
         planned.push((block, items, pairs, hash, canonical, ts));
     }
 
@@ -5523,9 +5552,7 @@ pub async fn backfill_direct(
         .await?;
         let l1_rows = l1_block_rows(registry, &rows, &block_data)?;
         let ts = block_data.timestamps;
-        for r in &mut rows {
-            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-        }
+        apply_row_timestamps(registry, &mut rows, &ts);
         // RFC-0023 tier-3: resolve declared [[calls]] for this window and merge into rows so the
         // sealed segment is identical to what the hot path would have produced via process_window.
         if let Some(rpc) = state_rpc {
@@ -5539,6 +5566,7 @@ pub async fn backfill_direct(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -6393,9 +6421,7 @@ pub async fn backfill_direct_pipelined_with(
         // Seal in canonical (block, log_index) order, not RPC-provider order, so a segment's bytes
         // (and its content address) are identical across providers - see `backfill_direct`.
         rows.sort_by_key(|r| (r.block_number, r.log_index));
-        for r in &mut rows {
-            r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
-        }
+        apply_row_timestamps(registry, &mut rows, &ts);
         // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
         if let Some(rpc) = state_rpc {
             let call_rows = resolve_calls_for_window(
@@ -6408,6 +6434,7 @@ pub async fn backfill_direct_pipelined_with(
                 w_to,
                 &ts,
                 registry.timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -6946,7 +6973,7 @@ pub async fn backfill_direct_factory_with(
         .await?;
         let l1_rows = l1_block_rows(registry, &rows, &block_data)?;
         let ts = block_data.timestamps;
-        apply_row_timestamps(&mut rows, &ts);
+        apply_row_timestamps(registry, &mut rows, &ts);
         children.apply_timestamps(&ts);
         // RFC-0023 tier-3: resolve declared [[calls]] and merge so sealed segments match the hot path.
         if let Some(rpc) = state_rpc {
@@ -6960,6 +6987,7 @@ pub async fn backfill_direct_factory_with(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -7995,6 +8023,7 @@ impl nuthatch_core::extra::ExtraRows for NodeRows<'_> {
             to,
             timestamps,
             self.registry.timestamps(),
+            self.registry.null_timestamps(),
             headers,
             Some(TIP_RETRY_ATTEMPTS),
         )
@@ -20843,7 +20872,7 @@ template = "pool"
         store.set_meta(LAST_BLOCK_KEY, "150").unwrap();
         let config = covering("n", "http://a", ADDRESS, 100);
         let untouched = store.write_generation();
-        guard_timestamp_policy(&store, true, false).unwrap();
+        guard_timestamp_policy(&store, crate::config::TimestampPolicy::Eager, false).unwrap();
         guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, false).unwrap();
         guard_coverage(&store, &config, false).unwrap();
         assert_eq!(
@@ -20857,13 +20886,14 @@ template = "pool"
 
         guard_coverage(&store, &config, true).unwrap();
         guard_registry_identity(&store, "aaaa", "aaaa", "aaaa", false, true).unwrap();
-        guard_timestamp_policy(&store, true, true).unwrap();
+        guard_timestamp_policy(&store, crate::config::TimestampPolicy::Eager, true).unwrap();
         let recorded = store.write_generation();
         guard_coverage(&store, &covering("n", "http://a", ADDRESS, 101), false)
             .expect_err("a reader refuses a coverage mismatch it can prove");
         guard_registry_identity(&store, "bbbb", "bbbb", "bbbb", false, false)
             .expect_err("and a registry mismatch");
-        guard_timestamp_policy(&store, false, false).expect_err("and a timestamp switch");
+        guard_timestamp_policy(&store, crate::config::TimestampPolicy::Omitted, false)
+            .expect_err("and a timestamp switch");
         assert_eq!(store.write_generation(), recorded);
     }
 
@@ -23585,6 +23615,153 @@ template="pool"
             .collect()
     }
 
+    /// A `ResultCapSource` that counts the blocks a backfill asks it for headers of.
+    struct HeaderCounting {
+        inner: ResultCapSource,
+        asked: std::sync::atomic::AtomicUsize,
+        /// Added to every timestamp this source serves: a second endpoint that answers differently.
+        skew: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Source for HeaderCounting {
+        async fn tip(&self) -> Result<u64> {
+            self.inner.tip().await
+        }
+        // Every header path counts: `block_hashes` and `block_records` default to these two, and the
+        // source's other header methods are left at their defaults, which buy nothing.
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.inner.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.asked
+                .fetch_add(blocks.len(), std::sync::atomic::Ordering::SeqCst);
+            let mut ts = self.inner.block_timestamps(blocks).await?;
+            ts.values_mut().for_each(|t| *t += self.skew);
+            Ok(ts)
+        }
+    }
+
+    /// #3065: a null nest's backfill buys no header at all and seals every row `null`, so its bytes
+    /// are the same whichever endpoint answered, one stamping differently from the next. An eager
+    /// nest buys a header per block and its rows carry the stamp, so the two never share a hash.
+    #[tokio::test]
+    async fn a_null_backfill_buys_no_headers_and_seals_the_same_bytes_from_any_endpoint() {
+        let run = |reg: DecodeRegistry, skew: u64| async move {
+            let (_, addresses, topic0s) = usdc_transfers();
+            let logs = (1u64..=300).map(|b| transfer_log(b, 0)).collect();
+            let source = HeaderCounting {
+                inner: ResultCapSource::new(logs, usize::MAX),
+                asked: Default::default(),
+                skew,
+            };
+            let d = tempfile::tempdir().unwrap();
+            let total = backfill_direct_pipelined(
+                &source,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                300,
+                50,
+                SPAN_OFF,
+                2,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(total, 300);
+            let rows = seal::read_table_rows(d.path(), &reg.schema()[0]).unwrap();
+            let asked = source.asked.load(std::sync::atomic::Ordering::SeqCst);
+            (asked, sealed_hashes(d.path()), rows, d)
+        };
+
+        let (reg, _, _) = usdc_transfers();
+        let (asked, null_a, rows, _d) = run(reg.with_null_timestamps(true), 0).await;
+        assert_eq!(asked, 0, "a null nest must not ask for one header");
+        assert_eq!(rows.len(), 300);
+        assert!(rows.iter().all(|r| r.timestamp().is_none()));
+        let (reg, _, _) = usdc_transfers();
+        let (asked, null_b, _, _d2) = run(reg.with_null_timestamps(true), 7).await;
+        assert_eq!(asked, 0);
+        assert_eq!(
+            null_a, null_b,
+            "a null nest's segments must not depend on which endpoint answered"
+        );
+
+        let (reg, _, _) = usdc_transfers();
+        let (asked, eager, rows, _d3) = run(reg, 0).await;
+        assert!(
+            asked >= 300,
+            "eager buys a header for every block with a log ({asked})"
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.timestamp() == Some(r.block_number * 1000)));
+        assert_ne!(null_a, eager);
+    }
+
+    /// #3065: the null nest's rows must not depend on a stamp the endpoint volunteers. Here the logs
+    /// themselves carry `blockTimestamp`, and the two endpoints disagree on it by 7 seconds.
+    #[tokio::test]
+    async fn a_null_backfill_ignores_the_blockstamp_its_logs_carry() {
+        let mut hashes = Vec::new();
+        for skew in [0, 7] {
+            let (reg, addresses, topic0s) = usdc_transfers();
+            let reg = reg.with_null_timestamps(true);
+            let logs = (1u64..=300).map(|b| transfer_log(b, 0)).collect();
+            let (url, server, headers) = stamping_node(logs, skew).await;
+            let rpc = crate::rpc::RpcClient::new(vec![url]).unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let total = backfill_direct_pipelined(
+                &rpc,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                300,
+                50,
+                SPAN_OFF,
+                2,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            server.abort();
+            assert_eq!(total, 300);
+            assert_eq!(headers.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let rows = seal::read_table_rows(d.path(), &reg.schema()[0]).unwrap();
+            assert!(rows.iter().all(|r| r.timestamp().is_none()));
+            hashes.push(sealed_hashes(d.path()));
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "a stamp the logs carry must not reach a null nest's sealed bytes"
+        );
+    }
+
     /// #1787: a split lowers the ceiling to the piece that was served. Over a long empty tail after
     /// it the ceiling must climb back, not walk the tail at the piece's width.
     #[tokio::test]
@@ -23773,12 +23950,29 @@ template="pool"
     /// An `eth_getLogs` node with no result cap, serving `logs` over HTTP (#1788). Every log carries
     /// `blockTimestamp`, so no header is asked for.
     async fn uncapped_node(logs: Vec<crate::rpc::Log>) -> (String, tokio::task::JoinHandle<()>) {
+        let (url, server, _) = stamping_node(logs, 0).await;
+        (url, server)
+    }
+
+    /// [`uncapped_node`] whose log stamps are `skew` seconds off, and which counts the
+    /// `eth_getBlockByNumber` calls it is asked: a second endpoint that answers differently.
+    async fn stamping_node(
+        logs: Vec<crate::rpc::Log>,
+        skew: u64,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use axum::{extract::State, routing::post, Json, Router};
         use serde_json::{json, Value};
-        async fn handler(
-            State(logs): State<Arc<Vec<crate::rpc::Log>>>,
-            Json(req): Json<Value>,
-        ) -> Json<Value> {
+        type Node = (
+            Vec<crate::rpc::Log>,
+            u64,
+            Arc<std::sync::atomic::AtomicUsize>,
+        );
+        async fn handler(State(node): State<Arc<Node>>, Json(req): Json<Value>) -> Json<Value> {
+            let (logs, skew, headers) = &*node;
             let hex = |v: &Value| {
                 u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
             };
@@ -23818,7 +24012,7 @@ template="pool"
                                         "data": l.data,
                                         "blockNumber": format!("0x{:x}", l.block_number),
                                         "blockHash": l.block_hash,
-                                        "blockTimestamp": format!("0x{:x}", l.block_number * 12),
+                                        "blockTimestamp": format!("0x{:x}", l.block_number * 12 + skew),
                                         "transactionHash": l.tx_hash,
                                         "logIndex": format!("0x{:x}", l.log_index),
                                     })
@@ -23827,11 +24021,12 @@ template="pool"
                         )
                     }
                     Some("eth_getBlockByNumber") => {
+                        headers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let b = hex(&r["params"][0]);
                         json!({
                             "number": format!("0x{b:x}"),
                             "hash": format!("0x{b:064x}"),
-                            "timestamp": format!("0x{:x}", b * 12),
+                            "timestamp": format!("0x{:x}", b * 12 + skew),
                         })
                     }
                     _ => Value::Null,
@@ -23843,15 +24038,16 @@ template="pool"
                 r => one(r),
             })
         }
+        let headers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
             .route("/", post(handler))
-            .with_state(Arc::new(logs));
+            .with_state(Arc::new((logs, skew, headers.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("http://{addr}/"), handle)
+        (format!("http://{addr}/"), handle, headers)
     }
 
     /// A source that remembers the most logs one `getLogs` answer handed the backfill, and panics when
@@ -25952,6 +26148,7 @@ template="pool"
             7,
             &std::collections::HashMap::from([(5, 1005), (6, 1006)]),
             true,
+            false,
             None,
         )
         .await
@@ -26037,6 +26234,7 @@ template="pool"
             8,
             &std::collections::HashMap::new(),
             false,
+            false,
             None,
         )
         .await
@@ -26092,6 +26290,7 @@ template="pool"
             5,
             5,
             &std::collections::HashMap::new(),
+            false,
             false,
             None,
         )
@@ -26185,6 +26384,7 @@ template="pool"
                 5,
                 &data.timestamps,
                 true,
+                false,
                 data.headers.as_ref(),
             )
             .await
@@ -26249,6 +26449,7 @@ template="pool"
                     5,
                     &std::collections::HashMap::from([(5, 1_700_000_005)]),
                     true,
+                    false,
                     cached.then_some(&headers),
                 ),
             )
@@ -26355,6 +26556,7 @@ template="pool"
                     5,
                     &std::collections::HashMap::from([(5, 1_700_000_005)]),
                     true,
+                    false,
                     Some(&headers),
                 ),
             )
@@ -28588,15 +28790,15 @@ template="pool"
         let store = Store::open(&dir.path().join(DB_FILE)).unwrap();
 
         // First start records what the nest is built with.
-        guard_timestamp_policy(&store, true, true).unwrap();
+        guard_timestamp_policy(&store, crate::config::TimestampPolicy::Eager, true).unwrap();
         assert_eq!(
             store.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
             Some("1")
         );
         // Restarting unchanged is fine, repeatedly.
-        guard_timestamp_policy(&store, true, true).unwrap();
+        guard_timestamp_policy(&store, crate::config::TimestampPolicy::Eager, true).unwrap();
 
-        let err = guard_timestamp_policy(&store, false, true)
+        let err = guard_timestamp_policy(&store, crate::config::TimestampPolicy::Omitted, true)
             .unwrap_err()
             .to_string();
         assert!(
@@ -28622,14 +28824,14 @@ template="pool"
         // Untouched nest: adopts whatever it declares.
         let fresh = tempfile::tempdir().unwrap();
         let s1 = Store::open(&fresh.path().join(DB_FILE)).unwrap();
-        guard_timestamp_policy(&s1, false, true).unwrap();
+        guard_timestamp_policy(&s1, crate::config::TimestampPolicy::Omitted, true).unwrap();
         assert_eq!(s1.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("0"));
 
         // Nest with history but no key - as every nest built before slice 4 will be.
         let old = tempfile::tempdir().unwrap();
         let s2 = Store::open(&old.path().join(DB_FILE)).unwrap();
         s2.set_meta(LAST_BLOCK_KEY, "1234").unwrap();
-        let err = guard_timestamp_policy(&s2, false, true)
+        let err = guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Omitted, true)
             .unwrap_err()
             .to_string();
         assert!(
@@ -28639,8 +28841,26 @@ template="pool"
         // It recorded the truth (it *has* timestamps), so the next start gives the same answer rather
         // than depending on whether `last_block` happens to still be there.
         assert_eq!(s2.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(), Some("1"));
-        assert!(guard_timestamp_policy(&s2, false, true).is_err());
-        guard_timestamp_policy(&s2, true, true).unwrap();
+        assert!(
+            guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Omitted, true).is_err()
+        );
+        guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Eager, true).unwrap();
+
+        // #3065: null records its own value, and neither it nor eager can turn into the other.
+        let lz = tempfile::tempdir().unwrap();
+        let s3 = Store::open(&lz.path().join(DB_FILE)).unwrap();
+        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Null, true).unwrap();
+        assert_eq!(
+            s3.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
+            Some("null")
+        );
+        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Null, true).unwrap();
+        let err = guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Eager, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("may be null"), "{err}");
+        assert!(guard_timestamp_policy(&s1, crate::config::TimestampPolicy::Null, true).is_err());
+        assert!(guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Null, true).is_err());
     }
 
     /// Upgrading an existing nest must be a no-op: `block_timestamps` absent from `nuthatch.toml`
@@ -28658,7 +28878,7 @@ rpc_urls = ["https://rpc.example"]
         )
         .unwrap();
         assert!(
-            cfg.nest.block_timestamps,
+            cfg.nest.block_timestamps == crate::config::TimestampPolicy::Eager,
             "absent must mean on, or upgrading silently drops a column from every table"
         );
     }

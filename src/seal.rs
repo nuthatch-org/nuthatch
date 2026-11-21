@@ -880,7 +880,11 @@ pub fn visit_segment_rows(
                             .as_any()
                             .downcast_ref::<UInt64Array>()
                             .context("a UInt64 column that is not one")?;
-                        Value::from(a.value(row))
+                        if a.is_null(row) {
+                            Value::Null
+                        } else {
+                            Value::from(a.value(row))
+                        }
                     }
                     DataType::Utf8 => {
                         let a = column

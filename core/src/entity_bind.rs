@@ -328,7 +328,10 @@ impl Binding {
         Ok(match extract {
             Extract::BlockNumber => Scalar::Int(i128::from(row.block_number)),
             Extract::BlockHash => Scalar::Str(row.block_hash.clone()),
-            Extract::BlockTimestamp => Scalar::Int(i128::from(row.block_timestamp)),
+            // A null-mode row is NULL, never the in-memory sentinel (#3065).
+            Extract::BlockTimestamp => row
+                .timestamp()
+                .map_or(Scalar::Null, |t| Scalar::Int(i128::from(t))),
             Extract::TxHash => Scalar::Str(row.tx_hash.clone()),
             Extract::LogIndex => Scalar::Int(i128::from(row.log_index)),
             Extract::Address => Scalar::Str(row.address.clone()),

@@ -128,7 +128,8 @@ impl CallRegistry {
                 .map_err(|e| anyhow!("contract {} has an unparseable address: {e}", c.alias))?;
             specs.push((c.alias.clone(), address, abi));
         }
-        Ok(Self::build(specs, &config.extract)?.with_timestamps(config.nest.block_timestamps))
+        Ok(Self::build(specs, &config.extract)?
+            .with_timestamps(config.nest.block_timestamps.column()))
     }
 
     /// See [`crate::registry::DecodeRegistry::with_timestamps`].
