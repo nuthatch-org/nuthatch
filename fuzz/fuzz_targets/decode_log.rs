@@ -206,6 +206,7 @@ fuzz_target!(|input: FuzzInput| {
         block_hash: "0x00".to_string(),
         tx_hash: "0x00".to_string(),
         log_index: 0,
+        block_timestamp: None,
     };
 
     // Hunting panics and unbounded allocation (nuthatch#290) - a malformed log producing `Err` (or

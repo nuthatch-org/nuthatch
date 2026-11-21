@@ -341,6 +341,24 @@ fn sql_rows(blocks: std::ops::RangeInclusive<u64>) -> serde_json::Value {
         .collect()
 }
 
+/// What this build's seal path writes for the eager rows v3.13.2 sealed. Not v3.13.2's own bytes
+/// (the writer has changed since), but pinned from `main` at 72a591e1, before #3065's lazy timestamps:
+/// the default policy must keep sealing these exact bytes, so its content addresses cannot move.
+const EAGER_RESEAL_SEGMENT: &str =
+    "9efc6298c8b402db769334e1ef6763517d12c6621d6587bc66ce3f39398a720a";
+
+#[test]
+fn eager_rows_seal_to_the_bytes_they_sealed_to_before_lazy_timestamps() {
+    let segment = fixture_root()
+        .join("v3.13.2/runtime/segments")
+        .join(format!("{V3_13_2_SEGMENT}.parquet"));
+    let mut rows =
+        nuthatch_seal::segment_rows(std::fs::read(&segment).unwrap().into()).expect("read back");
+    assert!(rows.iter().all(|r| r["block_timestamp"].is_u64()));
+    let resealed = nuthatch_seal::seal_rows(&mut rows).expect("re-seal");
+    assert_eq!(nuthatch_seal::content_hash(&resealed), EAGER_RESEAL_SEGMENT);
+}
+
 /// The three config files as a 4.0 user writes them. Frozen: a later 4.x must read the same meaning.
 #[test]
 fn config_written_for_4_0_keeps_its_meaning() {
@@ -361,7 +379,10 @@ fn config_written_for_4_0_keeps_its_meaning() {
         ["https://arb1.arbitrum.io/rpc", "https://arbitrum.drpc.org"]
     );
     assert_eq!(cfg.nest.schema_version, 2);
-    assert!(cfg.nest.block_timestamps);
+    assert_eq!(
+        cfg.nest.block_timestamps,
+        nuthatch::config::TimestampPolicy::Eager
+    );
     let contracts: Vec<_> = cfg
         .contracts
         .iter()

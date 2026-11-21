@@ -14,7 +14,7 @@ pub const DB_FILE: &str = "nuthatch.redb";
 pub const ABI_FILE: &str = "abi.json";
 
 pub use nuthatch_core::nest_config::{
-    required_schema_version, Contract, Extract, Factory, Flags, Nest, Template,
+    required_schema_version, Contract, Extract, Factory, Flags, Nest, Template, TimestampPolicy,
     CURRENT_SCHEMA_VERSION, DEFAULT_VELOCITY_WINDOW, GRAPH_SCHEMA_VERSION,
 };
 
@@ -513,7 +513,7 @@ impl Config {
                 chain_id: v1.chain_id,
                 rpc_urls: v1.rpc_urls,
                 schema_version: CURRENT_SCHEMA_VERSION,
-                block_timestamps: true,
+                block_timestamps: TimestampPolicy::Eager,
             },
             contracts: vec![Contract {
                 alias: "c0".to_string(),
@@ -842,7 +842,7 @@ mod tests {
                 chain_id: 1,
                 rpc_urls: vec!["https://rpc.example".into()],
                 schema_version: CURRENT_SCHEMA_VERSION,
-                block_timestamps: true,
+                block_timestamps: TimestampPolicy::Eager,
             },
             contracts: vec![
                 Contract {
@@ -1013,10 +1013,10 @@ rpc_urls = ["https://rpc.example"]
     /// requirements; only `block_timestamps = false` actually needs a v2 reader.
     #[test]
     fn only_a_timestamp_free_nest_raises_the_schema_version() {
-        assert_eq!(required_schema_version(true), 1);
-        assert_eq!(required_schema_version(false), 2);
+        assert_eq!(required_schema_version(TimestampPolicy::Eager), 1);
+        assert_eq!(required_schema_version(TimestampPolicy::Omitted), 2);
         assert!(
-            required_schema_version(false) <= CURRENT_SCHEMA_VERSION,
+            required_schema_version(TimestampPolicy::Omitted) <= CURRENT_SCHEMA_VERSION,
             "this build must be able to read what it writes"
         );
     }
@@ -1346,7 +1346,7 @@ block_timestamps = false
         )
         .unwrap();
         let cfg = Config::load(dir.path()).unwrap();
-        assert!(!cfg.nest.block_timestamps);
+        assert_eq!(cfg.nest.block_timestamps, TimestampPolicy::Omitted);
     }
 
     /// RFC-0063: a rotki-mode nest watches accounts and declares no contract, and must still load.
@@ -1421,7 +1421,7 @@ rpc_urls = ["https://rpc.example"]
         .unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.nest.schema_version, 1);
-        assert!(cfg.nest.block_timestamps);
+        assert_eq!(cfg.nest.block_timestamps, TimestampPolicy::Eager);
     }
 
     /// RFC-0035 §2: the Starlark front-end is removed in 2.0, and a `nest.star` is **refused** rather

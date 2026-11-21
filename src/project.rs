@@ -320,6 +320,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         chain_id: chain.chain_id,
         rpc_urls,
         block_timestamps: !args.no_timestamps,
+        lazy_timestamps: args.lazy_timestamps,
         contracts,
     };
     // The config and ABIs come from the scaffold as a tab gets them; the rest is written by
@@ -379,13 +380,23 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     if let Some(note) = chains::keyless_caveat(
         &chain.name,
         &config.nest.rpc_urls,
-        config.nest.block_timestamps,
+        config.nest.block_timestamps == crate::config::TimestampPolicy::Eager,
     ) {
         say!();
         say!("note:  {note}");
     }
     done.next = vec![step.command, "nuthatch mcp".to_string()];
     Ok(done)
+}
+
+/// The `[nest] block_timestamps` an `init` declares from its flags.
+fn timestamp_policy(args: &InitArgs) -> crate::config::TimestampPolicy {
+    use crate::config::TimestampPolicy;
+    match (args.no_timestamps, args.lazy_timestamps) {
+        (true, _) => TimestampPolicy::Omitted,
+        (false, true) => TimestampPolicy::Lazy,
+        (false, false) => TimestampPolicy::Eager,
+    }
 }
 
 /// `nuthatch add 0xAnother` - grow an existing nest with more contracts without re-`init`. This is
@@ -1011,8 +1022,8 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             chain: chain.name.clone(),
             chain_id: chain.chain_id,
             rpc_urls,
-            schema_version: crate::config::required_schema_version(!args.no_timestamps),
-            block_timestamps: !args.no_timestamps,
+            schema_version: crate::config::required_schema_version(timestamp_policy(args)),
+            block_timestamps: timestamp_policy(args),
         },
         contracts,
         flags: crate::config::Flags::default(),
@@ -2730,7 +2741,9 @@ mod tests {
                 chain: config.nest.chain.clone(),
                 chain_id: config.nest.chain_id,
                 rpc_urls: config.nest.rpc_urls.clone(),
-                block_timestamps: config.nest.block_timestamps,
+                block_timestamps: config.nest.block_timestamps
+                    == crate::config::TimestampPolicy::Eager,
+                lazy_timestamps: config.nest.block_timestamps.lazy(),
                 contracts: config
                     .contracts
                     .iter()
@@ -4165,6 +4178,7 @@ abi = "abis/tok.json"
             rpc: vec![silent, good],
             dir: dir.path().join("nest").to_string_lossy().into_owned(),
             no_timestamps: false,
+            lazy_timestamps: false,
             json: false,
         };
 
@@ -4262,6 +4276,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            lazy_timestamps: false,
             json: false,
         };
 
@@ -4321,6 +4336,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            lazy_timestamps: false,
             json: false,
         };
         let r = init_from_subgraph(&source, &args).await;
@@ -4515,6 +4531,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
+            lazy_timestamps: false,
             json: false,
         };
 

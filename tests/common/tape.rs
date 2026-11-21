@@ -64,6 +64,7 @@ pub fn transfer_log(
     value: u128,
 ) -> Log {
     Log {
+        block_timestamp: None,
         address: address.to_string(),
         topics: vec![
             TRANSFER_TOPIC0.to_string(),
@@ -121,6 +122,7 @@ pub fn sync_log(
     reserve1: u128,
 ) -> Log {
     Log {
+        block_timestamp: None,
         address: address.to_string(),
         topics: vec![SYNC_TOPIC0.to_string()],
         data: format!("0x{reserve0:064x}{reserve1:064x}"),

@@ -1437,6 +1437,16 @@ pub struct InitArgs {
     #[arg(long)]
     pub no_timestamps: bool,
 
+    /// Keep `block_timestamp` on every row, but never buy a block header for it: a row carries the
+    /// `blockTimestamp` its log carried and is null where the node stamps none (#3065).
+    ///
+    /// For chains whose `eth_getLogs` carries no `blockTimestamp` (XDC, for one), where the eager
+    /// default costs one `eth_getBlockByNumber` per block that holds a log - most of a cold start's
+    /// RPC bill. Written as `block_timestamps = "lazy"`, an `init`-time declaration like
+    /// `--no-timestamps`: a nest that has indexed refuses to switch. Sealed rows stay null for good.
+    #[arg(long, conflicts_with = "no_timestamps")]
+    pub lazy_timestamps: bool,
+
     /// Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias,
     /// deployment block, proxy warning), `tables`, `files_written`, `files_skipped` (scaffold files that were
     /// already there and kept), `files_appended` (existing files given a nuthatch section),
