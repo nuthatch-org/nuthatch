@@ -23711,6 +23711,50 @@ template="pool"
         assert_ne!(null_a, eager);
     }
 
+    /// #3065: the null nest's rows must not depend on a stamp the endpoint volunteers. Here the logs
+    /// themselves carry `blockTimestamp`, and the two endpoints disagree on it by 7 seconds.
+    #[tokio::test]
+    async fn a_null_backfill_ignores_the_blockstamp_its_logs_carry() {
+        let mut hashes = Vec::new();
+        for skew in [0, 7] {
+            let (reg, addresses, topic0s) = usdc_transfers();
+            let reg = reg.with_null_timestamps(true);
+            let logs = (1u64..=300).map(|b| transfer_log(b, 0)).collect();
+            let (url, server, headers) = stamping_node(logs, skew).await;
+            let rpc = crate::rpc::RpcClient::new(vec![url]).unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let total = backfill_direct_pipelined(
+                &rpc,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                300,
+                50,
+                SPAN_OFF,
+                2,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            server.abort();
+            assert_eq!(total, 300);
+            assert_eq!(headers.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let rows = seal::read_table_rows(d.path(), &reg.schema()[0]).unwrap();
+            assert!(rows.iter().all(|r| r.timestamp().is_none()));
+            hashes.push(sealed_hashes(d.path()));
+        }
+        assert_eq!(
+            hashes[0], hashes[1],
+            "a stamp the logs carry must not reach a null nest's sealed bytes"
+        );
+    }
+
     /// #1787: a split lowers the ceiling to the piece that was served. Over a long empty tail after
     /// it the ceiling must climb back, not walk the tail at the piece's width.
     #[tokio::test]
@@ -23899,12 +23943,29 @@ template="pool"
     /// An `eth_getLogs` node with no result cap, serving `logs` over HTTP (#1788). Every log carries
     /// `blockTimestamp`, so no header is asked for.
     async fn uncapped_node(logs: Vec<crate::rpc::Log>) -> (String, tokio::task::JoinHandle<()>) {
+        let (url, server, _) = stamping_node(logs, 0).await;
+        (url, server)
+    }
+
+    /// [`uncapped_node`] whose log stamps are `skew` seconds off, and which counts the
+    /// `eth_getBlockByNumber` calls it is asked: a second endpoint that answers differently.
+    async fn stamping_node(
+        logs: Vec<crate::rpc::Log>,
+        skew: u64,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use axum::{extract::State, routing::post, Json, Router};
         use serde_json::{json, Value};
-        async fn handler(
-            State(logs): State<Arc<Vec<crate::rpc::Log>>>,
-            Json(req): Json<Value>,
-        ) -> Json<Value> {
+        type Node = (
+            Vec<crate::rpc::Log>,
+            u64,
+            Arc<std::sync::atomic::AtomicUsize>,
+        );
+        async fn handler(State(node): State<Arc<Node>>, Json(req): Json<Value>) -> Json<Value> {
+            let (logs, skew, headers) = &*node;
             let hex = |v: &Value| {
                 u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
             };
@@ -23944,7 +24005,7 @@ template="pool"
                                         "data": l.data,
                                         "blockNumber": format!("0x{:x}", l.block_number),
                                         "blockHash": l.block_hash,
-                                        "blockTimestamp": format!("0x{:x}", l.block_number * 12),
+                                        "blockTimestamp": format!("0x{:x}", l.block_number * 12 + skew),
                                         "transactionHash": l.tx_hash,
                                         "logIndex": format!("0x{:x}", l.log_index),
                                     })
@@ -23953,11 +24014,12 @@ template="pool"
                         )
                     }
                     Some("eth_getBlockByNumber") => {
+                        headers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let b = hex(&r["params"][0]);
                         json!({
                             "number": format!("0x{b:x}"),
                             "hash": format!("0x{b:064x}"),
-                            "timestamp": format!("0x{:x}", b * 12),
+                            "timestamp": format!("0x{:x}", b * 12 + skew),
                         })
                     }
                     _ => Value::Null,
@@ -23969,15 +24031,16 @@ template="pool"
                 r => one(r),
             })
         }
+        let headers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
             .route("/", post(handler))
-            .with_state(Arc::new(logs));
+            .with_state(Arc::new((logs, skew, headers.clone())));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        (format!("http://{addr}/"), handle)
+        (format!("http://{addr}/"), handle, headers)
     }
 
     /// A source that remembers the most logs one `getLogs` answer handed the backfill, and panics when

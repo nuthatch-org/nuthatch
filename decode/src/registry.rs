@@ -596,7 +596,12 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
 /// Build the `l1_blocks` row for one header, keyed like a block row. `None` when the header has no
 /// hash or no `l1BlockNumber`: unlike `blocks`, a 0 here would be sealed as a wrong answer rather than
 /// an absent field, so the caller refuses the window instead.
-pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<DecodedRow> {
+pub fn l1_block_row(
+    number: u64,
+    header: &Json,
+    timestamps: bool,
+    null: bool,
+) -> Option<DecodedRow> {
     let hex = |k: &str| -> Option<u64> {
         header
             .get(k)
@@ -610,7 +615,12 @@ pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<Deco
         params: vec![("l1_block_number".to_string(), Value::U64(l1))],
         block_number: number,
         block_hash: hash.clone(),
-        block_timestamp: hex("timestamp").unwrap_or(0),
+        // A null-mode nest bought no header to stamp this row: null, as `build_row` leaves its rows.
+        block_timestamp: if null {
+            UNKNOWN_TIMESTAMP
+        } else {
+            hex("timestamp").unwrap_or(0)
+        },
         timestamps,
         log_index: BLOCK_ROW_LOG_INDEX,
         tx_hash: hash,
@@ -1603,6 +1613,18 @@ fn parse_bytes(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod stored_roundtrip {
     use super::*;
+
+    /// #3065: a null-mode nest's `l1_blocks` row is null too, whatever its header carried.
+    #[test]
+    fn an_l1_block_row_is_null_for_a_null_nest_and_stamped_otherwise() {
+        let header = serde_json::json!({
+            "hash": "0xaa", "l1BlockNumber": "0x10", "timestamp": "0x64",
+        });
+        let eager = l1_block_row(5, &header, true, false).unwrap();
+        assert_eq!(eager.timestamp(), Some(100));
+        let null = l1_block_row(5, &header, true, true).unwrap();
+        assert_eq!(null.timestamp(), None);
+    }
 
     fn col(name: &str, sol: &str, kind: StorageKind) -> ColumnSchema {
         ColumnSchema {

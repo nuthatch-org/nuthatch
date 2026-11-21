@@ -155,7 +155,14 @@ pub fn l1_block_rows(
         .map(|b| {
             data.l1_headers
                 .get(&b)
-                .and_then(|h| nuthatch_decode::registry::l1_block_row(b, h, registry.timestamps()))
+                .and_then(|h| {
+                    nuthatch_decode::registry::l1_block_row(
+                        b,
+                        h,
+                        registry.timestamps(),
+                        registry.null_timestamps(),
+                    )
+                })
                 .with_context(|| {
                     format!(
                         "block {b}'s header carries no l1BlockNumber; [extract] l1_blocks needs an \
