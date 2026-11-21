@@ -306,10 +306,11 @@ impl Gate {
                 .and_then(|h| h.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            block_timestamp: v
-                .get("block_timestamp")
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0),
+            // A null-mode row stored `null` (#3065); it stays unknown, not 0.
+            block_timestamp: match v.get("block_timestamp") {
+                Some(serde_json::Value::Null) => crate::registry::UNKNOWN_TIMESTAMP,
+                t => t.and_then(|t| t.as_u64()).unwrap_or(0),
+            },
             timestamps: v.get("block_timestamp").is_some(),
             log_index: head.log_index,
             tx_hash: String::new(),

@@ -1012,7 +1012,8 @@ unsure, keep them - the default is on for a reason.
 start. `nuthatch init --null-timestamps` keeps `block_timestamp` on every table and leaves it `null`
 on every row, even where the node did stamp the log: which endpoints stamp varies, and a nest's
 stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
-backfill buys none. Tip-following still reads one header per unfinalised block that holds a row, as
+backfill buys none for that (a nest with canonical `[[calls]]` still reads a header per window to
+check each call's block hash). Tip-following still reads one header per unfinalised block that holds a row, as
 every nest does, to check the block's hash against reorgs. Nothing fills a null later - sealed
 segments are immutable. Join on `block_number` when you need time. If your endpoints do stamp their
 logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
