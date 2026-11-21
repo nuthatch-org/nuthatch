@@ -243,7 +243,6 @@ pub fn logs_of(
                 block_hash: block_hash.to_string(),
                 tx_hash: String::new(),
                 log_index: index,
-                block_timestamp: None,
             };
             index += 1;
             if filters.iter().any(|f| f.matches(&log)) {

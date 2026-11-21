@@ -40,7 +40,7 @@ pub fn seal_rows(rows: &mut [Value]) -> Result<Vec<u8>> {
 /// can be folded by re-sealing (#1150). The inverse of `rows_to_batch` exactly: a `UInt64` column
 /// becomes a number, a `Utf8` value a string, and a null is an absent key - which is what
 /// `rows_to_batch` maps an absent key *to*, so a fold round-trips to the bytes a single seal of the
-/// same rows produces. The exception is a null `block_timestamp` (a lazy nest's, #3065), which
+/// same rows produces. The exception is a null `block_timestamp` (a null-mode nest's, #3065), which
 /// `rows_to_batch` was given as an explicit `null` and so gets back as one.
 pub fn segment_rows(bytes: bytes::Bytes) -> Result<Vec<Value>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
@@ -56,7 +56,7 @@ pub fn segment_rows(bytes: bytes::Bytes) -> Result<Vec<Value>> {
             for (c, field) in schema.fields().iter().enumerate() {
                 let col = batch.column(c);
                 if col.is_null(i) {
-                    // A lazy nest's unknown `block_timestamp` (#3065) is the one null `rows_to_batch`
+                    // A null-mode nest's unknown `block_timestamp` (#3065) is the one null `rows_to_batch`
                     // was given as a value rather than an absent key, and the only one that makes
                     // the column nullable; it comes back as it went in, or a fold would seal it as 0.
                     if field.name() == "block_timestamp" {
@@ -108,9 +108,9 @@ pub fn rows_to_batch(rows: &[Value]) -> Result<RecordBatch> {
     for col in &columns {
         if col == "block_number" || col == "log_index" || col == "_seq" || col == "block_timestamp"
         {
-            // A lazy nest's `block_timestamp` is `null` where its log carried none (#3065). The
-            // column is nullable only when a row in this batch is, so every batch an eager nest
-            // writes - none of whose rows can be null - has the schema and bytes it always had.
+            // A null-mode nest's `block_timestamp` is `null` on every row (#3065). The column is
+            // nullable only then, so every batch an eager nest writes - none of whose rows can be
+            // null - has the schema and bytes it always had.
             if col == "block_timestamp" && rows.iter().any(|r| r.get(col) == Some(&Value::Null)) {
                 let vals: Vec<Option<u64>> = rows
                     .iter()
@@ -234,8 +234,8 @@ mod tests {
         assert_eq!(segment_rows(bytes.into()).unwrap(), rows);
     }
 
-    /// #3065: `block_timestamp` is nullable only in a batch that holds a null, so every batch an eager
-    /// nest seals keeps the non-nullable schema (and bytes) it always had.
+    /// #3065: `block_timestamp` is nullable only in a batch of nulls (a null-mode nest's, every row
+    /// null), so every batch an eager nest seals keeps the non-nullable schema (and bytes) it always had.
     #[test]
     fn block_timestamp_is_nullable_only_where_a_row_is_null() {
         let eager = vec![
@@ -247,19 +247,19 @@ mod tests {
         let field = schema.field_with_name("block_timestamp").unwrap();
         assert!(!field.is_nullable());
 
-        let mut lazy = vec![
-            serde_json::json!({"block_number": 1, "log_index": 0, "block_timestamp": 100}),
+        let mut null = vec![
+            serde_json::json!({"block_number": 1, "log_index": 0, "block_timestamp": null}),
             serde_json::json!({"block_number": 2, "log_index": 0, "block_timestamp": null}),
         ];
-        let batch = rows_to_batch(&lazy).unwrap();
+        let batch = rows_to_batch(&null).unwrap();
         let schema = batch.schema();
         assert!(schema
             .field_with_name("block_timestamp")
             .unwrap()
             .is_nullable());
-        let bytes = seal_rows(&mut lazy).unwrap();
+        let bytes = seal_rows(&mut null).unwrap();
         let mut back = segment_rows(bytes.clone().into()).unwrap();
-        assert_eq!(back, lazy);
+        assert_eq!(back, null);
         // A fold re-seals what it read back; the null must not become 0 on the way.
         assert_eq!(seal_rows(&mut back).unwrap(), bytes);
     }

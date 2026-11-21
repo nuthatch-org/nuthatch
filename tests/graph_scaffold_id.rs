@@ -71,7 +71,6 @@ fn nft_transfer(
     token: u64,
 ) -> Log {
     Log {
-        block_timestamp: None,
         address: BAYC.to_string(),
         topics: vec![
             TRANSFER_TOPIC0.to_string(),

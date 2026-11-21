@@ -684,7 +684,6 @@ mod tests {
 
     fn log(topic0: &str, a: &str, b: &str, value: &str, block: u64, li: u64) -> Log {
         Log {
-            block_timestamp: None,
             address: TOKEN.into(),
             topics: vec![
                 topic0.into(),

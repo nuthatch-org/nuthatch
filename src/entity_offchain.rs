@@ -735,7 +735,6 @@ mod through_the_binder {
     fn transfer(from: &str, to: &str, value: &str, block: u64, li: u64) -> Log {
         let topic = |a: &str| format!("0x{:0>64}", a.trim_start_matches("0x"));
         Log {
-            block_timestamp: None,
             address: TOKEN.into(),
             topics: vec![TRANSFER_TOPIC0.into(), topic(from), topic(to)],
             data: format!("0x{value:0>64}"),

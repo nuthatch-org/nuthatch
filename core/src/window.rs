@@ -51,8 +51,8 @@ pub async fn fetch_timestamps(
     registry: &DecodeRegistry,
     blocks: &[u64],
 ) -> Result<HashMap<u64, u64>> {
-    // A lazy nest's rows already hold what their logs carried (#3065); a header is never bought.
-    if !registry.timestamps() || registry.lazy_timestamps() {
+    // A null-mode nest's rows are all null (#3065); a header is never bought for a stamp.
+    if !registry.timestamps() || registry.null_timestamps() {
         return Ok(HashMap::new());
     }
     source.block_timestamps(blocks).await
@@ -65,7 +65,7 @@ pub fn refuse_unstamped(
     blocks: &[u64],
     timestamps: &HashMap<u64, u64>,
 ) -> Result<()> {
-    if !registry.timestamps() || registry.lazy_timestamps() {
+    if !registry.timestamps() || registry.null_timestamps() {
         return Ok(());
     }
     match blocks
@@ -183,15 +183,14 @@ pub fn blocks_needing_timestamps(
     blocks
 }
 
-/// Stamp rows from `ts`. A lazy nest's rows keep what decode gave them from their own logs (#3065), so
-/// a header fetched for another reason (canonical calls, `l1_blocks`) never fills one row and not
-/// the next: a lazy row's timestamp depends on its log alone.
+/// Stamp rows from `ts`. A null-mode nest's rows stay null (#3065), so a header fetched for another
+/// reason (canonical calls, `l1_blocks`) never stamps one.
 pub fn apply_row_timestamps(
     registry: &DecodeRegistry,
     rows: &mut [DecodedRow],
     ts: &HashMap<u64, u64>,
 ) {
-    if registry.lazy_timestamps() {
+    if registry.null_timestamps() {
         return;
     }
     for r in rows {
@@ -345,7 +344,7 @@ pub fn decode_window(
                     }
                 };
                 if let Some(mut r) = decoded {
-                    if !registry.lazy_timestamps() {
+                    if !registry.null_timestamps() {
                         r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
                     }
                     if let Some(fs) = factory {

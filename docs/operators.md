@@ -1006,10 +1006,10 @@ you are standing up a new nest over a long history. **When it is clearly wrong:*
 "per day" or "per hour" later. Blocks give you ordering; only timestamps give you time. If you are
 unsure, keep them - the default is on for a reason.
 
-**`block_timestamps = "lazy"` - keep the column, never buy a header for it (#3065).** On a node whose
+**`block_timestamps = "null"` - keep the column, never buy a header for it (#3065).** On a node whose
 `eth_getLogs` carries no `blockTimestamp` (XDC's public RPC, for one), the default costs one
 `eth_getBlockByNumber` per block that holds a matching log, which on a dense history is most of a cold
-start. `nuthatch init --lazy-timestamps` keeps `block_timestamp` on every table and leaves it `null`
+start. `nuthatch init --null-timestamps` keeps `block_timestamp` on every table and leaves it `null`
 on every row, even where the node did stamp the log: which endpoints stamp varies, and a nest's
 stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
 backfill buys none. Tip-following still reads one header per unfinalised block that holds a row, as
@@ -1018,7 +1018,7 @@ segments are immutable. Join on `block_number` when you need time. If your endpo
 logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
 `--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
 refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
-and content addresses are exactly what they were before `"lazy"` existed.
+and content addresses are exactly what they were before `"null"` existed.
 
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
 (RFC-0019 §4) is that secrets never go into a published bundle - so keep the directory `0700` and

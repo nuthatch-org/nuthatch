@@ -320,7 +320,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         chain_id: chain.chain_id,
         rpc_urls,
         block_timestamps: !args.no_timestamps,
-        lazy_timestamps: args.lazy_timestamps,
+        null_timestamps: args.null_timestamps,
         contracts,
     };
     // The config and ABIs come from the scaffold as a tab gets them; the rest is written by
@@ -392,9 +392,9 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
 /// The `[nest] block_timestamps` an `init` declares from its flags.
 fn timestamp_policy(args: &InitArgs) -> crate::config::TimestampPolicy {
     use crate::config::TimestampPolicy;
-    match (args.no_timestamps, args.lazy_timestamps) {
+    match (args.no_timestamps, args.null_timestamps) {
         (true, _) => TimestampPolicy::Omitted,
-        (false, true) => TimestampPolicy::Lazy,
+        (false, true) => TimestampPolicy::Null,
         (false, false) => TimestampPolicy::Eager,
     }
 }
@@ -2743,7 +2743,7 @@ mod tests {
                 rpc_urls: config.nest.rpc_urls.clone(),
                 block_timestamps: config.nest.block_timestamps
                     == crate::config::TimestampPolicy::Eager,
-                lazy_timestamps: config.nest.block_timestamps.lazy(),
+                null_timestamps: config.nest.block_timestamps.null(),
                 contracts: config
                     .contracts
                     .iter()
@@ -4178,7 +4178,7 @@ abi = "abis/tok.json"
             rpc: vec![silent, good],
             dir: dir.path().join("nest").to_string_lossy().into_owned(),
             no_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             json: false,
         };
 
@@ -4276,7 +4276,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             json: false,
         };
 
@@ -4336,7 +4336,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             json: false,
         };
         let r = init_from_subgraph(&source, &args).await;
@@ -4531,7 +4531,7 @@ dataSources:
             rpc: vec![],
             dir: dir.path().to_string_lossy().into_owned(),
             no_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             json: false,
         };
 

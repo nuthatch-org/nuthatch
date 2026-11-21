@@ -618,7 +618,7 @@ pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<Deco
     })
 }
 
-/// A lazy nest's row whose log carried no `blockTimestamp` (#3065). Never a real timestamp, never
+/// A null-mode nest's row (#3065). Never a real timestamp, never
 /// produced by an eager nest (`refuse_unstamped` refuses a header without one), stored and served as
 /// `null`, and read back from `null` - so it exists only in memory, between decode and serialisation.
 /// A sentinel rather than `Option<u64>` so the dozens of row literals and the eager path's arithmetic
@@ -637,8 +637,8 @@ pub struct DecodedRow {
     pub block_number: u64,
     pub block_hash: String,
     /// Unix seconds from the block header. Set by the indexer after decode (the log doesn't carry
-    /// it); 0 until then, and 0 if the source couldn't supply it. A lazy nest's row instead keeps
-    /// what its own log carried, or [`UNKNOWN_TIMESTAMP`] (#3065).
+    /// it); 0 until then, and 0 if the source couldn't supply it. A null-mode nest's row is
+    /// [`UNKNOWN_TIMESTAMP`] always (#3065).
     pub block_timestamp: u64,
     /// Whether this row's table has a `block_timestamp` column at all (RFC-0029 §6b), copied from the
     /// registry that decoded it. When false, [`DecodedRow::to_json`] omits the key entirely - the
@@ -666,7 +666,7 @@ impl DecodedRow {
         (self.block_number << 20) | (self.log_index & 0xF_FFFF)
     }
 
-    /// This row's block timestamp, `None` for a lazy row whose log carried none (#3065).
+    /// This row's block timestamp, `None` for a null-mode row (#3065).
     pub fn timestamp(&self) -> Option<u64> {
         (self.block_timestamp != UNKNOWN_TIMESTAMP).then_some(self.block_timestamp)
     }
@@ -877,8 +877,8 @@ pub struct DecodeRegistry {
     /// into it would invalidate the snapshots of every existing nest to describe something the
     /// content-addressed segment bytes already distinguish.
     timestamps: bool,
-    /// `[nest] block_timestamps = "lazy"` (#3065): see [`DecodeRegistry::with_lazy_timestamps`].
-    lazy_timestamps: bool,
+    /// `[nest] block_timestamps = "null"` (#3065): see [`DecodeRegistry::with_null_timestamps`].
+    null_timestamps: bool,
     /// Whether this nest declares `[extract] blocks` (RFC-0036). Lives here for the same reason
     /// `timestamps` does: the registry is the single source of truth for a nest's table set, and a
     /// second place that decides which tables exist is a second place that can disagree.
@@ -1020,17 +1020,17 @@ impl DecodeRegistry {
         self
     }
 
-    /// `[nest] block_timestamps = "lazy"` (#3065): every row is [`UNKNOWN_TIMESTAMP`] (stored and
+    /// `[nest] block_timestamps = "null"` (#3065): every row is [`UNKNOWN_TIMESTAMP`] (stored and
     /// served as `null`) and no header is fetched for it. A log's own `blockTimestamp` is ignored:
     /// which endpoints stamp varies, and stored state must not (non-negotiable 4). Not folded into [`DecodeRegistry::hash`], for the reason `timestamps` is not.
-    pub fn with_lazy_timestamps(mut self, lazy: bool) -> DecodeRegistry {
-        self.lazy_timestamps = lazy && self.timestamps;
+    pub fn with_null_timestamps(mut self, null: bool) -> DecodeRegistry {
+        self.null_timestamps = null && self.timestamps;
         self
     }
 
-    /// Whether this nest's timestamps come only from its logs (see [`Self::with_lazy_timestamps`]).
-    pub fn lazy_timestamps(&self) -> bool {
-        self.lazy_timestamps
+    /// Whether this nest's timestamps are always null (see [`Self::with_null_timestamps`]).
+    pub fn null_timestamps(&self) -> bool {
+        self.null_timestamps
     }
 
     /// Whether this nest indexes block timestamps. Callers that would otherwise fetch them (the four
@@ -1121,7 +1121,7 @@ impl DecodeRegistry {
             hash,
             skipped_anonymous,
             timestamps: true,
-            lazy_timestamps: false,
+            null_timestamps: false,
             blocks: false,
             l1_blocks: false,
         })
@@ -1285,7 +1285,7 @@ impl DecodeRegistry {
             log,
             emitter,
             self.timestamps,
-            self.lazy_timestamps,
+            self.null_timestamps,
         )?))
     }
 
@@ -1321,7 +1321,7 @@ impl DecodeRegistry {
             log,
             emitter,
             self.timestamps,
-            self.lazy_timestamps,
+            self.null_timestamps,
         )?))
     }
 }
@@ -1333,7 +1333,7 @@ fn build_row(
     log: &Log,
     emitter: Address,
     timestamps: bool,
-    lazy: bool,
+    null: bool,
 ) -> Result<DecodedRow> {
     let topics: Vec<B256> = log
         .topics
@@ -1364,9 +1364,9 @@ fn build_row(
         params,
         block_number: log.block_number,
         block_hash: log.block_hash.clone(),
-        // Eager: filled by the indexer from the block header (see index_loop). Lazy: always null,
+        // Eager: filled by the indexer from the block header (see index_loop). Null: always null,
         // whatever the log carried, so the row cannot depend on which endpoint served it.
-        block_timestamp: if lazy { UNKNOWN_TIMESTAMP } else { 0 },
+        block_timestamp: if null { UNKNOWN_TIMESTAMP } else { 0 },
         timestamps,
         log_index: log.log_index,
         tx_hash: log.tx_hash.clone(),
@@ -2015,10 +2015,10 @@ mod stored_roundtrip {
         }
     }
 
-    /// #3065: a lazy row whose log carried no timestamp is `null` in the store and comes back as the
+    /// #3065: a null-mode row is `null` in the store and comes back as the
     /// same in-memory sentinel, never as a number.
     #[test]
-    fn a_lazy_row_without_a_timestamp_is_null_and_comes_back_unknown() {
+    fn a_null_row_without_a_timestamp_is_null_and_comes_back_unknown() {
         let schema = transfer_schema(true);
         let mut row = a_row(true);
         row.block_timestamp = UNKNOWN_TIMESTAMP;
@@ -2034,10 +2034,9 @@ mod stored_roundtrip {
         assert_eq!(row.to_json()["block_timestamp"], json!(1_700_000_000u64));
     }
 
-    /// #3065: a lazy registry leaves every row null, stamped log or not; an eager one leaves the row
-    /// for the indexer to stamp, whatever the log carried.
+    /// #3065: a null-mode registry leaves every row null; an eager one leaves it for the indexer to stamp.
     #[test]
-    fn a_lazy_registry_leaves_every_row_null_whatever_its_log_carried() {
+    fn a_null_registry_leaves_every_row_null() {
         const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
             {"name":"from","type":"address","indexed":true},
             {"name":"to","type":"address","indexed":true},
@@ -2053,7 +2052,7 @@ mod stored_roundtrip {
             }])
             .unwrap()
         };
-        let log = |ts: Option<u64>| Log {
+        let log = Log {
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
             topics: vec![
                 "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".into(),
@@ -2065,33 +2064,22 @@ mod stored_roundtrip {
             block_hash: "0xbh".into(),
             tx_hash: "0xtx".into(),
             log_index: 0,
-            block_timestamp: ts,
         };
-        let lazy = build().with_lazy_timestamps(true);
-        assert!(lazy.lazy_timestamps());
-        let stamped = lazy.decode(&log(Some(1234))).unwrap().unwrap();
-        let bare = lazy.decode(&log(None)).unwrap().unwrap();
-        assert_eq!(stamped.timestamp(), None);
-        assert_eq!(stamped, bare);
+        let null = build().with_null_timestamps(true);
+        assert!(null.null_timestamps());
+        assert_eq!(null.decode(&log).unwrap().unwrap().timestamp(), None);
 
         let eager = build();
-        assert!(!eager.lazy_timestamps());
-        assert_eq!(
-            eager
-                .decode(&log(Some(1234)))
-                .unwrap()
-                .unwrap()
-                .block_timestamp,
-            0
-        );
+        assert!(!eager.null_timestamps());
+        assert_eq!(eager.decode(&log).unwrap().unwrap().block_timestamp, 0);
 
-        // Lazy means nothing without the column.
+        // Null means nothing without the column.
         assert!(!build()
             .with_timestamps(false)
-            .with_lazy_timestamps(true)
-            .lazy_timestamps());
+            .with_null_timestamps(true)
+            .null_timestamps());
         // And it is not part of the registry's identity, any more than `timestamps` is.
-        assert_eq!(build().hash(), build().with_lazy_timestamps(true).hash());
+        assert_eq!(build().hash(), build().with_null_timestamps(true).hash());
     }
 
     /// The column order comes from the schema, never from the stored map. A plan indexes columns by
@@ -2630,7 +2618,6 @@ mod tests {
 
     fn log(addr: &str, topics: &[&str], data: &str, block: u64, li: u64) -> Log {
         Log {
-            block_timestamp: None,
             address: addr.into(),
             topics: topics.iter().map(|s| s.to_string()).collect(),
             data: data.into(),

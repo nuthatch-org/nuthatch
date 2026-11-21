@@ -1366,7 +1366,7 @@ async fn hot_store_backfill(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
-                registry.lazy_timestamps(),
+                registry.null_timestamps(),
                 None,
             )
             .await?;

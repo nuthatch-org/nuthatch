@@ -440,7 +440,6 @@ mod tests {
             }
             let d = self.n();
             Ok(vec![Log {
-                block_timestamp: None,
                 address: "0xa0b8".into(),
                 topics: vec!["0xddf2".into()],
                 data: format!("0x{d}"),
@@ -578,7 +577,6 @@ mod tests {
         }
         async fn logs(&self, _f: &LogFilter, from: u64, _to: u64) -> Result<Vec<Log>> {
             Ok(vec![Log {
-                block_timestamp: None,
                 address: "0xa0b8".into(),
                 topics: vec!["0xddf2".into()],
                 data: "0x1".into(),

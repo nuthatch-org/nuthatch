@@ -342,13 +342,13 @@ fn sql_rows(blocks: std::ops::RangeInclusive<u64>) -> serde_json::Value {
 }
 
 /// What this build's seal path writes for the eager rows v3.13.2 sealed. Not v3.13.2's own bytes
-/// (the writer has changed since), but pinned from `main` at 72a591e1, before #3065's lazy timestamps:
+/// (the writer has changed since), but pinned from `main` at 72a591e1, before #3065's null timestamps:
 /// the default policy must keep sealing these exact bytes, so its content addresses cannot move.
 const EAGER_RESEAL_SEGMENT: &str =
     "9efc6298c8b402db769334e1ef6763517d12c6621d6587bc66ce3f39398a720a";
 
 #[test]
-fn eager_rows_seal_to_the_bytes_they_sealed_to_before_lazy_timestamps() {
+fn eager_rows_seal_to_the_bytes_they_sealed_to_before_null_timestamps() {
     let segment = fixture_root()
         .join("v3.13.2/runtime/segments")
         .join(format!("{V3_13_2_SEGMENT}.parquet"));

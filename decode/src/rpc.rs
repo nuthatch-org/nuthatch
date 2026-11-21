@@ -19,12 +19,6 @@ pub struct Log {
     pub block_hash: String,
     pub tx_hash: String,
     pub log_index: u64,
-    /// `blockTimestamp` as the node stamped it on the log (execution-apis, 2025), when it did. Read
-    /// only by a `block_timestamps = "lazy"` nest (#3065), whose rows carry exactly what their own
-    /// logs carried, so a lazy row's timestamp is a function of its `eth_getLogs` answer and nothing
-    /// else. Skipped when absent, so a tape recorded from a node that does not stamp is unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub block_timestamp: Option<u64>,
 }
 
 impl Log {
@@ -58,12 +52,6 @@ impl Log {
             block_hash: field_str(v, "blockHash").unwrap_or_default(),
             tx_hash: field_str(v, "transactionHash")?,
             log_index,
-            // arb1.arbitrum.io sends `0x0` on every log: absent, not the epoch.
-            block_timestamp: v
-                .get("blockTimestamp")
-                .and_then(Value::as_str)
-                .and_then(|s| parse_hex_u64(s).ok())
-                .filter(|&t| t != 0),
         })
     }
 }
@@ -94,26 +82,6 @@ mod tests {
             "transactionHash": "0xtx",
             "logIndex": log_index,
         })
-    }
-
-    /// #3065: `blockTimestamp` is read when a node stamps it, and `0x0` (arb1's placeholder) is absent.
-    #[test]
-    fn a_stamped_log_keeps_its_timestamp_and_a_zero_one_is_absent() {
-        let topics = serde_json::json!([]);
-        assert_eq!(
-            Log::from_rpc(&rpc_log(topics.clone(), "0x0"))
-                .unwrap()
-                .block_timestamp,
-            None
-        );
-        let mut v = rpc_log(topics, "0x0");
-        v["blockTimestamp"] = "0x6553f100".into();
-        assert_eq!(
-            Log::from_rpc(&v).unwrap().block_timestamp,
-            Some(0x6553_f100)
-        );
-        v["blockTimestamp"] = "0x0".into();
-        assert_eq!(Log::from_rpc(&v).unwrap().block_timestamp, None);
     }
 
     /// #2228: a malformed topic used to vanish, shifting every later topic into the wrong parameter.

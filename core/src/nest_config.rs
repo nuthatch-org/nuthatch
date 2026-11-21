@@ -34,29 +34,27 @@ fn default_schema_version() -> u32 {
 /// 0.8.x opening nests it can serve perfectly well. The version records what a *reader* must
 /// understand, not which binary happened to write it. Canonical calls additionally require v3,
 /// enforced by `check_schema_version`, so older readers cannot silently use block-number reads.
-/// A `block_timestamps = "lazy"` nest is v2 as well: a pre-0.9 binary would ignore the key and index
-/// eagerly, and a 0.9+ binary that predates `"lazy"` refuses the string where it expects a bool.
+/// A `block_timestamps = "null"` nest is v2 as well: a pre-0.9 binary would ignore the key and index
+/// eagerly, and a 0.9+ binary that predates `"null"` refuses the string where it expects a bool.
 pub fn required_schema_version(block_timestamps: TimestampPolicy) -> u32 {
     match block_timestamps {
         TimestampPolicy::Eager => 1,
-        TimestampPolicy::Omitted | TimestampPolicy::Lazy => 2,
+        TimestampPolicy::Omitted | TimestampPolicy::Null => 2,
     }
 }
 
 /// `[nest] block_timestamps`: whether rows carry `block_timestamp`, and where it comes from.
 ///
 /// Written as it always was for the two existing policies (`true`, `false`), so an eager or
-/// timestamp-free nest's `nuthatch.toml` is byte-for-byte what it was before `"lazy"` existed.
+/// timestamp-free nest's `nuthatch.toml` is byte-for-byte what it was before `"null"` existed.
 ///
 /// - `true` (**eager**, the default): every row carries its block's header timestamp, bought with one
 ///   `eth_getBlockByNumber` per block that holds a row unless the node stamps `blockTimestamp` on its
 ///   logs. Never null.
 /// - `false` (**omitted**, RFC-0029 §6b): the column does not exist on any table.
-/// - `"lazy"` (#3065): the column exists and is **nullable**. A row carries the `blockTimestamp` its
-///   own log carried, and `null` when the node did not stamp one; no header is ever bought for it.
-///   On a node that stamps (Ethereum mainnet's current clients) a lazy nest fills the column; on one
-///   that does not (XDC) the column is null. Nothing fills it later: a sealed segment is immutable, and
-///   a fill that ran only on unsealed rows would make a row's value depend on when it sealed.
+/// - `"null"` (#3065): the column exists and is **nullable**, and every row's value is `null`, whatever
+///   the node's logs carry: no header is ever bought for it, and a sealed segment depends on this
+///   file alone (non-negotiable 4). Use eager for timestamps.
 ///
 /// All three are `init`-time declarations; changing one on a nest that has indexed is refused at
 /// startup (`TIMESTAMPS_KEY` in `indexer.rs`).
@@ -65,7 +63,7 @@ pub enum TimestampPolicy {
     #[default]
     Eager,
     Omitted,
-    Lazy,
+    Null,
 }
 
 impl TimestampPolicy {
@@ -75,8 +73,8 @@ impl TimestampPolicy {
     }
 
     /// Whether the column is nullable and filled only from the logs themselves.
-    pub fn lazy(self) -> bool {
-        self == TimestampPolicy::Lazy
+    pub fn null(self) -> bool {
+        self == TimestampPolicy::Null
     }
 
     /// The declaration as it is written in `nuthatch.toml`.
@@ -84,7 +82,7 @@ impl TimestampPolicy {
         match self {
             TimestampPolicy::Eager => "true",
             TimestampPolicy::Omitted => "false",
-            TimestampPolicy::Lazy => "\"lazy\"",
+            TimestampPolicy::Null => "\"null\"",
         }
     }
 }
@@ -100,7 +98,7 @@ impl Serialize for TimestampPolicy {
         match self {
             TimestampPolicy::Eager => s.serialize_bool(true),
             TimestampPolicy::Omitted => s.serialize_bool(false),
-            TimestampPolicy::Lazy => s.serialize_str("lazy"),
+            TimestampPolicy::Null => s.serialize_str("null"),
         }
     }
 }
@@ -116,9 +114,9 @@ impl<'de> Deserialize<'de> for TimestampPolicy {
         match Raw::deserialize(d)? {
             Raw::Bool(true) => Ok(TimestampPolicy::Eager),
             Raw::Bool(false) => Ok(TimestampPolicy::Omitted),
-            Raw::Text(t) if t == "lazy" => Ok(TimestampPolicy::Lazy),
+            Raw::Text(t) if t == "null" => Ok(TimestampPolicy::Null),
             Raw::Text(t) => Err(serde::de::Error::custom(format!(
-                "block_timestamps = \"{t}\" is not a policy: use true, false or \"lazy\""
+                "block_timestamps = \"{t}\" is not a policy: use true, false or \"null\""
             ))),
         }
     }
@@ -409,7 +407,7 @@ pub struct Nest {
     /// What it buys is real - timestamp acquisition measured at ~85% of backfill wall clock - but it is
     /// a *new-nest* win, which is a narrower claim than "backfills get faster".
     ///
-    /// `"lazy"` keeps the column but fills it only from the logs (see [`TimestampPolicy`]).
+    /// `"null"` keeps the column and leaves it null on every row (see [`TimestampPolicy`]).
     #[serde(default)]
     pub block_timestamps: TimestampPolicy,
 }
@@ -540,7 +538,7 @@ pub fn build_registry(
     }
     Ok(DecodeRegistry::build_with_templates(specs, template_specs)?
         .with_timestamps(nest.block_timestamps.column())
-        .with_lazy_timestamps(nest.block_timestamps.lazy())
+        .with_null_timestamps(nest.block_timestamps.null())
         .with_blocks(extract.blocks)
         .with_l1_blocks(extract.l1_blocks))
 }
@@ -684,7 +682,7 @@ abi = "abis/token.json"
         format!("{:#}", NestConfig::parse(raw).expect_err("refused"))
     }
 
-    /// #3065: `block_timestamps` reads `true`, `false` and `"lazy"`, defaults to eager, and refuses
+    /// #3065: `block_timestamps` reads `true`, `false` and `"null"`, defaults to eager, and refuses
     /// any other string by naming the three it accepts.
     #[test]
     fn block_timestamps_reads_three_policies() {
@@ -701,17 +699,17 @@ abi = "abis/token.json"
         for (line, want) in [
             ("block_timestamps = true", TimestampPolicy::Eager),
             ("block_timestamps = false", TimestampPolicy::Omitted),
-            ("block_timestamps = \"lazy\"", TimestampPolicy::Lazy),
+            ("block_timestamps = \"null\"", TimestampPolicy::Null),
         ] {
             let cfg = NestConfig::parse(&with(line)).unwrap();
             assert_eq!(cfg.nest.block_timestamps, want, "{line}");
             assert_eq!(format!("block_timestamps = {want}"), line);
         }
         let err = refused(&with("block_timestamps = \"sometimes\""));
-        assert!(err.contains("\"lazy\""), "{err}");
-        assert!(TimestampPolicy::Lazy.column() && TimestampPolicy::Lazy.lazy());
+        assert!(err.contains("\"null\""), "{err}");
+        assert!(TimestampPolicy::Null.column() && TimestampPolicy::Null.null());
         assert!(!TimestampPolicy::Omitted.column());
-        assert_eq!(required_schema_version(TimestampPolicy::Lazy), 2);
+        assert_eq!(required_schema_version(TimestampPolicy::Null), 2);
     }
 
     #[test]

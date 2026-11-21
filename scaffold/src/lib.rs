@@ -31,9 +31,9 @@ pub struct Nest {
     pub chain_id: u64,
     pub rpc_urls: Vec<String>,
     pub block_timestamps: bool,
-    /// `block_timestamps = "lazy"` (#3065): the column, filled only from what the logs carry.
+    /// `block_timestamps = "null"` (#3065): the column, null on every row.
     /// Meaningless without `block_timestamps`.
-    pub lazy_timestamps: bool,
+    pub null_timestamps: bool,
     pub contracts: Vec<Contract>,
 }
 
@@ -104,12 +104,12 @@ struct NestToml<'a> {
     block_timestamps: TimestampsToml,
 }
 
-/// `true`, `false` or `"lazy"`, as `nuthatch_core::nest_config::TimestampPolicy` reads it.
+/// `true`, `false` or `"null"`, as `nuthatch_core::nest_config::TimestampPolicy` reads it.
 #[derive(Serialize)]
 #[serde(untagged)]
 enum TimestampsToml {
     Declared(bool),
-    Lazy(&'static str),
+    Null(&'static str),
 }
 
 #[derive(Serialize)]
@@ -132,14 +132,14 @@ pub fn config_toml(nest: &Nest) -> Result<String> {
             rpc_urls: &nest.rpc_urls,
             // A timestamped nest is a v1 file and stays readable by 0.8.x
             // (`config::required_schema_version`).
-            // A lazy nest is v2 for the reason a timestamp-free one is: an older reader must refuse it.
-            schema_version: if nest.block_timestamps && !nest.lazy_timestamps {
+            // A null-mode nest is v2 for the reason a timestamp-free one is: an older reader must refuse it.
+            schema_version: if nest.block_timestamps && !nest.null_timestamps {
                 1
             } else {
                 2
             },
-            block_timestamps: if nest.block_timestamps && nest.lazy_timestamps {
-                TimestampsToml::Lazy("lazy")
+            block_timestamps: if nest.block_timestamps && nest.null_timestamps {
+                TimestampsToml::Null("null")
             } else {
                 TimestampsToml::Declared(nest.block_timestamps)
             },
@@ -180,7 +180,7 @@ pub fn registry(nest: &Nest) -> Result<DecodeRegistry> {
     }
     Ok(DecodeRegistry::build_with_templates(specs, Vec::new())?
         .with_timestamps(nest.block_timestamps)
-        .with_lazy_timestamps(nest.lazy_timestamps))
+        .with_null_timestamps(nest.null_timestamps))
 }
 
 fn parse_address(s: &str) -> Result<Address> {
@@ -457,7 +457,7 @@ mod tests {
             chain_id: 1,
             rpc_urls: Vec::new(),
             block_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             contracts: vec![Contract {
                 alias: "weth".into(),
                 address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),
@@ -476,17 +476,17 @@ mod tests {
     }
 
     /// #3065: the three timestamp policies as `init` writes them. Eager and timestamp-free files are
-    /// what they were before `"lazy"` existed; a lazy one is v2 so an older reader refuses it.
+    /// what they were before `"null"` existed; a null one is v2 so an older reader refuses it.
     #[test]
     fn each_timestamp_policy_is_written_as_it_is_read() {
-        for (timestamps, lazy, line, version) in [
+        for (timestamps, null, line, version) in [
             (true, false, "block_timestamps = true", 1),
             (false, false, "block_timestamps = false", 2),
-            (true, true, "block_timestamps = \"lazy\"", 2),
+            (true, true, "block_timestamps = \"null\"", 2),
         ] {
             let mut nest = nest_with(serde_json::json!({}));
             nest.block_timestamps = timestamps;
-            nest.lazy_timestamps = lazy;
+            nest.null_timestamps = null;
             let toml = config_toml(&nest).unwrap();
             assert!(toml.lines().any(|l| l == line), "{toml}");
             assert!(
@@ -504,7 +504,7 @@ mod tests {
             chain_id: 1,
             rpc_urls: Vec::new(),
             block_timestamps: false,
-            lazy_timestamps: false,
+            null_timestamps: false,
             contracts: vec![Contract {
                 alias: "tok".into(),
                 address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2".into(),

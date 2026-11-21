@@ -213,17 +213,18 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > and refuses `[mounts.sync]` by name, and the code stays. A redesign (rows shown without the engine,
 > §12's column probe) waits for a user who asks for it.
 >
-> **`block_timestamps = "lazy"` is accepted, and this line is the record RFC-0044 §8 asks for.** Chief
-> accepted #3065 (PR #3078) on 2026-11-21: an opt-in `[nest] block_timestamps = "lazy"`, set by
-> `nuthatch init --lazy-timestamps`, so a chain whose `eth_getLogs` carries no `blockTimestamp` (XDC,
+> **`block_timestamps = "null"` is accepted, and this line is the record RFC-0044 §8 asks for.** Chief
+> accepted #3065 (PR #3078) on 2026-11-21: an opt-in `[nest] block_timestamps = "null"`, set by
+> `nuthatch init --null-timestamps`, so a chain whose `eth_getLogs` carries no `blockTimestamp` (XDC,
 > #3061) backfills without one `eth_getBlockByNumber` per log block. It is new binary capability: a
-> config value, a CLI flag and a `schema_version = 2` nest. **Every lazy row's `block_timestamp` is
+> config value, a CLI flag and a `schema_version = 2` nest. **Every null-mode row's `block_timestamp` is
 > null, even where the node stamped the log.** Chief chose that over keeping each log's own stamp,
 > which made which rows were null depend on which endpoint served `eth_getLogs`, against
 > non-negotiable 4, and over amending the non-negotiable, which stands as written. Nothing is lost by
 > it: the eager default already takes a log's stamp and buys no header when the node sends one, so
-> lazy is only for chains whose endpoints do not. An indexed nest is refused if it switches to or from
-> lazy, and eager and timestamp-free nests keep their sealed bytes and content addresses.
+> null is only for chains whose endpoints do not. An indexed nest is refused if it switches to or from
+> null, and eager and timestamp-free nests keep their sealed bytes and content addresses.
+> **null = timestamps always null, deterministic by construction; use eager for timestamps.**
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

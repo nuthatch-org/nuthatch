@@ -4721,12 +4721,12 @@ fn guard_timestamp_policy(
     owner: bool,
 ) -> Result<()> {
     use crate::config::TimestampPolicy;
-    // "1" and "0" are what every nest before `"lazy"` recorded, and stay what eager and timestamp-free
-    // nests record; a lazy nest records its own value, so no pair of policies can share a store.
+    // "1" and "0" are what every nest before `"null"` recorded, and stay what eager and timestamp-free
+    // nests record; a null-mode nest records its own value, so no pair of policies can share a store.
     let recorded = |p: TimestampPolicy| match p {
         TimestampPolicy::Eager => "1",
         TimestampPolicy::Omitted => "0",
-        TimestampPolicy::Lazy => "lazy",
+        TimestampPolicy::Null => "null",
     };
     let want = recorded(declared);
     match store.get_meta(TIMESTAMPS_KEY)? {
@@ -4734,7 +4734,7 @@ fn guard_timestamp_policy(
             let was = match found.as_str() {
                 "1" => TimestampPolicy::Eager,
                 "0" => TimestampPolicy::Omitted,
-                "lazy" => TimestampPolicy::Lazy,
+                "null" => TimestampPolicy::Null,
                 other => anyhow::bail!(
                     "this nest recorded `block_timestamps` policy {other:?}, which this nuthatch \
                      does not know; it was indexed by a newer build"
@@ -4743,7 +4743,7 @@ fn guard_timestamp_policy(
             let effect = match (was.column(), declared.column()) {
                 (true, false) => "removes the column from every table",
                 (false, true) => "adds the column to every table",
-                // Lazy and eager share the column; what differs is whether it may be null.
+                // Null and eager share the column; what differs is whether it may be null.
                 _ => "changes whether the column may be null",
             };
             anyhow::bail!(
@@ -4772,7 +4772,7 @@ fn guard_timestamp_policy(
                     "this nest has already indexed with `block_timestamp`, so it cannot switch to \
                      `block_timestamps = {declared}` in place - that changes the column on every \
                      table and invalidates every sealed segment. `nuthatch init` a new nest instead \
-                     (`--no-timestamps` or `--lazy-timestamps`), and serve it alongside this one \
+                     (`--no-timestamps` or `--null-timestamps`), and serve it alongside this one \
                      (RFC-0020 slice 3)."
                 );
             }
@@ -5130,7 +5130,7 @@ pub(crate) async fn resolve_calls_for_window(
     to: u64,
     timestamps: &std::collections::HashMap<u64, u64>,
     with_timestamps: bool,
-    lazy: bool,
+    null: bool,
     window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
     resolve_calls_for_window_upto(
@@ -5143,7 +5143,7 @@ pub(crate) async fn resolve_calls_for_window(
         to,
         timestamps,
         with_timestamps,
-        lazy,
+        null,
         window_headers,
         None,
     )
@@ -5162,7 +5162,7 @@ async fn resolve_calls_for_window_upto(
     to: u64,
     timestamps: &std::collections::HashMap<u64, u64>,
     with_timestamps: bool,
-    lazy: bool,
+    null: bool,
     window_headers: Option<&std::collections::HashMap<u64, serde_json::Value>>,
     attempts: Option<usize>,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
@@ -5247,8 +5247,8 @@ async fn resolve_calls_for_window_upto(
             {
                 anyhow::bail!("canonical call source has no valid block hash at {block}");
             }
-            // A lazy nest bought no header for its rows' timestamps, so there is nothing to agree.
-            if with_timestamps && !lazy {
+            // A null-mode nest bought no header for its rows' timestamps, so there is nothing to agree.
+            if with_timestamps && !null {
                 let timestamp = headers
                     .get(&block)
                     .and_then(|h| h.get("timestamp"))
@@ -5280,8 +5280,8 @@ async fn resolve_calls_for_window_upto(
                 }
             }
         }
-        // A lazy nest's call row has no log to carry a timestamp: null, never a header bought for it.
-        let ts = if lazy {
+        // A null-mode nest's call row has no log to carry a timestamp: null, never a header bought for it.
+        let ts = if null {
             crate::registry::UNKNOWN_TIMESTAMP
         } else {
             timestamps.get(&block).copied().unwrap_or(0)
@@ -5566,7 +5566,7 @@ pub async fn backfill_direct(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
-                registry.lazy_timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -6434,7 +6434,7 @@ pub async fn backfill_direct_pipelined_with(
                 w_to,
                 &ts,
                 registry.timestamps(),
-                registry.lazy_timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -6987,7 +6987,7 @@ pub async fn backfill_direct_factory_with(
                 chunk_to,
                 &ts,
                 registry.timestamps(),
-                registry.lazy_timestamps(),
+                registry.null_timestamps(),
                 block_data.headers.as_ref(),
             )
             .await?;
@@ -8016,7 +8016,7 @@ impl nuthatch_core::extra::ExtraRows for NodeRows<'_> {
             to,
             timestamps,
             self.registry.timestamps(),
-            self.registry.lazy_timestamps(),
+            self.registry.null_timestamps(),
             headers,
             Some(TIP_RETRY_ATTEMPTS),
         )
@@ -11308,7 +11308,6 @@ mod tests {
                 }
                 Ok((from..=to)
                     .map(|b| Log {
-                        block_timestamp: None,
                         address: "0xabc".into(),
                         topics: vec![],
                         data: "0x".into(),
@@ -11410,7 +11409,6 @@ mod tests {
                 }
                 Ok((from..=to)
                     .map(|b| Log {
-                        block_timestamp: None,
                         address: "0xabc".into(),
                         topics: vec![],
                         data: "0x".into(),
@@ -11605,7 +11603,6 @@ mod tests {
                 }
                 Ok((from..=to)
                     .map(|b| Log {
-                        block_timestamp: None,
                         address: "0xabc".into(),
                         topics: vec![],
                         data: "0x".into(),
@@ -11783,7 +11780,6 @@ template="pool"
         let source = FilteringSource {
             logs: vec![
                 Log {
-                    block_timestamp: None,
                     address: factory_addr.into(),
                     topics: vec![topic0("factory__pool_created")],
                     data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -11793,7 +11789,6 @@ template="pool"
                     log_index: 0,
                 },
                 Log {
-                    block_timestamp: None,
                     address: pool_addr.into(),
                     topics: vec![topic0("pool__swap")],
                     data: format!("0x{:064x}", 999u64),
@@ -11935,7 +11930,6 @@ template="pool"
         // grew is not on disk. What survives is the segment and `SEALED_THROUGH`.
         let seed = FilteringSource {
             logs: vec![Log {
-                block_timestamp: None,
                 address: factory_addr.into(),
                 topics: vec![topic0("factory__pool_created")],
                 data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -12035,7 +12029,6 @@ template="pool"
         }
         let source = ResumeSource {
             swap: Log {
-                block_timestamp: None,
                 address: pool_addr.into(),
                 topics: vec![topic0("pool__swap")],
                 data: format!("0x{:064x}", 999u64),
@@ -12193,7 +12186,6 @@ template="pool"
             refusals: AtomicUsize::new(0),
             logs: vec![
                 Log {
-                    block_timestamp: None,
                     address: factory_addr.into(),
                     topics: vec![topic0("factory__pool_created")],
                     data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -12203,7 +12195,6 @@ template="pool"
                     log_index: 0,
                 },
                 Log {
-                    block_timestamp: None,
                     address: pool_addr.into(),
                     topics: vec![topic0("pool__swap")],
                     data: format!("0x{:064x}", 7u64),
@@ -12320,7 +12311,6 @@ template="pool"
         let fs = FactorySet::build(&config).unwrap();
 
         let created = |block, li, pool: &str| Log {
-            block_timestamp: None,
             address: factory_addr.into(),
             topics: vec![topic0("factory__pool_created")],
             data: format!("0x{:0>64}", pool.trim_start_matches("0x")),
@@ -12330,7 +12320,6 @@ template="pool"
             log_index: li,
         };
         let swap = |block, li, pool: &str, amt: u64| Log {
-            block_timestamp: None,
             address: pool.into(),
             topics: vec![topic0("pool__swap")],
             data: format!("0x{amt:064x}"),
@@ -12475,7 +12464,6 @@ template="tok"
             )
         };
         let mut logs = vec![Log {
-            block_timestamp: None,
             address: factory_addr.into(),
             topics: vec![topic0("factory__pool_created")],
             data: format!("0x{:0>64}", tok.trim_start_matches("0x")),
@@ -12604,7 +12592,6 @@ template = "pool"
         // PoolCreated(pool) at log 0, then the pool's Swap(500) at log 1 - same block.
         let logs = vec![
             Log {
-                block_timestamp: None,
                 address: factory_addr.into(),
                 topics: vec![topic0("factory__pool_created")],
                 data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -12614,7 +12601,6 @@ template = "pool"
                 log_index: 0,
             },
             Log {
-                block_timestamp: None,
                 address: pool_addr.into(),
                 topics: vec![topic0("pool__swap")],
                 data: format!("0x{:064x}", 500u64),
@@ -14859,7 +14845,6 @@ template = "pool"
         let child = "0x0000000000000000000000000000000000000033";
         vec![
             crate::rpc::Log {
-                block_timestamp: None,
                 address: "0x0000000000000000000000000000000000000022".into(),
                 topics: vec![
                     nest_topic0(fact, "fac__child_created"),
@@ -14872,7 +14857,6 @@ template = "pool"
                 log_index: 0,
             },
             crate::rpc::Log {
-                block_timestamp: None,
                 address: child.into(),
                 topics: vec![nest_topic0(fact, "child__ping")],
                 data: "0x".into(),
@@ -15278,7 +15262,6 @@ template = "pool"
             )
         };
         let log = |address: &str, topics: Vec<String>, log_index: u64| crate::rpc::Log {
-            block_timestamp: None,
             address: address.into(),
             topics,
             data: "0x".into(),
@@ -15791,7 +15774,6 @@ template = "pool"
         li: u64,
     ) -> crate::rpc::Log {
         crate::rpc::Log {
-            block_timestamp: None,
             address: address.into(),
             topics,
             data,
@@ -17749,7 +17731,6 @@ template = "pool"
             "0x0000000000000000000000000000000000000044",
         );
         let created = |child: &str, block, li| crate::rpc::Log {
-            block_timestamp: None,
             address: "0x0000000000000000000000000000000000000022".into(),
             topics: vec![
                 nest_topic0(fact, "fac__child_created"),
@@ -17762,7 +17743,6 @@ template = "pool"
             log_index: li,
         };
         let ping = |child: &str, block, li| crate::rpc::Log {
-            block_timestamp: None,
             address: child.into(),
             topics: vec![nest_topic0(fact, "child__ping")],
             data: "0x".into(),
@@ -18044,7 +18024,6 @@ template = "pool"
         let mut logs = factory_history_logs(&nest);
         // A ping with a topic Ping() does not index, before the child's announcement in its block.
         logs.push(crate::rpc::Log {
-            block_timestamp: None,
             address: c.into(),
             topics: vec![ping_t0.clone(), format!("0x{:064x}", 1)],
             data: "0x".into(),
@@ -18055,7 +18034,6 @@ template = "pool"
         });
         // A ChildCreated missing its indexed `child` topic.
         logs.push(crate::rpc::Log {
-            block_timestamp: None,
             address: "0x0000000000000000000000000000000000000022".into(),
             topics: vec![created_t0.clone()],
             data: "0x".into(),
@@ -18137,7 +18115,6 @@ template = "pool"
         }
 
         let log = |block: u64| crate::rpc::Log {
-            block_timestamp: None,
             address: "0x0000000000000000000000000000000000000022".into(),
             topics: vec![format!("0x{:064x}", 7)],
             data: "0x".into(),
@@ -18308,7 +18285,6 @@ template = "pool"
         let source = CappedSource {
             logs: vec![
                 crate::rpc::Log {
-                    block_timestamp: None,
                     address: factory_addr.into(),
                     topics: vec![nest_topic0(&fact, "fac__child_created"), pad(child)],
                     data: "0x".into(),
@@ -18318,7 +18294,6 @@ template = "pool"
                     log_index: 0,
                 },
                 crate::rpc::Log {
-                    block_timestamp: None,
                     address: child.into(),
                     topics: vec![nest_topic0(&fact, "child__ping")],
                     data: "0x".into(),
@@ -18328,7 +18303,6 @@ template = "pool"
                     log_index: 1,
                 },
                 crate::rpc::Log {
-                    block_timestamp: None,
                     address: token.into(),
                     topics: vec![
                         nest_topic0(&stat, "tok__transfer"),
@@ -18471,7 +18445,6 @@ template = "pool"
             let source: Arc<dyn Source> = Arc::new(CappedSource {
                 logs: vec![
                     crate::rpc::Log {
-                        block_timestamp: None,
                         address: factory_addr.into(),
                         topics: vec![nest_topic0(&fact, "fac__child_created"), pad(child)],
                         data: "0x".into(),
@@ -18481,7 +18454,6 @@ template = "pool"
                         log_index: 0,
                     },
                     crate::rpc::Log {
-                        block_timestamp: None,
                         address: child.into(),
                         topics: vec![nest_topic0(&fact, "child__ping")],
                         data: "0x".into(),
@@ -18491,7 +18463,6 @@ template = "pool"
                         log_index: 1,
                     },
                     crate::rpc::Log {
-                        block_timestamp: None,
                         address: token.into(),
                         topics: vec![
                             nest_topic0(&stat, "tok__transfer"),
@@ -18700,7 +18671,6 @@ template = "pool"
             let b = build_test_nest(db.path(), b_addr).await;
             let pad = |x: &str| format!("0x{:0>64}", x.trim_start_matches("0x"));
             let transfer = |nest: &NestIngest, addr: &str, li: u64| crate::rpc::Log {
-                block_timestamp: None,
                 address: addr.into(),
                 topics: vec![
                     nest_topic0(nest, "tok__transfer"),
@@ -22284,7 +22254,6 @@ template="pool"
 
     fn transfer_log(block: u64, li: u64) -> crate::rpc::Log {
         crate::rpc::Log {
-            block_timestamp: None,
             address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
             topics: vec![
                 "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".into(),
@@ -23643,6 +23612,8 @@ template="pool"
     struct HeaderCounting {
         inner: ResultCapSource,
         asked: std::sync::atomic::AtomicUsize,
+        /// Added to every timestamp this source serves: a second endpoint that answers differently.
+        skew: u64,
     }
 
     #[async_trait::async_trait]
@@ -23670,29 +23641,24 @@ template="pool"
         ) -> Result<std::collections::HashMap<u64, u64>> {
             self.asked
                 .fetch_add(blocks.len(), std::sync::atomic::Ordering::SeqCst);
-            self.inner.block_timestamps(blocks).await
+            let mut ts = self.inner.block_timestamps(blocks).await?;
+            ts.values_mut().for_each(|t| *t += self.skew);
+            Ok(ts)
         }
     }
 
-    /// #3065: a lazy nest's backfill buys no header at all and seals every row `null`, so its bytes
-    /// are the same whether or not the endpoints stamped their logs. An eager nest's sealed bytes are
-    /// likewise independent of stamping, so the default's content addresses do not move.
+    /// #3065: a null nest's backfill buys no header at all and seals every row `null`, so its bytes
+    /// are the same whichever endpoint answered, one stamping differently from the next. An eager
+    /// nest buys a header per block and its rows carry the stamp, so the two never share a hash.
     #[tokio::test]
-    async fn a_lazy_backfill_buys_no_headers_and_seals_the_same_bytes_whatever_was_stamped() {
-        // Every block holds a transfer; even blocks are stamped by the node, odd ones are not.
-        let logs = |stamp: bool| -> Vec<crate::rpc::Log> {
-            (1u64..=300)
-                .map(|b| crate::rpc::Log {
-                    block_timestamp: (stamp && b % 2 == 0).then_some(b * 12),
-                    ..transfer_log(b, 0)
-                })
-                .collect()
-        };
-        let run = |reg: DecodeRegistry, logs: Vec<crate::rpc::Log>| async move {
+    async fn a_null_backfill_buys_no_headers_and_seals_the_same_bytes_from_any_endpoint() {
+        let run = |reg: DecodeRegistry, skew: u64| async move {
             let (_, addresses, topic0s) = usdc_transfers();
+            let logs = (1u64..=300).map(|b| transfer_log(b, 0)).collect();
             let source = HeaderCounting {
                 inner: ResultCapSource::new(logs, usize::MAX),
                 asked: Default::default(),
+                skew,
             };
             let d = tempfile::tempdir().unwrap();
             let total = backfill_direct_pipelined(
@@ -23721,19 +23687,20 @@ template="pool"
         };
 
         let (reg, _, _) = usdc_transfers();
-        let (asked, lazy_hashes, rows, _d) = run(reg.with_lazy_timestamps(true), logs(true)).await;
-        assert_eq!(asked, 0, "a lazy nest must not ask for one header");
+        let (asked, null_a, rows, _d) = run(reg.with_null_timestamps(true), 0).await;
+        assert_eq!(asked, 0, "a null nest must not ask for one header");
         assert_eq!(rows.len(), 300);
         assert!(rows.iter().all(|r| r.timestamp().is_none()));
         let (reg, _, _) = usdc_transfers();
-        let (_, lazy_bare, _, _d3) = run(reg.with_lazy_timestamps(true), logs(false)).await;
+        let (asked, null_b, _, _d2) = run(reg.with_null_timestamps(true), 7).await;
+        assert_eq!(asked, 0);
         assert_eq!(
-            lazy_hashes, lazy_bare,
-            "a lazy nest's segments must not depend on which endpoints stamped their logs"
+            null_a, null_b,
+            "a null nest's segments must not depend on which endpoint answered"
         );
 
         let (reg, _, _) = usdc_transfers();
-        let (asked, plain, rows, _d1) = run(reg, logs(false)).await;
+        let (asked, eager, rows, _d3) = run(reg, 0).await;
         assert!(
             asked >= 300,
             "eager buys a header for every block with a log ({asked})"
@@ -23741,13 +23708,7 @@ template="pool"
         assert!(rows
             .iter()
             .all(|r| r.timestamp() == Some(r.block_number * 1000)));
-        let (reg, _, _) = usdc_transfers();
-        let (_, stamped, _, _d2) = run(reg, logs(true)).await;
-        assert_eq!(
-            plain, stamped,
-            "an eager nest's segments must not depend on whether its logs carried blockTimestamp"
-        );
-        assert_ne!(lazy_hashes, plain);
+        assert_ne!(null_a, eager);
     }
 
     /// #1787: a split lowers the ceiling to the piece that was served. Over a long empty tail after
@@ -24270,7 +24231,6 @@ template="pool"
         let fs = FactorySet::build(&config).unwrap();
         // The pool is created at block 10 and trades three times a block from 200,001.
         let swap = |b: u64, li: u64| Log {
-            block_timestamp: None,
             address: pool_addr.into(),
             topics: vec![topic0("pool__swap")],
             data: format!("0x{:064x}", b * 10 + li),
@@ -24280,7 +24240,6 @@ template="pool"
             log_index: li,
         };
         let logs: Vec<Log> = std::iter::once(Log {
-            block_timestamp: None,
             address: factory_addr.into(),
             topics: vec![topic0("factory__pool_created")],
             data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -24419,7 +24378,6 @@ template="pool"
         blocks
             .iter()
             .map(|&b| crate::rpc::Log {
-                block_timestamp: None,
                 address: "0x1111111111111111111111111111111111111111".into(),
                 topics: vec![topic0.clone()],
                 data: format!("0x{:064x}", b),
@@ -24527,7 +24485,6 @@ template="pool"
 
         let source = CountingSource::new(vec![
             Log {
-                block_timestamp: None,
                 address: factory_addr.into(),
                 topics: vec![topic0("factory__pool_created")],
                 data: format!("0x{:0>64}", pool_addr.trim_start_matches("0x")),
@@ -24537,7 +24494,6 @@ template="pool"
                 log_index: 0,
             },
             Log {
-                block_timestamp: None,
                 address: pool_addr.into(),
                 topics: vec![topic0("pool__swap")],
                 data: format!("0x{:064x}", 7u64),
@@ -24547,7 +24503,6 @@ template="pool"
                 log_index: 0,
             },
             Log {
-                block_timestamp: None,
                 address: foreign_addr.into(),
                 topics: vec![topic0("factory__pool_created")],
                 data: format!("0x{:0>64}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -25115,7 +25070,6 @@ template="pool"
 
         let source: Arc<dyn Source> = Arc::new(MockSource {
             logs: vec![crate::rpc::Log {
-                block_timestamp: None,
                 address: "0x0000000000000000000000000000000000000022".into(),
                 topics: vec!["0x".into()],
                 data: "0x".into(),
@@ -25631,7 +25585,6 @@ template="pool"
         // Two events naming the *same* document, so dedupe is exercised rather than assumed.
         let logs: Vec<crate::rpc::Log> = (0..2)
             .map(|i| crate::rpc::Log {
-                block_timestamp: None,
                 address: "0x1111111111111111111111111111111111111111".into(),
                 topics: vec![topic0.clone()],
                 data: abi_string(uri),
@@ -26633,7 +26586,6 @@ template="pool"
             )
         );
         let log = crate::rpc::Log {
-            block_timestamp: None,
             address: "0x1111111111111111111111111111111111111111".into(),
             topics: vec![
                 topic0,
@@ -26718,7 +26670,6 @@ template="pool"
         let pad = |b: u8| format!("0x{:064x}", b);
         let logs: Vec<crate::rpc::Log> = (1u8..=2)
             .map(|i| crate::rpc::Log {
-                block_timestamp: None,
                 address: "0x1111111111111111111111111111111111111111".into(),
                 topics: vec![topic0.clone(), pad(0xaa), pad(0xb0 + i)],
                 data: format!("0x{:064x}", 1000 * i as u64),
@@ -26892,7 +26843,6 @@ template="pool"
         );
         let src = HeadersAndOneLog;
         let logs = vec![crate::rpc::Log {
-            block_timestamp: None,
             address: "0x1111111111111111111111111111111111111111".into(),
             topics: vec![topic0],
             data: "0x".into(),
@@ -28826,21 +28776,21 @@ template="pool"
         );
         guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Eager, true).unwrap();
 
-        // #3065: lazy records its own value, and neither it nor eager can turn into the other.
+        // #3065: null records its own value, and neither it nor eager can turn into the other.
         let lz = tempfile::tempdir().unwrap();
         let s3 = Store::open(&lz.path().join(DB_FILE)).unwrap();
-        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Lazy, true).unwrap();
+        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Null, true).unwrap();
         assert_eq!(
             s3.get_meta(TIMESTAMPS_KEY).unwrap().as_deref(),
-            Some("lazy")
+            Some("null")
         );
-        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Lazy, true).unwrap();
+        guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Null, true).unwrap();
         let err = guard_timestamp_policy(&s3, crate::config::TimestampPolicy::Eager, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("may be null"), "{err}");
-        assert!(guard_timestamp_policy(&s1, crate::config::TimestampPolicy::Lazy, true).is_err());
-        assert!(guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Lazy, true).is_err());
+        assert!(guard_timestamp_policy(&s1, crate::config::TimestampPolicy::Null, true).is_err());
+        assert!(guard_timestamp_policy(&s2, crate::config::TimestampPolicy::Null, true).is_err());
     }
 
     /// Upgrading an existing nest must be a no-op: `block_timestamps` absent from `nuthatch.toml`
