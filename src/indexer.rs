@@ -23674,11 +23674,11 @@ template="pool"
         }
     }
 
-    /// #3065: a lazy nest's backfill buys no header at all. Each row seals with the `blockTimestamp`
-    /// its own log carried, `null` where it carried none; an eager nest's sealed bytes are the same
-    /// whether or not its logs were stamped, so the default's content addresses do not move.
+    /// #3065: a lazy nest's backfill buys no header at all and seals every row `null`, so its bytes
+    /// are the same whether or not the endpoints stamped their logs. An eager nest's sealed bytes are
+    /// likewise independent of stamping, so the default's content addresses do not move.
     #[tokio::test]
-    async fn a_lazy_backfill_buys_no_headers_and_seals_what_the_logs_carried() {
+    async fn a_lazy_backfill_buys_no_headers_and_seals_the_same_bytes_whatever_was_stamped() {
         // Every block holds a transfer; even blocks are stamped by the node, odd ones are not.
         let logs = |stamp: bool| -> Vec<crate::rpc::Log> {
             (1u64..=300)
@@ -23724,10 +23724,13 @@ template="pool"
         let (asked, lazy_hashes, rows, _d) = run(reg.with_lazy_timestamps(true), logs(true)).await;
         assert_eq!(asked, 0, "a lazy nest must not ask for one header");
         assert_eq!(rows.len(), 300);
-        for r in &rows {
-            let want = (r.block_number % 2 == 0).then_some(r.block_number * 12);
-            assert_eq!(r.timestamp(), want, "block {}", r.block_number);
-        }
+        assert!(rows.iter().all(|r| r.timestamp().is_none()));
+        let (reg, _, _) = usdc_transfers();
+        let (_, lazy_bare, _, _d3) = run(reg.with_lazy_timestamps(true), logs(false)).await;
+        assert_eq!(
+            lazy_hashes, lazy_bare,
+            "a lazy nest's segments must not depend on which endpoints stamped their logs"
+        );
 
         let (reg, _, _) = usdc_transfers();
         let (asked, plain, rows, _d1) = run(reg, logs(false)).await;

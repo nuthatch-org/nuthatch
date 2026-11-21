@@ -1020,9 +1020,9 @@ impl DecodeRegistry {
         self
     }
 
-    /// `[nest] block_timestamps = "lazy"` (#3065): rows keep the `blockTimestamp` their own log
-    /// carried and are [`UNKNOWN_TIMESTAMP`] (stored and served as `null`) otherwise; no header is
-    /// fetched for them. Not folded into [`DecodeRegistry::hash`], for the reason `timestamps` is not.
+    /// `[nest] block_timestamps = "lazy"` (#3065): every row is [`UNKNOWN_TIMESTAMP`] (stored and
+    /// served as `null`) and no header is fetched for it. A log's own `blockTimestamp` is ignored:
+    /// which endpoints stamp varies, and stored state must not (non-negotiable 4). Not folded into [`DecodeRegistry::hash`], for the reason `timestamps` is not.
     pub fn with_lazy_timestamps(mut self, lazy: bool) -> DecodeRegistry {
         self.lazy_timestamps = lazy && self.timestamps;
         self
@@ -1364,13 +1364,9 @@ fn build_row(
         params,
         block_number: log.block_number,
         block_hash: log.block_hash.clone(),
-        // Eager: filled by the indexer from the block header (see index_loop). Lazy: what the log
-        // carried, and nothing the indexer does later replaces it.
-        block_timestamp: if lazy {
-            log.block_timestamp.unwrap_or(UNKNOWN_TIMESTAMP)
-        } else {
-            0
-        },
+        // Eager: filled by the indexer from the block header (see index_loop). Lazy: always null,
+        // whatever the log carried, so the row cannot depend on which endpoint served it.
+        block_timestamp: if lazy { UNKNOWN_TIMESTAMP } else { 0 },
         timestamps,
         log_index: log.log_index,
         tx_hash: log.tx_hash.clone(),
@@ -2038,10 +2034,10 @@ mod stored_roundtrip {
         assert_eq!(row.to_json()["block_timestamp"], json!(1_700_000_000u64));
     }
 
-    /// #3065: a lazy registry keeps what the log carried and never takes a header's word; an eager one
-    /// leaves the row for the indexer to stamp, whatever the log carried.
+    /// #3065: a lazy registry leaves every row null, stamped log or not; an eager one leaves the row
+    /// for the indexer to stamp, whatever the log carried.
     #[test]
-    fn a_lazy_registry_stamps_rows_from_their_own_logs_only() {
+    fn a_lazy_registry_leaves_every_row_null_whatever_its_log_carried() {
         const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
             {"name":"from","type":"address","indexed":true},
             {"name":"to","type":"address","indexed":true},
@@ -2074,9 +2070,9 @@ mod stored_roundtrip {
         let lazy = build().with_lazy_timestamps(true);
         assert!(lazy.lazy_timestamps());
         let stamped = lazy.decode(&log(Some(1234))).unwrap().unwrap();
-        assert_eq!(stamped.timestamp(), Some(1234));
         let bare = lazy.decode(&log(None)).unwrap().unwrap();
-        assert_eq!(bare.timestamp(), None);
+        assert_eq!(stamped.timestamp(), None);
+        assert_eq!(stamped, bare);
 
         let eager = build();
         assert!(!eager.lazy_timestamps());

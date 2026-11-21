@@ -710,15 +710,13 @@ pub async fn process_window<E: WindowEntity>(
             blocks.dedup();
             // A log row's timestamp was read by height alone, so it may be another fork's: it must be
             // the one this hash has. Block and call rows took theirs from the header checked here.
-            // A lazy row (#3065) took its timestamp from its log, and is checked the same way when it
-            // has one: the header is fetched for the hash regardless, so the check costs no call. A
-            // lazy row its log left unstamped has nothing to check and stays null.
+            // A lazy row (#3065) is always null, so it has no timestamp to check.
             let stamped: Vec<_> = rows
                 .iter()
                 .filter(|r| {
                     registry.timestamps()
+                        && !registry.lazy_timestamps()
                         && r.block_number > final_through
-                        && (!registry.lazy_timestamps() || r.timestamp().is_some())
                 })
                 .collect();
             let now = match stamped.is_empty() {
@@ -1862,20 +1860,15 @@ mod tests {
         assert_eq!(store.count().unwrap(), 0);
     }
 
-    /// #3065: a lazy row's timestamp came from its log, so it is held to the header the hash check
-    /// reads anyway. A stamp from another fork refuses the window; the right one commits; a log the
-    /// node left unstamped commits with no timestamp to check.
+    /// #3065: a lazy row ignores its log's stamp, so a stamp from another fork, the right one and none
+    /// at all commit the same null row. The block's hash is still checked.
     #[test]
-    fn a_lazy_rows_log_stamp_is_checked_against_the_header_its_hash_names() {
+    fn a_lazy_row_commits_null_whatever_stamp_its_log_carried() {
         let lazy = || token().with_timestamps(true).with_lazy_timestamps(true);
         let source = HeadSplit::default();
         let none = &crate::extra::NoExtraRows;
 
-        let (processed, store) = split_logs(&source, none, lazy(), Some(stamp_of(10) + 12));
-        assert_eq!(processed, Processed::Refused);
-        assert_eq!(store.count().unwrap(), 0);
-
-        for stamp in [Some(stamp_of(10)), None] {
+        for stamp in [Some(stamp_of(10) + 12), Some(stamp_of(10)), None] {
             let (processed, store) = split_logs(&source, none, lazy(), stamp);
             assert_eq!(processed, Processed::Stored(1), "{stamp:?}");
             assert_eq!(store.get_block_hash(10).unwrap(), Some(hash_of(10)));

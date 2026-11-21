@@ -1009,17 +1009,13 @@ unsure, keep them - the default is on for a reason.
 **`block_timestamps = "lazy"` - keep the column, never buy a header for it (#3065).** On a node whose
 `eth_getLogs` carries no `blockTimestamp` (XDC's public RPC, for one), the default costs one
 `eth_getBlockByNumber` per block that holds a matching log, which on a dense history is most of a cold
-start. `nuthatch init --lazy-timestamps` keeps `block_timestamp` on every table but fills it only from
-what each log carried: where the node stamped the log, the row has that value, and where it did not,
-the row is `null`. No header is fetched to *stamp* a row, so a backfill buys none. Tip-following
-still reads one header per unfinalised block that holds a row, as every nest does, to check the
-block's hash against reorgs; a lazy row whose log carried a timestamp is checked against that same
-header at no extra call. Nothing fills a null later - sealed segments are immutable, and a fill that
-touched only unsealed rows would make a row's value depend on when it sealed. Query with that in mind
-(`count(block_timestamp)` counts only stamped rows). Because a row holds what its own `eth_getLogs`
-answer carried, which rows are `null` depends on the endpoints that served the backfill: give a lazy
-nest RPC endpoints that agree on stamping (all stamp, or none do), or two runs of the same nest can
-seal different nulls. Like
+start. `nuthatch init --lazy-timestamps` keeps `block_timestamp` on every table and leaves it `null`
+on every row, even where the node did stamp the log: which endpoints stamp varies, and a nest's
+stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
+backfill buys none. Tip-following still reads one header per unfinalised block that holds a row, as
+every nest does, to check the block's hash against reorgs. Nothing fills a null later - sealed
+segments are immutable. Join on `block_number` when you need time. If your endpoints do stamp their
+logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
 `--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
 refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
 and content addresses are exactly what they were before `"lazy"` existed.
