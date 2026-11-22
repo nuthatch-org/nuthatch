@@ -5062,6 +5062,7 @@ fn refuse_event_flags(args: &crate::cli::DevArgs) -> Result<()> {
         ("--state-rpc", !args.state_rpc.is_empty()),
         ("--ipfs", !args.ipfs.is_empty()),
         ("--registry", args.registry.is_some()),
+        ("--history-source", args.history_source.is_some()),
     ]
     .into_iter()
     .filter_map(|(flag, on)| on.then_some(flag))
@@ -9214,6 +9215,7 @@ mod tests {
             &["--finality-only"],
             &["--publish-target", "s3://x"],
             &["--audit-rpc", "https://x"],
+            &["--history-source", "xatu"],
         ] {
             let err = refuse_event_flags(&parse(flag)).unwrap_err();
             assert!(err.to_string().contains(flag[0]), "{flag:?}: {err}");

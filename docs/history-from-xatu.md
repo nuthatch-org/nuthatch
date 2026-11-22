@@ -57,7 +57,7 @@ seal line and the tail always comes from the RPC. You do not configure the hando
   The first missing file is logged once (`WARN xatu: the dataset has no file for blocks …`) with the
   URL it tried: expected at the dataset's head, and the sign to look for if `--history-url` points at
   a mirror with another layout.
-- A file is used only once its last block is past the chain's `finalized` block (or 96 blocks deep on
+- A file is used only once its last block is at or below the chain's `finalized` block (or 96 blocks deep on
   an RPC that exposes none). The indexer's reorg check asks for block hashes, and a held file answers
   them; a file that could still reorganise must not. The public dataset lags by hours, so this only
   matters for a mirror that keeps up with the head.
@@ -81,17 +81,27 @@ between its checked ends would pass, and the hashes of the blocks in between (wh
 log's `block_hash` and into window checkpoints) are the dataset's word, in every file. A wrong one
 cannot hide a reorg, but it can invent one: once that file leaves the cache, the indexer's reorg check
 compares the stored checkpoint with the RPC, sees a mismatch, and rolls the nest back to the last
-block where they agree. The block timestamp is checked at the same blocks as the hash.
+block where they agree. The block timestamp is checked at the same blocks as the hash; between them, timestamps are the
+dataset's word too, checked only to rise block by block, as the chain requires.
 
 What it cannot check: that every log of a block is *present*. The dataset carries no receipts root.
 The equality below is measured on the sample it was measured on; if you need proof for a range you
 care about, compare a few `eth_getLogs` answers against it, or leave the flag off.
 
+This is also where determinism rests on the dataset. A run without the flag is the reference: if the
+dataset ever lacked a log that the node has, a nest backfilled with the flag would seal different
+rows from one backfilled without it, and nothing in the segment records which source served a range.
+Nothing like that has been observed, but it cannot be ruled out, so for state you will need to
+re-derive bit for bit from a node alone, backfill without the flag.
+
 Memory is bounded at about 0.5 GB, inside the 2 GB per-cursor budget: the compressed bytes of four
 logs files (up to about 200 MB); the hashes and timestamps of the last 128 files (about 13 MB), so a
 wide `--window` does not pay header calls for the files it has moved past; and the decoded rows of
 the filter last asked of each held file, at most 256 MiB between them (a file of USDC's logs is 60 to 110 MB
-decoded). A filter that matches more than that of one file is decoded window by window instead.
+decoded). A filter that matches more than that of one file is decoded window by window instead,
+which bounds memory but costs a scan of the whole file per window. Each file keeps the rows of one
+filter; two filters read concurrently over the same file (a fanned-out factory backfill, say) take
+turns decoding it.
 
 Fixtures in CI (`tests/fixtures/xatu`) are real mainnet files for blocks 26,462,624 to 26,462,635
 beside the recorded `eth_getLogs` and header answers for the same blocks; the tests assert the logs

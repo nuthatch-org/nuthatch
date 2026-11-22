@@ -297,10 +297,14 @@ impl XatuSource {
                 )));
             }
             let at = parsed.timestamps[(block - start) as usize];
-            if time.is_some_and(|t| t != at) {
+            let Some(time) = time else {
+                return Err(Fault::Transient(anyhow!(
+                    "the RPC gave no timestamp for block {block} to check the chunk against"
+                )));
+            };
+            if time != at {
                 return Err(Fault::Bad(anyhow!(
-                    "block {block} is at {at} in the dataset but {} on the chain",
-                    time.unwrap_or_default()
+                    "block {block} is at {at} in the dataset but {time} on the chain"
                 )));
             }
         }

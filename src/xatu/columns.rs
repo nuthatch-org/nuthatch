@@ -132,6 +132,11 @@ pub(super) fn parse_blocks(bytes: Bytes, start: u64, len: u64) -> Result<Blocks>
         if r.3 == 0 {
             bail!("block {} has a zero timestamp", r.0);
         }
+        // The chain's own rule (a block is later than its parent), so an interior timestamp the
+        // anchors cannot see is at least in order.
+        if i > 0 && r.3 <= rows[i - 1].3 {
+            bail!("block {} is not later than block {}", r.0, r.0 - 1);
+        }
         if i > 0
             && r.2
                 .as_deref()
