@@ -50,6 +50,8 @@ LOCAL_HOST=${NEST_LOCAL_HOST:-}
 local_host_line=
 [ -z "$LOCAL_HOST" ] || { [[ $LOCAL_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || die "bad NEST_LOCAL_HOST: $LOCAL_HOST"; local_host_line="    --local-host $LOCAL_HOST \\"$'\n'; }
 under=${name//-/_}
+# nginx refuses a syslog tag over 32 characters ("nuthatch_public_" is 16 of them), so a long name is cut for the tag only
+tag_name=${under:0:16}
 public_host=$name.nuthatch-indexer.com          # only ever sent as a Host header; never needs DNS
 site=$name.$HOST_IP.sslip.io
 unit=nuthatch-public-$name
@@ -150,7 +152,7 @@ render_proxy_unit() {
 }
 render_nginx() {
   sed -e "s/8121/$port/g" -e "s/8481/$pport/g" -e "s#nuthatch-public-base-usdc#$unit#g" \
-      -e "s/nuthatch_public_base_usdc/nuthatch_public_$under/g" -e "s/Base USDC/$name/g" \
+      -e "s/nuthatch_public_base_usdc/nuthatch_public_$tag_name/g" -e "s/Base USDC/$name/g" \
       -e "s/nginx-base-usdc\.conf/nginx-$name.conf/g" "$tpl/nginx-base-usdc.conf"
 }
 render_caddy() {

@@ -136,3 +136,16 @@ started on a real host or run through `test-proxy.sh` in this change.
 - **Order for the scrape targets.** `deploy/monitoring/targets/nests.yml` scrapes the public nests on their tailnet
   address, which only answers once the unit runs with `--local-host 100.82.188.91`. Restart each public unit from the
   new unit file first, then land the targets; otherwise Prometheus raises TargetDown on a nest that is fine.
+
+## Notes from hosting spendshield-aevum (Aevum testnet, a chain nuthatch has no registry entry for)
+
+- **An unregistered chain gets `Depth(64)` finality and a 20-block window.** There is no key in `nuthatch.toml` for
+  either (only the runtime's admin API takes `finality_depth`), so the `finalized` tag is never asked for, even when
+  the RPC answers it (Aevum's does, about 960 blocks behind the tip). Pass `--window 1000` for an RPC that caps
+  `eth_getLogs` at 1,000 blocks. A registry entry with `FinalizedTag` would need a release; the nest ran without one.
+- **`sudo` drops `NEST_DEV_ARGS` and `NEST_LOCAL_HOST`** (`sudo -E` is ignored on the host). Run the script with
+  `sudo env NEST_DEV_ARGS=... NEST_LOCAL_HOST=... deploy/hosted-nest/new-nest.sh --apply ...`, or the unit is written
+  with the defaults (3 s poll, 4-way backfill) and a light-load nest hits the RPC much harder. Check `ExecStart`.
+- **The generated nginx conf has no CORS block**; the live pharos-eth conf does (a 204 preflight and
+  `Access-Control-Allow-Origin: *` on `/sql` and `/mcp`). Without it a browser cannot call the nest and the showcase
+  page fails. Copy that conf for the new nest instead of the generated one until the template carries it.
