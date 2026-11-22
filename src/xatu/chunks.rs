@@ -324,7 +324,13 @@ impl XatuSource {
         self.stats
             .bytes
             .fetch_add(logs.len() as u64, Ordering::Relaxed);
-        check_logs_schema(&logs).map_err(Fault::Bad)?;
+        // Off the async task, like the other parsers: a damaged footer can panic inside the reader
+        // (arrow-ipc's schema decode), and that must fail this chunk, not the indexer's task.
+        let footer = logs.clone();
+        tokio::task::spawn_blocking(move || check_logs_schema(&footer))
+            .await
+            .map_err(|e| Fault::Bad(anyhow!("reading the logs file: {e}")))?
+            .map_err(Fault::Bad)?;
         Ok(Some(Chunk {
             headers: Arc::new(Headers {
                 start,

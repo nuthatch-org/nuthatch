@@ -582,3 +582,44 @@ async fn a_logs_file_not_yet_published_is_tried_again_not_given_up_on() {
         "asked again, not marked bad"
     );
 }
+
+/// A logs file damaged in its footer: the Parquet reader can panic decoding the embedded schema
+/// (arrow-ipc's `unimplemented!` on an unknown type), and that must fail the chunk over to RPC, not
+/// unwind through the indexer's task.
+#[tokio::test]
+async fn a_damaged_logs_footer_falls_back_rather_than_panicking() {
+    struct Flipped(Arc<Files>, usize);
+    #[async_trait::async_trait]
+    impl Fetch for Flipped {
+        async fn get(&self, url: &str) -> Result<Option<Bytes>> {
+            let b = self.0.get(url).await?;
+            if !url.contains("canonical_execution_logs") {
+                return Ok(b);
+            }
+            Ok(b.map(|b| {
+                let mut v = b.to_vec();
+                let at = v.len() - self.1;
+                v[at] ^= 0x01;
+                v.into()
+            }))
+        }
+    }
+    let rpc = Recorded::load();
+    let f = filter(&[USDC, USDT]);
+    let want = rpc.answer(&f, FIRST, FIRST + 3);
+    let mut fell_back = 0;
+    for back in (9..600).step_by(3) {
+        let x = XatuSource::with_chunk_len(
+            rpc.clone(),
+            Arc::new(Flipped(Files::all(), back)),
+            "https://mirror.test/",
+            4,
+        );
+        let got = x.logs(&f, FIRST, FIRST + 3).await.unwrap();
+        if x.stats.fallbacks.load(Ordering::SeqCst) > 0 {
+            fell_back += 1;
+            same(&got, &want);
+        }
+    }
+    assert!(fell_back > 0, "premise: some flips reach the footer parse");
+}
