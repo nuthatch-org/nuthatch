@@ -92,9 +92,14 @@ Most forms ask for the same few things. Use these.
    (`logo` in that manifest) is the one thing the listing would want that the repo does not have.
 
 7. **Anthropic's plugin directory**: https://claude.ai/directory/manage, from a paid claude.ai account.
-   The plugin is the `plugin/` folder (`plugin/.claude-plugin/plugin.json`), because the directory
-   refuses a repository with a file over 5 MiB (#3013). The validator asks for a square
-   PNG icon, 512 to 2048 px, at `plugin/.claude-plugin/icon.png`; the first one submitted becomes the
+   Submit the path **`plugin-directory`** (`plugin-directory/.claude-plugin/plugin.json`), not `plugin/`:
+   the directory refuses a repository with a file over 5 MiB, and, while the organisation is not
+   Verified, a local stdio MCP server and any file that is not Markdown, text, JSON, YAML or an image
+   (#3013). `plugin-directory/` is generated from `plugin/` by `scripts/build-directory-plugin.sh`
+   (CI runs it with `--check`); it has no local MCP server, only the public read-only demo nest
+   `https://arc.nuthatch-indexer.com/mcp`, and its version is the release's, so rerun the script when
+   the version changes. The validator asks for a square
+   PNG icon, 512 to 2048 px, at `plugin-directory/.claude-plugin/icon.png` (a copy of `plugin/`'s); the first one submitted becomes the
    listing's icon for good, so add the real one before submitting.
 
 8. **affpapa.org** and any other copier of the 4.0.0 command: ask them to use the install and MCP
