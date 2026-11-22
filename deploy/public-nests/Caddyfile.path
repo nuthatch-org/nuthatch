@@ -1,0 +1,160 @@
+# The path-based front door for the public nests (#3028): https://nuthatch-indexer.com/nests/arc-usdc and
+# /nests/base-usdc. nuthatch-frontend's vercel.json rewrites each of those paths to one of the two sites
+# below, the pattern bounty-nest already uses. A name under sslip.io already resolves to the host and Caddy
+# gets its certificate the way it does for any name, so adding a nest never needs a DNS record.
+#
+#   browser/agent -> Vercel (nuthatch-indexer.com/nests/<id>/...) -> Caddy :443 (this file)
+#                 -> nginx (the allowlist and limits, nginx*.conf) -> the nest
+#
+# Append to Helsinki's /etc/caddy/Caddyfile, with your own host's name for the two sites. Two things differ
+# from Caddyfile.arc-testnet, because the caller is Vercel and not the visitor:
+#
+#  - Host. The nest answers only the name it was told with --public-host, so each site sends that name.
+#  - The visitor's address. Every request arrives from one of Vercel's addresses, which differ per request, so
+#    nginx would count every visitor as one caller. Vercel puts the visitor's address in X-Vercel-Forwarded-For
+#    and overwrites a copy a visitor sends (checked 2026-11-19 by sending spoofed X-Vercel-Forwarded-For,
+#    X-Forwarded-For, X-Real-IP and X-Vercel-Proxied-For through a deployment: the nest saw the real address;
+#    X-Real-IP is not used here because it did not always get overwritten). When that header holds an address
+#    it becomes X-Forwarded-For, which nginx rate-limits on. A request straight to this host has no such
+#    header from Vercel, but a caller can add one, and so name the address they are limited under; the
+#    per-nest limit on all callers together (`all_query` in nginx.conf) still caps what that can cost.
+#    Do not add `trusted_proxies`: Vercel's addresses are not a fixed list.
+#
+# The `header_up Host` line must name what the nest was started with as PUBLIC_HOST in its env file
+# (arc-testnet.env, base-usdc.env); change the two together.
+#
+# arc.nuthatch-indexer.com (Caddyfile.arc-testnet) keeps working beside this.
+arc-usdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8480 {
+			header_up Host arc.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8480 {
+			header_up Host arc.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+
+base-usdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8481 {
+			header_up Host base.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8481 {
+			header_up Host base.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+
+# The lead nests (docs/hosted-nests.md, deploy/hosted-nest/new-nest.sh): /nests/{gooddollar-xdc,sablier-xdc,pharos-eth}.
+# BEGIN nuthatch-public gooddollar-xdc
+gooddollar-xdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8484 {
+			header_up Host gooddollar-xdc.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8484 {
+			header_up Host gooddollar-xdc.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public gooddollar-xdc
+# BEGIN nuthatch-public sablier-xdc
+sablier-xdc.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8485 {
+			header_up Host sablier-xdc.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8485 {
+			header_up Host sablier-xdc.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public sablier-xdc
+# BEGIN nuthatch-public pharos-eth
+pharos-eth.89.167.109.4.sslip.io {
+	request_body {
+		max_size 64KB
+	}
+	@viavercel header_regexp vercel X-Vercel-Forwarded-For ^[0-9a-fA-F:.]{3,45}$
+	handle @viavercel {
+		reverse_proxy 127.0.0.1:8486 {
+			header_up Host pharos-eth.nuthatch-indexer.com
+			header_up X-Forwarded-For {http.request.header.X-Vercel-Forwarded-For}
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8486 {
+			header_up Host pharos-eth.nuthatch-indexer.com
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 20s
+			}
+		}
+	}
+}
+# END nuthatch-public pharos-eth

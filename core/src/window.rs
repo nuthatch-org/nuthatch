@@ -51,7 +51,8 @@ pub async fn fetch_timestamps(
     registry: &DecodeRegistry,
     blocks: &[u64],
 ) -> Result<HashMap<u64, u64>> {
-    if !registry.timestamps() {
+    // A null-mode nest's rows are all null (#3065); a header is never bought for a stamp.
+    if !registry.timestamps() || registry.null_timestamps() {
         return Ok(HashMap::new());
     }
     source.block_timestamps(blocks).await
@@ -64,7 +65,7 @@ pub fn refuse_unstamped(
     blocks: &[u64],
     timestamps: &HashMap<u64, u64>,
 ) -> Result<()> {
-    if !registry.timestamps() {
+    if !registry.timestamps() || registry.null_timestamps() {
         return Ok(());
     }
     match blocks
@@ -154,7 +155,14 @@ pub fn l1_block_rows(
         .map(|b| {
             data.l1_headers
                 .get(&b)
-                .and_then(|h| nuthatch_decode::registry::l1_block_row(b, h, registry.timestamps()))
+                .and_then(|h| {
+                    nuthatch_decode::registry::l1_block_row(
+                        b,
+                        h,
+                        registry.timestamps(),
+                        registry.null_timestamps(),
+                    )
+                })
                 .with_context(|| {
                     format!(
                         "block {b}'s header carries no l1BlockNumber; [extract] l1_blocks needs an \
@@ -182,7 +190,16 @@ pub fn blocks_needing_timestamps(
     blocks
 }
 
-pub fn apply_row_timestamps(rows: &mut [DecodedRow], ts: &HashMap<u64, u64>) {
+/// Stamp rows from `ts`. A null-mode nest's rows stay null (#3065), so a header fetched for another
+/// reason (canonical calls, `l1_blocks`) never stamps one.
+pub fn apply_row_timestamps(
+    registry: &DecodeRegistry,
+    rows: &mut [DecodedRow],
+    ts: &HashMap<u64, u64>,
+) {
+    if registry.null_timestamps() {
+        return;
+    }
     for r in rows {
         r.block_timestamp = ts.get(&r.block_number).copied().unwrap_or(0);
     }
@@ -334,7 +351,9 @@ pub fn decode_window(
                     }
                 };
                 if let Some(mut r) = decoded {
-                    r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
+                    if !registry.null_timestamps() {
+                        r.block_timestamp = timestamps.get(&r.block_number).copied().unwrap_or(0);
+                    }
                     if let Some(fs) = factory {
                         // Every child this event announces, not just the first (issue #241).
                         for child in fs.discover(&r) {

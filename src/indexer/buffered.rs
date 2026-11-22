@@ -1676,6 +1676,9 @@ impl Source for HeaderedSource<'_> {
     fn forget_cached_above(&self, block: u64) {
         self.inner.forget_cached_above(block)
     }
+    fn set_log_group_fanout(&self, n: usize) {
+        self.inner.set_log_group_fanout(n)
+    }
     async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<crate::rpc::Log>> {
         self.inner.logs(filter, from, to).await
     }

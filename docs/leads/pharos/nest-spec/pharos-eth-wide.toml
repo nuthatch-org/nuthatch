@@ -1,0 +1,67 @@
+[nest]
+name = "pharos-eth-wide"
+chain = "mainnet"
+chain_id = 1
+rpc_urls = ["https://gateway.tenderly.co/public/mainnet"]
+schema_version = 2
+block_timestamps = false
+
+[[contracts]]
+alias = "lp0"
+address = "0xed279fdd11ca84beef15af5d39bb4d4bee23f0ca"
+start_block = 12184843
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp1"
+address = "0x3041cbd36888becc7bbcbc0045e3b1f144466f5f"
+start_block = 10092378
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp2"
+address = "0x6c3f90f043a72fa612cbac8115ee7e52bde6e490"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp3"
+address = "0x06325440d014e39736583c165c2963ba99faf14e"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp4"
+address = "0xd632f22692fac7611d2aa1c0d552930d43caed3b"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp5"
+address = "0x4dece678ceceb27446b35c672dc7d61f30bad69e"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp6"
+address = "0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp7"
+address = "0xa478c2975ab1ea89e8196811f51a7b7ade33eb11"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp8"
+address = "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"
+
+[[contracts]]
+alias = "lp9"
+address = "0x397ff1542f962076d0bfe58ea045ffa2d347aca0"
+start_block = 10000000
+abi = "abis/erc20_transfer.json"

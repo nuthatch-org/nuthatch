@@ -1006,6 +1006,21 @@ you are standing up a new nest over a long history. **When it is clearly wrong:*
 "per day" or "per hour" later. Blocks give you ordering; only timestamps give you time. If you are
 unsure, keep them - the default is on for a reason.
 
+**`block_timestamps = "null"` - keep the column, never buy a header for it (#3065).** On a node whose
+`eth_getLogs` carries no `blockTimestamp` (XDC's public RPC, for one), the default costs one
+`eth_getBlockByNumber` per block that holds a matching log, which on a dense history is most of a cold
+start. `nuthatch init --null-timestamps` keeps `block_timestamp` on every table and leaves it `null`
+on every row, even where the node did stamp the log: which endpoints stamp varies, and a nest's
+stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
+backfill buys none for that (a nest with canonical `[[calls]]` still reads a header per window to
+check each call's block hash). Tip-following still reads one header per unfinalised block that holds a row, as
+every nest does, to check the block's hash against reorgs. Nothing fills a null later - sealed
+segments are immutable. Join on `block_number` when you need time. If your endpoints do stamp their
+logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
+`--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
+refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
+and content addresses are exactly what they were before `"null"` existed.
+
 **Secrets.** Private RPC URLs and webhook HMAC secrets live in the nest's `nuthatch.toml`. The rule
 (RFC-0019 §4) is that secrets never go into a published bundle - so keep the directory `0700` and
 owned by the service user, and never publish a bundle built from a config carrying a credential.
@@ -1300,7 +1315,7 @@ only the series labelled with that mount).
 
 A nest whose `nuthatch.toml` has an `[address_history]` table and no `[[contracts]]` watches accounts
 rather than contracts, for rotki. It is a different service: no SQL engine, no sealing, none of the
-per-nest routes above except `/health`, `/ready`, `/metrics` and `/diff`, and one cursor polling the
+per-nest routes above except `/health`, `/ready`, `/metrics`, `/diff` and `/shape`, and one cursor polling the
 chain head every five minutes unless `poll_interval` in the table or `--poll-interval` says otherwise.
 
 ```toml
@@ -1349,6 +1364,14 @@ addresses = []        # or seed some; rotki registers its own through /api/watch
   rotki on the same machine needs no configuration; with it, rotki must send the token. The flag is
   refused off a loopback bind, where those actions are refused to everyone, and on an event nest or
   a runtime.
+- **`GET /api/coverage`** lists each watched account's covered blocks per action and, between
+  `start_block` and the finalized head, the ranges it does not hold, each `pending`, `stalled` (owed, but the account's backfill windows
+  or the cursor are failing, with the error), `not_watched` or `never` with why, read in one store
+  transaction with its `generation`, finalized head and tip. Before the first finalized head there is
+  no `missing`, and `missing_unknown` says why.
+  `?address=` asks for one account, watched or not; on a directory of chains the answer is per chain
+  under `chains`, or one chain with `?chainid=`. `nuthatch mcp` reads it for its `coverage` tool
+  ([recipe](rotki-wallets-with-claude.md)).
 - **`/ready`** carries `mode: "address_history"`, `watched`, `stalled`, `stalled_backfill`, and
   `served_through`: per action family, the block up to which every watched account is answered
   without waiting, `null` before any is.
@@ -2375,7 +2398,9 @@ A runtime hosting several nests serves nothing at its root: point `--url` at one
 `nuthatch mcp` is a thin, fully-offline stdio bridge to the local `dev` HTTP API - it never contends
 with the single writer and nothing phones home. The client launches it; you ask for your contract's
 data in plain English and it writes the SQL. Tool advertisement is adaptive (RFC-0025): a nest only
-advertises the tools it can actually answer.
+advertises the tools it can actually answer. An address-history nest gets `coverage`,
+`wallet_history`, `wallet_status` and `diff` instead of the event-table tools
+([recipe](rotki-wallets-with-claude.md)).
 
 A nest behind a gateway that wants a bearer token: put the token in an environment variable and name
 the variable, so the token never appears in `ps` or in the client's config.

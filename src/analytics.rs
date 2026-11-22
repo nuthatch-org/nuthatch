@@ -2693,7 +2693,9 @@ fn define_children_views(session: &dyn Session, dir: &Path) {
     // `debug!` below, so a factory nest would silently lose `{template}__children` entirely. Omitted
     // rather than `0 AS discovered_timestamp` for the same reason the column itself is omitted: a
     // zero that looks like a timestamp is worse than an error.
-    for (name, ddl) in nuthatch_core::bind::children_views(&fs, config.nest.block_timestamps) {
+    for (name, ddl) in
+        nuthatch_core::bind::children_views(&fs, config.nest.block_timestamps.column())
+    {
         if let Err(e) = session.execute(&ddl) {
             tracing::debug!("children view {name} skipped: {e}");
         }

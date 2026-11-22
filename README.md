@@ -31,6 +31,12 @@ Etherscan's [`Free API access is not supported for this chain`](https://nuthatch
 **For AI coding agents:** [AGENTS.md](AGENTS.md) is install, init, a headless `dev`, query and MCP
 setup for every common client, as commands to paste.
 
+**Try it without installing anything:** two live read-only nests, no key and no sign-up, rate-limited per
+address: [Arc testnet USDC](https://nuthatch-indexer.com/nests/arc-usdc) and [Base USDC](https://nuthatch-indexer.com/nests/base-usdc)
+(`curl -sG https://nuthatch-indexer.com/nests/base-usdc/sql --data-urlencode 'q=SELECT count(*) FROM usdc__transfer'`). For an
+agent: `claude mcp add --transport http base-usdc https://nuthatch-indexer.com/nests/base-usdc/mcp` (or `arc-usdc` and the Arc URL).
+How they run: [docs/public-nests.md](docs/public-nests.md).
+
 **Also:** self-hosted Etherscan-compatible history for the chains that lost their free tier.
 Base and BNB Chain, plus Gnosis, on your own RPC (Base and BNB Chain need an archive node with tracing): [examples/paywalled-chains](examples/paywalled-chains/).
 

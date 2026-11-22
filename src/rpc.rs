@@ -12,6 +12,11 @@ use std::time::Duration;
 
 pub type RpcClient = nuthatch_core::rpc::RpcClient<Http>;
 
+/// Sent on every RPC request. Cloudflare-fronted public RPCs (rpc.xinfin.network) answer 403 to a
+/// request with no `User-Agent` at all. Fixed and version-only: it names the software, never the
+/// operator, so non-negotiable 3 holds.
+const USER_AGENT: &str = concat!("nuthatch/", env!("CARGO_PKG_VERSION"));
+
 /// reqwest, counting into the process's Prometheus series.
 pub struct Http(reqwest::Client);
 
@@ -29,7 +34,12 @@ impl Transport for Http {
     type Reply = HttpReply;
 
     fn build(timeout: Duration) -> anyhow::Result<Self> {
-        Ok(Self(reqwest::Client::builder().timeout(timeout).build()?))
+        Ok(Self(
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .user_agent(USER_AGENT)
+                .build()?,
+        ))
     }
 
     async fn post(&self, url: &str, body: &Value) -> Result<HttpReply, TransportError> {
@@ -108,7 +118,7 @@ impl Reply for HttpReply {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A one-endpoint fake JSON-RPC server on a loopback port. Returns `(url, handle)`; the caller
@@ -141,6 +151,45 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{addr}/"), handle)
+    }
+
+    /// Cloudflare-fronted public RPCs refuse a request with no `User-Agent` (#3068). Every RPC
+    /// request carries exactly `nuthatch/<version>` and nothing that names the operator.
+    #[tokio::test]
+    async fn every_rpc_request_sends_the_fixed_user_agent() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use nuthatch_core::rpc::Transport;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let s2 = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |h: HeaderMap| {
+                let s2 = s2.clone();
+                async move {
+                    let ua = h.get("user-agent").and_then(|v| v.to_str().ok());
+                    s2.lock().unwrap().push(ua.unwrap_or("<none>").to_string());
+                    Json(serde_json::json!({"jsonrpc":"2.0","id":1,"result":"0x1"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let http = <super::Http as Transport>::build(std::time::Duration::from_secs(5)).unwrap();
+        http.post(
+            &format!("http://{addr}/"),
+            &serde_json::json!({"method":"eth_blockNumber"}),
+        )
+        .await
+        .map_err(|e| e.error)
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![concat!("nuthatch/", env!("CARGO_PKG_VERSION")).to_string()]
+        );
     }
 
     /// An endpoint that answers every request with `body`.
@@ -1081,6 +1130,199 @@ mod tests {
             asked.lock().unwrap().clone(),
             vec![9, 9, 9, 7],
             "the next call starts at the group size that worked"
+        );
+    }
+
+    /// Like [`address_capped_rpc`], refusing `refuse_from` or more addresses and answering after
+    /// `delay`, while counting requests and the most that were ever in flight at once.
+    async fn slow_capped_rpc(
+        refuse_from: Arc<AtomicUsize>,
+        delay: std::time::Duration,
+        requests: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use serde_json::{json, Value};
+        let live = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let (requests, peak, live) = (requests.clone(), peak.clone(), live.clone());
+                let refuse_from = refuse_from.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    live.fetch_sub(1, Ordering::SeqCst);
+                    let addrs: Vec<String> = req["params"][0]["address"]
+                        .as_array()
+                        .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+                        .unwrap_or_default();
+                    if addrs.len() >= refuse_from.load(Ordering::SeqCst) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({"jsonrpc":"2.0","id":1,
+                                "error":{"code":-32602,"message":"Request blocked"}})),
+                        );
+                    }
+                    // Newest address first, so a merge that forgets to sort is caught.
+                    let logs: Vec<Value> = addrs
+                        .iter()
+                        .rev()
+                        .map(|a| {
+                            let n = u64::from_str_radix(&a[2..], 16).unwrap();
+                            json!({"address": a, "topics": [], "data": "0x",
+                                "blockNumber": format!("0x{:x}", 100 + n % 3),
+                                "transactionHash": "0x01",
+                                "logIndex": format!("0x{n:x}")})
+                        })
+                        .collect();
+                    (
+                        StatusCode::OK,
+                        Json(json!({"jsonrpc":"2.0","id":1,"result": logs})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/"), handle)
+    }
+
+    /// #3066: many children behind an endpoint that takes ten addresses a request. Asked in parallel
+    /// the answer is exactly the one-at-a-time answer, at the same request count, with no more in
+    /// flight than asked for - whether the cap is already known or is learned during the call.
+    #[tokio::test]
+    async fn address_groups_asked_in_parallel_answer_as_one_at_a_time_does() {
+        let addrs: Vec<String> = (1..=95u64).map(|i| format!("0x{i:040x}")).collect();
+        let delay = std::time::Duration::from_millis(40);
+        for learn in [false, true] {
+            let mut runs = Vec::new();
+            for fanout in [1usize, 4] {
+                let (requests, peak) =
+                    (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+                let (url, server) = slow_capped_rpc(
+                    Arc::new(AtomicUsize::new(10)),
+                    delay,
+                    requests.clone(),
+                    peak.clone(),
+                )
+                .await;
+                let c = super::RpcClient::new(vec![url]).unwrap();
+                c.set_log_group_fanout(fanout);
+                if !learn {
+                    c.get_logs(&addrs[..12], &[], 100, 102).await.unwrap();
+                }
+                requests.store(0, Ordering::SeqCst);
+                peak.store(0, Ordering::SeqCst);
+                let t = std::time::Instant::now();
+                let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+                let took = t.elapsed();
+                server.abort();
+                assert!(
+                    peak.load(Ordering::SeqCst) <= fanout,
+                    "bounded by the fanout"
+                );
+                eprintln!(
+                    "95 addresses, cap learned during call: {learn}, fanout {fanout}: {} requests, \
+                     peak {} in flight, {took:?}",
+                    requests.load(Ordering::SeqCst),
+                    peak.load(Ordering::SeqCst)
+                );
+                let keys: Vec<_> = logs
+                    .iter()
+                    .map(|l| (l.block_number, l.log_index, l.address.clone()))
+                    .collect();
+                runs.push((
+                    keys,
+                    took,
+                    peak.load(Ordering::SeqCst),
+                    requests.load(Ordering::SeqCst),
+                ));
+            }
+            assert_eq!(runs[0].0.len(), 95);
+            assert_eq!(runs[0].0, runs[1].0, "same rows, same order");
+            if !learn {
+                assert_eq!(
+                    runs[0].3, runs[1].3,
+                    "no extra requests once the cap is known"
+                );
+                assert!(runs[1].2 > 1, "groups really overlapped");
+                assert!(runs[1].1 < runs[0].1, "and the call is faster for it");
+            }
+        }
+    }
+
+    /// An endpoint that never takes an address list still works with the groups asked in parallel:
+    /// the refusals narrow the width to one address, and the rows are the sequential rows.
+    #[tokio::test]
+    async fn an_endpoint_refusing_address_lists_still_works_in_parallel() {
+        let addrs: Vec<String> = (1..=7u64).map(|i| format!("0x{i:040x}")).collect();
+        let mut runs = Vec::new();
+        for fanout in [1usize, 3] {
+            let (requests, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let (url, server) = slow_capped_rpc(
+                Arc::new(AtomicUsize::new(2)),
+                std::time::Duration::from_millis(5),
+                requests,
+                peak,
+            )
+            .await;
+            let c = super::RpcClient::new(vec![url]).unwrap();
+            c.set_log_group_fanout(fanout);
+            let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+            server.abort();
+            runs.push(
+                logs.iter()
+                    .map(|l| (l.block_number, l.log_index))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(runs[0].len(), 7);
+        assert_eq!(runs[0], runs[1]);
+    }
+
+    /// A cap that tightens after it was learned: the groups already answered are kept, only the
+    /// rest is asked again, and the rows are the one-at-a-time rows.
+    #[tokio::test]
+    async fn a_cap_that_tightens_mid_list_keeps_the_groups_already_answered() {
+        let addrs: Vec<String> = (1..=60u64).map(|i| format!("0x{i:040x}")).collect();
+        let mut runs = Vec::new();
+        for fanout in [1usize, 2] {
+            let (requests, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let refuse = Arc::new(AtomicUsize::new(10));
+            let (url, server) = slow_capped_rpc(
+                refuse.clone(),
+                std::time::Duration::from_millis(5),
+                requests.clone(),
+                peak,
+            )
+            .await;
+            let c = super::RpcClient::new(vec![url]).unwrap();
+            c.set_log_group_fanout(fanout);
+            c.get_logs(&addrs[..12], &[], 100, 102).await.unwrap(); // learns a cap of 6
+            refuse.store(4, Ordering::SeqCst); // the endpoint now takes at most 3
+            requests.store(0, Ordering::SeqCst);
+            let logs = c.get_logs(&addrs, &[], 100, 102).await.unwrap();
+            server.abort();
+            runs.push((
+                logs.iter()
+                    .map(|l| (l.block_number, l.log_index))
+                    .collect::<Vec<_>>(),
+                requests.load(Ordering::SeqCst),
+            ));
+        }
+        assert_eq!(runs[0].0.len(), 60);
+        assert_eq!(runs[0].0, runs[1].0);
+        assert!(
+            runs[1].1 <= runs[0].1 + 3,
+            "answered groups are not asked again: {} requests parallel, {} sequential",
+            runs[1].1,
+            runs[0].1
         );
     }
 
@@ -3618,5 +3860,206 @@ mod rfc0036_tests {
             "{err:#}"
         );
         assert!(!crate::chunker::is_result_too_large(&err), "{err:#}");
+    }
+}
+
+/// Each endpoint's batch width is learned from its refusals (GraphOps answers HTTP 413
+/// `rpc_batch_too_large` above 100 calls and runs none of them; Alchemy takes ~1000).
+#[cfg(test)]
+mod batch_width_tests {
+    use super::RpcClient;
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Copy)]
+    enum Refusal {
+        /// GraphOps: HTTP 413, named code, no call run.
+        Http413,
+        /// HTTP 413 that states no maximum.
+        Http413Bare,
+        /// HTTP 200 carrying a top-level JSON-RPC error.
+        RpcError,
+        /// HTTP 200 with an empty array.
+        Empty,
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        /// Sizes of batches the endpoint accepted and ran.
+        accepted: Vec<usize>,
+        rejected: Vec<usize>,
+        /// How many times each call's data was run.
+        runs: std::collections::HashMap<String, usize>,
+    }
+
+    async fn endpoint(limit: usize, how: Refusal) -> (String, Arc<Mutex<Seen>>) {
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let log = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |Json(req): Json<Value>| {
+                let log = log.clone();
+                async move {
+                    let Value::Array(items) = req else {
+                        return Json(json!({"jsonrpc":"2.0","id":1,"result":"0x1"})).into_response();
+                    };
+                    let mut seen = log.lock().unwrap();
+                    if items.len() > limit {
+                        seen.rejected.push(items.len());
+                        return match how {
+                            Refusal::Http413 => (
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                r#"{"code":"rpc_batch_too_large","message":"max 100 calls per batch"}"#,
+                            )
+                                .into_response(),
+                            Refusal::Http413Bare => {
+                                (StatusCode::PAYLOAD_TOO_LARGE, "too large").into_response()
+                            }
+                            Refusal::RpcError => Json(json!({"jsonrpc":"2.0","id":null,
+                                "error":{"code":-32600,"message":"batch size exceeds the limit"}}))
+                            .into_response(),
+                            Refusal::Empty => Json(json!([])).into_response(),
+                        };
+                    }
+                    seen.accepted.push(items.len());
+                    let answers: Vec<Value> = items
+                        .iter()
+                        .map(|item| {
+                            if item["method"] == "eth_getBlockByNumber" {
+                                let b = u64::from_str_radix(
+                                    item["params"][0].as_str().unwrap().trim_start_matches("0x"),
+                                    16,
+                                )
+                                .unwrap();
+                                *seen.runs.entry(format!("block {b}")).or_default() += 1;
+                                json!({"jsonrpc":"2.0","id":item["id"],
+                                    "result":{"number":format!("0x{b:x}"),"timestamp":format!("0x{:x}", b * 10)}})
+                            } else {
+                                let data = item["params"][0]["data"].as_str().unwrap().to_string();
+                                *seen.runs.entry(data.clone()).or_default() += 1;
+                                json!({"jsonrpc":"2.0","id":item["id"],"result":data})
+                            }
+                        })
+                        .collect();
+                    Json(Value::Array(answers)).into_response()
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (format!("http://{addr}/"), seen)
+    }
+
+    fn calls(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| (format!("0x{:040x}", 1), format!("0x{i:08x}")))
+            .collect()
+    }
+
+    async fn check_calls(
+        how: Refusal,
+        limit: usize,
+        n: usize,
+        max_rejections: usize,
+        learned: usize,
+    ) {
+        let (url, seen) = endpoint(limit, how).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let calls = calls(n);
+        let got = rpc.eth_call_batch_at(&calls, 7).await.expect("answered");
+        assert_eq!(got.len(), n);
+        for (i, r) in got.iter().enumerate() {
+            assert_eq!(
+                r.as_deref(),
+                Some(calls[i].1.as_str()),
+                "call {i} out of place"
+            );
+        }
+        let (accepted, rejected, runs) = {
+            let s = seen.lock().unwrap();
+            (s.accepted.clone(), s.rejected.clone(), s.runs.clone())
+        };
+        assert!(accepted.iter().all(|&s| s <= limit), "{accepted:?}");
+        assert_eq!(runs.len(), n);
+        assert!(runs.values().all(|&c| c == 1), "a call ran twice");
+        assert!(rejected.len() <= max_rejections, "{rejected:?}");
+        // The refusal was about the batch, not the endpoint: it is still served, and the next batch
+        // goes out at the learned width with no further refusal.
+        let before = rpc.request_count();
+        rpc.eth_call_batch_at(&calls, 8)
+            .await
+            .expect("served again");
+        assert_eq!(
+            rpc.request_count() - before,
+            n.div_ceil(learned) as u64,
+            "the learned width was not kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_413_above_100_ends_with_batches_of_at_most_100_and_one_rejection() {
+        // The refusal states the maximum, so one rejected attempt is all it costs.
+        check_calls(Refusal::Http413, 100, 450, 1, 100).await;
+    }
+
+    #[tokio::test]
+    async fn a_413_that_states_no_maximum_is_searched_to_the_width_it_takes() {
+        // 450 -> 225 -> 112 -> 56 ok -> 84 -> 98 -> 105 -> 101 -> 99 ok -> 100 ok: a binary search between the
+        // widest width known good and the narrowest known refused, so it lands on the real limit.
+        check_calls(Refusal::Http413Bare, 100, 450, 8, 100).await;
+    }
+
+    #[tokio::test]
+    async fn an_unstated_limit_of_137_is_found_exactly() {
+        check_calls(Refusal::Http413Bare, 137, 1_500, 9, 137).await;
+    }
+
+    #[tokio::test]
+    async fn a_json_rpc_error_about_the_batch_is_handled_the_same_way() {
+        check_calls(Refusal::RpcError, 100, 450, 8, 100).await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_empty_answer_is_handled_the_same_way() {
+        check_calls(Refusal::Empty, 100, 450, 8, 100).await;
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_takes_a_thousand_is_not_narrowed() {
+        let (url, seen) = endpoint(1_000, Refusal::Http413).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let calls = calls(800);
+        for block in 1..=3 {
+            rpc.eth_call_batch_at(&calls, block).await.unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.accepted, vec![800, 800, 800]);
+        assert!(seen.rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_batches_learn_the_limit_and_answer_every_block_once() {
+        let (url, seen) = endpoint(100, Refusal::Http413).await;
+        let rpc = RpcClient::new(vec![url]).unwrap();
+        let blocks: Vec<u64> = (5_000..6_000).collect();
+        let got = rpc.block_timestamps(&blocks).await.expect("answered");
+        assert!(blocks.iter().all(|b| got[b] == b * 10));
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.accepted.iter().all(|&s| s <= 100),
+            "{:?}",
+            seen.accepted
+        );
+        assert!(
+            seen.runs.values().all(|&c| c == 1),
+            "a header was fetched twice"
+        );
+        assert_eq!(seen.runs.len(), blocks.len());
+        // Up to the header fan-out (4) of 200-wide chunks were in flight before the first refusal
+        // was learned; none is retried at the same width.
+        assert!(seen.rejected.len() <= 4, "{:?}", seen.rejected);
+        assert!(seen.rejected.iter().all(|&s| s > 100));
     }
 }

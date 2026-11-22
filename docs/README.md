@@ -38,6 +38,8 @@ not to infer work that remains.
 - [Address history](../skills/nuthatch-builder/config-reference.md#address_history---an-accounts-history-for-rotki-rfc-0063):
   a nest that watches accounts and serves them Etherscan-shaped at `/api` (RFC-0063). Its rows live in
   the nest's store, not in SQL tables or sealed segments.
+- [Use your rotki wallets with Claude](rotki-wallets-with-claude.md): an address-history nest over
+  your own addresses, bridged to Claude by `nuthatch mcp`.
 - [`nuthatch diff`](../skills/nuthatch-builder/cli-reference.md#nuthatch-diff): what happened between
   two blocks, as sentences (RFC-0071).
 - [Release notes](releases/README.md)

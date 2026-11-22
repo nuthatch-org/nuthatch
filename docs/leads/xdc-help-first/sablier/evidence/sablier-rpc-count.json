@@ -1,0 +1,1 @@
+{"http_requests": 1449, "rpc_calls": 1512, "by_method": {"eth_chainId": 2, "eth_blockNumber": 181, "eth_getBlockByNumber": 653, "eth_getLogs": 676}, "errors": 1}

@@ -1,0 +1,16 @@
+{
+  "title": "TODO: what this nest is, for example USDC on Base",
+  "tagline": "TODO: one plain sentence for the prospect.",
+  "chain": "TODO: base (8453)",
+  "events": { "table": "TODO_alias__transfer", "from": "from", "to": "to", "amount": "value", "decimals": 6, "symbol": "TOKEN" },
+  "queries": [
+    { "title": "Latest events", "sql": "SELECT * FROM TODO_alias__transfer ORDER BY block_number DESC, log_index DESC LIMIT 20" }
+  ],
+  "prompts": [
+    "TODO: five questions a person at this company would really ask. Keep each answerable with one SQL query.",
+    "TODO",
+    "TODO",
+    "TODO",
+    "TODO"
+  ]
+}

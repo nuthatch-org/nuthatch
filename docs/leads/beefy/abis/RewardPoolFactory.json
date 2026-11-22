@@ -1,0 +1,380 @@
+[
+ {
+  "inputs": [
+   {
+    "internalType": "address",
+    "name": "_keeper",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable",
+  "type": "constructor"
+ },
+ {
+  "inputs": [],
+  "name": "IsImmutable",
+  "type": "error"
+ },
+ {
+  "inputs": [],
+  "name": "NotManager",
+  "type": "error"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "address",
+    "name": "owner",
+    "type": "address"
+   }
+  ],
+  "name": "OwnableInvalidOwner",
+  "type": "error"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "address",
+    "name": "account",
+    "type": "address"
+   }
+  ],
+  "name": "OwnableUnauthorizedAccount",
+  "type": "error"
+ },
+ {
+  "inputs": [],
+  "name": "VersionExists",
+  "type": "error"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": false,
+    "internalType": "string",
+    "name": "RewardPoolName",
+    "type": "string"
+   },
+   {
+    "indexed": false,
+    "internalType": "address",
+    "name": "newImplementation",
+    "type": "address"
+   }
+  ],
+  "name": "InstanceUpgraded",
+  "type": "event"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": false,
+    "internalType": "string",
+    "name": "rewardPoolName",
+    "type": "string"
+   },
+   {
+    "indexed": false,
+    "internalType": "address",
+    "name": "implementation",
+    "type": "address"
+   }
+  ],
+  "name": "NewRewardPoolAdded",
+  "type": "event"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": true,
+    "internalType": "address",
+    "name": "previousOwner",
+    "type": "address"
+   },
+   {
+    "indexed": true,
+    "internalType": "address",
+    "name": "newOwner",
+    "type": "address"
+   }
+  ],
+  "name": "OwnershipTransferred",
+  "type": "event"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": false,
+    "internalType": "string",
+    "name": "rewardPoolName",
+    "type": "string"
+   },
+   {
+    "indexed": false,
+    "internalType": "address",
+    "name": "proxy",
+    "type": "address"
+   }
+  ],
+  "name": "ProxyCreated",
+  "type": "event"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": false,
+    "internalType": "string",
+    "name": "rewardPoolName",
+    "type": "string"
+   }
+  ],
+  "name": "RewardPoolIsImmutable",
+  "type": "event"
+ },
+ {
+  "anonymous": false,
+  "inputs": [
+   {
+    "indexed": false,
+    "internalType": "address",
+    "name": "keeper",
+    "type": "address"
+   }
+  ],
+  "name": "SetKeeper",
+  "type": "event"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "_rewardPoolName",
+    "type": "string"
+   }
+  ],
+  "name": "SetRewardPoolTypeImmutable",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "_rewardPoolName",
+    "type": "string"
+   },
+   {
+    "internalType": "address",
+    "name": "_implementation",
+    "type": "address"
+   }
+  ],
+  "name": "addRewardPool",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "_rewardPoolName",
+    "type": "string"
+   }
+  ],
+  "name": "createRewardPool",
+  "outputs": [
+   {
+    "internalType": "address",
+    "name": "",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "_rewardPoolName",
+    "type": "string"
+   }
+  ],
+  "name": "getImplementation",
+  "outputs": [
+   {
+    "internalType": "address",
+    "name": "",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [],
+  "name": "getRewardPoolTypes",
+  "outputs": [
+   {
+    "internalType": "string[]",
+    "name": "",
+    "type": "string[]"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "",
+    "type": "string"
+   }
+  ],
+  "name": "instances",
+  "outputs": [
+   {
+    "internalType": "contract UpgradeableBeacon",
+    "name": "",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "",
+    "type": "string"
+   }
+  ],
+  "name": "isImmutable",
+  "outputs": [
+   {
+    "internalType": "bool",
+    "name": "",
+    "type": "bool"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [],
+  "name": "keeper",
+  "outputs": [
+   {
+    "internalType": "address",
+    "name": "",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [],
+  "name": "owner",
+  "outputs": [
+   {
+    "internalType": "address",
+    "name": "",
+    "type": "address"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [],
+  "name": "renounceOwnership",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "uint256",
+    "name": "",
+    "type": "uint256"
+   }
+  ],
+  "name": "rewardPoolTypes",
+  "outputs": [
+   {
+    "internalType": "string",
+    "name": "",
+    "type": "string"
+   }
+  ],
+  "stateMutability": "view",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "address",
+    "name": "_keeper",
+    "type": "address"
+   }
+  ],
+  "name": "setKeeper",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "address",
+    "name": "newOwner",
+    "type": "address"
+   }
+  ],
+  "name": "transferOwnership",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "inputs": [
+   {
+    "internalType": "string",
+    "name": "_rewardPoolName",
+    "type": "string"
+   },
+   {
+    "internalType": "address",
+    "name": "_newImplementation",
+    "type": "address"
+   }
+  ],
+  "name": "upgradeTo",
+  "outputs": [],
+  "stateMutability": "nonpayable",
+  "type": "function"
+ },
+ {
+  "type": "event",
+  "name": "ProxyCreated",
+  "anonymous": false,
+  "inputs": [
+   {
+    "name": "proxy",
+    "type": "address",
+    "indexed": false
+   }
+  ]
+ }
+]

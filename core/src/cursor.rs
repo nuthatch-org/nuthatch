@@ -593,7 +593,7 @@ pub async fn process_window<E: WindowEntity>(
             }
         };
         let timestamps = &block_data.timestamps;
-        apply_row_timestamps(&mut rows, timestamps);
+        apply_row_timestamps(registry, &mut rows, timestamps);
         found.apply_timestamps(timestamps);
         // The logs and this hash are two calls. A tip that moved between them would commit the
         // fork's rows under the hash the chain has now, and the next reorg check would see them agree.
@@ -710,9 +710,14 @@ pub async fn process_window<E: WindowEntity>(
             blocks.dedup();
             // A log row's timestamp was read by height alone, so it may be another fork's: it must be
             // the one this hash has. Block and call rows took theirs from the header checked here.
+            // A null-mode row (#3065) is always null: nothing to check.
             let stamped: Vec<_> = rows
                 .iter()
-                .filter(|r| registry.timestamps() && r.block_number > final_through)
+                .filter(|r| {
+                    registry.timestamps()
+                        && !registry.null_timestamps()
+                        && r.block_number > final_through
+                })
                 .collect();
             let now = match stamped.is_empty() {
                 true => source.block_hashes(&blocks).await.map(|now| {
@@ -1839,6 +1844,20 @@ mod tests {
 
         assert_eq!(processed, Processed::Refused);
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    /// #3065: a null-mode row has no timestamp to check, so a header stamp from the other side of a
+    /// head split, which refuses an eager window, commits the same null row. The hash is still checked.
+    #[test]
+    fn a_null_mode_row_has_no_stamp_to_check_against_the_header() {
+        let null = token().with_timestamps(true).with_null_timestamps(true);
+        let source = HeadSplit {
+            stamp: true,
+            ..Default::default()
+        };
+        let (processed, store) = split_with(&source, &crate::extra::NoExtraRows, null);
+        assert_eq!(processed, Processed::Stored(1));
+        assert_eq!(store.get_block_hash(10).unwrap(), Some(hash_of(10)));
     }
 
     /// One top-level call at block 10, read from a body on fork B.

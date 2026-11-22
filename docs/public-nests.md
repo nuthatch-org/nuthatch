@@ -3,8 +3,8 @@
 How to put a nest on a public URL that anyone can query, without an account and without being able to
 change anything. First user: the Arc testnet USDC nest
 ([#3031](https://github.com/nuthatch-org/nuthatch/issues/3031), under
-[#3028](https://github.com/nuthatch-org/nuthatch/issues/3028)). The kit is in
-[`deploy/public-nests/`](../deploy/public-nests/).
+[#3028](https://github.com/nuthatch-org/nuthatch/issues/3028)); second, [Base USDC](#the-second-nest-base-usdc-on-the-graphops-rpc),
+the one on a keyed RPC. The kit is in [`deploy/public-nests/`](../deploy/public-nests/).
 
 This is the stock binary run as an operator would run it. Nothing in nuthatch is built for it: no
 accounts, no billing, no hosted-service code (see the out-of-scope list in `CLAUDE.md`). The credentials,
@@ -16,9 +16,13 @@ internet -> Caddy :443            TLS, the public name           (already on the
          -> nuthatch 127.0.0.1:8120  --no-admin, read routes only
 ```
 
+The URL people are given is a path on the main site, `https://nuthatch-indexer.com/nests/<name>`, not a name of
+its own: [see below](#the-public-url-is-a-path-not-a-subdomain). A new nest needs no DNS record.
+
 ## Live
 
-The Arc testnet USDC nest has been live since 2026-11-19 at **https://arc.nuthatch-indexer.com** (helsinki-nests,
+The Arc testnet USDC nest has been live since 2026-11-19 at **https://nuthatch-indexer.com/nests/arc-usdc**, and
+still at https://arc.nuthatch-indexer.com (helsinki-nests,
 unit `nuthatch-public-arc-testnet` behind `nuthatch-public-proxy` and Caddy, nuthatch 5.23.0, Arc's keyless
 public RPCs). Cold backfill from block 72,550,000 took 35 min 52 s (3,253,137 events, about 1,500 events a
 second, 221 MB on disk, 423 MB peak memory), then it follows the tip at `lag_blocks` 0. Smoke-tested from
@@ -26,13 +30,58 @@ outside: `/sql` and `/mcp` `tools/list` answer `200` with no key, `check-proxy.s
 `--burst`, `/_admin` and `/metrics` answer `403`.
 
 ```sh
-curl -sG "https://arc.nuthatch-indexer.com/sql" --data-urlencode \
+curl -sG "https://nuthatch-indexer.com/nests/arc-usdc/sql" --data-urlencode \
   'q=SELECT block_number, tx_hash, "from", "to", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 3'
+```
+
+The Base USDC nest is the second one, at **https://nuthatch-indexer.com/nests/base-usdc** (it has no name of its
+own; helsinki-nests, unit `nuthatch-public-base-usdc` behind `nuthatch-public-base-usdc-proxy` and Caddy, nuthatch
+5.23.0, the GraphOps RPC; see [the section below](#the-second-nest-base-usdc-on-the-graphops-rpc)).
+
+```sh
+curl -sG "https://nuthatch-indexer.com/nests/base-usdc/sql" --data-urlencode \
+  'q=SELECT block_number, tx_hash, "from", "to", value_dec FROM usdc__transfer ORDER BY block_number DESC, log_index DESC LIMIT 3'
+```
+
+For an agent, either nest speaks MCP over HTTP, with no key. With Claude Code:
+
+```sh
+claude mcp add --transport http arc-usdc https://nuthatch-indexer.com/nests/arc-usdc/mcp
+claude mcp add --transport http base-usdc https://nuthatch-indexer.com/nests/base-usdc/mcp
 ```
 
 On the host, `nginx` was already installed and in use, so step 5's `apt-get install`, `policy-rc.d` and
 `systemctl disable nginx` were skipped, as the note under step 5 says. The Caddyfile was backed up to
 `/etc/caddy/Caddyfile.bak-public-nests-<timestamp>` before the site was appended.
+
+## The public URL is a path, not a subdomain
+
+`https://nuthatch-indexer.com/nests/<name>` is what people are given, as it is for the other hosted nests
+(`bounty-nest`, `irmarket`, ...). Two pieces make it work, and neither is a DNS record:
+
+1. **nuthatch-frontend**, `vercel.json`: `/nests/<name>/:path*` rewrites to `https://<name>.89.167.109.4.sslip.io/:path*`,
+   and `src/data/public-nests.ts` has an entry, which renders the page at `/nests/<name>` (status, query it,
+   tables) from the live nest at build. A name under `sslip.io` already resolves to the host.
+2. **Caddy on the host**: [`Caddyfile.path`](../deploy/public-nests/Caddyfile.path) has a site per nest on that
+   `sslip.io` name. It forwards to the same nginx as before, so the route allowlist, body and time limits and
+   per-address limits are unchanged.
+
+Through Vercel, a request reaches Caddy from one of Vercel's addresses, and a different one most times, so left
+alone nginx would count all visitors as one caller. Caddy therefore takes the visitor's address from
+`X-Vercel-Forwarded-For`, which Vercel sets and overwrites, and passes it on as `X-Forwarded-For`. It also sends
+the `Host` the nest was started with (`--public-host`), since the request arrives under the `sslip.io` name.
+`POST /mcp` and `POST /sql` pass through the rewrite as they do direct. The reasoning and what was tested are in
+the comment at the top of `Caddyfile.path`.
+
+Checked on 2026-11-19 against the real URLs: `check-proxy.sh https://nuthatch-indexer.com/nests/base-usdc --burst` and
+the same for `/nests/arc-usdc` pass every check except where Vercel answers for the host (a trailing-slash
+`/_admin/` is a 404 and `//_admin/` a 308, both refusals, which the script now accepts); `/sql` and `POST /mcp`
+`tools/list` answer `200`, and the flood from one address is answered `429`.
+
+To add one: start the nest and its nginx as above, add a site to `Caddyfile.path` on the host (a new name
+`<name>.89.167.109.4.sslip.io`, the port of its nginx and the `Host` it was started with), and add the rewrite and
+the `public-nests.ts` entry to nuthatch-frontend. Merging that repo is not publishing it: the site is deployed
+with `vercel --prod` (see its README).
 
 ## What nuthatch's read-only surface is
 
@@ -272,11 +321,82 @@ nest repo's README with `<PUBLIC_URL>` replaced.
 - **Stop it.** `sudo systemctl disable --now nuthatch-public-proxy nuthatch-public-arc-testnet`, and remove
   the Caddy site. The data is in `/var/lib/nuthatch-public/arc-usdc-nest/data`; `nuthatch prune` or `rm -r`
   reclaims it.
-- **Monitoring.** To scrape it, add `{targets: ["100.82.188.91:8120"], labels: {unit: nuthatch-public-arc-testnet, box: helsinki, role: cursor}}`
-  to `deploy/monitoring/targets/nests.yml` once it is live; the tailnet-only Caddy site already maps
-  `/8120/metrics`. It is not added in this change, because it would page `TargetDown` until the unit exists.
+- **Monitoring.** Both public units are in `deploy/monitoring/targets/nests.yml`
+  (`nuthatch-public-arc-testnet` on 8120, `nuthatch-public-base-usdc` on 8121); the tailnet-only Caddy site
+  maps `/8120/metrics` and `/8121/metrics`. A nest on a loopback bind refuses a `Host` it was not told, and
+  Prometheus reaches it by the tailnet address, so each unit also passes `--local-host 100.82.188.91`.
 - **Raising a limit** is one line in `nginx.conf` or the env file, then `systemctl reload
   nuthatch-public-proxy` or `restart nuthatch-public-arc-testnet`. Change the table above with it.
+
+## The second nest: Base USDC, on the GraphOps RPC
+
+Circle's native USDC on Base (`0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`), from
+[`nuthatch-org/usdc-base-nest`](https://github.com/nuthatch-org/usdc-base-nest), for
+[#3028](https://github.com/nuthatch-org/nuthatch/issues/3028)'s "a chain people recognise, on the GraphOps RPC".
+Everything above applies; this is what differs, and the files are `*-base-usdc*` beside the Arc ones.
+
+| | Arc testnet USDC | Base USDC |
+|---|---|---|
+| Public URL | `https://nuthatch-indexer.com/nests/arc-usdc` (and `arc.nuthatch-indexer.com`) | `https://nuthatch-indexer.com/nests/base-usdc` |
+| Unit, port | `nuthatch-public-arc-testnet`, 8120 | `nuthatch-public-base-usdc`, 8121 |
+| Proxy | `nuthatch-public-proxy`, `nginx.conf`, 8480 | `nuthatch-public-base-usdc-proxy`, `nginx-base-usdc.conf`, 8481 |
+| Env file | `arc-testnet.env` | `base-usdc.env` |
+| RPC | Arc's keyless public endpoints | GraphOps, a key limited to RPC, in `NUTHATCH_RPC` |
+| Nest | `nuthatch-org/arc-usdc-nest` | `nuthatch-org/usdc-base-nest` |
+| History | from block 72,550,000 | the last 3,000,000 blocks (`--backfill`) |
+
+- **A second proxy, not a second route.** `nginx-base-usdc.conf` is `nginx.conf` with the two ports, the runtime
+  directory and the syslog tag changed (`diff nginx.conf nginx-base-usdc.conf` is those lines), so the limits
+  are the same table above, counted per nest, and a change to one front door cannot take the other down.
+- **The key is in one file.** GraphOps' URL is `https://rpc.graphops.xyz/v1/evm/8453/<api key>` (chain id 8453;
+  the key is the last segment). It goes in `base-usdc.env` as `NUTHATCH_RPC`, which `nuthatch dev` reads as
+  `--rpc`, so it is not in the unit, not in `ps`, not in `systemctl status` and not in this repo.
+  `base-usdc.env.example` has a placeholder. Checked on 2026-11-19 that the key does not come back on a public route:
+  `/`, `/health`, `/ready`, `/nest`, `/shape`, `/schema`, `/tables`, `/mcp` (`status`) and `/sql` through the proxy
+  contained neither the RPC host nor `/v1/evm`. Make the key with `graphops api-keys create` limited to RPC for
+  Base, so it can be revoked without touching another nest.
+- **Not from genesis.** The nest declares `start_block = 2797221`, the proxy's deployment. Base now makes a block
+  every 200 ms, so that is 56.7 M blocks. `--backfill 3000000` overrides it on the
+  first run and starts seven days back (3 M blocks at 5 a second is 6.9 days); a store that has indexed a block
+  ignores the flag on restart. The 7.6 M block the implementation contract was deployed at is long behind it, so
+  the vendored ABI decodes everything in range.
+- **GraphOps answers at most 20,000 logs a call** (`-32012`, "query exceeds max results 20000"). USDC on Base
+  is about 9 Transfers and 13 events of any kind a block (28.0 M Transfers over 3.02 M blocks is 9.3 a block). The cap counts every log the `eth_getLogs` filter matches: the USDC address and the topic0s of the events in the nest's ABI. That includes more than `Transfer`, so the ceiling lies between 20,000 / 13 (about 1,540 blocks, if all 13 events match) and 20,000 / 9 (about 2,200 blocks, Transfers only); the figures here do not say how many of the 13 the ABI's topic0 list matches. `--window 1500` is under the lower of the two, so it is safe either way, and a window over about 1,540 blocks may be refused;
+  the unit sets `--window 1500` rather than finding that out by refusals. `--seal-direct --concurrency 4`
+  backfills straight to sealed segments, four windows at a time.
+- **The key stays out of error responses.** Checked on 2026-11-20 with nuthatch 5.23.0: `NUTHATCH_RPC` pointed at
+  a closed local port, and at a local server answering every POST with HTTP 500, each with the dummy path segment
+  `SECRETKEYSEG123`. `/ready`, `/health`, `/nest`, `/metrics`, `/status` and `/` and the process log were searched for it
+  and it appeared in none: the endpoint is logged as scheme, host and port only (`redact_url`). That is a test of
+  those two failure shapes, not of every upstream error body.
+- **What it costs in credits.** GraphOps prices `eth_getLogs` and `eth_call` at 2 credits and a block header at 1
+  (docs/lodestar-rpc-cost-graphops.md). The backfill is the log calls, about 9,300 of them, so about 19,000
+  credits. Following the tip is a tip call, one log call and a header for each block since the last poll
+  (`block_timestamps`), about 6 credits a second at `--poll-interval 6s`: roughly 0.5 M a day, 15 M a month.
+  [Base USDC: measured](#base-usdc-measured) has the counts.
+- **Deploy.** As steps 1 to 10, with the files above, `git clone https://github.com/nuthatch-org/usdc-base-nest`
+  in step 3 and `PUBLIC_HOST=base.<your-domain>`. The service user, the binary and nginx are already there from
+  the Arc deploy. Check before the DNS record exists, on the box, with `curl -s -H "Host: $PUBLIC_HOST"
+  http://127.0.0.1:8481/ready`. Caddy retries the certificate with back-off until the record resolves.
+
+### Base USDC: measured
+
+Read from the nest's own `/metrics` and `/ready` on 2026-11-19, nuthatch 5.23.0, one RPC endpoint (GraphOps),
+`--seal-direct --concurrency 4 --window 1500`:
+
+| | |
+|---|---|
+| Range indexed | blocks 56,516,981 to the tip (59,537,520 at the check), 6.99 days |
+| Backfill time | 65 min (13:09:32 to 14:15:31 UTC), 28.0 M `Transfer` rows, about 7,100 a second |
+| Backfill RPC | 9,261 `eth_getLogs`, 0 failover retries (`nuthatch_rpc_endpoint_retries_total` counts only retries onto another endpoint, and there is one), 2 failed calls that nuthatch retried against the same endpoint; about 19,000 credits. 3.02 M blocks over 9,261 calls is about 330 blocks a call, not the 1,500 of `--window`: that is a ceiling, and nuthatch narrows the range it asks for to stay under the 20,000-log answer (`fetch_window_blocks` read 332 at the check) |
+| Disk | 1.8 GB for the nest directory |
+| Memory | 436 MB resident when following; the cgroup's 2 GB limit counts 1.3 GB of page cache, which the kernel gives back |
+| Following the tip | `lag_blocks` 0 at a 6 s poll. A poll is one tip call, one `eth_getLogs` and one `eth_getBlockByNumber` per block since the last poll (about 37, sent as batches). Re-read on 2026-11-19 over 63 s from `/metrics`: 9 polls, 9 `eth_getLogs`, 9 tip calls and 335 headers, so 362 credits, **about 5.7 credits a second** (0.5 M a day). The earlier "36 of each in 4 minutes" counted polls, not headers |
+| Through the proxy | `check-proxy.sh http://127.0.0.1:8481 --burst` passed, including the flood (7 served, 73 limited); `/sql`, `/mcp` `tools/list` answer, `/_admin` and a wrong `Host` answer `403` |
+
+The two reads that are not measured: the credit totals are the call counts times GraphOps' published prices,
+not a figure from platform.graphops.xyz (the CLI's usage report is per organisation, and other nests run on it),
+and the public name was not tried because its DNS record did not exist yet. It was served under the path URL instead, below.
 
 ## What this does not prove
 

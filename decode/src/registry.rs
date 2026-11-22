@@ -596,7 +596,12 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
 /// Build the `l1_blocks` row for one header, keyed like a block row. `None` when the header has no
 /// hash or no `l1BlockNumber`: unlike `blocks`, a 0 here would be sealed as a wrong answer rather than
 /// an absent field, so the caller refuses the window instead.
-pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<DecodedRow> {
+pub fn l1_block_row(
+    number: u64,
+    header: &Json,
+    timestamps: bool,
+    null: bool,
+) -> Option<DecodedRow> {
     let hex = |k: &str| -> Option<u64> {
         header
             .get(k)
@@ -610,13 +615,25 @@ pub fn l1_block_row(number: u64, header: &Json, timestamps: bool) -> Option<Deco
         params: vec![("l1_block_number".to_string(), Value::U64(l1))],
         block_number: number,
         block_hash: hash.clone(),
-        block_timestamp: hex("timestamp").unwrap_or(0),
+        // A null-mode nest bought no header to stamp this row: null, as `build_row` leaves its rows.
+        block_timestamp: if null {
+            UNKNOWN_TIMESTAMP
+        } else {
+            hex("timestamp").unwrap_or(0)
+        },
         timestamps,
         log_index: BLOCK_ROW_LOG_INDEX,
         tx_hash: hash,
         address: String::new(),
     })
 }
+
+/// A null-mode nest's row (#3065). Never a real timestamp, never
+/// produced by an eager nest (`refuse_unstamped` refuses a header without one), stored and served as
+/// `null`, and read back from `null` - so it exists only in memory, between decode and serialisation.
+/// A sentinel rather than `Option<u64>` so the dozens of row literals and the eager path's arithmetic
+/// are untouched; [`DecodedRow::timestamp`] is the reading that callers outside decode should use.
+pub const UNKNOWN_TIMESTAMP: u64 = u64::MAX;
 
 /// One decoded log row.
 ///
@@ -630,7 +647,8 @@ pub struct DecodedRow {
     pub block_number: u64,
     pub block_hash: String,
     /// Unix seconds from the block header. Set by the indexer after decode (the log doesn't carry
-    /// it); 0 until then, and 0 if the source couldn't supply it.
+    /// it); 0 until then, and 0 if the source couldn't supply it. A null-mode nest's row is
+    /// [`UNKNOWN_TIMESTAMP`] always (#3065).
     pub block_timestamp: u64,
     /// Whether this row's table has a `block_timestamp` column at all (RFC-0029 §6b), copied from the
     /// registry that decoded it. When false, [`DecodedRow::to_json`] omits the key entirely - the
@@ -658,13 +676,18 @@ impl DecodedRow {
         (self.block_number << 20) | (self.log_index & 0xF_FFFF)
     }
 
+    /// This row's block timestamp, `None` for a null-mode row (#3065).
+    pub fn timestamp(&self) -> Option<u64> {
+        (self.block_timestamp != UNKNOWN_TIMESTAMP).then_some(self.block_timestamp)
+    }
+
     pub fn to_json(&self) -> Json {
         let mut obj = serde_json::Map::new();
         obj.insert("table".into(), json!(self.table));
         obj.insert("block_number".into(), json!(self.block_number));
         obj.insert("block_hash".into(), json!(self.block_hash));
         if self.timestamps {
-            obj.insert("block_timestamp".into(), json!(self.block_timestamp));
+            obj.insert("block_timestamp".into(), json!(self.timestamp()));
         }
         obj.insert("tx_hash".into(), json!(self.tx_hash));
         obj.insert("log_index".into(), json!(self.log_index));
@@ -750,7 +773,10 @@ impl DecodedRow {
             block_number,
             block_hash: text("block_hash")?,
             block_timestamp: if timestamps {
-                number("block_timestamp")?
+                match obj.get("block_timestamp") {
+                    Some(Json::Null) => UNKNOWN_TIMESTAMP,
+                    _ => number("block_timestamp")?,
+                }
             } else {
                 0
             },
@@ -861,6 +887,8 @@ pub struct DecodeRegistry {
     /// into it would invalidate the snapshots of every existing nest to describe something the
     /// content-addressed segment bytes already distinguish.
     timestamps: bool,
+    /// `[nest] block_timestamps = "null"` (#3065): see [`DecodeRegistry::with_null_timestamps`].
+    null_timestamps: bool,
     /// Whether this nest declares `[extract] blocks` (RFC-0036). Lives here for the same reason
     /// `timestamps` does: the registry is the single source of truth for a nest's table set, and a
     /// second place that decides which tables exist is a second place that can disagree.
@@ -1002,6 +1030,19 @@ impl DecodeRegistry {
         self
     }
 
+    /// `[nest] block_timestamps = "null"` (#3065): every row is [`UNKNOWN_TIMESTAMP`] (stored and
+    /// served as `null`) and no header is fetched for it. A log's own `blockTimestamp` is ignored:
+    /// which endpoints stamp varies, and stored state must not (non-negotiable 4). Not folded into [`DecodeRegistry::hash`], for the reason `timestamps` is not.
+    pub fn with_null_timestamps(mut self, null: bool) -> DecodeRegistry {
+        self.null_timestamps = null && self.timestamps;
+        self
+    }
+
+    /// Whether this nest's timestamps are always null (see [`Self::with_null_timestamps`]).
+    pub fn null_timestamps(&self) -> bool {
+        self.null_timestamps
+    }
+
     /// Whether this nest indexes block timestamps. Callers that would otherwise fetch them (the four
     /// backfill/tip paths in `indexer.rs`) consult this before spending the round trips.
     pub fn timestamps(&self) -> bool {
@@ -1090,6 +1131,7 @@ impl DecodeRegistry {
             hash,
             skipped_anonymous,
             timestamps: true,
+            null_timestamps: false,
             blocks: false,
             l1_blocks: false,
         })
@@ -1248,7 +1290,13 @@ impl DecodeRegistry {
         let Some(dec) = decoders.iter().find(|d| d.contract == emitter) else {
             return Ok(None);
         };
-        Ok(Some(build_row(dec, log, emitter, self.timestamps)?))
+        Ok(Some(build_row(
+            dec,
+            log,
+            emitter,
+            self.timestamps,
+            self.null_timestamps,
+        )?))
     }
 
     /// The alias of the contract decoder [`decode`](Self::decode) would match `log` against, if any.
@@ -1278,7 +1326,13 @@ impl DecodeRegistry {
             return Ok(None);
         };
         let emitter = parse_address(&log.address)?;
-        Ok(Some(build_row(dec, log, emitter, self.timestamps)?))
+        Ok(Some(build_row(
+            dec,
+            log,
+            emitter,
+            self.timestamps,
+            self.null_timestamps,
+        )?))
     }
 }
 
@@ -1289,6 +1343,7 @@ fn build_row(
     log: &Log,
     emitter: Address,
     timestamps: bool,
+    null: bool,
 ) -> Result<DecodedRow> {
     let topics: Vec<B256> = log
         .topics
@@ -1319,7 +1374,9 @@ fn build_row(
         params,
         block_number: log.block_number,
         block_hash: log.block_hash.clone(),
-        block_timestamp: 0, // filled by the indexer from the block header (see index_loop)
+        // Eager: filled by the indexer from the block header (see index_loop). Null: always null,
+        // whatever the log carried, so the row cannot depend on which endpoint served it.
+        block_timestamp: if null { UNKNOWN_TIMESTAMP } else { 0 },
         timestamps,
         log_index: log.log_index,
         tx_hash: log.tx_hash.clone(),
@@ -1556,6 +1613,18 @@ fn parse_bytes(s: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod stored_roundtrip {
     use super::*;
+
+    /// #3065: a null-mode nest's `l1_blocks` row is null too, whatever its header carried.
+    #[test]
+    fn an_l1_block_row_is_null_for_a_null_nest_and_stamped_otherwise() {
+        let header = serde_json::json!({
+            "hash": "0xaa", "l1BlockNumber": "0x10", "timestamp": "0x64",
+        });
+        let eager = l1_block_row(5, &header, true, false).unwrap();
+        assert_eq!(eager.timestamp(), Some(100));
+        let null = l1_block_row(5, &header, true, true).unwrap();
+        assert_eq!(null.timestamp(), None);
+    }
 
     fn col(name: &str, sol: &str, kind: StorageKind) -> ColumnSchema {
         ColumnSchema {
@@ -1966,6 +2035,73 @@ mod stored_roundtrip {
                 .unwrap_or_else(|e| panic!("sealed, timestamps={timestamps}: {e:#}"));
             assert_eq!(back, original, "sealed spelling, timestamps={timestamps}");
         }
+    }
+
+    /// #3065: a null-mode row is `null` in the store and comes back as the
+    /// same in-memory sentinel, never as a number.
+    #[test]
+    fn a_null_row_without_a_timestamp_is_null_and_comes_back_unknown() {
+        let schema = transfer_schema(true);
+        let mut row = a_row(true);
+        row.block_timestamp = UNKNOWN_TIMESTAMP;
+        assert_eq!(row.timestamp(), None);
+        let stored = row.to_json();
+        assert_eq!(stored["block_timestamp"], Json::Null);
+        let back = DecodedRow::from_stored(&stored, &schema).unwrap();
+        assert_eq!(back, row);
+        assert_eq!(back.timestamp(), None);
+
+        row.block_timestamp = 1_700_000_000;
+        assert_eq!(row.timestamp(), Some(1_700_000_000));
+        assert_eq!(row.to_json()["block_timestamp"], json!(1_700_000_000u64));
+    }
+
+    /// #3065: a null-mode registry leaves every row null; an eager one leaves it for the indexer to stamp.
+    #[test]
+    fn a_null_registry_leaves_every_row_null() {
+        const ERC20: &str = r#"[{"type":"event","name":"Transfer","inputs":[
+            {"name":"from","type":"address","indexed":true},
+            {"name":"to","type":"address","indexed":true},
+            {"name":"value","type":"uint256","indexed":false}],"anonymous":false}]"#;
+        let build = || {
+            DecodeRegistry::build(vec![ContractSpec {
+                alias: "usdc".into(),
+                address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                    .parse()
+                    .unwrap(),
+                abi: serde_json::from_str(ERC20).unwrap(),
+                events: Vec::new(),
+            }])
+            .unwrap()
+        };
+        let log = Log {
+            address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            topics: vec![
+                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".into(),
+                format!("0x{:064x}", 1),
+                format!("0x{:064x}", 2),
+            ],
+            data: format!("0x{:064x}", 5),
+            block_number: 10,
+            block_hash: "0xbh".into(),
+            tx_hash: "0xtx".into(),
+            log_index: 0,
+        };
+        let null = build().with_null_timestamps(true);
+        assert!(null.null_timestamps());
+        assert_eq!(null.decode(&log).unwrap().unwrap().timestamp(), None);
+
+        let eager = build();
+        assert!(!eager.null_timestamps());
+        assert_eq!(eager.decode(&log).unwrap().unwrap().block_timestamp, 0);
+
+        // Null means nothing without the column.
+        assert!(!build()
+            .with_timestamps(false)
+            .with_null_timestamps(true)
+            .null_timestamps());
+        // And it is not part of the registry's identity, any more than `timestamps` is.
+        assert_eq!(build().hash(), build().with_null_timestamps(true).hash());
     }
 
     /// The column order comes from the schema, never from the stored map. A plan indexes columns by

@@ -829,7 +829,7 @@ jobs:
       NUTHATCH_REQUIRE_FLIGHT_GO: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: tools/flight-client/go.mod
           cache-dependency-path: tools/flight-client/go.sum
@@ -1268,21 +1268,21 @@ jobs:
       # The lesson for whoever touches this next: the advisory DB is a live external input whose schema
       # moves. A scanner that hard-fails on an unknown CVSS version is one upstream change away from
       # blocking every release - so keep this current rather than pinned-and-forgotten.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           command: check advisories licenses bans sources
       # RFC-0070 S1: nuthatch-timelapse is not a dependency of the binary, so the step above never
       # sees its tree.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           manifest-path: timelapse/Cargo.toml
           command: check advisories licenses bans sources
       # #2617: the wasm engine every release attaches is two separate trees with their own lockfiles.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           manifest-path: embed/Cargo.toml
           command: check advisories licenses bans sources
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
         with:
           manifest-path: embed/plain/Cargo.toml
           command: check advisories licenses bans sources

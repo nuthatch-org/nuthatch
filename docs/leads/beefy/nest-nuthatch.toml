@@ -1,0 +1,63 @@
+[nest]
+name = "beefy-hyperevm"
+chain = "hyperevm"
+chain_id = 999
+rpc_urls = ["https://rpc.hyperliquid.xyz/evm"]
+schema_version = 2
+block_timestamps = false
+
+# The three factories the Envio config lists for chain 999.
+[[contracts]]
+alias = "classic_vault_factory"
+address = "0xBC4a342B0c057501E081484A2d24e576E854F823"
+start_block = 4883535
+abi = "abis/ClassicVaultFactory.json"
+
+[[contracts]]
+alias = "reward_pool_factory"
+address = "0x2ec5d5e9aaf3c3f56eBeF2fC46A5af9e42810b41"
+start_block = 4883535
+abi = "abis/RewardPoolFactory.json"
+
+[[contracts]]
+alias = "clm_manager_factory"
+address = "0x7cac900B2f504047b40F5554F633248f78bD960A"
+start_block = 4883535
+abi = "abis/ClmManagerFactory.json"
+
+# Share tokens: every proxy a factory announces is indexed from its announcement block.
+[[templates]]
+name = "classic_vault"
+abi = "abis/ClassicVault.json"
+
+[[templates]]
+name = "reward_pool"
+abi = "abis/RewardPool.json"
+
+[[templates]]
+name = "clm_manager"
+abi = "abis/ClmManager.json"
+
+[[factories]]
+watch = "classic_vault_factory"
+event = "ProxyCreated"
+child_param = "proxy"
+template = "classic_vault"
+
+[[factories]]
+watch = "reward_pool_factory"
+event = "ProxyCreated(address)"
+child_param = "proxy"
+template = "reward_pool"
+
+[[factories]]
+watch = "reward_pool_factory"
+event = "ProxyCreated(string,address)"
+child_param = "proxy"
+template = "reward_pool"
+
+[[factories]]
+watch = "clm_manager_factory"
+event = "ProxyCreated"
+child_param = "proxy"
+template = "clm_manager"

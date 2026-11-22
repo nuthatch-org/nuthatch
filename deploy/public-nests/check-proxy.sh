@@ -61,7 +61,13 @@ body_has "POST /mcp tools/list"      '"tools"' "${json[@]}" -H 'accept: applicat
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"
 
 echo "== refused: admin and operator surface"
-expect "GET /_admin/"                403 "$base/_admin/"
+# Against the host itself nginx answers these, so they are held to its exact answers. Behind the path URL on
+# nuthatch-indexer.com (a /nests/ URL) Vercel answers first: a trailing-slash /_admin/ is a 404 and a double
+# slash a 308 before either reaches the host. Both are refusals, so only that URL is let off the exact answer.
+# That also means a run against the path URL does not exercise nginx's own refusal: run it against the host too.
+admin_slash=403; dslash='403|404'
+if [[ $base == */nests/* ]]; then admin_slash='403|404'; dslash='403|404|308'; fi
+expect "GET /_admin/"                "$admin_slash" "$base/_admin/"
 expect "GET /_admin"                 403 "$base/_admin"
 expect "GET /_admin/config"          403 "$base/_admin/config"
 expect "GET /_admin/events"          403 "$base/_admin/events"
@@ -71,7 +77,7 @@ expect "PUT /_admin/runtime"         403 -X PUT "${json[@]}" -d '{}' "$base/_adm
 expect "GET /metrics"                403 "$base/metrics"
 expect "traversal /sql/../_admin/"   '403|404' --path-as-is "$base/sql/../_admin/config"
 expect "encoded /%5fadmin/config"    '403|404' --path-as-is "$base/%5fadmin/config"
-expect "double slash //_admin/"      '403|404' --path-as-is "$base//_admin/config"
+expect "double slash //_admin/"      "$dslash" --path-as-is "$base//_admin/config"
 
 echo "== refused: routes not offered publicly"
 for p in /nests /entities /entity/x /derived /derived/x /balances /balance/0x0 /exposure/0x0 /flags \
