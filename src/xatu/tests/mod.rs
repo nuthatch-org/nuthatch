@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 mod bench;
 
@@ -36,6 +37,8 @@ struct Recorded {
     header_calls: AtomicUsize,
     /// Lie about this block's hash, to make the anchor disagree.
     wrong_hash_at: Option<u64>,
+    /// The node's `finalized` block; `None` is a node that exposes none.
+    finalized: Option<u64>,
 }
 
 impl Recorded {
@@ -86,6 +89,7 @@ impl Recorded {
             log_calls: Mutex::new(Vec::new()),
             header_calls: AtomicUsize::new(0),
             wrong_hash_at,
+            finalized: None,
         }
     }
     fn header(&self, n: u64) -> Option<&(u64, String, u64)> {
@@ -113,6 +117,9 @@ impl Source for Recorded {
         }
         Ok(self.header(n).map(|h| h.1.clone()))
     }
+    async fn finalized(&self) -> Result<Option<u64>> {
+        Ok(self.finalized)
+    }
     async fn block_timestamps(&self, blocks: &[u64]) -> Result<HashMap<u64, u64>> {
         self.header_calls.fetch_add(1, Ordering::SeqCst);
         Ok(blocks
@@ -131,6 +138,8 @@ struct Files {
     missing: HashSet<u64>,
     corrupt_logs: HashSet<u64>,
     old_schema: bool,
+    /// Chunks whose logs file fails to come down (a stalled or erroring host).
+    failing_logs: HashSet<u64>,
     gets: AtomicUsize,
 }
 
@@ -143,6 +152,7 @@ impl Files {
             missing: missing.iter().copied().collect(),
             corrupt_logs: corrupt_logs.iter().copied().collect(),
             old_schema: false,
+            failing_logs: HashSet::new(),
             gets: AtomicUsize::new(0),
         })
     }
@@ -164,6 +174,9 @@ impl Fetch for Files {
             .unwrap();
         if self.missing.contains(&start) {
             return Ok(None);
+        }
+        if rel.starts_with("canonical_execution_logs") && self.failing_logs.contains(&start) {
+            anyhow::bail!("{url}: HTTP 503");
         }
         if rel.starts_with("canonical_execution_logs") && self.corrupt_logs.contains(&start) {
             return Ok(Some(Bytes::from_static(b"not parquet at all")));
@@ -323,6 +336,7 @@ async fn the_handoff_to_rpc_has_no_gap_and_no_duplicate() {
     let before = files.gets.load(Ordering::SeqCst);
     x.logs(&f, FIRST + 8, LAST).await.unwrap();
     assert_eq!(files.gets.load(Ordering::SeqCst), before);
+    assert_eq!(x.stats.absent.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -358,6 +372,8 @@ async fn a_chunk_that_disagrees_with_the_chain_is_not_used() {
         "headers there come from RPC"
     );
     assert!(x.cached(FIRST + 5).is_none());
+    // The anchor is checked before the logs file is downloaded: three block files, two logs files.
+    assert_eq!(files.gets.load(Ordering::SeqCst), 5);
 }
 
 #[tokio::test]
@@ -366,9 +382,115 @@ async fn a_reorg_notice_drops_what_it_could_reach() {
     let x = source(&rpc, &files);
     x.logs(&filter(&[USDC]), FIRST, LAST).await.unwrap();
     assert!(x.cached(LAST).is_some());
+    // The trait forgets what is *above* the block: a chunk ending exactly there stays.
+    x.forget_cached_above(FIRST + 7);
+    assert!(x.cached(FIRST + 7).is_some() && x.cached(FIRST + 8).is_none());
     x.forget_cached_above(FIRST + 5);
     assert!(x.cached(FIRST + 1).is_some(), "a chunk wholly below stays");
     assert!(x.cached(LAST).is_none() && x.cached(FIRST + 5).is_none());
+}
+
+#[tokio::test]
+async fn a_chunk_not_yet_final_is_left_to_rpc() {
+    // A mirror that keeps up with the head: a held chunk would answer the indexer's reorg check
+    // (`block_hash`) with its own word, so nothing above finality may be held.
+    let rpc = Arc::new(Recorded {
+        finalized: Some(FIRST + 5),
+        ..Recorded::with(None)
+    });
+    let files = Files::all();
+    let x = source(&rpc, &files);
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 4, LAST)]);
+    assert!(x.cached(FIRST + 5).is_none() && x.cached(FIRST + 3).is_some());
+    assert_eq!(
+        files.gets.load(Ordering::SeqCst),
+        2,
+        "only the final chunk was fetched"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_host_is_not_asked_again_by_every_window() {
+    let rpc = Recorded::load();
+    let files = Arc::new(Files {
+        failing_logs: [FIRST + 4].into_iter().collect(),
+        ..Arc::try_unwrap(Files::all()).ok().unwrap()
+    });
+    let mut x = source(&rpc, &files);
+    x.retry_after = Duration::from_millis(300);
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 4, FIRST + 7)]);
+    let before = files.gets.load(Ordering::SeqCst);
+    x.logs(&f, FIRST + 4, FIRST + 7).await.unwrap();
+    assert_eq!(
+        files.gets.load(Ordering::SeqCst),
+        before,
+        "remembered for a while"
+    );
+    // Transient, not bad: once the while is over it is tried again.
+    tokio::time::sleep(x.retry_after + Duration::from_millis(50)).await;
+    x.logs(&f, FIRST + 4, FIRST + 7).await.unwrap();
+    assert!(files.gets.load(Ordering::SeqCst) > before);
+}
+
+#[tokio::test]
+async fn headers_outlive_the_logs_of_a_window_wider_than_the_cache() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let mut x = source(&rpc, &files);
+    x.keep_chunks = 1;
+    let f = filter(&[USDC, USDT]);
+    x.logs(&f, FIRST, LAST).await.unwrap();
+    let blocks: Vec<u64> = (FIRST..=LAST).collect();
+    let ts = x.block_timestamps(&blocks).await.unwrap();
+    for h in &rpc.headers {
+        assert_eq!(ts[&h.0], h.2);
+    }
+    assert_eq!(
+        rpc.header_calls.load(Ordering::SeqCst),
+        3,
+        "the anchors only, no header call for a chunk whose logs were evicted"
+    );
+}
+
+#[tokio::test]
+async fn a_filter_matching_too_much_is_decoded_per_window_not_held() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let mut x = source(&rpc, &files);
+    x.matched_budget = 1;
+    let f = filter(&[USDC, USDT]);
+    for (from, to) in [
+        (FIRST, LAST),
+        (FIRST + 1, FIRST + 2),
+        (FIRST + 3, FIRST + 9),
+    ] {
+        same(
+            &x.logs(&f, from, to).await.unwrap(),
+            &rpc.answer(&f, from, to),
+        );
+    }
+    assert!(rpc.log_calls.lock().unwrap().is_empty());
+    assert_eq!(x.stats.fallbacks.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_empty_range_is_the_rpcs_to_answer() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let x = source(&rpc, &files);
+    let got = x
+        .logs(&filter(&[USDC]), FIRST + 2, FIRST + 1)
+        .await
+        .unwrap();
+    assert!(got.is_empty());
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 2, FIRST + 1)]);
 }
 
 #[test]
@@ -379,4 +501,26 @@ fn a_dataset_in_another_shape_is_refused_not_guessed() {
         "raw bytes are not the format this reads"
     );
     assert!(hex_text(b"deadbeef").is_err());
+}
+
+#[tokio::test]
+async fn decoded_rows_are_held_within_the_budget_across_chunks() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let f = filter(&[USDC, USDT]);
+    let x = source(&rpc, &files);
+    x.logs(&f, FIRST, LAST).await.unwrap();
+    let all = x.matched_bytes();
+    assert!(all > 0);
+
+    let mut x = source(&rpc, &files);
+    x.matched_budget = all - 1;
+    for (from, to) in [(FIRST, LAST), (FIRST + 2, FIRST + 5), (FIRST + 9, LAST)] {
+        same(
+            &x.logs(&f, from, to).await.unwrap(),
+            &rpc.answer(&f, from, to),
+        );
+        let held = x.matched_bytes();
+        assert!(held > 0 && held < all, "{held} of {all} held");
+    }
+    assert!(rpc.log_calls.lock().unwrap().is_empty());
 }

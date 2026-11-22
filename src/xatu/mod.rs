@@ -14,16 +14,25 @@
 //! RPC source, in contiguous runs. Parts are disjoint and visited in ascending order, so the handoff
 //! has no gap and no duplicate by construction.
 //!
-//! **Trust.** A chunk is used only after it passes three checks, each cheap and deterministic: its
-//! block file has exactly one row per block with an unbroken parent-hash chain; the logs file opens
-//! with the columns this reader needs; and the RPC's hash for the chunk's *last* block equals the
-//! dataset's. That is one RPC call per 1,000 blocks. Any mismatch, fetch error or parse error falls
-//! back to RPC for that chunk with a warning, never an empty answer. What it cannot check is that a
-//! block's logs are *complete*: the dataset carries no receipts root.
+//! **Trust.** A chunk is used only once it is past the chain's finality (so a cached hash can never
+//! hide a reorg from the indexer's reorg check) and after three checks, each cheap and
+//! deterministic: its block file has exactly one row per block, and, where the file carries parent
+//! hashes, an unbroken parent-hash chain; the RPC's hash for the chunk's *last* block (and its first,
+//! in older files without parent hashes) equals the dataset's; and the logs file opens with the
+//! columns this reader needs. That is one or two RPC calls per 1,000 blocks, made before the large
+//! logs file is downloaded. The parent-hash chain is the file agreeing with itself, not the chain
+//! vouching for it: the hashes of the blocks between the anchors are the dataset's word. Any
+//! mismatch, fetch error or parse error falls back to RPC for that chunk with a warning, never an
+//! empty answer. What it cannot check is that a block's logs are *complete*: the dataset carries no
+//! receipts root.
 //!
-//! **Memory.** The compressed bytes of at most `KEEP_CHUNKS` chunks are held, and each chunk keeps
-//! the decoded rows of the one filter last asked of it, so a backfill's many small windows decode a
-//! chunk once.
+//! **Memory.** The compressed logs of at most `KEEP_CHUNKS` chunks (4 x 35 to 50 MB on mainnet); the
+//! hashes and timestamps of the last `KEEP_HEADERS` chunks (about 100 KB each), so a wide window's
+//! header lookups do not outlive its logs; and the decoded rows of the filter last asked of each held
+//! chunk, within `MATCHED_BUDGET` (256 MiB) between them, least recently used dropped first. A filter
+//! matching more than that of one chunk is decoded per window instead. About 0.5 GB held at most,
+//! plus the decode in flight, inside the 2 GB cursor budget; a backfill's many small windows still
+//! decode a chunk once.
 
 mod chunks;
 mod columns;
@@ -37,6 +46,7 @@ use crate::source::Source;
 use chunks::State;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use config::with_history_source;
 pub use fetch::{Fetch, HttpFetch};
@@ -61,6 +71,9 @@ pub struct Stats {
     pub fallbacks: AtomicU64,
     /// Block-timestamp and hash lookups answered from the dataset.
     pub header_hits: AtomicU64,
+    /// Chunks the dataset had no file for (its head, or a mirror without the layout), then asked
+    /// of the RPC.
+    pub absent: AtomicU64,
 }
 
 pub struct XatuSource {
@@ -70,6 +83,14 @@ pub struct XatuSource {
     chunk_len: u64,
     state: Mutex<State>,
     load: tokio::sync::Mutex<()>,
+    /// The highest block seen to be final, so old chunks need no finality call each.
+    final_seen: AtomicU64,
+    keep_chunks: usize,
+    keep_headers: usize,
+    matched_budget: usize,
+    /// How long a transient failure (a stalled host, an RPC that would not answer the anchor) is
+    /// remembered before the chunk is tried again.
+    retry_after: Duration,
     pub stats: Stats,
 }
 
@@ -92,6 +113,11 @@ impl XatuSource {
             chunk_len,
             state: Mutex::new(State::default()),
             load: tokio::sync::Mutex::new(()),
+            final_seen: AtomicU64::new(0),
+            keep_chunks: chunks::KEEP_CHUNKS,
+            keep_headers: chunks::KEEP_HEADERS,
+            matched_budget: chunks::MATCHED_BUDGET,
+            retry_after: chunks::TRANSIENT_FOR,
             stats: Stats::default(),
         }
     }

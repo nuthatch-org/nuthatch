@@ -172,8 +172,17 @@ pub(super) fn check_logs_schema(bytes: &Bytes) -> Result<()> {
 
 /// Every log of the chunk that `filter` asks for, in (block, log index) order, normalised to what
 /// `eth_getLogs` returns: lowercase `0x` hex, empty data as `0x`, the block hash joined from the
-/// block file (the dataset's logs carry none).
-pub(super) fn extract_logs(c: &Chunk, filter: &LogFilter, len: u64) -> Result<Vec<Log>> {
+/// block file (the dataset's logs carry none). Only blocks in `range` are kept, and `Ok(None)` is
+/// "the kept rows grew past `budget` bytes" (an estimate of their heap size).
+pub(super) fn extract_logs(
+    c: &Chunk,
+    filter: &LogFilter,
+    len: u64,
+    range: (u64, u64),
+    budget: usize,
+) -> Result<Option<Vec<Log>>> {
+    let start = c.headers.start;
+    let mut held = 0usize;
     let builder = open(c.logs.clone())?;
     let schema = builder.parquet_schema();
     let mask = ProjectionMask::columns(schema, LOG_COLUMNS);
@@ -213,8 +222,11 @@ pub(super) fn extract_logs(c: &Chunk, filter: &LogFilter, len: u64) -> Result<Ve
                 }
             }
             let bn = number.value(i);
-            if bn < c.start || bn >= c.start + len {
+            if bn < start || bn >= start + len {
                 bail!("a log is for block {bn}, outside the chunk");
+            }
+            if bn < range.0 || bn > range.1 {
+                continue;
             }
             let mut t = Vec::new();
             for col in &topics {
@@ -232,11 +244,15 @@ pub(super) fn extract_logs(c: &Chunk, filter: &LogFilter, len: u64) -> Result<Ve
                     hex_text(data.value(i))?.into_owned()
                 },
                 block_number: bn,
-                block_hash: c.hashes[(bn - c.start) as usize].clone(),
+                block_hash: c.headers.hashes[(bn - start) as usize].clone(),
                 tx_hash: hex_text(tx.value(i))?.into_owned(),
                 log_index: index.value(i),
             };
             if filter.matches(&log) {
+                held += heap_size(&log);
+                if held > budget {
+                    return Ok(None);
+                }
                 out.push(log);
             }
         }
@@ -248,5 +264,16 @@ pub(super) fn extract_logs(c: &Chunk, filter: &LogFilter, len: u64) -> Result<Ve
     {
         bail!("the logs file repeats a (block, log index)");
     }
-    Ok(out)
+    Ok(Some(out))
+}
+
+/// Roughly what a decoded `Log` holds on the heap, for [`extract_logs`]'s budget.
+pub(super) fn heap_size(l: &Log) -> usize {
+    const STRING: usize = std::mem::size_of::<String>();
+    std::mem::size_of::<Log>()
+        + l.address.len()
+        + l.data.len()
+        + l.block_hash.len()
+        + l.tx_hash.len()
+        + l.topics.iter().map(|t| t.len() + STRING).sum::<usize>()
 }

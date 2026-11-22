@@ -18,6 +18,11 @@ impl HttpFetch {
     pub fn new() -> Result<Self> {
         Ok(Self(
             reqwest::Client::builder()
+                // A host that accepts and then stalls must fail in seconds, not minutes: every
+                // window behind this chunk waits on it. 30 s without a byte is a stall; 300 s in
+                // all still lets a 50 MB file come down a slow line.
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(30))
                 .timeout(Duration::from_secs(300))
                 .user_agent("nuthatch")
                 .build()?,

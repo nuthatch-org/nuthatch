@@ -20,7 +20,10 @@ to the dataset, and no code on the default path knows it exists.
   change what a nest *is*, so a nest backfilled from the dataset has the same NID as one backfilled
   from RPC, and the two can share segments.
 - Public, anonymous HTTPS GETs of static files. No account, no key, no identifier sent. If the
-  dataset is unreachable, you lose nothing: the RPC serves everything, as it does today.
+  dataset is unreachable, you lose nothing: the RPC serves everything, as it does today. A host that
+  refuses connections costs nothing; one that accepts and then stalls costs up to about 30 seconds a
+  attempt (three attempts) before that range goes to the RPC, and is then left alone for a minute
+  rather than retried by every window.
 
 ## When to use it
 
@@ -49,27 +52,41 @@ seal line and the tail always comes from the RPC. You do not configure the hando
   beyond its newest file, and any file that failed, go to the RPC in contiguous runs.
 - Parts are disjoint and taken in ascending order, so there is no gap and no duplicate.
 - A missing file is remembered for ten minutes, so the tail does not ask the dataset on every poll.
+  The first missing file is logged once (`WARN xatu: the dataset has no file for blocks …`) with the
+  URL it tried: expected at the dataset's head, and the sign to look for if `--history-url` points at
+  a mirror with another layout.
+- A file is used only once its last block is past the chain's `finalized` block (or 64 blocks deep on
+  an RPC that exposes none). The indexer's reorg check asks for block hashes, and a held file answers
+  them; a file that could still reorganise must not. The public dataset lags by hours, so this only
+  matters for a mirror that keeps up with the head.
 
 ## How it stays honest
 
 A file is used only after three checks, and any failure falls back to the RPC for that 1,000-block
 range with a `WARN xatu:` log line saying why:
 
-1. The block file has exactly one row per block and an unbroken parent-hash chain. Files before about
-   block 26.4M carry no parent hashes (the column is missing or empty), so there the RPC's hash is
-   checked at the file's first block too: two RPC calls per 1,000 blocks, and the hashes of the
-   blocks between are the dataset's word.
-2. The logs file has the columns this reader needs, in the format it knows (hex text; anything else is
+1. The block file has exactly one row per block, and, where it carries parent hashes, an unbroken
+   parent-hash chain.
+2. The RPC's hash for the file's last block equals the dataset's: **one RPC call per 1,000 blocks**.
+   Files before about block 26.4M carry no parent hashes (the column is missing or empty), so there
+   the file's first block is checked too: two calls. This is done before the logs file is downloaded.
+3. The logs file has the columns this reader needs, in the format it knows (hex text; anything else is
    refused, never guessed at).
-3. The RPC's hash for the file's last block equals the dataset's: **one RPC call per 1,000 blocks**
-   (two on the older files above).
+
+Only the checked blocks are the chain's word. The parent-hash chain shows the file agrees with
+itself, not that the chain agrees with every hash in it: a file that is wrong but self-consistent
+between its checked ends would pass, and the hashes of the blocks in between (which go into each
+log's `block_hash` and into window checkpoints) are the dataset's word, in every file.
 
 What it cannot check: that every log of a block is *present*. The dataset carries no receipts root.
 The equality below is measured on the sample it was measured on; if you need proof for a range you
 care about, compare a few `eth_getLogs` answers against it, or leave the flag off.
 
-Memory is bounded: the compressed bytes of four files (up to about 200 MB) and the decoded rows of
-the one filter last asked of each.
+Memory is bounded at about 0.5 GB, inside the 2 GB per-cursor budget: the compressed bytes of four
+logs files (up to about 200 MB); the hashes and timestamps of the last 128 files (about 13 MB), so a
+wide `--window` does not pay header calls for the files it has moved past; and the decoded rows of
+the filter last asked of each held file, at most 256 MiB between them (a file of USDC's logs is 60 to 110 MB
+decoded). A filter that matches more than that of one file is decoded window by window instead.
 
 Fixtures in CI (`tests/fixtures/xatu`) are real mainnet files for blocks 26,462,624 to 26,462,635
 beside the recorded `eth_getLogs` and header answers for the same blocks; the tests assert the logs

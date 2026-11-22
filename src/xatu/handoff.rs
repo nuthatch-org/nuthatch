@@ -112,6 +112,10 @@ impl Source for XatuSource {
     }
 
     async fn logs(&self, filter: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
+        if from > to {
+            // Not a range this splits; whatever the RPC says to it is the answer.
+            return self.inner.logs(filter, from, to).await;
+        }
         let mut out: Vec<Log> = Vec::new();
         // The RPC run being gathered: contiguous parts the dataset did not serve.
         let mut run: Option<(u64, u64)> = None;
