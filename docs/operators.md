@@ -964,6 +964,7 @@ and `--concurrency`):
 | `--listen` | bind address. Defaults to `127.0.0.1:8288` |
 | `--rpc` | override configured endpoints without editing config. Repeatable. Single-chain runtimes only (ambiguous once a runtime spans chains) |
 | `--rpc-fallback` | endpoint(s) asked only while every other endpoint is failing. Repeatable. Put a paid key here behind free endpoints and it bills only for what they could not answer. Otherwise endpoints share the load round-robin, so a paid key in `--rpc` takes its share of every call. Single-chain runtimes only |
+| `--history-source xatu` | read old logs and block timestamps from ethPandaOps' public Xatu Parquet, the RPC for the tail and anything it lacks. Ethereum mainnet only; off unless named. [Details](history-from-xatu.md) |
 | `--seal-direct` | backfill finalised history straight to Parquet, bypassing the hot store. Prerequisite for `--concurrency`; the storage path alone is not a speedup. Current figures: [benchmarks.md](benchmarks.md) |
 | `--concurrency` | concurrent window fetches during seal-direct backfill. 8-16 against your own node; low on rate-limited public RPC |
 | `--window` | the widest `eth_getLogs` block range nuthatch asks for, and where its adaptive window starts. Without it the window starts at the chain default and grows over empty ranges (to 100,000 blocks for a log-only nest); with it no request is wider than this, though it still shrinks when a provider refuses a range. Set it to your provider's range cap, or high (50k) for a *sparse* contract |
