@@ -21,9 +21,11 @@ to the dataset, and no code on the default path knows it exists.
   from RPC, and the two can share segments.
 - Public, anonymous HTTPS GETs of static files. No account, no key, no identifier sent. If the
   dataset is unreachable, you lose nothing: the RPC serves everything, as it does today. A host that
-  refuses connections costs nothing; one that accepts and then stalls costs up to about 30 seconds a
-  attempt (three attempts) before that range goes to the RPC, and is then left alone for a minute
-  rather than retried by every window.
+  refuses connections costs nothing. One that accepts and then stalls is given up on after 30 seconds
+  without a byte (three attempts per file, two files per 1,000 blocks), one that trickles after 300
+  seconds a file; that range then goes to the RPC and the dataset is left alone for it for a minute
+  rather than retried by every window. Files are fetched one at a time, so while a stalled file is
+  being given up on, other backfill windows that need a new file wait for it; the tip does not.
 
 ## When to use it
 
@@ -55,7 +57,7 @@ seal line and the tail always comes from the RPC. You do not configure the hando
   The first missing file is logged once (`WARN xatu: the dataset has no file for blocks …`) with the
   URL it tried: expected at the dataset's head, and the sign to look for if `--history-url` points at
   a mirror with another layout.
-- A file is used only once its last block is past the chain's `finalized` block (or 64 blocks deep on
+- A file is used only once its last block is past the chain's `finalized` block (or 96 blocks deep on
   an RPC that exposes none). The indexer's reorg check asks for block hashes, and a held file answers
   them; a file that could still reorganise must not. The public dataset lags by hours, so this only
   matters for a mirror that keeps up with the head.
@@ -67,7 +69,7 @@ range with a `WARN xatu:` log line saying why:
 
 1. The block file has exactly one row per block, and, where it carries parent hashes, an unbroken
    parent-hash chain.
-2. The RPC's hash for the file's last block equals the dataset's: **one RPC call per 1,000 blocks**.
+2. The RPC's hash and timestamp for the file's last block equal the dataset's: **one RPC call per 1,000 blocks**.
    Files before about block 26.4M carry no parent hashes (the column is missing or empty), so there
    the file's first block is checked too: two calls. This is done before the logs file is downloaded.
 3. The logs file has the columns this reader needs, in the format it knows (hex text; anything else is
@@ -76,7 +78,10 @@ range with a `WARN xatu:` log line saying why:
 Only the checked blocks are the chain's word. The parent-hash chain shows the file agrees with
 itself, not that the chain agrees with every hash in it: a file that is wrong but self-consistent
 between its checked ends would pass, and the hashes of the blocks in between (which go into each
-log's `block_hash` and into window checkpoints) are the dataset's word, in every file.
+log's `block_hash` and into window checkpoints) are the dataset's word, in every file. A wrong one
+cannot hide a reorg, but it can invent one: once that file leaves the cache, the indexer's reorg check
+compares the stored checkpoint with the RPC, sees a mismatch, and rolls the nest back to the last
+block where they agree. The block timestamp is checked at the same blocks as the hash.
 
 What it cannot check: that every log of a block is *present*. The dataset carries no receipts root.
 The equality below is measured on the sample it was measured on; if you need proof for a range you

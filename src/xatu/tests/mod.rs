@@ -39,6 +39,8 @@ struct Recorded {
     wrong_hash_at: Option<u64>,
     /// The node's `finalized` block; `None` is a node that exposes none.
     finalized: Option<u64>,
+    /// Say this block is a second later than it was, to make the timestamp anchor disagree.
+    wrong_time_at: Option<u64>,
 }
 
 impl Recorded {
@@ -90,6 +92,7 @@ impl Recorded {
             header_calls: AtomicUsize::new(0),
             wrong_hash_at,
             finalized: None,
+            wrong_time_at: None,
         }
     }
     fn header(&self, n: u64) -> Option<&(u64, String, u64)> {
@@ -117,6 +120,12 @@ impl Source for Recorded {
         }
         Ok(self.header(n).map(|h| h.1.clone()))
     }
+    /// One header, as the RPC client answers it.
+    async fn block_record(&self, n: u64) -> Result<Option<(String, Option<u64>)>> {
+        let hash = self.block_hash(n).await?;
+        let skew = u64::from(self.wrong_time_at == Some(n));
+        Ok(hash.map(|h| (h, self.header(n).map(|h| h.2 + skew))))
+    }
     async fn finalized(&self) -> Result<Option<u64>> {
         Ok(self.finalized)
     }
@@ -140,6 +149,8 @@ struct Files {
     old_schema: bool,
     /// Chunks whose logs file fails to come down (a stalled or erroring host).
     failing_logs: HashSet<u64>,
+    /// Chunks whose block file is published but not (yet) their logs file.
+    missing_logs: HashSet<u64>,
     gets: AtomicUsize,
 }
 
@@ -153,6 +164,7 @@ impl Files {
             corrupt_logs: corrupt_logs.iter().copied().collect(),
             old_schema: false,
             failing_logs: HashSet::new(),
+            missing_logs: HashSet::new(),
             gets: AtomicUsize::new(0),
         })
     }
@@ -173,6 +185,9 @@ impl Fetch for Files {
             .parse()
             .unwrap();
         if self.missing.contains(&start) {
+            return Ok(None);
+        }
+        if rel.starts_with("canonical_execution_logs") && self.missing_logs.contains(&start) {
             return Ok(None);
         }
         if rel.starts_with("canonical_execution_logs") && self.failing_logs.contains(&start) {
@@ -523,4 +538,47 @@ async fn decoded_rows_are_held_within_the_budget_across_chunks() {
         assert!(held > 0 && held < all, "{held} of {all} held");
     }
     assert!(rpc.log_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_chunk_whose_timestamp_disagrees_with_the_chain_is_not_used() {
+    // Timestamps are sealed into every row: a file shifted by a unit or a time zone must not pass
+    // on its hashes alone.
+    let rpc = Arc::new(Recorded {
+        wrong_time_at: Some(FIRST + 7),
+        ..Recorded::with(None)
+    });
+    let files = Files::all();
+    let x = source(&rpc, &files);
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 4, FIRST + 7)]);
+    assert!(x.cached(FIRST + 5).is_none());
+}
+
+#[tokio::test]
+async fn a_logs_file_not_yet_published_is_tried_again_not_given_up_on() {
+    let rpc = Recorded::load();
+    let files = Arc::new(Files {
+        missing_logs: [FIRST + 8].into_iter().collect(),
+        ..Arc::try_unwrap(Files::all()).ok().unwrap()
+    });
+    let mut x = source(&rpc, &files);
+    x.retry_after = Duration::from_millis(100);
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 8, LAST)]);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let before = files.gets.load(Ordering::SeqCst);
+    x.logs(&f, FIRST + 8, LAST).await.unwrap();
+    assert!(
+        files.gets.load(Ordering::SeqCst) > before,
+        "asked again, not marked bad"
+    );
 }

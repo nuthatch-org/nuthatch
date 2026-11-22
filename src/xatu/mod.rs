@@ -17,8 +17,8 @@
 //! **Trust.** A chunk is used only once it is past the chain's finality (so a cached hash can never
 //! hide a reorg from the indexer's reorg check) and after three checks, each cheap and
 //! deterministic: its block file has exactly one row per block, and, where the file carries parent
-//! hashes, an unbroken parent-hash chain; the RPC's hash for the chunk's *last* block (and its first,
-//! in older files without parent hashes) equals the dataset's; and the logs file opens with the
+//! hashes, an unbroken parent-hash chain; the RPC's hash and timestamp for the chunk's *last* block (and
+//! its first, in older files without parent hashes) equal the dataset's; and the logs file opens with the
 //! columns this reader needs. That is one or two RPC calls per 1,000 blocks, made before the large
 //! logs file is downloaded. The parent-hash chain is the file agreeing with itself, not the chain
 //! vouching for it: the hashes of the blocks between the anchors are the dataset's word. Any
@@ -83,6 +83,9 @@ pub struct XatuSource {
     chunk_len: u64,
     state: Mutex<State>,
     load: tokio::sync::Mutex<()>,
+    /// Held while a chunk is decoded whole: one such decode in flight, so the decoded-rows budget
+    /// holds while it runs and concurrent windows of one chunk decode it once.
+    decoding: tokio::sync::Mutex<()>,
     /// The highest block seen to be final, so old chunks need no finality call each.
     final_seen: AtomicU64,
     keep_chunks: usize,
@@ -113,6 +116,7 @@ impl XatuSource {
             chunk_len,
             state: Mutex::new(State::default()),
             load: tokio::sync::Mutex::new(()),
+            decoding: tokio::sync::Mutex::new(()),
             final_seen: AtomicU64::new(0),
             keep_chunks: chunks::KEEP_CHUNKS,
             keep_headers: chunks::KEEP_HEADERS,

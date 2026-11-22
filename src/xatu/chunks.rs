@@ -34,8 +34,8 @@ const ABSENT_FOR: Duration = Duration::from_secs(600);
 pub(super) const TRANSIENT_FOR: Duration = Duration::from_secs(60);
 
 /// When the RPC exposes no `finalized` block, a chunk is used once its last block is this deep.
-/// Two epochs: mainnet's finality.
-const FINALITY_DEPTH: u64 = 64;
+/// Three epochs: mainnet finalizes 2 to 3 epochs (64 to 96 slots) behind the head.
+const FINALITY_DEPTH: u64 = 96;
 
 /// The blocks of a chunk that passed the checks.
 pub(super) struct Headers {
@@ -50,8 +50,6 @@ pub(super) struct Chunk {
     pub(super) logs: Bytes,
     /// The decoded rows for the filter last asked, sorted by (block, log index).
     matched: Mutex<Option<(LogFilter, Matched)>>,
-    /// Held while the chunk is decoded whole, so concurrent windows of one chunk decode it once.
-    decoding: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -102,6 +100,21 @@ impl XatuSource {
         if let Some(c) = self.lookup(start) {
             return c;
         }
+        // Past finality only, decided before queueing behind another chunk's download so the tip's
+        // windows never wait on one. The indexer checks for reorgs by asking `block_hash`, which a
+        // held chunk answers; a chunk that could still reorganise would hide the reorg it should
+        // see. The public dataset lags by hours, so this only ever bites a mirror that does not.
+        match self.is_final(start + self.chunk_len - 1).await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.forget_for(start, ABSENT_FOR);
+                return None;
+            }
+            Err(Fault::Transient(e) | Fault::Bad(e)) => {
+                self.transient(start, &e);
+                return None;
+            }
+        }
         let _one_load_at_a_time = self.load.lock().await;
         if let Some(c) = self.lookup(start) {
             return c;
@@ -151,18 +164,7 @@ impl XatuSource {
                 None
             }
             Err(Fault::Transient(e)) => {
-                self.stats.fallbacks.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    "xatu: could not check blocks {start}..={} ({e:#}); asking the RPC for them, and \
-                     the dataset again in {}s",
-                    start + self.chunk_len - 1,
-                    self.retry_after.as_secs()
-                );
-                self.state
-                    .lock()
-                    .unwrap()
-                    .gone
-                    .insert(start, Some(Instant::now() + self.retry_after));
+                self.transient(start, &e);
                 None
             }
             Err(Fault::Bad(e)) => {
@@ -189,6 +191,25 @@ impl XatuSource {
             }
             None => None,
         }
+    }
+
+    fn forget_for(&self, start: u64, d: Duration) {
+        self.state
+            .lock()
+            .unwrap()
+            .gone
+            .insert(start, Some(Instant::now() + d));
+    }
+
+    fn transient(&self, start: u64, e: &anyhow::Error) {
+        self.stats.fallbacks.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "xatu: could not check blocks {start}..={} ({e:#}); asking the RPC for them, and the \
+             dataset again in {}s",
+            start + self.chunk_len - 1,
+            self.retry_after.as_secs()
+        );
+        self.forget_for(start, self.retry_after);
     }
 
     pub(super) fn mark_bad(&self, start: u64, why: &anyhow::Error) {
@@ -231,12 +252,6 @@ impl XatuSource {
 
     async fn load_chunk(&self, start: u64) -> Result<Option<Chunk>, Fault> {
         let last = start + self.chunk_len - 1;
-        // Past finality only. The indexer checks for reorgs by asking `block_hash`, which a held
-        // chunk answers; a chunk that could still reorganise would hide the reorg it should see. The
-        // public dataset lags by hours, so this only ever bites a mirror that does not.
-        if !self.is_final(last).await? {
-            return Ok(None);
-        }
         let Some(blocks) = self
             .fetch
             .get(&self.url("canonical_execution_block", start))
@@ -251,17 +266,19 @@ impl XatuSource {
             .map_err(|e| Fault::Bad(anyhow!(e)))?
             .map_err(Fault::Bad)?;
 
-        // The anchor, before the large logs file is downloaded: the chain's own hash for the chunk's
-        // last block, and for its first when the file has no parent hashes to chain the blocks
-        // between. The chain is the file agreeing with itself; only the anchors are the chain's word.
+        // The anchor, before the large logs file is downloaded: the chain's own hash and timestamp
+        // for the chunk's last block, and for its first when the file has no parent hashes to chain
+        // the blocks between (one header each from an RPC client). The chain is the file agreeing
+        // with itself; only the anchors are the chain's word. The timestamp is checked because it is
+        // sealed into every row, and a writer's unit or time-zone slip would shift the whole file.
         let mut anchors = vec![last];
         if !parsed.chained {
             anchors.insert(0, start);
         }
         for block in anchors {
             self.stats.anchor_calls.fetch_add(1, Ordering::Relaxed);
-            let canonical = match self.inner.block_hash(block).await {
-                Ok(Some(h)) => h,
+            let (canonical, time) = match self.inner.block_record(block).await {
+                Ok(Some(r)) => r,
                 Ok(None) => {
                     return Err(Fault::Transient(anyhow!(
                         "the RPC has no hash for block {block} to check the chunk against"
@@ -279,6 +296,13 @@ impl XatuSource {
                     "block {block} is {ours} in the dataset but {canonical} on the chain"
                 )));
             }
+            let at = parsed.timestamps[(block - start) as usize];
+            if time.is_some_and(|t| t != at) {
+                return Err(Fault::Bad(anyhow!(
+                    "block {block} is at {at} in the dataset but {} on the chain",
+                    time.unwrap_or_default()
+                )));
+            }
         }
 
         let Some(logs) = self
@@ -287,8 +311,10 @@ impl XatuSource {
             .await
             .map_err(Fault::Transient)?
         else {
-            return Err(Fault::Bad(anyhow!(
-                "the dataset has the block file for this chunk but not the logs file"
+            // Not bad: the two files may be published apart, so the newest chunk can have its
+            // block file first. Try again in a while.
+            return Err(Fault::Transient(anyhow!(
+                "the dataset has the block file for this chunk but not (yet) the logs file"
             )));
         };
         self.stats
@@ -303,7 +329,6 @@ impl XatuSource {
             }),
             logs,
             matched: Mutex::new(None),
-            decoding: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -326,7 +351,7 @@ impl XatuSource {
         };
         let mut found = hit();
         let _decoding = if found.is_none() {
-            let guard = c.decoding.lock().await;
+            let guard = self.decoding.lock().await;
             found = hit();
             Some(guard)
         } else {
