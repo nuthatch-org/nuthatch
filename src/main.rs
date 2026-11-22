@@ -171,6 +171,12 @@ async fn run(command: cli::Command) -> Result<()> {
                          audit sealed --dir <nest>` against each nest instead"
                     );
                 }
+                if args.history_source.is_some() {
+                    anyhow::bail!(
+                        "--history-source backfills a single nest; a runtime directory reads every \
+                         mount's history from its chain's RPC (docs/history-from-xatu.md)"
+                    );
+                }
                 for (flag, set) in [
                     ("--trace-rpc", !args.trace_rpc.is_empty()),
                     ("--write-token-env", args.write_token_env.is_some()),

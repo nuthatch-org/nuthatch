@@ -115,8 +115,8 @@ mismatch and a reorg notice.
 | `--history-source xatu` | turn it on (mainnet only) |
 | `--history-url <url>` | read the files from a mirror with the same layout |
 
-Applies to single-nest `nuthatch dev`. A `mounts.toml` runtime and address-history nests do not use
-it yet.
+Applies to single-nest `nuthatch dev`. A `mounts.toml` runtime and address-history nests refuse it by name;
+they do not use it yet.
 
 ## Measured
 

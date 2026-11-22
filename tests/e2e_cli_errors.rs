@@ -192,3 +192,14 @@ async fn a_query_the_nest_refuses_is_sql_invalid_with_its_hint_as_next() {
     assert_eq!(v["error"]["code"], "sql_invalid");
     assert_eq!(v["error"]["next"], "the column is `value`");
 }
+
+/// `--history-source` reaches only single-nest `dev`; a runtime directory refuses it by name rather
+/// than starting and reading every mount's history from the RPC regardless.
+#[test]
+fn a_runtime_directory_refuses_history_source_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mounts.toml"), "[runtime]\nname = \"t\"\n").unwrap();
+    let out = run_in(dir.path(), &["dev", "--history-source", "xatu"]);
+    assert_ne!(out.code, 0, "{}", out.stderr);
+    assert!(out.stderr.contains("--history-source"), "{}", out.stderr);
+}
