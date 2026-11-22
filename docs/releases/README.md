@@ -21,6 +21,9 @@ missing notes file is a build failure, not a warning.
 test fails the release PR's CI if they lag. Once the tag's image and npm package are published, run the manual `mcp registry`
 workflow to publish the entry: the registry refuses an entry whose npm version does not exist yet.
 
+The same PR reruns `scripts/build-directory-plugin.sh` and commits `plugin-directory/`: its `plugin.json` takes
+the version from `Cargo.toml`, and CI's `scripts/build-directory-plugin.sh --check` fails until it is regenerated.
+
 No em dashes - spaced hyphen, matching the rest of the project's public-facing prose.
 
 ## Patch releases on 4.x
