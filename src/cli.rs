@@ -21,6 +21,13 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// A public dataset `nuthatch dev --history-source` can read old history from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum HistorySource {
+    /// ethPandaOps' Xatu Parquet files. Ethereum mainnet only.
+    Xatu,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum LogFormat {
     Text,
@@ -1788,6 +1795,18 @@ pub struct DevArgs {
     /// rather than config, because a keyed URL does not belong in the nest.
     #[arg(long = "rpc-fallback", value_name = "URL")]
     pub rpc_fallback: Vec<String>,
+
+    /// Backfill old history from a public dataset instead of `eth_getLogs` and per-block header
+    /// calls (`xatu`: ethPandaOps' Parquet files, Ethereum mainnet only). The RPC still serves
+    /// the tail, which the dataset lags by 9 to 13 hours, and anything the dataset cannot. Off
+    /// unless named. A flag rather than config: where history is read from does not change what
+    /// the nest is.
+    #[arg(long = "history-source", value_enum, env = "NUTHATCH_HISTORY_SOURCE")]
+    pub history_source: Option<HistorySource>,
+
+    /// Where the dataset's files are served from, to use a mirror. Needs `--history-source`.
+    #[arg(long = "history-url", value_name = "URL", requires = "history_source")]
+    pub history_url: Option<String>,
 
     /// Endpoint(s) answering `trace_filter` for an address-history nest (RFC-0063, repeatable).
     /// Defaults to the nest's RPC; give an index-backed trace API here when that one re-executes

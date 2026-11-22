@@ -58,6 +58,38 @@ use crate::store::{IDENTITY_FORMULA, IDENTITY_FORMULA_KEY, REGISTRY_KEY};
 /// Cold-start origin when a nest declares neither `start_block`s nor an explicit `--backfill`.
 const DEFAULT_BACKFILL: u64 = 5_000;
 
+/// Wrap `rpc` in the public-dataset history source when the operator asked for one. Refuses a chain
+/// the dataset does not cover, rather than quietly ignoring the flag.
+fn with_history_source(
+    rpc: Arc<dyn Source>,
+    config: &Config,
+    args: &DevArgs,
+) -> Result<Arc<dyn Source>> {
+    let Some(crate::cli::HistorySource::Xatu) = args.history_source else {
+        return Ok(rpc);
+    };
+    if config.nest.chain_id != 1 {
+        anyhow::bail!(
+            "--history-source xatu covers Ethereum mainnet only, and this nest is on chain {} \
+             ({}); drop the flag to index it from the RPC",
+            config.nest.chain_id,
+            config.nest.chain
+        );
+    }
+    let base = args
+        .history_url
+        .as_deref()
+        .unwrap_or(crate::xatu::DEFAULT_BASE_URL);
+    tracing::info!(
+        "history source: xatu ({base}); blocks it holds are read from there, the rest from the RPC"
+    );
+    Ok(Arc::new(crate::xatu::XatuSource::new(
+        rpc,
+        Arc::new(crate::xatu::HttpFetch::new()?),
+        base,
+    )))
+}
+
 /// `nuthatch dev` - the RPC front-end. Builds an RPC `Source` from the nest's `rpc_urls` and runs
 /// the shared pipeline. The colocated-reth front-end (`nuthatch-node`, RFC-0003) builds an ExEx
 /// `Source` instead and calls [`run`] directly - same core, different tip source.
@@ -105,6 +137,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     rpc.verify_chain_ids(config.nest.chain_id).await?;
     config.freshness = config.freshness.for_chain(&config.nest.chain, &rpc).await;
     let source: Arc<dyn Source> = Arc::new(rpc);
+    let source = with_history_source(source, &config, &args)?;
     let concurrency =
         backfill_concurrency_for(args.concurrency, args.seal_direct, &[&config.nest.name]);
     let publish = args
