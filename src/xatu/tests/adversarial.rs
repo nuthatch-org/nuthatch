@@ -85,7 +85,7 @@ fn keys(logs: &[Log]) -> Vec<(u64, u64, String, String)> {
         .collect()
 }
 
-/// Every window `[from, to]` between the edges from two blocks before the dataset to two after, over every mix of
+/// Every window `[from, to]` between the edges from one block before the dataset to one after, over every mix of
 /// served, absent, corrupt and off-chain chunks: the answer is the node's, and the RPC is asked
 /// only for disjoint ranges inside the window that no served chunk covers.
 #[tokio::test]
