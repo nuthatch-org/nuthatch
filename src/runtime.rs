@@ -2602,7 +2602,15 @@ pub async fn dev(
         );
     }
     let meta = &mounts.runtime;
-    let endpoints = mounts.chain_endpoints()?;
+    // Nor does an empty start need a chain (#3093): `POST /_admin/chains` declares one live
+    // (RFC-0073 FR9), so a platform that drives the runtime only over HTTP starts it with a bare
+    // `[runtime]`. With anything mounted, or no admin API, a chain is still required.
+    let no_chain = mounts.chains.is_empty() && meta.chain.is_none() && meta.chain_id.is_none();
+    let endpoints = if no_chain && admin_enabled && mounts.mount_refs().is_empty() {
+        Vec::new()
+    } else {
+        mounts.chain_endpoints()?
+    };
     // The RSS budget is now **per active-chain cursor** (RFC-0021), not per whole runtime.
     let max_rss = meta.max_rss_mb.unwrap_or(DEFAULT_MAX_RSS_MB);
     if max_rss > DEFAULT_MAX_RSS_MB {
