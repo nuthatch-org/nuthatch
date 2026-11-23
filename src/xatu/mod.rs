@@ -33,8 +33,9 @@
 //! a file's author cannot know which, are asked of the RPC with the same filter (`eth_getLogs` over
 //! one block) and must equal the dataset's rows for them field for field. One draw is uniform over
 //! the chunk's blocks, so a block the dataset left empty can be drawn; the other is weighted by the
-//! rows that matched, so the logs the nest will actually store are what gets checked. A mismatch is
-//! evidence against the whole dataset, not one block: it is logged naming the block and the field,
+//! rows that matched, so the logs the nest will actually store are what gets checked (uniform too
+//! for a filter whose matches outgrow `MATCHED_BUDGET`, as they are not held to draw from). A
+//! mismatch is evidence against the whole dataset, not one block: it is logged naming the block and the field,
 //! and the dataset is not used again this run. This is a sample, not a proof. It catches a fault that
 //! touches a fair share of blocks within a few chunks; one edited block in a file evades it with
 //! probability 1 - 2/1000 per chunk. Proving every block against the receipts root is #3096's

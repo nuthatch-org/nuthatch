@@ -96,9 +96,11 @@ and no logs bloom, so no file can prove its own logs. What is done instead (#309
   without those checksums, which is why flips there mostly decode into other logs.)
 - **A wrong but well-formed file is spot-checked.** The first time a filter reads a file, two of
   its blocks are asked of the RPC with the same filter (`eth_getLogs`, one block each) and must equal
-  the dataset's rows for them, every field: address, topics, data, transaction hash, log index, block
-  hash, and the count. One block is drawn uniformly, so a block the dataset left empty can be drawn;
-  the other is drawn by matched row, so the logs your nest stores are what gets checked. The draw is
+  the dataset's rows for them, every field of a log: address, topics, data, transaction hash, log
+  index, block hash (the block number is the one asked), and the count. One block is drawn uniformly, so a block the dataset left empty can be drawn;
+  the other is drawn by matched row, so the logs your nest stores are what gets checked (for a filter
+  so dense its matches in a file are not held whole, both are drawn uniformly; most of its blocks
+  have rows anyway). The draw is
   random per run, so a file's author cannot know which blocks will be asked. Cost: **two RPC calls
   per 1,000 blocks**, per filter (more only if the RPC client splits a large address set into
   groups).
@@ -169,8 +171,8 @@ The 50,000-block row downloaded 1,899 MB (50 files); the 5,000-block row 176 MB.
 requests are the hash checks above. Both rows predate the spot check of log content. Re-measured
 with it on 2026-11-23, same 50,000 blocks: **184** HTTP requests to the RPC (83 anchors, 100 spot
 checks, two per file, and the finality check), against 4,176 for the RPC alone. Same 4,161,008
-logs, same digest, no mismatch. (Wall times that run were 727 s against 1,049 s, on a machine busy
-with a build, so compare them with each other, not with the table.) How to read it:
+logs, no mismatch, 1,899 MB downloaded (`xatu_bench`, Alchemy; the `anchor calls` and `spot checks`
+counters it prints give the split). How to read it:
 
 - Alchemy puts `blockTimestamp` on logs, so this run never paid for headers. On a provider that does
   not, the RPC-only column also carries up to one header lookup per log-bearing block (here, every
