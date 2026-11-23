@@ -106,6 +106,10 @@ ignore = [
   # and actix-web is only dragged in by dbsp's types crate; actix-web 4 pins cookie 0.16, so no
   # lockfile bump fixes it. Drop this when feldera moves past actix-web 4.18. Checked 2026-11-23.
   "RUSTSEC-2026-0594", # cookie: private cookie nonces repeat in forking processes
+  #
+  # parquet 59.3.0: flaw in encrypted Parquet only. nuthatch never writes encrypted Parquet (the `encryption`
+  # feature is off); 59.3.3 changes sealed bytes, bump tracked separately. Checked 2026-11-23.
+  "RUSTSEC-2026-0595", # parquet: encrypted-file crypto failure
 ]
 
 [licenses]
