@@ -63,6 +63,8 @@ pub(super) struct Chunk {
     /// under one filter says nothing of another's rows; a filter already checked is not checked again
     /// when its rows are decoded again (another filter came between, or the budget dropped them).
     checked: Mutex<VecDeque<LogFilter>>,
+    /// Held while this chunk's rows for a filter are decoded and spot-checked.
+    checking: tokio::sync::Mutex<()>,
 }
 
 const CHECKED_FILTERS: usize = 8;
@@ -106,6 +108,9 @@ impl XatuSource {
     /// they follow the logs read of the same window, which loaded the chunk, and a miss just goes to
     /// RPC.
     pub(super) fn cached(&self, block: u64) -> Option<Arc<Headers>> {
+        if self.distrusted.load(Ordering::SeqCst) {
+            return None;
+        }
         let s = self.start_of(block);
         self.state.lock().unwrap().headers.get(&s).cloned()
     }
@@ -149,6 +154,11 @@ impl XatuSource {
                     start + self.chunk_len - 1
                 );
                 let mut st = self.state.lock().unwrap();
+                // Read under the state lock `distrust` clears it under: a load that was in flight
+                // when the dataset failed a check is not held.
+                if self.distrusted.load(Ordering::SeqCst) {
+                    return None;
+                }
                 st.ready.insert(start, c.clone());
                 touch(&mut st.order, start);
                 while st.order.len() > self.keep_chunks {
@@ -358,6 +368,7 @@ impl XatuSource {
             logs,
             matched: Mutex::new(None),
             checked: Mutex::new(VecDeque::new()),
+            checking: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -379,20 +390,35 @@ impl XatuSource {
                 .map(|(_, m)| m.clone())
         };
         let mut found = hit();
-        let _decoding = if found.is_none() {
-            let guard = self.decoding.lock().await;
+        // Readers of this chunk wait for one another while its rows are decoded and spot-checked
+        // (they need the outcome anyway); readers of other chunks wait only for the decoding, never
+        // for the check's RPC round trip.
+        let _this_chunk = if found.is_none() {
+            let g = c.checking.lock().await;
             found = hit();
-            Some(guard)
+            Some(g)
+        } else {
+            None
+        };
+        let decoding = if found.is_none() {
+            let g = self.decoding.lock().await;
+            found = hit();
+            Some(g)
         } else {
             None
         };
         let whole = (c.headers.start, c.headers.start + self.chunk_len - 1);
         let rows = match found {
             Some(Matched::Rows(rows, _)) => rows,
-            Some(Matched::TooBig) => return self.decode(c, filter, (a, b), usize::MAX).await,
+            Some(Matched::TooBig) => {
+                let rows = self.decode(c, filter, (a, b), usize::MAX).await;
+                return self.still_trusted(rows);
+            }
             None => match self.decode(c, filter, whole, self.matched_budget).await {
                 Ok(rows) => {
-                    self.spot_check(c, filter, Some(&rows)).await?;
+                    let ours = self.spot_rows(c, filter, Some(&rows)).await?;
+                    drop(decoding);
+                    self.spot_compare(c, filter, ours).await?;
                     let size = rows.iter().map(heap_size).sum();
                     let rows = Arc::new(rows);
                     *c.matched.lock().unwrap() =
@@ -401,32 +427,45 @@ impl XatuSource {
                     rows
                 }
                 Err(e) if e.is::<OverBudget>() => {
-                    self.spot_check(c, filter, None).await?;
+                    let ours = self.spot_rows(c, filter, None).await?;
+                    drop(decoding);
+                    self.spot_compare(c, filter, ours).await?;
                     *c.matched.lock().unwrap() = Some((filter.clone(), Matched::TooBig));
-                    return self.decode(c, filter, (a, b), usize::MAX).await;
+                    let _decoding = self.decoding.lock().await;
+                    let rows = self.decode(c, filter, (a, b), usize::MAX).await;
+                    return self.still_trusted(rows);
                 }
                 Err(e) => return Err(e),
             },
         };
         let lo = rows.partition_point(|l| l.block_number < a);
         let hi = rows.partition_point(|l| l.block_number <= b);
-        Ok(rows[lo..hi].to_vec())
+        self.still_trusted(Ok(rows[lo..hi].to_vec()))
     }
 
-    /// Check the dataset's rows for a few of the chunk's blocks against the RPC's `eth_getLogs` with
-    /// the same filter, before any row of `c` is served for `filter`. `rows` are the chunk's matched
-    /// rows when they were decoded whole; `None` decodes each checked block on its own. A
-    /// disagreement ends the dataset for the run ([`Mismatch`]); an RPC that would not answer leaves
-    /// the window to the RPC and the check to the next window ([`Unchecked`]).
-    async fn spot_check(
+    /// `rows`, unless the dataset was distrusted meanwhile (a window that held the chunk before
+    /// another window's check failed): then [`Distrusted`], and the window goes to the RPC.
+    fn still_trusted(&self, rows: Result<Vec<Log>>) -> Result<Vec<Log>> {
+        if self.distrusted.load(Ordering::SeqCst) {
+            return Err(anyhow!(Distrusted));
+        }
+        rows
+    }
+
+    /// The dataset's rows for the blocks of `c` to spot-check under `filter`, before any row of `c`
+    /// is served for it; empty if this filter already passed. `rows` are the chunk's matched rows
+    /// when they were decoded whole; `None` decodes each checked block on its own. Run under the
+    /// decoding guard; [`Self::spot_compare`] then asks the RPC without it.
+    async fn spot_rows(
         &self,
         c: &Arc<Chunk>,
         filter: &LogFilter,
         rows: Option<&[Log]>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(u64, Vec<Log>)>> {
         if c.checked.lock().unwrap().contains(filter) {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut out = Vec::new();
         for n in self.spot_blocks(c.headers.start, rows) {
             let ours = match rows {
                 Some(rows) => {
@@ -436,6 +475,24 @@ impl XatuSource {
                 }
                 None => self.decode(c, filter, (n, n), usize::MAX).await?,
             };
+            out.push((n, ours));
+        }
+        Ok(out)
+    }
+
+    /// Check `ours` (from [`Self::spot_rows`]) against the RPC's `eth_getLogs` with the same filter.
+    /// A disagreement ends the dataset for the run ([`Mismatch`]); an RPC that would not answer
+    /// leaves the window to the RPC and the check to the next window ([`Unchecked`]).
+    async fn spot_compare(
+        &self,
+        c: &Arc<Chunk>,
+        filter: &LogFilter,
+        ours: Vec<(u64, Vec<Log>)>,
+    ) -> Result<()> {
+        if ours.is_empty() {
+            return Ok(());
+        }
+        for (n, ours) in ours {
             self.stats.spot_checks.fetch_add(1, Ordering::Relaxed);
             let mut chain =
                 self.inner.logs(filter, n, n).await.map_err(|e| {
@@ -482,7 +539,7 @@ impl XatuSource {
 
     /// The dataset failed a spot check: stop reading it for the rest of the run, and drop what is
     /// held so every later read, header lookups included, goes to the RPC.
-    fn distrust(&self, why: &anyhow::Error) {
+    pub(super) fn distrust(&self, why: &anyhow::Error) {
         self.stats.mismatches.fetch_add(1, Ordering::Relaxed);
         if self.distrusted.swap(true, Ordering::SeqCst) {
             return;
@@ -611,6 +668,18 @@ impl std::fmt::Display for Unchecked {
 }
 
 impl std::error::Error for Unchecked {}
+
+/// The dataset failed a spot check while this read was under way: not served, asked of the RPC.
+#[derive(Debug)]
+pub(super) struct Distrusted;
+
+impl std::fmt::Display for Distrusted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the dataset failed a spot check")
+    }
+}
+
+impl std::error::Error for Distrusted {}
 
 /// The dataset's rows for a block are not what the RPC says.
 #[derive(Debug)]

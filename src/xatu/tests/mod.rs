@@ -44,6 +44,10 @@ struct Recorded {
     wrong_time_at: Option<u64>,
     /// Refuse every `eth_getLogs` while set: an RPC that is down or rate-limiting.
     logs_fail: std::sync::atomic::AtomicBool,
+    /// One-block `eth_getLogs` inside this range wait for `release` (a spot check on a slow RPC).
+    stall: Mutex<Option<(u64, u64)>>,
+    stalled: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
 }
 
 impl Recorded {
@@ -97,6 +101,9 @@ impl Recorded {
             finalized: None,
             wrong_time_at: None,
             logs_fail: Default::default(),
+            stall: Mutex::new(None),
+            stalled: Default::default(),
+            release: tokio::sync::Notify::new(),
         }
     }
     fn header(&self, n: u64) -> Option<&(u64, String, u64)> {
@@ -144,6 +151,11 @@ impl Source for Recorded {
         self.log_calls.lock().unwrap().push((from, to));
         if self.logs_fail.load(Ordering::SeqCst) {
             anyhow::bail!("HTTP 429");
+        }
+        let stall = *self.stall.lock().unwrap();
+        if matches!(stall, Some((lo, hi)) if from == to && (lo..=hi).contains(&from)) {
+            self.stalled.store(true, Ordering::SeqCst);
+            self.release.notified().await;
         }
         Ok(self.answer(f, from, to))
     }
@@ -836,6 +848,58 @@ async fn an_rpc_that_cannot_spot_check_is_not_evidence_against_the_dataset() {
     );
     assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 0);
     assert!(x.cached(FIRST).is_some());
+}
+
+#[tokio::test]
+async fn a_slow_spot_check_does_not_hold_up_reads_of_other_chunks() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let x = checked(&rpc, files.clone());
+    let f = filter(&[USDC, USDT]);
+    *rpc.stall.lock().unwrap() = Some((FIRST, FIRST + 3));
+    let first = x.logs(&f, FIRST, FIRST + 3);
+    tokio::pin!(first);
+    tokio::select! {
+        _ = &mut first => panic!("the first chunk's spot check should be stalled"),
+        _ = async {
+            while !rpc.stalled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    // The first chunk's check waits on the RPC; the next chunk decodes, checks and serves anyway.
+    let second = tokio::time::timeout(Duration::from_secs(10), x.logs(&f, FIRST + 4, FIRST + 7))
+        .await
+        .expect("a read of another chunk waited for the first chunk's spot check")
+        .unwrap();
+    same(&second, &rpc.answer(&f, FIRST + 4, FIRST + 7));
+    *rpc.stall.lock().unwrap() = None;
+    rpc.release.notify_one();
+    same(&first.await.unwrap(), &rpc.answer(&f, FIRST, FIRST + 3));
+    assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_dataset_distrusted_mid_read_serves_nothing_more_and_caches_nothing() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let x = checked(&rpc, files.clone());
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, FIRST + 3).await.unwrap(),
+        &rpc.answer(&f, FIRST, FIRST + 3),
+    );
+    let held = x.chunk(FIRST).await.expect("the first chunk is held");
+    // Another window's check fails while this one holds the chunk.
+    x.distrust(&anyhow::anyhow!("test"));
+    let e = x.read_chunk(&held, &f, FIRST, FIRST + 3).await.unwrap_err();
+    assert!(e.is::<chunks::Distrusted>(), "{e:#}");
+    assert!(x.cached(FIRST).is_none());
+    assert!(x.chunk(FIRST + 4).await.is_none());
+    rpc.log_calls.lock().unwrap().clear();
+    same(
+        &x.logs(&f, FIRST, FIRST + 3).await.unwrap(),
+        &rpc.answer(&f, FIRST, FIRST + 3),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST, FIRST + 3)]);
 }
 
 #[test]

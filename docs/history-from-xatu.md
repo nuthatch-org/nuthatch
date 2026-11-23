@@ -104,7 +104,8 @@ and no logs bloom, so no file can prove its own logs. What is done instead (#309
   groups).
 - **A mismatch ends the dataset for the run.** It is logged at `ERROR` (`xatu: the dataset disagrees
   with the RPC (block N: log I differs in data)`), that range and every later one come from the RPC,
-  and nothing more is read from the dataset until restart. A file that lied once is evidence against
+  and nothing more is read from the dataset until restart: a window that was already reading a
+  chunk when another window's check failed is answered by the RPC too. A file that lied once is evidence against
   the source, not one block. If the RPC cannot answer a spot check, that window goes to the RPC and
   the check is tried again on the next; a refusal is not a mismatch.
 
