@@ -61,6 +61,11 @@ file = "src/seal.rs"
 mutation = "replace > with >= in verify_in_background"
 reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
 
+[[survivor]]
+file = "src/seal.rs"
+mutation = "replace > with < in verify_in_background"
+reason = "Only gates the background pass's quarantine error line; the pass and its moves are unchanged."
+
 # --- Equivalent. ---------------------------------------------------------------------------------
 
 [[survivor]]

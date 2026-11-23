@@ -66,24 +66,40 @@ jobs:
           # 43, at seven to nine minutes a mutant, and a job cannot run past 360 minutes. A shard is
           # sized to about 25 mutants. seal.rs went to sixteen shards for #2758: at about 270 mutants
           # and 12 to 19 minutes each, two of eight shards were cancelled at 330 minutes.
+          #
+          # Twenty-four since #3084. By the 2026-11-22 run seal.rs had grown to 457 mutants, 29 a
+          # shard, and shards 8 and 9 were cancelled at 330 minutes with nothing hung: every mutant in
+          # them was viable and each held a slot for about 22 minutes (6 build + 16 test, at -j 2 the
+          # suite takes twice its unmutated 8 minutes), so 29 of them need ~320 minutes after a
+          # 17-minute baseline. Shards that finished had unviable mutants, which skip the test phase.
+          # At 19 a shard the same worst case is ~225 minutes. Keep a seal.rs shard under about 22
+          # mutants (`cargo mutants --list --file src/seal.rs | wc -l`, divided by the shard count).
           - { file: src/chunker.rs, shard: 0/2, timeout: 330 }
           - { file: src/chunker.rs, shard: 1/2, timeout: 330 }
-          - { file: src/seal.rs, shard: 0/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 1/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 2/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 3/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 4/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 5/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 6/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 7/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 8/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 9/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 10/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 11/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 12/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 13/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 14/16, timeout: 330 }
-          - { file: src/seal.rs, shard: 15/16, timeout: 330 }
+          - { file: src/seal.rs, shard: 0/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 1/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 2/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 3/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 4/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 5/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 6/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 7/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 8/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 9/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 10/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 11/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 12/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 13/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 14/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 15/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 16/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 17/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 18/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 19/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 20/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 21/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 22/24, timeout: 330 }
+          - { file: src/seal.rs, shard: 23/24, timeout: 330 }
           # Only 3 mutants because #581 moved decode into its own crate, so the decode path is
           # covered by the `decode` entry rather than by the file it used to live in.
           - { file: src/registry.rs, shard: 0/1, timeout: 120 }
@@ -114,6 +130,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost \
             /opt/hostedtoolcache
           df -h /
+      - uses: ./.github/actions/install-nextest
       - name: install cargo-mutants
         run: cargo install cargo-mutants --locked
 
@@ -128,7 +145,19 @@ jobs:
         # tens of megabytes over its 512 MiB ceiling before any mutant is scored (#2030, run
         # 38128606532). Skipping it here leaves it in the ordinary suite. A baseline entry cannot
         # help: the failure is the unmutated tree, not a survivor.
-        run: cargo mutants --no-shuffle -j 2 --file ${{ matrix.file }} --shard ${{ matrix.shard }} -- --lib -- --skip a_wide_batch_stays_under_the_cursor
+        #
+        # Through nextest's `mutants` profile (#3084), the harness CI runs: the first failing test
+        # ends the run, and a test a mutant hangs is killed at the slow timeout and scored as caught.
+        # Under `cargo test` six throttle and verifier mutants on the 2026-11-22 run hung one test,
+        # held the whole process to cargo-mutants' timeout (26 minutes each) and were reported
+        # TIMEOUT, and every caught mutant paid for the whole lib suite. `--timeout 2400` keeps
+        # cargo-mutants' own limit above nextest's 15-minute kill (60s x 15, .config/nextest.toml), so
+        # nextest scores a hang before cargo-mutants can call it a TIMEOUT. The slowest lib test is
+        # about three minutes.
+        run: >-
+          cargo mutants --no-shuffle -j 2 --test-tool nextest --timeout 2400 --file ${{ matrix.file }}
+          --shard ${{ matrix.shard }} --
+          --lib --profile mutants -E 'not test(a_wide_batch_stays_under_the_cursor)'
 
       # `if: always()` so the reading survives the failure it explains - the whole point of #733's
       # trailing `df` in `ci.yml`. Without it, the run that runs out of disk is the one run with no
