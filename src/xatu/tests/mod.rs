@@ -42,6 +42,8 @@ struct Recorded {
     finalized: Option<u64>,
     /// Say this block is a second later than it was, to make the timestamp anchor disagree.
     wrong_time_at: Option<u64>,
+    /// Refuse every `eth_getLogs` while set: an RPC that is down or rate-limiting.
+    logs_fail: std::sync::atomic::AtomicBool,
 }
 
 impl Recorded {
@@ -94,6 +96,7 @@ impl Recorded {
             wrong_hash_at,
             finalized: None,
             wrong_time_at: None,
+            logs_fail: Default::default(),
         }
     }
     fn header(&self, n: u64) -> Option<&(u64, String, u64)> {
@@ -139,6 +142,9 @@ impl Source for Recorded {
     }
     async fn logs(&self, f: &LogFilter, from: u64, to: u64) -> Result<Vec<Log>> {
         self.log_calls.lock().unwrap().push((from, to));
+        if self.logs_fail.load(Ordering::SeqCst) {
+            anyhow::bail!("HTTP 429");
+        }
         Ok(self.answer(f, from, to))
     }
 }
@@ -211,8 +217,17 @@ impl Fetch for Files {
     }
 }
 
+/// A source with the spot check off, for the tests of the handoff, whose RPC calls they assert
+/// exactly. The spot check has its own tests, and the first test runs with it on.
 fn source(rpc: &Arc<Recorded>, files: &Arc<Files>) -> XatuSource {
-    XatuSource::with_chunk_len(rpc.clone(), files.clone(), "https://mirror.test/", 4)
+    let mut x = checked(rpc, files.clone());
+    x.spot_checks = 0;
+    x
+}
+
+/// A source as the operator gets it: the spot check on.
+fn checked(rpc: &Arc<Recorded>, files: Arc<dyn Fetch>) -> XatuSource {
+    XatuSource::with_chunk_len(rpc.clone(), files, "https://mirror.test/", 4)
 }
 
 fn filter(addrs: &[&str]) -> LogFilter {
@@ -234,7 +249,7 @@ fn same(a: &[Log], b: &[Log]) {
 #[tokio::test]
 async fn logs_and_timestamps_are_exactly_what_the_node_said() {
     let (rpc, files) = (Recorded::load(), Files::all());
-    let x = source(&rpc, &files);
+    let x = checked(&rpc, files.clone());
     assert_eq!(
         rpc.logs.len(),
         4440,
@@ -282,8 +297,24 @@ async fn logs_and_timestamps_are_exactly_what_the_node_said() {
         Some(rpc.header(FIRST + 5).unwrap().2)
     );
 
-    // And it did that without the node: one hash per chunk to check it, no getLogs, no headers.
-    assert!(rpc.log_calls.lock().unwrap().is_empty());
+    // And it did that without the node's logs: the only `eth_getLogs` are the spot checks, one block
+    // each, at most two per chunk and filter (five filters here, three chunks), and none again for
+    // a chunk and filter already checked.
+    let calls = rpc.log_calls.lock().unwrap().clone();
+    assert!(calls.iter().all(|(a, b)| a == b), "{calls:?}");
+    assert_eq!(
+        calls.len() as u64,
+        x.stats.spot_checks.load(Ordering::SeqCst)
+    );
+    assert!(
+        calls.len() >= 5 * 3 && calls.len() <= 2 * 5 * 3,
+        "{}",
+        calls.len()
+    );
+    x.logs(&filter(&[USDC, USDT]), FIRST, LAST).await.unwrap();
+    assert_eq!(rpc.log_calls.lock().unwrap().len(), calls.len());
+    assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 0);
+    // One hash per chunk to check it, no headers.
     assert_eq!(rpc.header_calls.load(Ordering::SeqCst), 3);
     assert_eq!(x.stats.anchor_calls.load(Ordering::SeqCst), 3);
     // Chunks are downloaded once however many windows ask.
@@ -635,4 +666,190 @@ async fn a_damaged_logs_footer_falls_back_rather_than_panicking() {
         }
     }
     assert!(fell_back > 0, "premise: some flips reach the footer parse");
+}
+
+/// How [`rewrite_logs`] changes a row: the file stays well-formed, only what it says changes.
+enum Edit {
+    Keep,
+    Drop,
+    Data(Vec<u8>),
+}
+
+/// Re-encode a logs file with `edit` applied to each row (its index in the file, its `data`): a
+/// file that is wrong and well-formed, which no checksum or parse can catch.
+fn rewrite_logs(b: Bytes, edit: &dyn Fn(usize, Option<&[u8]>) -> Edit) -> Bytes {
+    use arrow::array::{Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(b)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut batches = Vec::new();
+    let mut row = 0;
+    for batch in reader {
+        let batch = batch.unwrap();
+        let i = batch.schema().index_of("data").unwrap();
+        let data =
+            arrow::compute::cast(batch.column(i), &arrow::datatypes::DataType::Binary).unwrap();
+        let data = data.as_any().downcast_ref::<BinaryArray>().unwrap();
+        let (mut keep, mut new) = (Vec::new(), BinaryBuilder::new());
+        for r in 0..batch.num_rows() {
+            let v = (!data.is_null(r)).then(|| data.value(r));
+            let e = edit(row, v);
+            keep.push(!matches!(e, Edit::Drop));
+            match e {
+                Edit::Data(d) => new.append_value(d),
+                Edit::Keep | Edit::Drop => new.append_option(v),
+            }
+            row += 1;
+        }
+        let new: ArrayRef =
+            arrow::compute::cast(&new.finish(), batch.column(i).data_type()).unwrap();
+        let mut cols = batch.columns().to_vec();
+        cols[i] = new;
+        let batch = arrow::record_batch::RecordBatch::try_new(batch.schema(), cols).unwrap();
+        let batch = arrow::compute::filter_record_batch(&batch, &BooleanArray::from(keep)).unwrap();
+        batches.push(batch);
+    }
+    let mut out = Vec::new();
+    let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, batches[0].schema(), None).unwrap();
+    for batch in &batches {
+        w.write(batch).unwrap();
+    }
+    w.close().unwrap();
+    out.into()
+}
+
+/// Decides each row's [`Edit`] from its index in the file and its `data`.
+type EditFn = fn(usize, Option<&[u8]>) -> Edit;
+
+/// Serves the recorded files with one chunk's logs file rewritten.
+struct Tampered(Arc<Files>, u64, EditFn);
+
+#[async_trait::async_trait]
+impl Fetch for Tampered {
+    async fn get(&self, url: &str) -> Result<Option<Bytes>> {
+        let b = self.0.get(url).await?;
+        if url.contains("canonical_execution_logs")
+            && url.ends_with(&format!("/{}.parquet", self.1))
+        {
+            return Ok(b.map(|b| rewrite_logs(b, &self.2)));
+        }
+        Ok(b)
+    }
+}
+
+/// One hex digit of a log's data changed: the same shape, another amount.
+fn flipped(d: &[u8]) -> Vec<u8> {
+    let mut d = d.to_vec();
+    let last = d.len() - 1;
+    d[last] = if d[last] == b'0' { b'1' } else { b'0' };
+    d
+}
+
+#[tokio::test]
+async fn a_log_edited_in_a_well_formed_file_is_caught_and_the_dataset_is_dropped() {
+    // #3091: the file parses, its anchors match, and one log in the second chunk says something else
+    // (an edited amount) or is missing. With every block checked it is caught wherever it is, on
+    // both decode paths (rows held whole, and decoded per window past the budget).
+    let edits: [(&str, EditFn); 2] = [
+        ("flipped data", |r, d| match (r, d) {
+            (0, Some(d)) => Edit::Data(flipped(d)),
+            _ => Edit::Keep,
+        }),
+        (
+            "missing log",
+            |r, _| if r == 0 { Edit::Drop } else { Edit::Keep },
+        ),
+    ];
+    for (what, edit) in edits {
+        for budget in [chunks::MATCHED_BUDGET, 1] {
+            let rpc = Recorded::load();
+            let files = Files::all();
+            let mut x = checked(&rpc, Arc::new(Tampered(files.clone(), FIRST + 4, edit)));
+            x.spot_checks = 4;
+            x.matched_budget = budget;
+            let f = filter(&[USDC, USDT]);
+            same(
+                &x.logs(&f, FIRST, LAST).await.unwrap(),
+                &rpc.answer(&f, FIRST, LAST),
+            );
+            assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 1, "{what}");
+            // The first chunk was checked and served; from the bad one on, everything is the RPC's,
+            // and the third chunk is not even downloaded.
+            let calls = rpc.log_calls.lock().unwrap().clone();
+            assert_eq!(calls.last(), Some(&(FIRST + 4, LAST)), "{what}: {calls:?}");
+            assert!(calls[..calls.len() - 1].iter().all(|(a, b)| a == b));
+            assert_eq!(files.gets.load(Ordering::SeqCst), 4, "{what}");
+            // Not trusted again this run, for logs or headers, even the chunk that passed.
+            assert!(x.cached(FIRST).is_none());
+            rpc.log_calls.lock().unwrap().clear();
+            same(
+                &x.logs(&f, FIRST, FIRST + 3).await.unwrap(),
+                &rpc.answer(&f, FIRST, FIRST + 3),
+            );
+            assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST, FIRST + 3)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_fault_across_a_file_is_caught_by_the_default_sample() {
+    // A writer bug touching every log of a file: the draw weighted by matched rows always lands
+    // on one, so two calls are enough.
+    let rpc = Recorded::load();
+    let tampered = Tampered(Files::all(), FIRST + 4, |_, d| match d {
+        Some(d) => Edit::Data(flipped(d)),
+        None => Edit::Keep,
+    });
+    let x = checked(&rpc, Arc::new(tampered));
+    let f = filter(&[USDC]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 1);
+    assert!(x.stats.spot_checks.load(Ordering::SeqCst) <= 4);
+}
+
+#[tokio::test]
+async fn an_rpc_that_cannot_spot_check_is_not_evidence_against_the_dataset() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let x = checked(&rpc, files.clone());
+    let f = filter(&[USDC, USDT]);
+    rpc.logs_fail.store(true, Ordering::SeqCst);
+    assert!(
+        x.logs(&f, FIRST, FIRST + 3).await.is_err(),
+        "unchecked rows are not served: the window is the RPC's, and the RPC is down"
+    );
+    rpc.logs_fail.store(false, Ordering::SeqCst);
+    rpc.log_calls.lock().unwrap().clear();
+    same(
+        &x.logs(&f, FIRST, FIRST + 3).await.unwrap(),
+        &rpc.answer(&f, FIRST, FIRST + 3),
+    );
+    // Checked this time and served from the dataset, not marked bad, not distrusted.
+    let calls = rpc.log_calls.lock().unwrap().clone();
+    assert!(
+        !calls.is_empty() && calls.iter().all(|(a, b)| a == b),
+        "{calls:?}"
+    );
+    assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 0);
+    assert!(x.cached(FIRST).is_some());
+}
+
+#[test]
+fn spot_checks_are_drawn_inside_the_chunk_at_most_two_per_chunk() {
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let mut x = checked(&rpc, files);
+    x.chunk_len = DATASET_CHUNK;
+    let rows: Vec<Log> = rpc.logs.iter().take(50).cloned().collect();
+    for start in (0..100).map(|i| i * DATASET_CHUNK) {
+        let b = x.spot_blocks(start, None);
+        assert!(!b.is_empty() && b.len() <= 2);
+        assert!(b.iter().all(|n| (start..start + DATASET_CHUNK).contains(n)));
+    }
+    // The weighted draw lands on a block with rows.
+    let b = x.spot_blocks(FIRST / DATASET_CHUNK * DATASET_CHUNK, Some(&rows));
+    assert!(rows.iter().any(|l| l.block_number == *b.last().unwrap()));
 }

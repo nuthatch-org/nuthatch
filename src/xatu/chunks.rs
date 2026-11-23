@@ -7,6 +7,7 @@ use crate::source::LogFilter;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -40,6 +41,11 @@ pub(super) const TRANSIENT_FOR: Duration = Duration::from_secs(60);
 /// Three epochs: mainnet finalizes 2 to 3 epochs (64 to 96 slots) behind the head.
 const FINALITY_DEPTH: u64 = 96;
 
+/// Blocks of each chunk checked against the RPC's `eth_getLogs`, per filter, before its rows are
+/// served: one drawn uniformly, one weighted by the rows that matched. Two RPC calls per 1,000
+/// blocks, beside the one or two of the anchor.
+pub(super) const SPOT_CHECKS: usize = 2;
+
 /// The blocks of a chunk that passed the checks.
 pub(super) struct Headers {
     pub(super) start: u64,
@@ -53,7 +59,13 @@ pub(super) struct Chunk {
     pub(super) logs: Bytes,
     /// The decoded rows for the filter last asked, sorted by (block, log index).
     matched: Mutex<Option<(LogFilter, Matched)>>,
+    /// The filters this chunk passed a spot check for, the last [`CHECKED_FILTERS`] of them. A check
+    /// under one filter says nothing of another's rows; a filter already checked is not checked again
+    /// when its rows are decoded again (another filter came between, or the budget dropped them).
+    checked: Mutex<VecDeque<LogFilter>>,
 }
+
+const CHECKED_FILTERS: usize = 8;
 
 #[derive(Clone)]
 enum Matched {
@@ -100,6 +112,9 @@ impl XatuSource {
 
     /// The chunk starting at `start` if the dataset can serve it; `None` means ask RPC.
     pub(super) async fn chunk(&self, start: u64) -> Option<Arc<Chunk>> {
+        if self.distrusted.load(Ordering::SeqCst) {
+            return None;
+        }
         if let Some(c) = self.lookup(start) {
             return c;
         }
@@ -342,6 +357,7 @@ impl XatuSource {
             }),
             logs,
             matched: Mutex::new(None),
+            checked: Mutex::new(VecDeque::new()),
         }))
     }
 
@@ -376,6 +392,7 @@ impl XatuSource {
             Some(Matched::TooBig) => return self.decode(c, filter, (a, b), usize::MAX).await,
             None => match self.decode(c, filter, whole, self.matched_budget).await {
                 Ok(rows) => {
+                    self.spot_check(c, filter, Some(&rows)).await?;
                     let size = rows.iter().map(heap_size).sum();
                     let rows = Arc::new(rows);
                     *c.matched.lock().unwrap() =
@@ -384,6 +401,7 @@ impl XatuSource {
                     rows
                 }
                 Err(e) if e.is::<OverBudget>() => {
+                    self.spot_check(c, filter, None).await?;
                     *c.matched.lock().unwrap() = Some((filter.clone(), Matched::TooBig));
                     return self.decode(c, filter, (a, b), usize::MAX).await;
                 }
@@ -393,6 +411,92 @@ impl XatuSource {
         let lo = rows.partition_point(|l| l.block_number < a);
         let hi = rows.partition_point(|l| l.block_number <= b);
         Ok(rows[lo..hi].to_vec())
+    }
+
+    /// Check the dataset's rows for a few of the chunk's blocks against the RPC's `eth_getLogs` with
+    /// the same filter, before any row of `c` is served for `filter`. `rows` are the chunk's matched
+    /// rows when they were decoded whole; `None` decodes each checked block on its own. A
+    /// disagreement ends the dataset for the run ([`Mismatch`]); an RPC that would not answer leaves
+    /// the window to the RPC and the check to the next window ([`Unchecked`]).
+    async fn spot_check(
+        &self,
+        c: &Arc<Chunk>,
+        filter: &LogFilter,
+        rows: Option<&[Log]>,
+    ) -> Result<()> {
+        if c.checked.lock().unwrap().contains(filter) {
+            return Ok(());
+        }
+        for n in self.spot_blocks(c.headers.start, rows) {
+            let ours = match rows {
+                Some(rows) => {
+                    let lo = rows.partition_point(|l| l.block_number < n);
+                    let hi = rows.partition_point(|l| l.block_number <= n);
+                    rows[lo..hi].to_vec()
+                }
+                None => self.decode(c, filter, (n, n), usize::MAX).await?,
+            };
+            self.stats.spot_checks.fetch_add(1, Ordering::Relaxed);
+            let mut chain =
+                self.inner.logs(filter, n, n).await.map_err(|e| {
+                    anyhow!(Unchecked(e.context(format!("spot-checking block {n}"))))
+                })?;
+            chain.sort_by_key(|l| l.log_index);
+            if let Some(diff) = differ(&ours, &chain) {
+                let why = anyhow!(Mismatch(format!("block {n}: {diff}")));
+                self.distrust(&why);
+                return Err(why);
+            }
+        }
+        let mut checked = c.checked.lock().unwrap();
+        checked.push_back(filter.clone());
+        if checked.len() > CHECKED_FILTERS {
+            checked.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Which blocks of the chunk at `start` to check: every block when [`SPOT_CHECKS`] covers the
+    /// chunk, else draws from this run's seed, alternating uniform over the blocks and weighted by
+    /// `rows` (uniform when there are none).
+    pub(super) fn spot_blocks(&self, start: u64, rows: Option<&[Log]>) -> Vec<u64> {
+        let len = self.chunk_len;
+        if self.spot_checks as u64 >= len {
+            return (start..start + len).collect();
+        }
+        let mut out = Vec::with_capacity(self.spot_checks);
+        for i in 0..self.spot_checks {
+            let r = self.spot_seed.hash_one((start, i));
+            let n = match rows {
+                Some(rows) if i % 2 == 1 && !rows.is_empty() => {
+                    rows[(r % rows.len() as u64) as usize].block_number
+                }
+                _ => start + r % len,
+            };
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    /// The dataset failed a spot check: stop reading it for the rest of the run, and drop what is
+    /// held so every later read, header lookups included, goes to the RPC.
+    fn distrust(&self, why: &anyhow::Error) {
+        self.stats.mismatches.fetch_add(1, Ordering::Relaxed);
+        if self.distrusted.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tracing::error!(
+            "xatu: the dataset disagrees with the RPC ({why:#}); not using it again this run, \
+             everything from here on comes from the RPC. Blocks already served from it passed the \
+             same checks; to be certain of them, re-index without --history-source"
+        );
+        let mut st = self.state.lock().unwrap();
+        st.ready.clear();
+        st.order.clear();
+        st.headers.clear();
+        st.header_order.clear();
     }
 
     /// Drop the decoded rows of the least recently used held chunks, other than `keep`, until the
@@ -461,6 +565,64 @@ impl XatuSource {
         st.gone.retain(|s, _| below(s));
     }
 }
+
+/// How the dataset's rows for one block differ from the RPC's, or `None` if they do not. Hex is
+/// compared without regard to case, as both are hex of the same bytes.
+fn differ(ours: &[Log], chain: &[Log]) -> Option<String> {
+    if ours.len() != chain.len() {
+        return Some(format!(
+            "the dataset has {} matching logs, the chain {}",
+            ours.len(),
+            chain.len()
+        ));
+    }
+    let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    for (a, b) in ours.iter().zip(chain) {
+        let field = if a.log_index != b.log_index {
+            "log_index"
+        } else if !eq(&a.address, &b.address) {
+            "address"
+        } else if a.topics.len() != b.topics.len()
+            || a.topics.iter().zip(&b.topics).any(|(x, y)| !eq(x, y))
+        {
+            "topics"
+        } else if !eq(&a.data, &b.data) {
+            "data"
+        } else if !eq(&a.tx_hash, &b.tx_hash) {
+            "transaction_hash"
+        } else if !eq(&a.block_hash, &b.block_hash) {
+            "block_hash"
+        } else {
+            continue;
+        };
+        return Some(format!("log {} differs in {field}", a.log_index));
+    }
+    None
+}
+
+/// The RPC could not be asked to spot-check a chunk: not evidence against the dataset.
+#[derive(Debug)]
+pub(super) struct Unchecked(anyhow::Error);
+
+impl std::fmt::Display for Unchecked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for Unchecked {}
+
+/// The dataset's rows for a block are not what the RPC says.
+#[derive(Debug)]
+pub(super) struct Mismatch(String);
+
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Mismatch {}
 
 /// A chunk's matches outgrew [`MATCHED_BUDGET`] while being decoded whole.
 #[derive(Debug)]

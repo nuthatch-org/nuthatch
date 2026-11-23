@@ -23,8 +23,22 @@
 //! logs file is downloaded. The parent-hash chain is the file agreeing with itself, not the chain
 //! vouching for it: the hashes of the blocks between the anchors are the dataset's word. Any
 //! mismatch, fetch error or parse error falls back to RPC for that chunk with a warning, never an
-//! empty answer. What it cannot check is that a block's logs are *complete*: the dataset carries no
-//! receipts root.
+//! empty answer.
+//!
+//! Log *content* is the dataset's word too, and it carries no receipts root to check it by (#3091).
+//! Random damage is caught before this reader sees a row: the public files are zstd frames with
+//! content checksums, so a flipped bit fails the decode. What is left is a file that is wrong and
+//! well-formed (a pipeline bug upstream, or a mirror serving edited files), and for that each chunk is
+//! **spot-checked** the first time a filter reads it: `SPOT_CHECKS` of its blocks, drawn per run so
+//! a file's author cannot know which, are asked of the RPC with the same filter (`eth_getLogs` over
+//! one block) and must equal the dataset's rows for them field for field. One draw is uniform over
+//! the chunk's blocks, so a block the dataset left empty can be drawn; the other is weighted by the
+//! rows that matched, so the logs the nest will actually store are what gets checked. A mismatch is
+//! evidence against the whole dataset, not one block: it is logged naming the block and the field,
+//! and the dataset is not used again this run. This is a sample, not a proof. It catches a fault that
+//! touches a fair share of blocks within a few chunks; one edited block in a file evades it with
+//! probability 1 - 2/1000 per chunk. Proving every block against the receipts root is #3096's
+//! verify mode, at about the RPC cost this source exists to avoid.
 //!
 //! **Memory.** The compressed logs of at most `KEEP_CHUNKS` chunks (4 x 35 to 50 MB on mainnet); the
 //! hashes and timestamps of the last `KEEP_HEADERS` chunks (about 100 KB each), so a wide window's
@@ -44,7 +58,8 @@ mod tests;
 
 use crate::source::Source;
 use chunks::State;
-use std::sync::atomic::AtomicU64;
+use std::collections::hash_map::RandomState;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,6 +89,11 @@ pub struct Stats {
     /// Chunks the dataset had no file for (its head, or a mirror without the layout), then asked
     /// of the RPC.
     pub absent: AtomicU64,
+    /// Blocks spot-checked against the RPC's `eth_getLogs` (one RPC call each, more only for a
+    /// filter the RPC client splits into address groups).
+    pub spot_checks: AtomicU64,
+    /// Spot checks the dataset failed. Any is the end of the dataset for the run.
+    pub mismatches: AtomicU64,
 }
 
 pub struct XatuSource {
@@ -94,6 +114,13 @@ pub struct XatuSource {
     /// How long a transient failure (a stalled host, an RPC that would not answer the anchor) is
     /// remembered before the chunk is tried again.
     retry_after: Duration,
+    /// Blocks per chunk and filter checked against the RPC before the dataset's rows are served;
+    /// a chunk's length or more checks every block.
+    spot_checks: usize,
+    /// Drawn per run, so which blocks are checked cannot be known from the files.
+    spot_seed: RandomState,
+    /// Set once a spot check failed: nothing more is read from the dataset this run.
+    distrusted: AtomicBool,
     pub stats: Stats,
 }
 
@@ -122,6 +149,9 @@ impl XatuSource {
             keep_headers: chunks::KEEP_HEADERS,
             matched_budget: chunks::MATCHED_BUDGET,
             retry_after: chunks::TRANSIENT_FOR,
+            spot_checks: chunks::SPOT_CHECKS,
+            spot_seed: RandomState::new(),
+            distrusted: AtomicBool::new(false),
             stats: Stats::default(),
         }
     }
