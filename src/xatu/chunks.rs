@@ -9,7 +9,10 @@ use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Tokio's clock, which is the system clock unless a test pauses it: the "remembered until" deadlines
+// below are then moved by the test, not by how long the machine took to parse a chunk.
+use tokio::time::Instant;
 
 /// Chunks whose logs are held at once. A chunk's compressed logs are 35 to 50 MB on mainnet, so this
 /// bounds the source at a few hundred MB beside the 2 GB cursor budget.

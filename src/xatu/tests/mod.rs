@@ -430,7 +430,11 @@ async fn a_chunk_not_yet_final_is_left_to_rpc() {
     );
 }
 
-#[tokio::test]
+/// On a paused clock. With a real one, the 300 ms "while" started when the logs file failed and
+/// kept running while the first call parsed the remaining chunk, so a slow (debug, loaded) run spent
+/// it before the second call was made and the second call fetched again (15/20 on a worker branch,
+/// 20/20 here under a 2x CPU oversubscription). Only `advance` moves the deadline now.
+#[tokio::test(start_paused = true)]
 async fn a_failing_host_is_not_asked_again_by_every_window() {
     let rpc = Recorded::load();
     let files = Arc::new(Files {
@@ -438,7 +442,7 @@ async fn a_failing_host_is_not_asked_again_by_every_window() {
         ..Arc::try_unwrap(Files::all()).ok().unwrap()
     });
     let mut x = source(&rpc, &files);
-    x.retry_after = Duration::from_millis(300);
+    x.retry_after = Duration::from_secs(60);
     let f = filter(&[USDC, USDT]);
     same(
         &x.logs(&f, FIRST, LAST).await.unwrap(),
@@ -452,8 +456,16 @@ async fn a_failing_host_is_not_asked_again_by_every_window() {
         before,
         "remembered for a while"
     );
-    // Transient, not bad: once the while is over it is tried again.
-    tokio::time::sleep(x.retry_after + Duration::from_millis(50)).await;
+    // Still remembered a moment before the while is over...
+    tokio::time::advance(x.retry_after - Duration::from_millis(1)).await;
+    x.logs(&f, FIRST + 4, FIRST + 7).await.unwrap();
+    assert_eq!(
+        files.gets.load(Ordering::SeqCst),
+        before,
+        "remembered for the whole while"
+    );
+    // ...and transient, not bad: once it is over it is tried again.
+    tokio::time::advance(Duration::from_millis(2)).await;
     x.logs(&f, FIRST + 4, FIRST + 7).await.unwrap();
     assert!(files.gets.load(Ordering::SeqCst) > before);
 }

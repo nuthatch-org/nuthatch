@@ -7662,8 +7662,25 @@ template="pool"
         );
     }
 
-    /// macOS reports bytes. Other targets report kilobytes.
+    /// This process's peak resident size, in bytes.
+    ///
+    /// On Linux it is `VmHWM`, the high-water mark of the memory map `execve` gave this process,
+    /// and not `getrusage`: Linux keeps `ru_maxrss` across `execve`, and `Command` spawns with a
+    /// vfork-style clone that shares the parent's map until the exec, so a child's `ru_maxrss` starts
+    /// at its parent's peak. Spawned from a test harness running the whole lib suite in parallel,
+    /// `a_wide_batch_stays_under_the_cursor`'s child reported 791 MB while its own peak was 411 MB.
+    ///
+    /// Elsewhere `getrusage`: macOS reports bytes, other targets kilobytes.
     fn resident_bytes() -> u64 {
+        if cfg!(target_os = "linux") {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let kb: u64 = status
+                .lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+                .expect("VmHWM in /proc/self/status");
+            return kb.saturating_mul(1024);
+        }
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
         assert_eq!(rc, 0);
