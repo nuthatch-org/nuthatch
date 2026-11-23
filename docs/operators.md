@@ -1925,6 +1925,46 @@ nuthatch dev --dir . --audit-rpc https://another-provider.example/KEY
   `nuthatch audit sealed` is run per nest instead. It is off unless set, and talks only to the
   endpoint you name.
 
+### Checking sealed history against the chain (`audit chain`)
+
+`audit sealed` compares two providers' `eth_getLogs` answers. `audit chain` (#3096) checks the sealed
+rows against what each block commits to, so a row is held to the chain whatever wrote it: an RPC's
+`eth_getLogs`, or a history dataset such as `--history-source xatu`, whose log content is otherwise
+taken on trust (#3091). It is off unless you run it, and `dev` never runs it.
+
+```sh
+nuthatch audit chain --dir . --from 21000000 --to 21000999
+nuthatch audit chain --dir . --from 21000000 --to 21000999 --rpc http://127.0.0.1:8545 --json
+```
+
+For every block in the range, which must be sealed, it asks the endpoint for the block with its
+transactions and for its receipts, and checks, naming the block and the field on any failure:
+
+- `hash`: the header's fields hash to the block's hash. A header that does not is not believed
+  further.
+- `parent_hash`: each block follows the one before it in the range.
+- `transactions_root` and `receipts_root`: the transactions and receipts hash to the header's roots.
+- `logs_bloom`: the receipts' logs make the header's logs bloom.
+- `block_hash`: the sealed rows for the block came from this block, not from a fork it replaced.
+- `logs`: the sealed rows are exactly the receipts' logs, as the nest's registry decodes them, by log
+  index: a row that differs, a sealed row no receipt holds, and a receipt log no sealed row holds.
+  Transaction hashes are recomputed from the transactions' bytes, never read from the answer.
+
+What is compared is what `audit sealed` compares: the contract event tables, every column except
+`block_timestamp` and `block_hash` (checked on its own). Factory children, `[extract] blocks` rows and
+`[[calls]]` rows are not compared.
+
+- **Trust.** The check shows the sealed rows are what the endpoint's blocks commit to, linked block to
+  block. It cannot show the endpoint's chain is the canonical one, so `--rpc` should name an endpoint
+  you trust, ideally your own node; without it the nest's own `rpc_urls` are used. Only that endpoint
+  is contacted.
+- **RPC cost.** Two requests per block (`eth_getBlockByNumber` with transactions, and
+  `eth_getBlockReceipts`) plus one `eth_chainId`. Eight blocks are asked for at a time. The endpoint
+  must serve `eth_getBlockReceipts`.
+- **Memory.** The sealed rows of 100 blocks and the bodies of eight blocks at a time.
+- **Never repairs.** A difference is reported and the command exits 1; sealed segments are immutable.
+  To repair a range that really differs, re-index it from an endpoint that serves it.
+
 ### Health versus readiness
 
 Get this right in your supervisor and your load balancer:

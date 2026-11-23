@@ -30,8 +30,8 @@ type RowKey = (u64, u64);
 /// uses. Factory children are left out, since which children exist at a block depends on all the
 /// history before it rather than on the sampled range.
 pub struct Auditor {
-    registry: DecodeRegistry,
-    schema: Vec<TableSchema>,
+    pub(crate) registry: DecodeRegistry,
+    pub(crate) schema: Vec<TableSchema>,
     filter: LogFilter,
     start_block: Option<u64>,
 }
@@ -144,7 +144,7 @@ impl RangeReport {
 
 /// A row as both sides compare it. `block_timestamp` comes from a header rather than the log, and
 /// the audit fetches no headers, so it is zeroed on both sides.
-fn canonical(row: &DecodedRow) -> String {
+pub(crate) fn canonical(row: &DecodedRow) -> String {
     let mut row = row.clone();
     row.block_timestamp = 0;
     row.to_json().to_string()
@@ -418,6 +418,35 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The nest's `sealed_through`, or `None` when a running nest holds the store's lock and the
+/// catalogue has to stand in for it.
+pub(crate) fn watermark(dir: &Path) -> Option<u64> {
+    crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE))
+        .ok()
+        .map(|store| store.sealed_through())
+}
+
+/// Refuse `from..=to` unless every block in it is sealed for the audited tables.
+pub(crate) fn check_sealed(
+    dir: &Path,
+    auditor: &Auditor,
+    watermark: Option<u64>,
+    from: u64,
+    to: u64,
+) -> Result<()> {
+    let Some(c) = Catalogue::load(dir, auditor, watermark)? else {
+        bail!("nothing in {} has sealed yet", dir.display());
+    };
+    if from > to || from < c.lo || to > c.hi {
+        bail!(
+            "blocks {from}..={to} are not inside the sealed range {}..={}",
+            c.lo,
+            c.hi
+        );
+    }
+    Ok(())
+}
+
 /// `nuthatch audit sealed`.
 pub async fn run_cli(args: crate::cli::AuditSealedArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
@@ -427,29 +456,14 @@ pub async fn run_cli(args: crate::cli::AuditSealedArgs) -> Result<()> {
     let rpc = crate::rpc::RpcClient::new(vec![args.rpc.clone()])?;
     rpc.verify_chain_ids(config.nest.chain_id).await?;
     let endpoint = crate::rpc::redact_url(&args.rpc);
-    // A running nest holds the store's lock; the catalogue then stands in for its watermark.
-    let watermark = match crate::store::Store::open_existing(&dir.join(crate::config::DB_FILE)) {
-        Ok(store) => Some(store.sealed_through()),
-        Err(_) => {
-            println!(
-                "the hot store is in use or absent; sampling up to the furthest sealed segment"
-            );
-            None
-        }
-    };
+    let watermark = watermark(&dir);
+    if watermark.is_none() {
+        println!("the hot store is in use or absent; sampling up to the furthest sealed segment");
+    }
 
     let ranges = match (args.from, args.to) {
         (Some(from), Some(to)) => {
-            let Some(c) = Catalogue::load(&dir, &auditor, watermark)? else {
-                bail!("nothing in {} has sealed yet", dir.display());
-            };
-            if from > to || from < c.lo || to > c.hi {
-                bail!(
-                    "blocks {from}..={to} are not inside the sealed range {}..={}",
-                    c.lo,
-                    c.hi
-                );
-            }
+            check_sealed(&dir, &auditor, watermark, from, to)?;
             vec![(from, to)]
         }
         _ => {
@@ -550,7 +564,7 @@ pub fn spawn(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn catalogue() -> Catalogue {
@@ -621,7 +635,7 @@ mod tests {
         }
     }
 
-    fn nest(d: &Path, extra: &str) -> Auditor {
+    pub(crate) fn nest(d: &Path, extra: &str) -> Auditor {
         std::fs::create_dir_all(d.join("abis")).unwrap();
         std::fs::write(
             d.join("abis/erc20.json"),
