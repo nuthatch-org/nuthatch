@@ -105,6 +105,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     rpc.verify_chain_ids(config.nest.chain_id).await?;
     config.freshness = config.freshness.for_chain(&config.nest.chain, &rpc).await;
     let source: Arc<dyn Source> = Arc::new(rpc);
+    let source = crate::xatu::with_history_source(source, &config, &args)?;
     let concurrency =
         backfill_concurrency_for(args.concurrency, args.seal_direct, &[&config.nest.name]);
     let publish = args

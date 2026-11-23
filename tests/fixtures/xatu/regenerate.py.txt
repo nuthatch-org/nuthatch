@@ -1,0 +1,16 @@
+# How the parquet fixtures here were cut from real Xatu files (mainnet 26462624..26462635, chunks of 4).
+# The logs and headers JSON are recorded from Alchemy eth_getLogs / eth_getBlockByNumber on the same blocks.
+import sys, json, pyarrow.parquet as pq, pyarrow.compute as pc, pyarrow as pa, os
+src, out = sys.argv[1], sys.argv[2]
+USDC=b"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"; USDT=b"0xdac17f958d2ee523a2206206994597c13d831ec7"
+LO,HI,N=26462624,26462635,4
+logs=pq.read_table(f"{src}/logs_26462000.parquet"); blocks=pq.read_table(f"{src}/block_26462000.parquet")
+for s in range(LO,HI+1,N):
+    lt=logs.filter(pc.and_(pc.greater_equal(logs["block_number"],s),pc.less(logs["block_number"],s+N)))
+    lt=lt.filter(pc.is_in(lt["address"],value_set=pa.array([USDC,USDT],type=lt["address"].type)))
+    bt=blocks.filter(pc.and_(pc.greater_equal(blocks["block_number"],s),pc.less(blocks["block_number"],s+N)))
+    pq.write_table(lt,f"{out}/canonical_execution_logs/{N}/{s}.parquet",compression="zstd",row_group_size=1<<20)
+    pq.write_table(bt,f"{out}/canonical_execution_block/{N}/{s}.parquet",compression="zstd")
+    print(s,lt.num_rows,bt.num_rows)
+# old-schema/: the same block files with parent_hash (and the other columns older mainnet files lack,
+# state_root, blob_gas_used, excess_blob_gas) dropped: t.drop_columns([...]) then pq.write_table.

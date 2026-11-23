@@ -30,6 +30,7 @@ not to infer work that remains.
 - [Verification](verification.md)
 - [Production guide](production.md)
 - [Operator reference](operators.md)
+- [Backfilling Ethereum history from Xatu's public Parquet](history-from-xatu.md): the opt-in `--history-source xatu` flag, its lag, checks and measured RPC savings
 - [Public read-only demo nests](public-nests.md): a nest on a public URL behind nginx limits, with the deploy steps and a proxy test (#3028, #3031)
 - [Runtime admin API](admin-api.md): mount by NID, jobs, suspend, move, reclaim, dry run - for a platform driving a runtime
 - [Reading sealed segments without nuthatch](reading-segments.md)
