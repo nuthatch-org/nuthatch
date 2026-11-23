@@ -1015,8 +1015,9 @@ on every row, even where the node did stamp the log: which endpoints stamp varie
 stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
 backfill buys none for that (a nest with canonical `[[calls]]` still reads a header per window to
 check each call's block hash). Tip-following still reads one header per unfinalised block that holds a row, as
-every nest does, to check the block's hash against reorgs. Nothing fills a null later - sealed
-segments are immutable. Join on `block_number` when you need time. If your endpoints do stamp their
+every nest does, to check the block's hash against reorgs. Rows are never stamped: nothing fills a
+null later - sealed segments are immutable - and `/at` (and `at_time` on `/sql`) refuses on such a
+nest, naming the mode. Join on `block_number` when you need time. If your endpoints do stamp their
 logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
 `--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
 refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes
@@ -1213,7 +1214,7 @@ Per-nest routes. In a runtime they are prefixed: `/<name>/sql`, `/<name>/tables`
 | `GET /entities`, `GET /entity/{id}` | entity point-reads, transparently across the hot/cold seam |
 | `GET /balances`, `GET /balance/{address}` | the derived IVM balance view |
 | `GET /exposure/{address}`, `GET /flags` | compliance surfaces (RFC-0008) |
-| `GET /at?time=<unix seconds>` | where the nest stood at a time (#2941): `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it, which proves the nest indexed past it. Its state at the time is its state at `block`; `exact` says the two are adjacent, `final` that `next_block` is sealed. Refused (409) for a time not yet indexed past, or before the first stamped block of a nest whose history does not start at deployment; 422 for a timestamp-free nest |
+| `GET /at?time=<unix seconds>` | where the nest stood at a time (#2941): `block`, the newest block at or before it the nest holds a timestamp for, and `next_block`, the oldest after it, which proves the nest indexed past it. Its state at the time is its state at `block`; `exact` says the two are adjacent, `final` that `next_block` is sealed. Refused (409) for a time not yet indexed past, or before the first stamped block of a nest whose history does not start at deployment; 422 for a timestamp-free or null-timestamp nest |
 | `GET /nest` | nest identity and registry hash, and the `undecoded` block `/ready` also carries |
 | `GET /shape` | capability probe: what this nest can answer (drives adaptive MCP) |
 | `POST /mcp` | MCP over Streamable HTTP: the query tools of `nuthatch mcp`, never the authoring ones; see [the AI section](#ai-point-a-coding-agent-at-your-data) |
