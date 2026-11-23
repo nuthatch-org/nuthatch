@@ -1015,8 +1015,8 @@ on every row, even where the node did stamp the log: which endpoints stamp varie
 stored rows must not depend on which one answered. No header is fetched to *stamp* a row, so a
 backfill buys none for that (a nest with canonical `[[calls]]` still reads a header per window to
 check each call's block hash). Tip-following still reads one header per unfinalised block that holds a row, as
-every nest does, to check the block's hash against reorgs. Nothing fills a null later - sealed
-segments are immutable. Join on `block_number` when you need time. If your endpoints do stamp their
+every nest does, to check the block's hash against reorgs. Rows are never stamped: nothing fills a null later - sealed
+segments are immutable - and `/at` refuses on such a nest, naming the mode. Join on `block_number` when you need time. If your endpoints do stamp their
 logs, use the default instead: it takes the timestamp from the log and buys no header for it. Like
 `--no-timestamps` it is an init-time declaration: it is `schema_version = 2`, a nest that has indexed
 refuses to switch to or from it, and an eager or timestamp-free nest's `nuthatch.toml`, sealed bytes

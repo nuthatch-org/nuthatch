@@ -1444,8 +1444,8 @@ pub struct InitArgs {
     #[arg(long)]
     pub no_timestamps: bool,
 
-    /// Keep `block_timestamp` on every row, but never buy a block header for it: every row's
-    /// `block_timestamp` is null (#3065), deterministic by construction. Use the default for timestamps.
+    /// Keep `block_timestamp` on every row, but never stamp it: no block header is bought for it, so
+    /// every row's `block_timestamp` is null (#3065), deterministic by construction. `/at` refuses. Use the default for timestamps.
     ///
     /// For chains whose `eth_getLogs` carries no `blockTimestamp` (XDC, for one), where the eager
     /// default costs one `eth_getBlockByNumber` per block that holds a log - most of a cold start's

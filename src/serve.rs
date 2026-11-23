@@ -6903,6 +6903,16 @@ async fn place(
             (status, Json(json!({ "error": error }))).into_response(),
         ))
     };
+    // A null-timestamp nest (#3065) keeps the column but never stamps a row, so there is nothing to
+    // resolve a time against; answering `block: null` would read as "before the first block".
+    if s.nest_info["null_timestamps"].as_bool() == Some(true) {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this nest runs with null block timestamps ([nest] block_timestamps = \"null\"), which \
+             never stamps its rows, so it cannot place a time"
+                .into(),
+        );
+    }
     // A timestamp-free nest (RFC-0029 §6b) declares no `block_timestamp` column on any table.
     let stamped = |t: &TableSchema| t.columns.iter().any(|c| c.name == "block_timestamp");
     if !s.tables.is_empty() && !s.tables.iter().any(stamped) {
@@ -10785,6 +10795,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no block timestamps"));
+    }
+
+    /// #3090: a null-timestamp nest refuses `/at` by naming the mode, not `block: null`.
+    #[tokio::test]
+    async fn a_null_timestamp_nest_refuses_to_place_a_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        state.nest_info = Arc::new(json!({ "null_timestamps": true }));
+        let (status, body) = get_json(state, "/at?time=1700000000").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("null block timestamps"), "{error}");
+        assert!(error.contains("never stamps"), "{error}");
     }
 
     /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never

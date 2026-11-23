@@ -2066,6 +2066,7 @@ impl Follower {
             "nid": r.nid,
             "registry_hash": format!("0x{identity}"),
             "table_count": registry.tables().len(),
+            "null_timestamps": registry.null_timestamps(),
             "contracts": config.contracts.iter()
                 .map(|c| serde_json::json!({ "alias": c.alias, "address": c.address }))
                 .collect::<Vec<_>>(),
