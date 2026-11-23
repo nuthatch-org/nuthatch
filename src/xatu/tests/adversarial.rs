@@ -145,8 +145,15 @@ async fn every_window_over_every_mix_of_chunks_is_the_nodes_answer() {
         }
         let blocks: Vec<u64> = (FIRST..=LAST).collect();
         let ts = x.block_timestamps(&blocks).await.unwrap();
+        let hs = x.block_hashes(&blocks).await.unwrap();
         for h in &rpc.headers {
             assert_eq!(ts[&h.0], h.2, "mix {mix}: timestamp of {}", h.0);
+            // The node's hash, which in an anchor-disagrees mix is its (deliberately wrong) one.
+            let node = match wrong {
+                Some(w) if w == h.0 => format!("0x{:064x}", 1),
+                _ => h.1.clone(),
+            };
+            assert_eq!(hs[&h.0], node, "mix {mix}: hash of {}", h.0);
         }
     }
 }
@@ -227,9 +234,10 @@ async fn a_logs_file_of_another_chunk_is_refused() {
 /// Single bits flipped through a logs file. Ignored: it fails, by design of the trust model rather
 /// than by a bug. Most flips decode cleanly into different logs (the files carry no page checksums
 /// this reader checks, and a log's content is the dataset's word, like its completeness), so a
-/// damaged file is served as the chain's logs. Kept as the reproducer for that limit.
+/// damaged file is served as the chain's logs. Kept as the reproducer for that limit, tracked in
+/// #3102: un-ignore it (or delete it, if the limit is accepted) when that issue is closed.
 #[tokio::test]
-#[ignore]
+#[ignore = "known limit of the trust model, tracked in #3102"]
 async fn flipped_bytes_in_a_logs_file() {
     let rpc = Recorded::load();
     let f = filter(&[USDC, USDT]);
