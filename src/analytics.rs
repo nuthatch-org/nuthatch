@@ -88,6 +88,7 @@ fn current_tenant() -> Option<Arc<str>> {
 
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
 fn open_session(dir: &Path, tenant: Option<&Arc<str>>) -> Result<Box<dyn Session>> {
+    #[cfg(test)]
     note_session_open(dir, tenant);
     let session = engine().open(dir, tenant.map(|t| &**t))?;
     if tenant.is_some() {
@@ -161,10 +162,14 @@ fn content_stamp(path: &Path) -> Option<InputStamp> {
 type SessionKey = (PathBuf, Option<Arc<str>>, u64);
 
 /// Opens are counted per dataset and tenant, across every watermark.
+#[cfg(test)]
 type SessionOpensKey = (PathBuf, Option<Arc<str>>);
 
 static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<SessionKey, SessionCache>>> =
     OnceLock::new();
+/// Only tests read it, so only test builds keep it: in a shared runtime it gained an entry for every
+/// (dataset, tenant) that ever opened a session and dropped none, whatever was unmounted (#3093).
+#[cfg(test)]
 static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionOpensKey, u64>>> =
     OnceLock::new();
 static SESSION_USE: AtomicU64 = AtomicU64::new(0);
@@ -208,6 +213,7 @@ fn session_cache_lock(
         .unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(test)]
 fn note_session_open(dir: &Path, tenant: Option<&Arc<str>>) {
     *SESSION_OPENS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
