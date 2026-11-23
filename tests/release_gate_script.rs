@@ -1037,6 +1037,33 @@ fn production_over_its_rss_budget_is_still_a_baseline_for_the_candidate() {
     assert!(text.contains("has no PROVENANCE"), "{text}");
 }
 
+/// #3098: with no PROVENANCE, production is the highest full release, not the newest-listed. An LTS
+/// backport published after a newer minor is listed first and is not what production runs.
+#[test]
+fn without_provenance_production_is_the_highest_release_not_an_older_lines_patch() {
+    let c = case();
+    let set = c.set(&[("answers", c.counts())]);
+    let r = releases(
+        &c,
+        &[
+            ("v5.31.0-rc1", "pre", 0),
+            ("v5.24.3", "full", 0),
+            ("v5.30.0", "full", 0),
+        ],
+        &[],
+    );
+    let (code, text) = r.runner(&c, &set, &["v5.31.0-rc1"], &[]);
+    assert_eq!(code, Some(0), "{text}");
+    let posted = r.read("posted");
+    let verdict = posted.lines().last().unwrap_or_default();
+    assert!(
+        verdict.starts_with("sha-v5.31.0-rc1 success ")
+            && verdict.contains("v5.30.0")
+            && !verdict.contains("v5.24.3"),
+        "{posted}\n{text}"
+    );
+}
+
 /// A statement production fails as well cannot be a regression, and the output says so, but the
 /// candidate is still failed for refusing it: its verdict is its own.
 #[test]

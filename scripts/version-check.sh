@@ -132,6 +132,27 @@ else
   echo "SECURITY.md supported versions: OK"
 fi
 
+# #3098: LTS lines live in their own section, outside the range above, because they outlive it by
+# design. What that section owes the reader is an end date per line, so a row without one fails.
+lts_bad="" lts_rows=0 today=$(date -u +%F)
+while IFS='|' read -r _ line designated ends status _; do
+  line=$(echo "$line" | xargs) designated=$(echo "$designated" | xargs)
+  ends=$(echo "$ends" | xargs) status=$(echo "$status" | xargs)
+  case "$line" in '' | Line | ---*) continue ;; esac
+  lts_rows=$((lts_rows + 1))
+  if ! [[ $line =~ ^[0-9]+\.[0-9]+$ && $designated =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && $ends =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    lts_bad="$lts_bad'$line' "
+  elif [[ $ends < $today && $status != Ended* ]]; then
+    echo "  note: LTS $line ended on $ends; mark its row Ended"
+  fi
+done < <(sed -n '/^## Long-term support/,/^## /p' SECURITY.md | grep '^|')
+if [ -n "$lts_bad" ]; then
+  echo "SECURITY.md LTS lines: STALE (rows ${lts_bad}need <major>.<minor>, a designated date and an end date, as YYYY-MM-DD)"
+  fail=$((fail + 1))
+else
+  echo "SECURITY.md LTS lines: OK ($lts_rows)"
+fi
+
 # 3. Everything else, reported but never judged. `docs/rfcs/` and the progress log are dated writing
 #    and *should* keep the version they were written about; so should a security note naming the
 #    release that fixed something. Listing them without a verdict is deliberate - a checker that
