@@ -310,19 +310,16 @@ async fn logs_and_timestamps_are_exactly_what_the_node_said() {
     );
 
     // And it did that without the node's logs: the only `eth_getLogs` are the spot checks, one block
-    // each, at most two per chunk and filter (five filters here, three chunks), and none again for
-    // a chunk and filter already checked.
+    // each. Four distinct filters read the dataset, touching 3 + 2 + 1 + 3 = 9 (chunk, filter) pairs
+    // (the repeated filter is already checked); each pair draws two blocks that may coincide, so one
+    // or two checks a pair, and none again for a pair already checked.
     let calls = rpc.log_calls.lock().unwrap().clone();
     assert!(calls.iter().all(|(a, b)| a == b), "{calls:?}");
     assert_eq!(
         calls.len() as u64,
         x.stats.spot_checks.load(Ordering::SeqCst)
     );
-    assert!(
-        calls.len() >= 5 * 3 && calls.len() <= 2 * 5 * 3,
-        "{}",
-        calls.len()
-    );
+    assert!(calls.len() >= 9 && calls.len() <= 2 * 9, "{}", calls.len());
     x.logs(&filter(&[USDC, USDT]), FIRST, LAST).await.unwrap();
     assert_eq!(rpc.log_calls.lock().unwrap().len(), calls.len());
     assert_eq!(x.stats.mismatches.load(Ordering::SeqCst), 0);
