@@ -10797,17 +10797,46 @@ mod tests {
             .contains("no block timestamps"));
     }
 
-    /// #3090: a null-timestamp nest refuses `/at` by naming the mode, not `block: null`.
+    /// #3090: a null-timestamp nest keeps `block_timestamp` on every table but leaves it null on
+    /// every row. `/at` and `/sql?at_time=` refuse by naming the mode rather than answering as if
+    /// the time were before the nest's first block.
     #[tokio::test]
     async fn a_null_timestamp_nest_refuses_to_place_a_time() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut state = table_fixture(tmp.path(), 1..=3, 4..=5);
+        let row = |b: u64| {
+            json!({"table":"t","block_number":b,"log_index":0,"block_timestamp":null,"v":"x"})
+                .to_string()
+        };
+        crate::seal::seal_range(tmp.path(), &[row(10), row(20)], 1, 30).unwrap();
+        let mut state = test_state(tmp.path(), 1);
+        state.store.set_meta("sealed_through", "30").unwrap();
+        state.store.set_meta("last_block", "50").unwrap();
+        state
+            .store
+            .put_entity(&Store::entity_key(40, 0), &row(40))
+            .unwrap();
+        state.tables = Arc::new(vec![crate::registry::TableSchema {
+            table: "t".into(),
+            alias: "t".into(),
+            kind: crate::registry::TableKind::Event,
+            function: String::new(),
+            selector: String::new(),
+            event: "T".into(),
+            topic0: "0x".into(),
+            columns: crate::registry::implicit_columns(true),
+        }]);
         state.nest_info = Arc::new(json!({ "null_timestamps": true }));
-        let (status, body) = get_json(state, "/at?time=1700000000").await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        let error = body["error"].as_str().unwrap();
-        assert!(error.contains("null block timestamps"), "{error}");
-        assert!(error.contains("never stamps"), "{error}");
+
+        for path in [
+            "/at?time=1700000000",
+            "/sql?q=SELECT%20count(*)%20AS%20n%20FROM%20t&at_time=1700000000",
+        ] {
+            let (status, body) = get_json(state.clone(), path).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{path}: {body}");
+            let error = body["error"].as_str().unwrap();
+            assert!(error.contains("null block timestamps"), "{path}: {error}");
+            assert!(error.contains("never stamps"), "{path}: {error}");
+        }
     }
 
     /// RFC-0073 FR8: a strict mount's queries run in its tenant's session on every SQL route, never
