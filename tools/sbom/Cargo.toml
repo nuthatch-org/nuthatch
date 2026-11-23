@@ -1,0 +1,18 @@
+[package]
+name = "nuthatch-sbom"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "#3097: the CycloneDX SBOM attached to every release artifact"
+publish = false
+
+# Its own crate, outside the binary, with no dependencies: it reads `cargo tree` and Cargo.lock and
+# writes JSON by hand, so the release gains no crate and the shipped binary is what it was. The root
+# crate's tests compile src/sbom.rs directly (tests/release_sbom.rs), so it runs on every PR rather
+# than only on a tag.
+[[bin]]
+name = "nuthatch-sbom"
+path = "src/main.rs"
+
+[dependencies]

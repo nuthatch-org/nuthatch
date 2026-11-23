@@ -174,6 +174,7 @@ depends = [
   "crate-count-receiver",
   "crate-fixture-rpc",
   "crate-lodestar-parity",
+  "crate-sbom",
   "crate-seal",
   "crate-identity",
   "crate-scaffold",
@@ -203,6 +204,14 @@ run = [
   "cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings",
 ]
 sources = ["tools/lodestar-parity/**", "rust-toolchain.toml"]
+
+# #3097: the release SBOM generator. Its logic is also compiled into tests/release_sbom.rs.
+[tasks.crate-sbom]
+run = [
+  "cargo fmt --check --manifest-path tools/sbom/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path tools/sbom/Cargo.toml -- -D warnings",
+]
+sources = ["tools/sbom/**", "rust-toolchain.toml"]
 
 [tasks.crate-seal]
 run = [

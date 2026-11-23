@@ -208,6 +208,8 @@ mod release_gate_script;
 mod release_latest_script;
 #[path = "release_provenance.rs"]
 mod release_provenance;
+#[path = "release_sbom.rs"]
+mod release_sbom;
 #[path = "required_checks.rs"]
 mod required_checks;
 #[path = "required_contexts_script.rs"]

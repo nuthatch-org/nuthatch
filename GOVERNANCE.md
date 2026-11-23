@@ -61,4 +61,8 @@ Releases are the supply chain an operator depends on. Signing/release-key custod
 successor/escrow arrangement for those keys, are tracked as an open governance item (RFC-0006 Q3) to
 be settled while the project is small. Until then: releases are cut from tagged commits on `main`,
 published to GitHub Releases (with per-artifact SHA-256), and reproducible from the
-pinned toolchain.
+pinned toolchain. Each binary and the engine's module carry a build provenance attestation and a
+CycloneDX SBOM (`<artifact>.cdx.json`) that the same attestation covers. The SBOM is generated from
+Cargo.lock, the resolved build graph and the pinned toolchain, is byte-identical for a commit, and
+its licences are held to `deny.toml`. The workflow verifies both before a release is published
+([docs/install.md](docs/install.md#software-bill-of-materials)).

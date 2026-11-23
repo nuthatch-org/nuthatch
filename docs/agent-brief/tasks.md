@@ -37,10 +37,11 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `crate-fixture-rpc` |  |  | cached on its inputs |
 | `crate-identity` |  |  | cached on its inputs |
 | `crate-lodestar-parity` |  |  | cached on its inputs |
+| `crate-sbom` |  |  | cached on its inputs |
 | `crate-scaffold` |  |  | cached on its inputs |
 | `crate-seal` |  |  | cached on its inputs |
 | `crate-timelapse` |  |  | cached on its inputs |
-| `crates` | fmt, clippy and test for the path crates CI checks beside decode | `crate-count-receiver`, `crate-fixture-rpc`, `crate-lodestar-parity`, `crate-seal`, `crate-identity`, `crate-scaffold`, `crate-timelapse`, `crate-eval-runner` | runs its dependencies only |
+| `crates` | fmt, clippy and test for the path crates CI checks beside decode | `crate-count-receiver`, `crate-fixture-rpc`, `crate-lodestar-parity`, `crate-sbom`, `crate-seal`, `crate-identity`, `crate-scaffold`, `crate-timelapse`, `crate-eval-runner` | runs its dependencies only |
 | `decode` | fmt, clippy and test for the decode crate (its own workspace, so the root cargo never runs its tests) |  | cached on its inputs |
 | `deny` | cargo-deny: advisories, licences, bans, sources, for each manifest CI checks |  | always runs |
 | `doc` | Build the API docs |  | cached on its inputs |

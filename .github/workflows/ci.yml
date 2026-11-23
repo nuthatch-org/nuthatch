@@ -345,6 +345,11 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: yatr crate-lodestar-parity
+      # #3097: the SBOM every release artifact ships; tests/release_sbom.rs runs its logic on this tree.
+      - name: fmt · clippy (sbom)
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: yatr crate-sbom
       # RFC-0065 S2. The bytes sealing writes, in their own crate so a browser tab can seal to the
       # same address; `seal::tests::sealed_bytes_are_pinned` in the root crate holds the hashes.
       - name: fmt · clippy · test (seal)

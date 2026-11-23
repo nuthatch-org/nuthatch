@@ -202,6 +202,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: build
         run: cargo build --profile dist --locked ${{ matrix.features }} --target ${{ matrix.target }}
+      # #3097: the CycloneDX SBOM of this binary, beside the tarball and under the same attestation.
+      # tools/sbom reads the graph `cargo tree` resolves for this target and these features (not the
+      # lockfile, which also lists crates no build here links), Cargo.lock's checksums and the pinned
+      # toolchain. It writes no timestamp or random serial, so one commit gives the same bytes, and it
+      # refuses to write one naming a licence deny.toml does not allow (cargo-deny checks only the
+      # default features). Std-only, built here: no crate is added to anything that ships.
+      - name: sbom
+        run: >-
+          cargo run --locked --release --manifest-path tools/sbom/Cargo.toml --
+          --manifest-path Cargo.toml --target ${{ matrix.target }} --deny deny.toml
+          --artifact nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+          --out nuthatch-${{ matrix.prefix }}${{ matrix.target }}.cdx.json
+          -- ${{ matrix.features }}
       - name: package
         run: |
           tar czf "$TARBALL" -C "target/${{ matrix.target }}/dist" nuthatch
@@ -215,6 +228,7 @@ jobs:
           path: |
             nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
             nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz.sha256
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.cdx.json
           retention-days: 7
       - name: attach to release
         if: github.event_name == 'push'
@@ -225,6 +239,7 @@ jobs:
           files: |
             nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
             nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz.sha256
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.cdx.json
           fail_on_unmatched_files: true
 
       # **#830: a checksum from the same release proves nothing.** A `.sha256` sidecar downloaded
@@ -238,12 +253,15 @@ jobs:
       #
       # Attested **here**, on the machine that produced the file, not in `publish`: attesting a file
       # downloaded back from the release would certify only that we successfully downloaded whatever
-      # is sitting there.
+      # is sitting there. The SBOM is a second subject of the same attestation (#3097): same run,
+      # same commit, so a reader can check it was written by the run that built the tarball.
       - name: attest the built artifact
         if: github.event_name == 'push'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+          subject-path: |
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.tar.gz
+            nuthatch-${{ matrix.prefix }}${{ matrix.target }}.cdx.json
       # Hand the x86_64 Linux default, scaled and flight binaries to the container job, so the images
       # ship the same artifacts attached to the release rather than a second build nobody diffed.
       - name: keep the binary for the image
@@ -292,6 +310,13 @@ jobs:
           plain/build.sh "$GITHUB_WORKSPACE/nuthatch-events.wasm"
           cargo build --locked --release --manifest-path tests/wasmtime-host/Cargo.toml
           cargo build --locked --release --manifest-path ../tools/fixture-rpc/Cargo.toml
+      # #3097: the module's SBOM, as the binaries' are made. `nuthatch-engine.js` has none: it is our
+      # own host files joined by build.mjs, which installs and fetches nothing.
+      - name: sbom
+        run: >-
+          cargo run --locked --release --manifest-path tools/sbom/Cargo.toml --
+          --manifest-path embed/plain/Cargo.toml --target wasm32-unknown-unknown --deny deny.toml
+          --artifact nuthatch-events.wasm --out nuthatch-events.cdx.json
       - name: gate the module that ships
         working-directory: embed
         # `shell: bash` for pipefail: every run is piped into tee.
@@ -348,6 +373,7 @@ jobs:
             nuthatch-events.wasm.sha256
             nuthatch-engine.js
             nuthatch-engine.js.sha256
+            nuthatch-events.cdx.json
             nuthatch-events-README.md
           retention-days: 7
       - name: attach to release
@@ -361,6 +387,7 @@ jobs:
             nuthatch-events.wasm.sha256
             nuthatch-engine.js
             nuthatch-engine.js.sha256
+            nuthatch-events.cdx.json
             nuthatch-events-README.md
           fail_on_unmatched_files: true
       - name: attest the built module
@@ -370,6 +397,7 @@ jobs:
           subject-path: |
             nuthatch-events.wasm
             nuthatch-engine.js
+            nuthatch-events.cdx.json
 
   # Build the container images (RFC-0005 release engineering). "Build it yourself from this Dockerfile"
   # is not a deployment story for a platform team, which is what this closes. Nothing is pushed here:
@@ -476,7 +504,7 @@ jobs:
           set -euo pipefail
           mkdir -p verify && cd verify
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.tar.gz' --pattern 'nuthatch-events.wasm' --pattern 'nuthatch-engine.js' --clobber
+            --pattern '*.tar.gz' --pattern '*.cdx.json' --pattern 'nuthatch-events.wasm' --pattern 'nuthatch-engine.js' --clobber
           shopt -s nullglob
           files=(*.tar.gz)
           if [ ${#files[@]} -eq 0 ]; then
@@ -491,7 +519,15 @@ jobs:
             echo "::error::no nuthatch-engine.js on the release - the engine job attached no host package"
             exit 1
           fi
-          files+=(nuthatch-events.wasm nuthatch-engine.js)
+          # #3097: every binary and the module ship their SBOM, and it verifies like they do.
+          for f in "${files[@]}" nuthatch-events.wasm; do
+            sbom="${f%.tar.gz}"; sbom="${sbom%.wasm}.cdx.json"
+            if [ ! -f "$sbom" ]; then
+              echo "::error::$f is on the release without its SBOM, $sbom"
+              exit 1
+            fi
+          done
+          files+=(nuthatch-events.wasm nuthatch-engine.js *.cdx.json)
           for f in "${files[@]}"; do
             echo "--- $f ---"
             gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-ref "$GITHUB_REF"
