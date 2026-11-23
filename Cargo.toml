@@ -140,7 +140,8 @@ bytes = "1"
 # graph-node computes its own `BigDecimal` on this crate, and the prices a subgraph stores need an
 # integer wider than any fixed-width type: `sqrtPriceX96^2` reaches 2^384.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
-# The analytical engine (RFC-0044 Amendment 2), pinned by rev. Its arrow is not ours, so no batch
+# The analytical engine (RFC-0044 Amendment 2), pinned by tag; Cargo.lock records the commit the tag
+# resolved to (8a75df12), so a moved tag cannot change a locked build. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
 burrmill = { git = "https://github.com/nuthatch-org/burrmill", tag = "v0.2.0", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
