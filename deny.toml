@@ -100,6 +100,12 @@ ignore = [
   # signing is ed25519, and the only secp256k1 signing is in tests with fixed keys. The fix is 0.7.6,
   # which needs k256 0.14; drop this on the alloy bump that takes it. Checked 2026-10-24.
   "RUSTSEC-2026-0387", # crypto-bigint: timing variability in constant-time operations
+  #
+  # cookie 0.16.2 (transitive: feldera-types 0.320 -> actix-web 4.18). Affects only a process that fork()s
+  # and then seals private cookies in more than one resulting process. Nuthatch never forks, uses no cookies,
+  # and actix-web is only dragged in by dbsp's types crate; actix-web 4 pins cookie 0.16, so no
+  # lockfile bump fixes it. Drop this when feldera moves past actix-web 4.18. Checked 2026-11-23.
+  "RUSTSEC-2026-0594", # cookie: private cookie nonces repeat in forking processes
 ]
 
 [licenses]
