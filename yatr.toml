@@ -181,6 +181,7 @@ depends = [
   "crate-count-receiver",
   "crate-fixture-rpc",
   "crate-lodestar-parity",
+  "crate-gateway",
   "crate-sbom",
   "crate-seal",
   "crate-identity",
@@ -219,6 +220,16 @@ run = [
   "cargo clippy --locked --all-targets --manifest-path tools/sbom/Cargo.toml -- -D warnings",
 ]
 sources = ["tools/sbom/**", "rust-toolchain.toml"]
+
+[tasks.crate-gateway]
+desc = "fmt, clippy and test for the reference read gateway (#3094)"
+run = [
+  "cargo fmt --check --manifest-path tools/gateway/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path tools/gateway/Cargo.toml -- -D warnings",
+  "cargo test --locked --manifest-path tools/gateway/Cargo.toml",
+]
+# `policy::tests::routes_are_classified` reads src/serve.rs, so a new nuthatch route reruns it.
+sources = ["tools/gateway/**", "src/serve.rs", "rust-toolchain.toml"]
 
 [tasks.crate-seal]
 run = [
@@ -468,6 +479,7 @@ run = [
   "cargo deny --all-features --manifest-path timelapse/Cargo.toml check advisories licenses bans sources",
   "cargo deny --all-features --manifest-path embed/Cargo.toml check advisories licenses bans sources",
   "cargo deny --all-features --manifest-path embed/plain/Cargo.toml check advisories licenses bans sources",
+  "cargo deny --all-features --manifest-path tools/gateway/Cargo.toml check advisories licenses bans sources",
 ]
 # Advisories arrive without Cargo.lock changing, so a cached pass would hide them.
 no_cache = true
