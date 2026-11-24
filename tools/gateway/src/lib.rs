@@ -137,8 +137,11 @@ enum Keys {
     },
 }
 
+/// A JWKS is a few keys; a megabyte is far past any real one.
+const MAX_JWKS_BYTES: usize = 1 << 20;
+
 async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<KeySet, String> {
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
@@ -146,10 +149,25 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<KeySet, Strin
     if !resp.status().is_success() {
         return Err(format!("JWKS fetch from jwks_url: HTTP {}", resp.status()));
     }
-    let body = resp
-        .bytes()
+    let too_big = || format!("JWKS from jwks_url is larger than {MAX_JWKS_BYTES} bytes");
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_JWKS_BYTES as u64)
+    {
+        return Err(too_big());
+    }
+    // Read in chunks so a chunked response with no length is cut off at the cap too.
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("JWKS fetch from jwks_url failed: {}", e.without_url()))?;
+        .map_err(|e| format!("JWKS fetch from jwks_url failed: {}", e.without_url()))?
+    {
+        if body.len() + chunk.len() > MAX_JWKS_BYTES {
+            return Err(too_big());
+        }
+        body.extend_from_slice(&chunk);
+    }
     KeySet::from_jwks(&body)
 }
 
@@ -404,6 +422,9 @@ async fn handle(State(g): State<Arc<Gateway>>, req: Request) -> Response {
     forward(&g, parts, forwarded).await
 }
 
+/// What the gateway adds to `Via` on every upstream request.
+const VIA: &str = "1.1 nuthatch-gateway";
+
 /// RFC 9110 §7.6.1's connection-specific fields, which a proxy does not forward.
 fn hop_by_hop(name: &HeaderName) -> bool {
     matches!(
@@ -429,9 +450,28 @@ async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) ->
     let mut out = g
         .client
         .request(parts.method.clone(), format!("{}{target}", g.upstream));
+    // RFC 9110 §7.6.1: a field `Connection` names is hop-by-hop too.
+    let nominated: Vec<String> = parts
+        .headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut via: Vec<String> = parts
+        .headers
+        .get_all(header::VIA)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    via.push(VIA.to_string());
     for (name, value) in &parts.headers {
         // The token stops here: nuthatch has no use for it, and would only log or echo it.
         let dropped = hop_by_hop(name)
+            || nominated.iter().any(|n| n == name.as_str())
+            || *name == header::VIA
             || *name == header::AUTHORIZATION
             || *name == header::HOST
             || *name == header::CONTENT_LENGTH;
@@ -439,6 +479,10 @@ async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) ->
             out = out.header(name, value);
         }
     }
+    // nuthatch's address mode lets a caller on this machine use the operator's RPC. The gateway
+    // rewrites Host to the upstream, so without a proxy marker every remote caller would look local.
+    // `Via` is on nuthatch's proxy-header list (src/address_mode.rs, PROXY_HEADERS).
+    out = out.header(header::VIA, via.join(", "));
     let resp = match out.body(body).send().await {
         Ok(r) => r,
         Err(e) => {

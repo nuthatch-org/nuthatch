@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 struct Seen {
     target: String,
     authorization: bool,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -38,12 +39,18 @@ async fn stub_nuthatch() -> (String, Log) {
         async move {
             let target = req.uri().path_and_query().unwrap().to_string();
             let authorization = req.headers().contains_key("authorization");
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
             let body = axum::body::to_bytes(req.into_body(), 1 << 20)
                 .await
                 .unwrap();
             seen.lock().unwrap().push(Seen {
                 target,
                 authorization,
+                headers,
                 body: body.to_vec(),
             });
             axum::Json(json!({ "upstream": true }))
@@ -738,4 +745,110 @@ prefix = ""
     ] {
         assert!(!log.contains(leaked), "the log carries {leaked:?}: {log}");
     }
+}
+
+/// nuthatch's address mode reads a caller with no proxy header and a loopback Host as local, and
+/// lends it the operator's RPC. The gateway rewrites Host, so it must mark every request itself.
+#[tokio::test]
+async fn every_upstream_request_carries_a_proxy_marker() {
+    let h = Harness::new().await;
+    let token = h.signer.sign("es", claims("read:usdc"));
+    let r = h
+        .http
+        .get(format!("{}/usdc/sql?q=SELECT%201", h.base))
+        .bearer_auth(&token)
+        .header("host", "gateway.public.example")
+        .header("via", "1.0 client-proxy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, _, _) = h.get("/usdc/tables", Some(&token)).await;
+    let seen = h.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    for s in &seen {
+        let via: Vec<&str> = s
+            .headers
+            .iter()
+            .filter(|(k, _)| k == "via")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(via.len(), 1, "{:?}", s.headers);
+        assert!(via[0].ends_with("1.1 nuthatch-gateway"), "{}", via[0]);
+    }
+    // A hop's own Via is kept in front of ours.
+    assert!(seen[0]
+        .headers
+        .iter()
+        .any(|(k, v)| k == "via" && v.starts_with("1.0 client-proxy")));
+}
+
+#[tokio::test]
+async fn connection_and_the_headers_it_names_are_not_forwarded() {
+    let h = Harness::new().await;
+    let token = h.signer.sign("es", claims("read:usdc"));
+    let r = h
+        .http
+        .get(format!("{}/usdc/tables", h.base))
+        .bearer_auth(&token)
+        .header("connection", "x-hop, Keep-Alive")
+        .header("x-hop", "1")
+        .header("keep-alive", "timeout=5")
+        .header("x-kept", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let seen = h.seen.lock().unwrap().clone();
+    let names: Vec<&str> = seen[0].headers.iter().map(|(k, _)| k.as_str()).collect();
+    for gone in ["x-hop", "keep-alive", "upgrade", "te"] {
+        assert!(!names.contains(&gone), "{gone} reached upstream: {names:?}");
+    }
+    assert!(names.contains(&"x-kept"), "{names:?}");
+}
+
+#[tokio::test]
+async fn an_id_token_is_refused_as_an_access_token() {
+    let h = Harness::new().await;
+    let mut c = claims("read:usdc");
+    c["nonce"] = json!("n-0S6_WzA2Mj");
+    let (status, body, _) = h.get("/usdc/tables", Some(&h.signer.sign("es", c))).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (401, Some("token_wrong_type")),
+        "{body}"
+    );
+    assert_eq!(h.forwarded(), 0);
+}
+
+#[tokio::test]
+async fn an_oversized_jwks_is_refused_at_start() {
+    let (upstream, _) = stub_nuthatch().await;
+    let big = format!(r#"{{"keys":[],"pad":"{}"}}"#, "x".repeat((1 << 20) + 1));
+    let idp = serve(axum::Router::new().route(
+        "/jwks.json",
+        axum::routing::get(move || {
+            let big = big.clone();
+            async move { ([("content-type", "application/json")], big) }
+        }),
+    ))
+    .await;
+    let cfg = Config::parse(&format!(
+        r#"
+        listen = "127.0.0.1:0"
+        upstream = "{upstream}"
+        issuer = "https://idp.test"
+        audience = "nuthatch"
+        jwks_url = "{idp}/jwks.json"
+        [[nest]]
+        name = "usdc"
+        prefix = "/usdc"
+        "#
+    ))
+    .unwrap();
+    let err = Gateway::new(cfg)
+        .await
+        .err()
+        .expect("an oversized JWKS is refused");
+    assert!(err.contains("larger than"), "{err}");
 }

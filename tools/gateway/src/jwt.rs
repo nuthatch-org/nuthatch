@@ -24,6 +24,8 @@ pub enum Refusal {
     NotYetValid,
     WrongIssuer,
     WrongAudience,
+    /// Not an access token: an OIDC ID token, or a `typ` that is neither `JWT` nor `at+jwt`.
+    WrongType,
 }
 
 impl Refusal {
@@ -39,6 +41,7 @@ impl Refusal {
             Refusal::NotYetValid => "token_not_yet_valid",
             Refusal::WrongIssuer => "token_wrong_issuer",
             Refusal::WrongAudience => "token_wrong_audience",
+            Refusal::WrongType => "token_wrong_type",
         }
     }
 }
@@ -236,6 +239,17 @@ pub fn verify(token: &str, keys: &KeySet, expect: &Expect, now: u64) -> Result<C
     if header.get("crit").is_some() {
         return Err(Refusal::UnsupportedAlg);
     }
+    // RFC 9068 §2.1 names `at+jwt` for access tokens; `JWT` is what most IdPs still send. Anything
+    // else (an ID token's `typ`, a logout token's `logout+jwt`) is not an access token.
+    if let Some(typ) = header.get("typ") {
+        let ok = typ.as_str().is_some_and(|t| {
+            let t = t.strip_prefix("application/").unwrap_or(t);
+            t.eq_ignore_ascii_case("jwt") || t.eq_ignore_ascii_case("at+jwt")
+        });
+        if !ok {
+            return Err(Refusal::WrongType);
+        }
+    }
     let alg = header["alg"]
         .as_str()
         .and_then(alg_named)
@@ -269,7 +283,7 @@ pub fn verify(token: &str, keys: &KeySet, expect: &Expect, now: u64) -> Result<C
         return Err(Refusal::Expired);
     }
     if let Some(nbf) = time("nbf").transpose()? {
-        if ((now + expect.leeway) as f64) < nbf {
+        if (now.saturating_add(expect.leeway) as f64) < nbf {
             return Err(Refusal::NotYetValid);
         }
     }
@@ -283,6 +297,14 @@ pub fn verify(token: &str, keys: &KeySet, expect: &Expect, now: u64) -> Result<C
     };
     if !aud_ok {
         return Err(Refusal::WrongAudience);
+    }
+    // OIDC Core §2 ID-token claims. An access token has no use for them, and an ID token minted for a
+    // client id that equals `audience` carries them even when its header says plain `JWT`.
+    if ["at_hash", "c_hash", "nonce"]
+        .iter()
+        .any(|k| claims.contains_key(*k))
+    {
+        return Err(Refusal::WrongType);
     }
     Ok(Claims(claims))
 }
@@ -344,6 +366,72 @@ mod tests {
             verify(&token, &keys, &expect("a", "b"), 0).unwrap_err(),
             Refusal::UnknownKey
         );
+    }
+
+    fn hs_token(header: &str, claims: &str, secret: &[u8]) -> String {
+        let h = URL_SAFE_NO_PAD.encode(header);
+        let p = URL_SAFE_NO_PAD.encode(claims);
+        let tag = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, secret),
+            format!("{h}.{p}").as_bytes(),
+        );
+        format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(tag.as_ref()))
+    }
+
+    #[test]
+    fn a_leeway_near_the_maximum_does_not_panic_on_nbf() {
+        let keys = KeySet::hs256(b"secret");
+        let token = hs_token(
+            r#"{"alg":"HS256"}"#,
+            r#"{"iss":"a","aud":"b","exp":9999999999,"nbf":100}"#,
+            b"secret",
+        );
+        for leeway in [u64::MAX, u64::MAX - 5] {
+            let e = Expect {
+                issuer: "a".into(),
+                audience: "b".into(),
+                leeway,
+            };
+            // Saturates instead of overflowing: nbf has long passed under such a leeway.
+            assert!(verify(&token, &keys, &e, 50).is_ok());
+        }
+    }
+
+    #[test]
+    fn id_tokens_and_foreign_typs_are_refused_access_tokens_pass() {
+        let keys = KeySet::hs256(b"secret");
+        let ok = r#"{"iss":"a","aud":"b","exp":9999999999}"#;
+        let run = |header: &str, claims: &str| {
+            verify(
+                &hs_token(header, claims, b"secret"),
+                &keys,
+                &expect("a", "b"),
+                0,
+            )
+        };
+        for typ in ["JWT", "at+jwt", "application/at+jwt", "AT+JWT"] {
+            assert!(
+                run(&format!(r#"{{"alg":"HS256","typ":"{typ}"}}"#), ok).is_ok(),
+                "{typ}"
+            );
+        }
+        assert!(run(r#"{"alg":"HS256"}"#, ok).is_ok());
+        for typ in [r#""ID""#, r#""logout+jwt""#, "5"] {
+            assert_eq!(
+                run(&format!(r#"{{"alg":"HS256","typ":{typ}}}"#), ok).unwrap_err(),
+                Refusal::WrongType,
+                "{typ}"
+            );
+        }
+        // An ID token whose header says plain JWT still carries its own claims.
+        for claim in [r#""nonce":"n""#, r#""at_hash":"h""#, r#""c_hash":"h""#] {
+            let c = format!(r#"{{"iss":"a","aud":"b","exp":9999999999,{claim}}}"#);
+            assert_eq!(
+                run(r#"{"alg":"HS256","typ":"JWT"}"#, &c).unwrap_err(),
+                Refusal::WrongType,
+                "{claim}"
+            );
+        }
     }
 
     #[test]
