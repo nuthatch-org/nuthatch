@@ -233,10 +233,12 @@ fn clip(s: &str) -> String {
 fn surface_of(path: &str) -> Option<&'static str> {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match segs.as_slice() {
+        // First: admin routes take `{*name}` wildcards, and a nest may be named `sql` or `mcp`
+        // or sit under a tenant `q`, so `/_admin/nests/sql` must not read as a query surface.
+        s if s.contains(&"_admin") => Some("admin"),
         [.., "q", _] => Some("query"),
         [.., "sql"] => Some("sql"),
         [.., "mcp"] => Some("mcp"),
-        s if s.contains(&"_admin") => Some("admin"),
         _ => None,
     }
 }
@@ -1475,5 +1477,20 @@ mod tests {
         assert_eq!(surface_of("/table/sql_x"), None);
         assert_eq!(surface_of("/entity/1"), None);
         assert_eq!(surface_of("/"), None);
+    }
+
+    #[test]
+    fn admin_wildcards_named_like_query_surfaces_stay_admin() {
+        for p in [
+            "/_admin/nests/sql",
+            "/_admin/nests/mcp",
+            "/_admin/nests/q/something",
+            "/_admin/mounts/q/x",
+            "/_admin/suspend/t/mcp",
+            "/_admin/resume/t/sql",
+            "/_admin/move/q/x",
+        ] {
+            assert_eq!(surface_of(p), Some("admin"), "{p}");
+        }
     }
 }
