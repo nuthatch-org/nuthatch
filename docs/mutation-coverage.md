@@ -10,8 +10,11 @@ hole (#725, #745). Two for two is not luck; it is a measurement of how much of a
 ## What runs, and when
 
 `.github/workflows/mutants.yml`, weekly (Sundays 03:00 UTC) and on demand, as one matrix job per file shard
-(two for `chunker.rs`, eight for `seal.rs`, one for `registry.rs`), each running `cargo mutants
---file <file> --shard <n/m> -- --lib -- --skip a_wide_batch_stays_under_the_cursor`. The skipped
+(two for `chunker.rs`, twenty-four for `seal.rs`, one for `registry.rs`), each running `cargo mutants
+--test-tool nextest --file <file> --shard <n/m> -- --lib --profile mutants -E 'not
+test(a_wide_batch_stays_under_the_cursor)'`. The `mutants` profile in `.config/nextest.toml` stops at
+the first failing test and kills a test a mutant hangs at the slow timeout, so a hang is scored as
+caught rather than as a cargo-mutants TIMEOUT (#3084). The skipped
 test measures one wide query's RSS in a child process. On a loaded runner it sits a few tens of
 megabytes over its 512 MiB ceiling and aborts the unmutated baseline before a mutant is scored
 (#2030). A baseline entry does not apply to that, and the ordinary suite still runs the test.
