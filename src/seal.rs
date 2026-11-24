@@ -6651,6 +6651,8 @@ mod tests {
 
     /// RFC-0065 S2: the segment bytes sealing writes, pinned. Moving the writer into `nuthatch-seal`
     /// must leave every hash here unchanged; a parquet or arrow bump that moves them is a re-seal.
+    /// Re-pinned at parquet 59.3.3: the footer `created_by` and the order of each column chunk's
+    /// `encoding_stats` (dictionary page first) changed; rows are identical and 59.3.0 segments still read.
     #[test]
     fn sealed_bytes_are_pinned() {
         let rows = vec![
@@ -6674,15 +6676,15 @@ mod tests {
             vec![
                 (
                     "mixed",
-                    "c2b562dc24a46706f9d66711586a92fe0baaa3a34b9d30cc4cfb68a86e4bf76d"
+                    "3ea5bc60c997d4d5b03cf18fb9ac23825b8ecb260ddedbd9427ce9f3fa0526b4"
                 ),
                 (
                     "usdc__approval",
-                    "f60fdcd1eca002cd2a665a4a222bedb7c657ec45662b7720101b5076cff17f2f"
+                    "2991d1bd46966d3f44563d5bfb2c88d2b54b2260b75933504051d31b2cfc86d2"
                 ),
                 (
                     "usdc__transfer",
-                    "057c0549505745d150c4426b9170825999b573f042c88912f130aac1bfccdc9f"
+                    "0274168838f777a55ae49f1d3d6163029604ae1874f7abbb092df386e827c416"
                 )
             ]
         );

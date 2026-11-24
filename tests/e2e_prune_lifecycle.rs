@@ -294,5 +294,5 @@ async fn the_window_path_seals_the_pinned_bytes() {
 
 const PINNED_THROUGH: u64 = 10;
 const PINNED_SEGMENTS: &[&str] = &[
-    "usdc__transfer 1..=10 20000 2a7275302ce29f4af8317d6003bb5bfb3a087f3a49e4ff0298333f42a9085fd7",
+    "usdc__transfer 1..=10 20000 536147aed52da1960be533a96f196ee1409854bdd8e22f6d2dcbaf2ca74aa85a",
 ];
