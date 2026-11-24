@@ -4187,7 +4187,8 @@ mod tests {
 
     /// Run `f` on a thread of its own and fail the test, rather than hang it, if it has not returned in
     /// `limit`. The pacing and verifier code sleeps and loops; a broken one must read as a failed
-    /// assertion, because a test that never ends is a timeout to the mutation sweep and not a kill. The
+    /// assertion, because a test that never ends costs the mutation sweep the full slow timeout (15 minutes under
+    /// the `mutants` profile) per mutant, and is slow to read as a failure. The
     /// stuck thread is left behind and dies with the test process.
     fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = std::sync::mpsc::channel();

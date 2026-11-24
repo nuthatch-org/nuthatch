@@ -81,8 +81,8 @@ jobs:
           # ~8 minutes there (6 build + ~2 test), a survivor still ~22 (it runs the whole suite).
           # A shard of 19 therefore costs 17 + 19 x 8 = ~170 minutes if all are caught, and ~210
           # at the 15% survivor rate seal.rs has (8 baselined of 52 on the last full local run). It
-          # only passes 330 minutes if more than about 14 of its 19 mutants survive (17 + n x 22 >
-          # 330), which would be a test-quality failure the sweep should report anyway. The ~22-mutant
+          # only passes 330 minutes if about 12 or more of its 19 mutants survive (17 + 8 x (19 - n)
+          # + 22 x n = 169 + 14n > 330), which would be a test-quality failure the sweep should report anyway. The ~22-mutant
           # ceiling below is an estimate from these figures, not a measured limit; the first scheduled
           # run under the profile is the check on it. Keep a seal.rs shard under about 22 mutants
           # (`cargo mutants --list --file src/seal.rs | wc -l`, divided by the shard count).
