@@ -84,6 +84,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `tab-module` | The tab module, nodejs target, into embed/pkg (needs wasm-bindgen, wasm-opt and the wasm32 C toolchain) |  | cached on its inputs |
 | `test` | Run the test suite (needs cargo-nextest, as CI does) | `doctest`, `parity-bin` | cached on its inputs |
 | `test-features` | The suite with every optional feature on | `doctest-features`, `parity-bin`, `test` | cached on its inputs |
+| `test-sbom` | The release SBOM tests, which need a toolchain (CI's shards skip them) |  | always runs |
 | `tip-lag` | Tip lag against MAX_SEEN_P50_MS |  | always runs |
 | `trino-contract` | Trino over the published prefix matches $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |
 | `trino-fixture` | Publish the drifted nest and record the local numbers to $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |

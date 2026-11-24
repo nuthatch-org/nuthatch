@@ -145,7 +145,7 @@ pub fn generate(req: &Request) -> Result<Sbom, String> {
             .args(req.cargo_args);
         run(&mut cmd)
     };
-    let all = tree("normal,build", "depth", "{p}|{l}")?;
+    let all = tree("normal,build", "depth", "|{p}|{l}")?;
     let linked = tree("normal,no-proc-macro", "none", "{p}")?;
 
     let mut components: BTreeMap<String, Component> = BTreeMap::new();
@@ -154,11 +154,15 @@ pub fn generate(req: &Request) -> Result<Sbom, String> {
     let mut root = None;
     for line in all.lines().filter(|l| !l.trim().is_empty()) {
         let line = line.strip_suffix(" (*)").unwrap_or(line);
-        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-        let depth: usize = line[..digits]
+        // The format opens with `|`, so the depth ends at the first one even when a package name
+        // begins with a digit (`13foo` would otherwise read as depth 13).
+        let (depth, rest) = line
+            .split_once('|')
+            .ok_or_else(|| format!("`cargo tree --prefix depth` line without a depth: {line}"))?;
+        let depth: usize = depth
             .parse()
             .map_err(|_| format!("`cargo tree --prefix depth` line without a depth: {line}"))?;
-        let (package, licence) = line[digits..]
+        let (package, licence) = rest
             .split_once('|')
             .ok_or_else(|| format!("`cargo tree` line without a licence field: {line}"))?;
         let mut c = resolve(package, &lock, dir)?;

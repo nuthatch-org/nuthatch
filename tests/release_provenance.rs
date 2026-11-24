@@ -63,7 +63,9 @@ fn files_under(key: &str) -> Vec<String> {
             lines[i + 1..]
                 .iter()
                 .map(|l| l.trim())
-                .take_while(|l| !l.is_empty() && !l.replace("${{", "").contains(':'))
+                .take_while(|l| {
+                    !l.is_empty() && !l.starts_with('#') && !l.replace("${{", "").contains(':')
+                })
                 .map(str::to_string),
         );
     }

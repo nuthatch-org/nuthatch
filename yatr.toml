@@ -48,6 +48,13 @@ run = ["cargo nextest run --locked"]
 sources = ["**/*"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
 
+# #3097: tests/release_sbom.rs runs rustc and `cargo tree`, which the toolchain-less shards cannot.
+[tasks.test-sbom]
+desc = "The release SBOM tests, which need a toolchain (CI's shards skip them)"
+run = ["cargo nextest run --locked --test it -E 'test(/^release_sbom::/)'"]
+sources = ["**/*"]
+no_cache = true
+
 [tasks.doctest]
 desc = "Doctests, which nextest does not run"
 run = ["cargo test --doc --locked"]

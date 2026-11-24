@@ -289,6 +289,10 @@ jobs:
       # cannot build, so the task builds it into the archive first.
       - name: build the parity comparison and the test archive
         run: yatr archive-default
+      # #3097: tests/release_sbom.rs needs rustc and `cargo tree`, so it runs here, where the shards leave it,
+      # rather than on a shard with no toolchain.
+      - name: release SBOM tests
+        run: yatr test-sbom
       # nextest does not run doctests. There are none today; this keeps the first one from going unrun.
       - name: doctests
         run: yatr doctest
