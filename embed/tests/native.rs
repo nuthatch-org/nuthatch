@@ -25,9 +25,10 @@ const WINDOW: &str = concat!(
     r#"balances=[("0x1111111111111111111111111111111111111111", 60), "#,
     r#"("0x2222222222222222222222222222222222222222", 40), "#,
     r#"("0x0000000000000000000000000000000000000000", -100)] "#,
+    // Segment hashes re-pinned for parquet 59.3.3 (footer created_by + encoding_stats order); rows/balances unchanged. Keep identical to run-node.mjs.
     r#"last=Some("12") sealed_through=12 hot=0 segments=["#,
-    r#""tok__transfer 10..=10 rows=1 1418460664977e9b6456532bbbb32543ece957f189c8a1d45b65317ba1705ca1", "#,
-    r#""tok__transfer 12..=12 rows=1 170d4dc640f41dddf3718712c011bbdff3cd2286eed32f44df4180a4856e4346"]"#,
+    r#""tok__transfer 10..=10 rows=1 8443352dbbaad16018cf1e8dded8897ce6d39ff6df75693b5277502ed3592d40", "#,
+    r#""tok__transfer 12..=12 rows=1 b0fda1e568ff6c9747f5f0e385ed94dc87e49c397bc96e1a68c3cf6701a6a162"]"#,
 );
 
 #[test]

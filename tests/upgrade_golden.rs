@@ -344,8 +344,10 @@ fn sql_rows(blocks: std::ops::RangeInclusive<u64>) -> serde_json::Value {
 /// What this build's seal path writes for the eager rows v3.13.2 sealed. Not v3.13.2's own bytes
 /// (the writer has changed since), but pinned from `main` at 72a591e1, before #3065's null timestamps:
 /// the default policy must keep sealing these exact bytes, so its content addresses cannot move.
+/// Re-pinned at parquet 59.3.3 (was 9efc6298...): `created_by` and the order of a chunk's dictionary
+/// `encoding_stats` changed; the rows and the old segment this test reads back are unchanged.
 const EAGER_RESEAL_SEGMENT: &str =
-    "9efc6298c8b402db769334e1ef6763517d12c6621d6587bc66ce3f39398a720a";
+    "e735ef1e9d36fdfc38cec36fa73630807075398ebb94407bf24c4a9336dbd3de";
 
 #[test]
 fn eager_rows_seal_to_the_bytes_they_sealed_to_before_null_timestamps() {

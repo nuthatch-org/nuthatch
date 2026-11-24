@@ -47,10 +47,10 @@ size-of = { package = "feldera-size-of", version = "0.1.7" }
 sqlparser = { version = "0.62", features = ["visitor"] }
 burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "24cc93e1179ab80ea9fbbb0aed10574e6866b65c", default-features = false, features = ["datafusion"] }
 object_store = { version = "0.13", default-features = false }
-arrow-array = { version = "=59.3.0", default-features = false }
+arrow-array = { version = "=59.3.3", default-features = false }
 # RFC-0081 S1: `/sql` answered as an Arrow IPC stream, and another nest's answers attached from one.
-arrow-ipc = { version = "=59.3.0", default-features = false }
-arrow-schema = { version = "=59.3.0", default-features = false }
+arrow-ipc = { version = "=59.3.3", default-features = false }
+arrow-schema = { version = "=59.3.3", default-features = false }
 base64 = "0.22"
 toml = "0.8"
 futures = "0.3"
