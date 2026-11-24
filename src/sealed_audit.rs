@@ -34,6 +34,7 @@ pub struct Auditor {
     pub(crate) schema: Vec<TableSchema>,
     filter: LogFilter,
     start_block: Option<u64>,
+    pub(crate) chain_id: u64,
 }
 
 impl Auditor {
@@ -63,6 +64,7 @@ impl Auditor {
             schema,
             filter,
             start_block: config.contracts.iter().filter_map(|c| c.start_block).min(),
+            chain_id: config.nest.chain_id,
         })
     }
 }

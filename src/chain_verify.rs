@@ -15,7 +15,7 @@
 //! transactions, and its receipts.
 
 use crate::address_discovery::Rpc;
-use crate::address_partitions::{checked_body, served_header, Body, Broken};
+use crate::address_partitions::{op_stack, served_body, served_header, Body, Broken};
 use crate::registry::{DecodedRow, TableSchema};
 use crate::sealed_audit::{canonical, Auditor};
 use alloy_primitives::{keccak256, Bloom, B256};
@@ -50,6 +50,9 @@ pub struct Report {
     pub blocks: u64,
     /// Sealed rows compared with the receipts' logs.
     pub rows: usize,
+    /// Blocks before Byzantium whose receipts the endpoint served without the post-state root, so
+    /// they could not be hashed to the receipts root. Their logs were still compared. Not problems.
+    pub receipts_unverified: u64,
     pub problems: Vec<Problem>,
 }
 
@@ -70,7 +73,7 @@ enum Served {
     },
 }
 
-async fn serve(rpc: &impl Rpc, b: u64) -> Result<Served> {
+async fn serve(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Served> {
     let v = rpc
         .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), true]))
         .await
@@ -87,7 +90,7 @@ async fn serve(rpc: &impl Rpc, b: u64) -> Result<Served> {
         Ok(h) => h,
         Err(e) => return Ok(Served::BadHeader(broke(e)?)),
     };
-    Ok(match checked_body(rpc, &header, hash, &v).await {
+    Ok(match served_body(rpc, chain_id, &header, hash, &v).await {
         Ok(body) => Served::Checked { header, hash, body },
         Err(e) => Served::BadBody {
             header,
@@ -283,6 +286,7 @@ pub async fn verify_range(
         to,
         blocks: 0,
         rows: 0,
+        receipts_unverified: 0,
         problems: Vec::new(),
     };
     let mut parent = None;
@@ -297,13 +301,16 @@ pub async fn verify_range(
             .await
             .context("the sealed read panicked")??;
         let mut served = futures::stream::iter(at..=end)
-            .map(|b| serve(rpc, b))
+            .map(|b| serve(rpc, auditor.chain_id, b))
             .buffered(IN_FLIGHT);
         for b in at..=end {
             let block = served.next().await.expect("one answer per block")?;
             let rows = stored.remove(&b).unwrap_or_default();
             report.rows += rows.len();
             report.blocks += 1;
+            if matches!(&block, Served::Checked { body, .. } if body.receipts_unverified) {
+                report.receipts_unverified += 1;
+            }
             compare(auditor, b, block, rows, &mut parent, &mut report.problems);
         }
         let Some(next) = end.checked_add(1) else {
@@ -314,10 +321,21 @@ pub async fn verify_range(
     Ok(report)
 }
 
+/// Refuse chains whose transactions this audit cannot hash to their root.
+fn supported(chain_id: u64) -> Result<()> {
+    anyhow::ensure!(
+        !op_stack(chain_id),
+        "audit chain does not support OP-stack chains (chain {chain_id}) yet: their blocks hold \
+         deposit transactions (type 0x7e), which the transactions root cannot be rebuilt from here"
+    );
+    Ok(())
+}
+
 /// `nuthatch audit chain`.
 pub async fn run_cli(args: crate::cli::AuditChainArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     let config = crate::config::Config::load(&dir)?;
+    supported(config.nest.chain_id)?;
     let auditor = Auditor::new(&dir, &config)?;
     let urls = match &args.rpc {
         Some(url) => vec![url.clone()],
@@ -347,6 +365,14 @@ pub async fn run_cli(args: crate::cli::AuditChainArgs) -> Result<()> {
             println!(
                 "  ... and {} more (--json lists them all)",
                 report.problems.len() - PRINTED
+            );
+        }
+        if report.receipts_unverified > 0 {
+            println!(
+                "  note: {} block(s) before Byzantium: this endpoint does not serve their \
+                 receipts' post-state roots, so the receipts root could not be checked; their \
+                 logs were still compared with the receipts and the header's logs bloom",
+                report.receipts_unverified
             );
         }
         println!(
@@ -600,7 +626,10 @@ mod tests {
         ];
         for (tamper, want) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            // Off mainnet: blocks 1..=3 are not pre-Byzantium ones, whose receipts roots may be
+            // unverifiable.
+            auditor.chain_id = 5;
             let mut chain = chain(&auditor);
             seal(dir.path(), &auditor, &chain, Some(5));
             tamper(&auditor, &mut chain);
@@ -609,6 +638,49 @@ mod tests {
                 .unwrap();
             assert_eq!(fields(&r), want, "{r:?}");
         }
+    }
+
+    /// Below Byzantium an endpoint that serves `status` where the chain committed to a post-state
+    /// root cannot have its receipts hashed: that is a named note, not a `receipts_root` failure,
+    /// and the logs are still compared.
+    #[tokio::test]
+    async fn pre_byzantium_receipts_without_a_root_are_not_a_receipts_root_failure() {
+        for (amount, want) in [(Some(5), vec![]), (Some(6), vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            let mut chain = chain(&auditor);
+            // The chain committed to a different receipts root than the served receipts make.
+            let mut header: Header = serde_json::from_value(chain[1].block.clone()).unwrap();
+            header.receipts_root = B256::repeat_byte(0x5a);
+            chain[1].hash = header.hash_slow();
+            chain[1].block["receiptsRoot"] = json!(header.receipts_root);
+            chain[1].block["hash"] = json!(chain[1].hash);
+            chain[2] = make(3, chain[1].hash, &[], 124, true);
+            seal(dir.path(), &auditor, &chain, amount);
+            let r = verify_range(dir.path(), &auditor, &rpc(chain.clone()), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+            assert_eq!(r.receipts_unverified, 1, "{r:?}");
+            assert_eq!(r.rows, usize::from(amount.is_some()));
+            // Off mainnet there is no such gap: the same block is a forgery.
+            let mut other = crate::sealed_audit::tests::nest(dir.path(), "");
+            other.chain_id = 5;
+            let r = verify_range(dir.path(), &other, &rpc(chain), 1, 3)
+                .await
+                .unwrap();
+            assert!(fields(&r).contains(&(2, "receipts_root")), "{r:?}");
+            assert_eq!(r.receipts_unverified, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn op_stack_chains_are_refused_by_name() {
+        for id in [10, 8453] {
+            let e = supported(id).unwrap_err().to_string();
+            assert!(e.contains("0x7e") && e.contains("OP-stack"), "{e}");
+        }
+        assert!(supported(1).is_ok());
     }
 
     /// A header whose hash and roots hold, and whose logs bloom the receipts' logs do not make.

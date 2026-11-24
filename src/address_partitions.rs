@@ -132,8 +132,17 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Published>> {
 /// Whether a chain's `withdrawalsRoot` commits to beacon withdrawals. On the OP stack it is the
 /// message passer's storage root from Isthmus on, and the block lists no withdrawals.
 pub fn beacon_withdrawals(chain_id: u64) -> bool {
-    !matches!(chain_id, 10 | 8453)
+    !op_stack(chain_id)
 }
+
+/// The OP-stack chains nuthatch knows by id: Optimism and Base.
+pub fn op_stack(chain_id: u64) -> bool {
+    matches!(chain_id, 10 | 8453)
+}
+
+/// The first Ethereum mainnet block whose receipts carry a `status` (EIP-658). Before it a receipt
+/// commits to a post-state `root`, which an endpoint may not serve.
+pub const BYZANTIUM_MAINNET: u64 = 4_370_000;
 
 /// A commitment in a block's header that the data served for the block does not keep (#3096).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,12 +338,36 @@ pub fn verify(
 pub struct Body {
     pub txs: Vec<TxEnvelope>,
     pub receipts: Vec<alloy_consensus::ReceiptEnvelope>,
+    /// The receipts could not be hashed to the header's receipts root: a pre-Byzantium block whose
+    /// endpoint serves `status` where the chain committed to a post-state `root`. Not a forgery.
+    pub receipts_unverified: bool,
 }
 
 /// The transactions in `block`, the RPC's answer for the block `header` hashes to `hash` with full
 /// transactions, and the block's receipts asked of `rpc`, each checked against its root in `header`.
 pub async fn checked_body(
     rpc: &impl Rpc,
+    header: &Header,
+    hash: B256,
+    block: &Value,
+) -> Result<Body> {
+    let body = served_body(rpc, 0, header, hash, block).await?;
+    if body.receipts_unverified {
+        return Err(Broken {
+            block: header.number,
+            commitment: Commitment::ReceiptsRoot,
+        }
+        .into());
+    }
+    Ok(body)
+}
+
+/// [`checked_body`], except that on Ethereum mainnet (`chain_id` 1) before Byzantium receipts that
+/// carry no post-state `root` come back as [`Body::receipts_unverified`] rather than as a broken
+/// receipts root: the endpoint dropped what the root is built from, which says nothing of forgery.
+pub async fn served_body(
+    rpc: &impl Rpc,
+    chain_id: u64,
     header: &Header,
     hash: B256,
     block: &Value,
@@ -361,12 +394,29 @@ pub async fn checked_body(
         .into_iter()
         .map(|r| r.into_primitives_receipt().inner)
         .collect();
-    if receipts.len() != txs.len()
-        || proofs::calculate_receipt_root(&receipts) != header.receipts_root
-    {
+    if receipts.len() != txs.len() {
         return Err(broken(Commitment::ReceiptsRoot).into());
     }
-    Ok(Body { txs, receipts })
+    let mut receipts_unverified = false;
+    if proofs::calculate_receipt_root(&receipts) != header.receipts_root {
+        use alloy_consensus::TxReceipt;
+        let no_root = receipts.iter().all(|r| {
+            matches!(
+                r.status_or_post_state(),
+                alloy_consensus::Eip658Value::Eip658(_)
+            )
+        });
+        if chain_id == 1 && n < BYZANTIUM_MAINNET && no_root {
+            receipts_unverified = true;
+        } else {
+            return Err(broken(Commitment::ReceiptsRoot).into());
+        }
+    }
+    Ok(Body {
+        txs,
+        receipts,
+        receipts_unverified,
+    })
 }
 
 /// What Etherscan's `getminedblocks` calls `blockReward`, from the block's own transactions,
@@ -382,7 +432,7 @@ pub async fn verified_reward(rpc: &impl Rpc, block: &VerifiedBlock) -> Result<U2
     if body.is_null() {
         bail!("the RPC has no block {hash}");
     }
-    let Body { txs, receipts } = checked_body(rpc, h, block.hash, &body).await?;
+    let Body { txs, receipts, .. } = checked_body(rpc, h, block.hash, &body).await?;
     let uncles = body["uncles"].as_array().map_or(0, Vec::len);
     let mut ommers = Vec::with_capacity(uncles);
     for i in 0..uncles {
