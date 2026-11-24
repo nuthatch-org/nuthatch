@@ -2037,7 +2037,7 @@ async fn a_mount_that_cannot_or_may_not_fetch_leaves_nothing_behind() {
 }
 
 /// A mount-jobs index in a directory of its own, kept for the life of the test process.
-fn test_jobs() -> Arc<nuthatch::mount_jobs::MountJobs> {
+pub(crate) fn test_jobs() -> Arc<nuthatch::mount_jobs::MountJobs> {
     let dir = tempfile::tempdir().unwrap().keep();
     Arc::new(nuthatch::mount_jobs::MountJobs::load(&dir))
 }
@@ -4188,7 +4188,11 @@ async fn a_dry_run_reads_the_cursors_tip_and_dials_nothing() {
 // RFC-0073 FR10: the bundle lifecycle over the admin API.
 
 /// A bundle of a scaffolded nest named `name` watching `address`, and its NID.
-fn a_bundle(dir: &std::path::Path, name: &str, address: &str) -> (std::path::PathBuf, String) {
+pub(crate) fn a_bundle(
+    dir: &std::path::Path,
+    name: &str,
+    address: &str,
+) -> (std::path::PathBuf, String) {
     let src = dir.join(format!("{name}-src"));
     std::fs::create_dir_all(&src).unwrap();
     scaffold_nest(&src, name, address);
@@ -4198,7 +4202,7 @@ fn a_bundle(dir: &std::path::Path, name: &str, address: &str) -> (std::path::Pat
     (file, nid)
 }
 
-fn bundle_routes(
+pub(crate) fn bundle_routes(
     handles: &Arc<tokio::sync::Mutex<runtime::RuntimeHandles>>,
     jobs: &Arc<nuthatch::mount_jobs::MountJobs>,
     registry: Option<&std::path::Path>,
@@ -4215,14 +4219,14 @@ fn bundle_routes(
 }
 
 /// No grace, so a prune in a test may take a blob published a moment ago.
-fn graceless() -> runtime::BundleLimits {
+pub(crate) fn graceless() -> runtime::BundleLimits {
     runtime::BundleLimits {
         prune_grace: std::time::Duration::ZERO,
         ..Default::default()
     }
 }
 
-async fn post_bundle(
+pub(crate) async fn post_bundle(
     routes: &axum::Router,
     uri: &str,
     bytes: Vec<u8>,

@@ -711,6 +711,75 @@ async fn a_declared_and_repointed_chain_survives_a_restart() {
     assert_redacted("the runtime's log", &log_text);
 }
 
+/// #3093: a platform that drives the runtime only over HTTP starts it with a bare `[runtime]`, no
+/// chain and no mount, and declares the chain live (FR9). The start used to fail on the missing
+/// chain before the admin API that could declare one was up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bare_runtime_starts_with_no_chain_and_takes_one_live() {
+    let roost = tempfile::tempdir().unwrap();
+    std::fs::write(
+        roost.path().join(runtime::MOUNTS_FILE),
+        "[runtime]\nname = \"r\"\n",
+    )
+    .unwrap();
+    let devnet = fake_chain(DEVNET_ID, 10).await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let log = roost.path().join("dev.log");
+    let mut child = Reaped(
+        std::process::Command::new(env!("CARGO_BIN_EXE_nuthatch"))
+            .args(["dev", "--dir"])
+            .arg(roost.path())
+            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .env("NUTHATCH_ADMIN_TOKEN", OPEN)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .expect("spawn dev"),
+    );
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let view: Value = loop {
+        let got = client
+            .get(format!("{base}/_admin/chains"))
+            .bearer_auth(OPEN)
+            .send()
+            .await;
+        if let Ok(resp) = got {
+            if resp.status() == 200 {
+                break resp.json().await.unwrap();
+            }
+        }
+        let exited = child.0.try_wait().unwrap();
+        assert!(
+            exited.is_none() && std::time::Instant::now() < deadline,
+            "a bare runtime never came up ({exited:?}): {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(view["chains"], json!([]), "{view}");
+
+    let resp = client
+        .post(format!("{base}/_admin/chains"))
+        .bearer_auth(OPEN)
+        .header("content-type", "application/json")
+        .body(declare_body("devnet", DEVNET_ID, &[devnet.keyed_url()]))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 201, "{body}");
+    let chains = chains_in_table(roost.path());
+    assert_eq!(chains.len(), 1, "the declaration is in mounts.toml");
+    assert_eq!(chains[0].chain, "devnet");
+}
+
 /// Boot `nuthatch dev --dir` over two mounts on one fake chain, the second broken by `break_it`,
 /// and return the two `/ready` answers once the healthy one serves.
 async fn boot_beside_a_broken_dataset(break_it: impl FnOnce(&std::path::Path)) -> (String, String) {

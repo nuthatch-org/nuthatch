@@ -591,7 +591,12 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/", get(summary))
             .route("/health", get(|| async { "ok" }))
             .route("/ready", get(ready))
-            .route("/metrics", get(metrics_handler))
+            .route("/metrics", {
+                // The route this is mounted at, not the dataset's: an alias's state is its holder's
+                // clone, holder's name and all (#3093).
+                let own: Arc<str> = Arc::from(label);
+                get(move |state: State<AppState>| metrics_handler(state, own.clone()))
+            })
             .route("/tables", get(tables))
             .route("/schema", get(schema_doc))
             .route("/table/{name}", get(table))
@@ -1722,7 +1727,7 @@ fn runtime_metrics(
     )
 }
 
-async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+async fn metrics_handler(State(s): State<AppState>, own: Arc<str>) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     // In a runtime, append the health series (RFC-0026 §5) so an operator can alert on "anything
     // quarantined" without polling `/nests`. Like the existing per-nest series, these describe the
@@ -1731,17 +1736,17 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         body.push_str(&health.render_metrics());
     }
     // A strict mount answers its own tenant, so it carries only the samples labelled with itself
-    // (#2714). The root `/metrics` keeps the whole runtime for the operator.
-    if s.isolation.is_some() {
-        let own = match &s.runtime_health {
-            Some((name, _)) => name.as_str(),
-            None => s.nest_info["name"].as_str().unwrap_or_default(),
-        };
-        body = own_series(&body, own);
+    // (#2714). The root `/metrics` keeps the whole runtime for the operator. "Itself" is the route it
+    // is mounted at: a mount sharing another tenant's dataset holds that mount's name as its health
+    // name, and filtering on it served the other tenant's series (#3093). The dataset's ingestion
+    // series are labelled with the holder alone, so such a mount does without them.
+    let strict = s.isolation.is_some();
+    if strict {
+        body = own_series(&body, &own);
     }
     body.push_str(&entity_metrics(&s));
     body.push_str(&snapshot_metrics(&s));
-    body.push_str(&integrity_metrics(&s));
+    body.push_str(&integrity_metrics(&s, strict.then_some(&*own)));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1845,10 +1850,12 @@ fn snapshot_metrics(s: &AppState) -> String {
 
 /// What the integrity passes took from this nest since its segments were last whole, as gauges an
 /// operator can alert on; zero on a healthy nest.
-fn integrity_metrics(s: &AppState) -> String {
-    let nest = match &s.runtime_health {
-        Some((name, _)) => name.as_str(),
-        None => s
+/// Labelled `own` when given, the strict mount's own route (#3093).
+fn integrity_metrics(s: &AppState, own: Option<&str>) -> String {
+    let nest = match (own, &s.runtime_health) {
+        (Some(own), _) => own,
+        (None, Some((name, _))) => name.as_str(),
+        (None, None) => s
             .nest_info
             .get("name")
             .and_then(Value::as_str)
@@ -9858,6 +9865,53 @@ mod tests {
             "{strict}"
         );
         assert!(strict.contains("# TYPE nuthatch_nest_health"), "{strict}");
+    }
+
+    /// #3093: a second tenant's mount of a NID another tenant already holds is served through a clone
+    /// of the holder's state, whose health name is the holder's. Its strict `/metrics` filtered on
+    /// that name, so `globex/usdc` was served every series labelled `acme/usdc`. It answers under the
+    /// route it is mounted at.
+    #[tokio::test]
+    async fn a_strict_alias_of_another_tenants_dataset_does_not_see_the_holders_series() {
+        let (holder, alias) = ("acme/usdc-3093", "globex/usdc-3093");
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register(holder, "mainnet");
+        health.register_alias(alias, holder, "mainnet");
+        crate::metrics::METRICS.nest(holder).set_tip(7);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        held.runtime_health = Some((holder.to_string(), health.clone()));
+        held.isolation = Some(Arc::from("acme"));
+        // What `begin_mount` and `fan_out_aliases` install for the alias: the holder's state, cloned,
+        // reseated on its own tenant.
+        let mut aliased = held.clone();
+        aliased.isolation = Some(Arc::from("globex"));
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![(holder.to_string(), held), (alias.to_string(), aliased)],
+            health,
+        );
+
+        let (_, body) = get(app.clone(), &format!("/{alias}/metrics")).await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("acme"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "nuthatch_nest_health{{nest=\"{alias}\",chain=\"mainnet\"}} 1"
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "nuthatch_quarantined_segments{{nest=\"{alias}\"}} 0"
+            )),
+            "{body}"
+        );
+        let (_, own) = get(app, &format!("/{holder}/metrics")).await;
+        let own = String::from_utf8(own.to_vec()).unwrap();
+        assert!(own.contains(&format!("nest=\"{holder}\"")), "{own}");
+        assert!(!own.contains("globex"), "{own}");
     }
 
     /// A kept sample carries its own family's header and no other's, and a name that only shares
