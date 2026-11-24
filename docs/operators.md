@@ -1682,7 +1682,10 @@ nothing is added to the request path. With it, every call to `/sql`, `/q/{name}`
   `nuthatch-audit: unwritable` header, and the failure is logged, so a client that retries on 503
   never repeats it. Either way the queue is bounded (1024), so a writer that falls behind slows
   calls down at their start rather than dropping their records, including the record of a call whose
-  client hung up (it goes on the slot the call already holds). A record torn by a crash is cut at the next start,
+  client hung up (it goes on the slot the call already holds). A slot is held until the handler
+  returns, so 1024 is also a cap on audited calls in flight, not only on records waiting to be
+  written: once 1024 are open, a further audited call, a `POST` to `/_admin` included, waits to
+  start until a slot frees. A record torn by a crash is cut at the next start,
   and the cut is recorded as an `"event":"recovered"` record. One process holds a log directory at a
   time; a second is refused.
 - **Rotation and retention:** a new file starts once the current one would pass
