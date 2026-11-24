@@ -1073,6 +1073,7 @@ fn settle_with(confidence: u32, verdict: &str, findings: &[(&str, u32)]) -> serd
         .arg("--self-test-review")
         .arg(dir.path().join("answer.json"))
         .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("MOONSHOT_API_KEY")
         .output()
         .expect("run pr-review.sh");
     assert!(
