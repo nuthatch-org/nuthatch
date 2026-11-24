@@ -16,7 +16,8 @@
 //!   re-running a backfill, or two operators running the same release, produce byte-identical segments
 //!   that dedupe against each other. Determinism holds.
 //! - **Across nuthatch versions built on different arrow-rs releases, segment identity may differ**
-//!   even when every decoded row is identical, because `created_by` changed underneath us.
+//!   even when every decoded row is identical, because `created_by` changed underneath us (59.3.3 also reordered `encoding_stats`, which moves the bytes
+//!   with no change to any row).
 //!
 //! That is a limit on *segment identity*, not on correctness: the rows are the same, the queries return
 //! the same answers, and re-execution still verifies. What it means practically is that a segment hash

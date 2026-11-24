@@ -11,7 +11,11 @@ use std::path::PathBuf;
 
 /// The lockfiles that build the engine. `embed/tests/wasmtime-host` is wasmtime driving the module,
 /// not part of it.
-const EMBED_LOCKS: &[&str] = &["embed/Cargo.lock", "embed/plain/Cargo.lock"];
+const EMBED_LOCKS: &[&str] = &[
+    "embed/Cargo.lock",
+    "embed/plain/Cargo.lock",
+    "fuzz/embed/Cargo.lock",
+];
 
 /// Crates allowed to differ, each with the reason it cannot follow the binary.
 const MAY_DIFFER: &[(&str, &str)] = &[
