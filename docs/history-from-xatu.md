@@ -114,7 +114,8 @@ and no logs bloom, so no file can prove its own logs. What is done instead (#309
 What this is not: a proof. It reliably catches a fault that touches a fair share of a file's logs
 (a writer bug, a stale or reordered export, the wrong table): the draw by matched row lands on one
 almost surely. It will usually *not* catch one edited log in a file of 1,000 blocks (about 1 in 500
-per file), so a mirror that edits a few logs on purpose can get them past it. Blocks served before a
+per file if the edited block still has matching logs; if every matching log of a block was dropped, only
+the uniform draw can land on it, about 1 in 1,000), so a mirror that edits a few logs on purpose can get them past it. Blocks served before a
 mismatch was found passed the same checks and stay served; the `ERROR` line says to re-index without
 the flag to be certain of them. Proving every block (header hash, receipts root, every log against
 it) is the optional verify mode tracked in #3096; on mainnet it costs about a header per block plus

@@ -751,8 +751,9 @@ impl Fetch for Tampered {
 /// One hex digit of a log's data changed: the same shape, another amount.
 fn flipped(d: &[u8]) -> Vec<u8> {
     let mut d = d.to_vec();
-    let last = d.len() - 1;
-    d[last] = if d[last] == b'0' { b'1' } else { b'0' };
+    if let Some(last) = d.last_mut() {
+        *last = if *last == b'0' { b'1' } else { b'0' };
+    }
     d
 }
 

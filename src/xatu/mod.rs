@@ -38,7 +38,9 @@
 //! mismatch is evidence against the whole dataset, not one block: it is logged naming the block and the field,
 //! and the dataset is not used again this run. This is a sample, not a proof. It catches a fault that
 //! touches a fair share of blocks within a few chunks; one edited block in a file evades it with
-//! probability 1 - 2/1000 per chunk. Proving every block against the receipts root is #3096's
+//! probability 1 - 2/1000 per chunk when the block still has matching logs (both draws can land on
+//! it); a block whose matching logs were all dropped has no rows, so only the uniform draw reaches
+//! it, and it evades with probability 1 - 1/1000. Proving every block against the receipts root is #3096's
 //! verify mode, at about the RPC cost this source exists to avoid.
 //!
 //! **Memory.** The compressed logs of at most `KEEP_CHUNKS` chunks (4 x 35 to 50 MB on mainnet); the
