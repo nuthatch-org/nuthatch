@@ -303,7 +303,15 @@ resolve_production() {
         --jq '.[] | select(.isDraft | not) | .tagName') || die "could not list the releases of $repo"
       listed_full=1
     fi
-    production=$(printf '%s\n' "$full_releases" | grep -vxF "$1" | head -n 1 || true)
+    # The highest version, not the newest-listed: `gh release list` is in creation order, and a
+    # patch on an older line (an LTS backport, #3098) published after a newer minor is listed first
+    # without ever being what production runs.
+    local t
+    production=""
+    for t in $full_releases; do
+      [ "$t" != "$1" ] || continue
+      if [ -z "$production" ] || semver_gt "$t" "$production"; then production=$t; fi
+    done
     production_from=latest
   fi
   [ -n "$production" ] || die "no full release to measure as production; pass --production"

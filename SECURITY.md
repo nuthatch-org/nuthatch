@@ -36,9 +36,10 @@ anonymous.
 The latest minor release receives security fixes, and so does the **previous minor for 30 days**
 after the next one ships. When 5.24.0 is released, 5.23 keeps receiving security fixes until 30 days
 after that date, then only 5.24 does. A backport is a patch release cut from `release/<major>.<minor>`
-by the process in [docs/releases/README.md](docs/releases/README.md#patch-releases-on-4x); it
+by the process in [docs/releases/README.md](docs/releases/README.md#patch-releases-on-an-older-line); it
 carries the security fix and nothing else, so an operator pinned to that minor can take it without
-taking the next minor's features. Older lines are not patched: upgrading is the remedy.
+taking the next minor's features. Older lines are not patched, except a long-term-support line
+([below](#long-term-support)): upgrading is the remedy.
 
 **Advance notice for hosting operators.** An operator who runs nuthatch for other people may ask
 for private notice of a security release before it is public. Write to the address under
@@ -53,3 +54,39 @@ published to GitHub Releases with per-artifact SHA-256, and reproducible from th
 the engine's module carry a build provenance attestation and a CycloneDX SBOM (`<artifact>.cdx.json`)
 under that same attestation, so an inventory of what you run comes from the release itself; how to
 verify both is in [docs/install.md](docs/install.md#software-bill-of-materials).
+
+## Long-term support
+
+For an organisation that validates a release before deploying it, a month is too short. So twice a
+year one minor is designated **long-term support (LTS)** and receives security fixes for **9 months
+from the day it is designated**, on the same terms as above: a patch release from
+`release/<major>.<minor>` carrying the security fix and nothing else. Every other minor keeps the
+30-day window. How a line is picked and how its patches are cut is in
+[docs/releases/README.md](docs/releases/README.md#long-term-support-lines); the lines are:
+
+| Line | Designated | Security fixes until | Status |
+|---|---|---|---|
+
+No line has been designated yet. The first is due in the first week of January 2027 (#3098).
+
+What an operator on an LTS line can rely on:
+
+- **The end date in the table is set at designation and is never shortened.** It may be extended,
+  and an extension is recorded here.
+- **A patch changes nothing but the fix.** Config, on-disk layout, CLI, HTTP, SQL and MCP surfaces
+  stay as they were on the line; taking a patch is replacing the binary and restarting.
+- **Every security advisory names the fixed version on each supported line**, LTS lines included.
+  If a fix cannot be made on a line without changing more than the fix (a format, a config key, an
+  API), the advisory says so and names the release to upgrade to. That is the honest limit of a
+  project with one maintainer, and it is stated rather than discovered.
+- **The same release process and provenance as any release**: GitHub Release with per-artifact
+  SHA-256 and attestations, the `ghcr.io/nuthatch-org/nuthatch:<version>` image, and npm under the
+  `line-<major>.<minor>` dist-tag. An LTS patch never takes the repository's Latest release, the
+  image's `:latest` or npm's `latest`.
+- **The next LTS is designated before the current one ends**, with at least 3 months of overlap,
+  and the upgrade from one LTS to the next is rehearsed before the new line is announced. Within a
+  major that upgrade is bounded by the [stability contract](docs/operators.md#stability-contract).
+- Private advance notice for hosting operators covers LTS lines on the same terms.
+
+None of this is a support contract. It is the same promise to everyone, and the line is a branch of
+this repository under the same `MIT OR Apache-2.0` licence, not a fork.

@@ -55,11 +55,26 @@ Non-negotiable regardless of who asks or pays:
 
 If a funder or partner requires any item on this list, we decline that term rather than the principle.
 
+## Release lines & maintenance capacity
+
+Which releases get security fixes, and for how long, is stated in [SECURITY.md](SECURITY.md#supported-versions):
+the newest minor, the previous one for 30 days, and twice a year one long-term-support (LTS) minor for
+9 months (#3098). Those numbers are what one maintainer, with AI workers preparing backport branches,
+can keep: never more than two LTS lines at once, a patch that carries only the fix, and a tag only the
+maintainer pushes. An end date, once published, is not shortened.
+
+The same neutrality applies here as everywhere. Every operator gets the same lines on the same
+terms; nobody gets a line, a longer window or a backport of their own. An LTS line is a branch of
+this repository under the same licence, not a fork. If the policy ever has to shrink, it shrinks
+by an amendment here and in SECURITY.md for lines not yet designated, never by quietly letting a
+published one lapse.
+
 ## Release integrity & key custody
 
 Releases are the supply chain an operator depends on. Signing/release-key custody, and a named
 successor/escrow arrangement for those keys, are tracked as an open governance item (RFC-0006 Q3) to
-be settled while the project is small. Until then: releases are cut from tagged commits on `main`,
+be settled while the project is small. Until then: releases are cut from tagged commits on `main` or
+a `release/<major>.<minor>` branch,
 published to GitHub Releases (with per-artifact SHA-256), and reproducible from the
 pinned toolchain. Each binary and the engine's module carry a build provenance attestation and a
 CycloneDX SBOM (`<artifact>.cdx.json`) that the same attestation covers. The SBOM is generated from

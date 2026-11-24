@@ -113,3 +113,40 @@ fn release_yml_pushes_latest_only_on_the_scripts_answer() {
         "these lines push :latest outside the step the script gates (#2736):\n{elsewhere:#?}"
     );
 }
+
+/// #3098: GitHub marks a newly published release "Latest" unless told otherwise, so an older line's
+/// patch (an LTS backport) published after a newer minor would take the repository's Latest badge and
+/// `releases/latest`. Every `gh release edit` that publishes must pass the script's answer as `--latest`.
+#[test]
+fn release_yml_marks_the_github_release_latest_only_on_the_scripts_answer() {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let s = std::fs::read_to_string(p).unwrap();
+    let code: Vec<&str> = s
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    // A command continued over lines is one command here.
+    let joined = code.join("\n").replace("\\\n", " ");
+    let publishing: Vec<&str> = joined
+        .lines()
+        .filter(|l| l.contains("gh release edit") && l.contains("--draft=false"))
+        .collect();
+    assert!(
+        !publishing.is_empty(),
+        "release.yml no longer publishes with `gh release edit --draft=false` - has the flow changed shape?"
+    );
+    for l in &publishing {
+        assert!(
+            l.contains("--latest=${{ steps.newest.outputs.move }}"),
+            "this publish does not take the Latest badge from scripts/release-latest.sh (#3098):\n{l}"
+        );
+    }
+    let creates_latest: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.contains("make_latest") && !l.contains("false"))
+        .collect();
+    assert!(
+        creates_latest.is_empty(),
+        "these lines mark a release Latest outside the script's answer (#3098):\n{creates_latest:#?}"
+    );
+}

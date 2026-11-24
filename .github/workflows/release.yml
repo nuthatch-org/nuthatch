@@ -613,8 +613,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # #3098: GitHub marks a newly published release "Latest" unless told otherwise, and
+          # `releases/latest` is what scripts and the repo front page offer. The same answer as
+          # `:latest` above, so a patch on an older line (an LTS backport) never takes it back.
           gh release edit "$GITHUB_REF_NAME" --draft=false \
-            --prerelease=${{ contains(github.ref_name, '-') }} --repo "$GITHUB_REPOSITORY"
+            --prerelease=${{ contains(github.ref_name, '-') }} \
+            --latest=${{ steps.newest.outputs.move }} --repo "$GITHUB_REPOSITORY"
           echo "published $GITHUB_REF_NAME"
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,assets \
             --jq '"draft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets | length)"'
