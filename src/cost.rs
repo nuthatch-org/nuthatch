@@ -43,6 +43,9 @@ struct Tally {
     engine_nanos: AtomicU64,
     peak_memory: AtomicU64,
     queue_nanos: AtomicU64,
+    /// Rows the request's answers carried, for the audit log (#3095); not part of the header.
+    result_rows: AtomicU64,
+    answered: std::sync::atomic::AtomicBool,
 }
 
 /// One request's tally, shared by every task and thread that works on it.
@@ -88,6 +91,19 @@ pub fn spawn_blocking<R: Send + 'static>(
     })
 }
 
+/// Run `f` metered by `meter`: what the audit log (#3095) records of a call it audits.
+pub async fn within<F: std::future::Future>(meter: Meter, f: F) -> F::Output {
+    METER.scope(meter, f).await
+}
+
+/// Rows one answer carried.
+pub fn result_rows(n: u64) {
+    with(|t| {
+        t.result_rows.fetch_add(n, Relaxed);
+        t.answered.store(true, Relaxed);
+    });
+}
+
 /// Whether the work on this task or thread is for a request that asked for its cost.
 pub fn asked() -> bool {
     current().is_some()
@@ -118,7 +134,41 @@ pub fn queued(d: Duration) {
     });
 }
 
+/// A request's figures, as the audit log records them: the header's, by the header's names.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct Figures {
+    pub sealed_bytes: u64,
+    pub sealed_bytes_read: u64,
+    pub hot_rows: u64,
+    pub engine_us: u64,
+    pub peak_mem_bytes: u64,
+    pub queue_us: u64,
+    pub scan_cpu_us: u64,
+}
+
 impl Meter {
+    /// What the request did so far.
+    pub fn figures(&self) -> Figures {
+        let t = &self.0;
+        Figures {
+            sealed_bytes: t.sealed_bytes.load(Relaxed),
+            sealed_bytes_read: t.sealed_bytes_read.load(Relaxed),
+            hot_rows: t.hot_rows.load(Relaxed),
+            engine_us: t.engine_nanos.load(Relaxed) / 1_000,
+            peak_mem_bytes: t.peak_memory.load(Relaxed),
+            queue_us: t.queue_nanos.load(Relaxed) / 1_000,
+            scan_cpu_us: t.scan_cpu_nanos.load(Relaxed) / 1_000,
+        }
+    }
+
+    /// Rows its answers carried; `None` when no answer counted any.
+    pub fn result_rows(&self) -> Option<u64> {
+        self.0
+            .answered
+            .load(Relaxed)
+            .then(|| self.0.result_rows.load(Relaxed))
+    }
+
     /// The header value: `key=value` pairs in a fixed order, every value an integer. A field is only
     /// ever added at the end.
     pub fn header(&self, result_bytes: u64) -> String {
@@ -158,8 +208,14 @@ pub async fn layer(
     if !metered {
         return next.run(req).await;
     }
-    let meter = Meter::default();
-    let mut resp = METER.scope(meter.clone(), next.run(req)).await;
+    // Under the audit log's meter already (#3095): report into that one, so both see every figure.
+    let (meter, mut resp) = match METER.try_with(Clone::clone) {
+        Ok(outer) => (outer, next.run(req).await),
+        Err(_) => {
+            let meter = Meter::default();
+            (meter.clone(), METER.scope(meter, next.run(req)).await)
+        }
+    };
     use axum::body::HttpBody;
     let result_bytes = resp.body().size_hint().exact().or_else(|| {
         resp.headers()

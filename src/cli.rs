@@ -115,7 +115,7 @@ pub enum Command {
     /// Build, sign, and verify the signed compliance-pack manifest (RFC-0008 C6).
     Pack(PackArgs),
     /// Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a
-    /// second endpoint.
+    /// second endpoint, `verify` checks an `--audit-log` directory's hash chain.
     Audit(AuditArgs),
     /// An answer as of a sealed block, with what someone else needs to get it again: `make` asks a
     /// running nest, `verify` asks another nest of the same NID (#2944).
@@ -901,6 +901,73 @@ pub enum AuditWhat {
     Report(AuditReportArgs),
     /// Re-fetch a sample of sealed ranges from a second endpoint and compare them row by row.
     Sealed(AuditSealedArgs),
+    /// Check an `--audit-log` directory's hash chain: a deleted, edited or reordered record fails.
+    Verify(AuditVerifyArgs),
+}
+
+#[derive(Args)]
+pub struct AuditVerifyArgs {
+    /// The `--audit-log` directory, or one `audit-<seq>.jsonl` file in it.
+    pub path: std::path::PathBuf,
+    /// The head an earlier `verify` printed (`<seq>:<hash>`), kept off this host: also catches a cut
+    /// or rewritten tail, which the chain alone cannot.
+    #[arg(long, value_name = "SEQ:HASH")]
+    pub head: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `--audit-log` and its settings (#3095), on `dev` and `serve`. Off unless `--audit-log` is given.
+/// Not `nuthatch.toml` fields: who called a nest is about the access path, not the nest's content.
+#[derive(Args, Clone, Debug, Default)]
+pub struct AuditLogArgs {
+    /// Record every `/sql`, `/q/{name}`, admin and MCP call, refused ones included, as hash-chained
+    /// JSON lines in this directory (`audit-<seq>.jsonl`). Check it with `nuthatch audit verify`.
+    #[arg(long = "audit-log", value_name = "DIR")]
+    pub audit_log: Option<std::path::PathBuf>,
+    /// The request header your gateway sets to the caller's identity, recorded as an opaque string.
+    /// The gateway must strip a copy the client sent. A verified token's subject wins over it.
+    #[arg(
+        long = "audit-log-identity-header",
+        value_name = "HEADER",
+        requires = "audit_log"
+    )]
+    pub audit_identity_header: Option<String>,
+    /// How a statement is recorded: `hash` (SHA-256 only) or `text` (also its text, and MCP tool
+    /// arguments).
+    #[arg(
+        long = "audit-log-statements",
+        value_enum,
+        default_value_t,
+        requires = "audit_log"
+    )]
+    pub audit_statements: crate::audit_log::Statements,
+    /// `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its
+    /// record's fsync, and is answered 503 if it cannot be written.
+    #[arg(
+        long = "audit-log-fsync",
+        value_enum,
+        default_value_t,
+        requires = "audit_log"
+    )]
+    pub audit_fsync: crate::audit_log::Fsync,
+    /// Start a new file once the current one would pass this size.
+    #[arg(
+        long = "audit-log-rotate-mb",
+        value_name = "MIB",
+        default_value_t = 64,
+        requires = "audit_log"
+    )]
+    pub audit_rotate_mb: u64,
+    /// Keep this many files, deleting the oldest at rotation. 0 keeps all of them.
+    #[arg(
+        long = "audit-log-keep",
+        value_name = "FILES",
+        default_value_t = 0,
+        requires = "audit_log"
+    )]
+    pub audit_keep: usize,
 }
 
 #[derive(Args)]
@@ -1648,6 +1715,9 @@ pub struct ServeArgs {
     #[arg(long = "local-host")]
     pub local_host: Vec<String>,
 
+    #[command(flatten)]
+    pub audit: AuditLogArgs,
+
     /// Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node
     /// owns no cursor, so the lifecycle routes it would expose have nothing to act on.
     #[arg(long)]
@@ -1926,6 +1996,9 @@ pub struct DevArgs {
     /// sample, as is the range, which `nuthatch audit sealed --from --to` re-checks.
     #[arg(long)]
     pub audit_seed: Option<u64>,
+
+    #[command(flatten)]
+    pub audit: AuditLogArgs,
 
     /// Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that
     /// front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or

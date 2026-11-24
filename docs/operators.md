@@ -1636,6 +1636,52 @@ Three things worth knowing first:
 - **Anything on the same Docker network reaches it** regardless of `-p 127.0.0.1:...`, because the
   publish flag governs the host, not the container network.
 
+### Call audit log (#3095)
+
+Off unless you start `dev` or `serve` with `--audit-log <DIR>`. Without it nothing is written and
+nothing is added to the request path. With it, every call to `/sql`, `/q/{name}`, the admin API
+(`/_admin…`, a runtime's lifecycle routes included) and `/mcp` gets one JSON line in
+`DIR/audit-<first seq>.jsonl`. That includes calls that were refused: a `401`, a `403`, a `413`, a
+`503` busy. Monitoring routes and point reads are not recorded. Nothing leaves the host.
+
+```json
+{"v":1,"seq":42,"prev":"<sha256 of record 41's line>","ts_ms":1764000000000,"event":"call",
+ "identity":"team-a","identity_from":"header","surface":"sql","method":"GET","path":"/lodestar/sql",
+ "nest":"lodestar","status":200,"outcome":"ok","us":5120,"statement_sha256":"…",
+ "tables":["usdc__transfer"],"rows":20,"cost":{"sealed_bytes":…,"hot_rows":…,"engine_us":…}}
+```
+
+- **Identity** is recorded as an opaque string. nuthatch authenticates nobody here. It comes from
+  `--audit-log-identity-header <name>`, a header your gateway sets (and must strip from what clients
+  send), or from a token check running in the process, whose verified subject wins and is marked
+  `"identity_from":"token"`. A credential header (`Authorization`, `Cookie`…) is refused as the
+  identity header.
+- **What is never recorded:** a query string, a header other than the identity header, a bearer or
+  admin token, an admin request body. An admin or `/q` body gets a SHA-256 (`arguments_sha256`),
+  because a mount's RPC URL may carry a key. A statement is recorded as `statement_sha256`, plus the
+  tables it reads. `--audit-log-statements text` adds the statement text and the MCP tool arguments.
+  A hash tells you which statement ran if you already have it, and hides it from nobody who can
+  guess it.
+- **Tamper evidence:** each record's `prev` is the SHA-256 of the line before it, and the chain runs
+  across files. `nuthatch audit verify DIR` fails by name on a deleted, edited or reordered record, and
+  prints the head (`<seq>:<hash>`). No chain can show that its own tail was cut or rewritten, so keep
+  the head somewhere this host cannot write, then pass it back with `verify --head`.
+- **fsync:** `--audit-log-fsync batch` (the default) has one writer thread that fsyncs after each batch
+  it drains, and a response does not wait for it. A crash can lose the records queued or written
+  since the last fsync. `per-record` holds each response until its record is fsynced (group commit,
+  so concurrent calls share an fsync). A record that cannot be written turns that call's answer into
+  `503 audit_unwritable`. Either way the queue is bounded (1024), so a writer that falls behind slows
+  calls down rather than dropping their records. A record torn by a crash is cut at the next start,
+  and the cut is recorded as an `"event":"recovered"` record. One process holds a log directory at a
+  time; a second is refused.
+- **Rotation and retention:** a new file starts once the current one would pass
+  `--audit-log-rotate-mb` (64). Files are never deleted unless you set `--audit-log-keep <N>`, which
+  keeps the newest N at each rotation. `verify` then reports the seq the log starts at. A rotated file
+  is closed and never written again, so you can ship it off the host with your own tooling (`rclone`,
+  `aws s3 sync`). nuthatch makes no network call for it.
+- **Not covered yet:** the Arrow Flight SQL listener (`--flight`), the scaled-mode control plane
+  (`nuthatch control`) and GraphQL routes.
+
 ---
 
 ## Observability

@@ -628,7 +628,9 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
         let backing = backing.clone();
         let serving = crate::metrics::METRICS.serving(label);
+        let nest: Arc<str> = Arc::from(label);
         move |req, next| {
+            crate::audit_log::nest(&nest);
             crate::metrics::serve_for(
                 serving.clone(),
                 count_request(ring.clone(), backing.clone(), req, next),
@@ -1312,8 +1314,14 @@ pub fn compose_listener(
     hosts: HostNames,
 ) -> Router {
     let app = crate::host_names::guard(app, loopback, hosts);
-    match cors {
+    let app = match cors {
         Some(layer) => cors_outside_admin(app, layer),
+        None => app,
+    };
+    // Outermost, so a call any layer inside refuses is still recorded (#3095). Absent, as it is by
+    // default, the app is exactly what it was.
+    match crate::audit_log::installed() {
+        Some(log) => crate::audit_log::wrap(app, log),
         None => app,
     }
 }
@@ -1356,6 +1364,7 @@ pub async fn bind_and_serve(
     )
     .await;
     tracing::info!("shutdown signal received; API stopped");
+    crate::audit_log::flush().await;
     Ok(())
 }
 
@@ -1369,6 +1378,10 @@ pub async fn serve_bound(
         Some(layer) => cors_outside_admin(app, layer),
         None => app,
     };
+    let app = match crate::audit_log::installed() {
+        Some(log) => crate::audit_log::wrap(app, log),
+        None => app,
+    };
     tracing::info!("API live on http://{}", listener.local_addr()?);
     serve_until(
         listener,
@@ -1379,6 +1392,7 @@ pub async fn serve_bound(
     )
     .await;
     tracing::info!("shutdown signal received; API stopped");
+    crate::audit_log::flush().await;
     Ok(())
 }
 
@@ -5268,7 +5282,7 @@ fn json_len(value: &serde_json::Value) -> u64 {
 /// The relations `sql` reads, last name part lowercased, less the CTEs it defines; any
 /// `information_schema` relation adds `information_schema`. A statement that will not parse falls
 /// back to every identifier in it, which can only copy more.
-fn relations_read(sql: &str) -> std::collections::HashSet<String> {
+pub(crate) fn relations_read(sql: &str) -> std::collections::HashSet<String> {
     use sqlparser::ast::{Query, Visit, Visitor};
     use std::ops::ControlFlow;
     struct Ctes(std::collections::HashSet<String>);
@@ -5503,6 +5517,7 @@ fn sql_body(body: &[u8], explain: bool) -> Result<SqlQuery, Box<axum::response::
 
 async fn sql_answer(s: AppState, q: SqlQuery, arrow: bool) -> axum::response::Response {
     use crate::metrics::METRICS;
+    crate::audit_log::statement(&q.q);
     if !s.surface.free_form_allowed() {
         return refuse_free_form(&s.surface);
     }
@@ -5723,7 +5738,8 @@ async fn run_sql_query_at(
         };
         let (st, sql) = (s.clone(), q.q.clone());
         let scope = crate::metrics::serving_scope();
-        match crate::seal::spawn_blocking(move || {
+        // `cost::`'s, so a remembered answer's rows reach the request's meter (#3095).
+        match crate::cost::spawn_blocking(move || {
             let _slot = slot;
             crate::metrics::within_serving_scope(scope, || remembered(&st, &sql, max_rows))
         })
@@ -6528,6 +6544,7 @@ fn sql_facts_envelope(
     cached: bool,
     rows: Value,
 ) -> Value {
+    crate::cost::result_rows(count as u64);
     // #1437, RFC-0045 stage 1's "provenance visible in the result": an answer that read an offchain
     // table, directly or through an entity, is reproducible by snapshot and says which snapshots.
     let read = out.offchain.as_ref().and_then(read_offchain_json);
@@ -10625,6 +10642,83 @@ mod tests {
         assert_eq!(out["result"]["isError"], false, "{out}");
         let resp = app.oneshot(call("/mcp".into())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #3095: through the real runtime router, `/<nest>/sql` and an MCP `sql` tool call are each one
+    /// record, with the nest, the statement's hash, the tables it reads and its rows - and a caller
+    /// that asked for `Nuthatch-Cost` still gets the header.
+    #[tokio::test]
+    async fn the_audit_log_records_sql_and_mcp_through_the_real_routes() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let name = "audit-mount-3095";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let log = crate::audit_log::AuditLog::open(crate::audit_log::Settings {
+            dir: logs.path().to_path_buf(),
+            identity_header: Some(axum::http::HeaderName::from_static("x-user")),
+            statements: crate::audit_log::Statements::Hash,
+            fsync: crate::audit_log::Fsync::PerRecord,
+            rotate_bytes: 1 << 20,
+            keep_files: 0,
+        })
+        .unwrap();
+        let app = crate::audit_log::wrap(compose_runtime(roster, nests, health), log.clone());
+
+        let sql = "SELECT 7 AS n UNION ALL SELECT 8";
+        let req = axum::http::Request::get(format!("/{name}/sql?q={}", url_encode(sql)))
+            .header("x-user", "team-a")
+            .header(crate::cost::HEADER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(crate::cost::HEADER));
+
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "sql", "arguments": {"query": sql}}});
+        let req = axum::http::Request::post(format!("/{name}/mcp"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = axum::http::Request::get(format!("/{name}/tables"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        log.flush().await;
+
+        let file = std::fs::read_dir(logs.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .unwrap();
+        let records: Vec<Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(sql.as_bytes()))
+        };
+        for (r, surface) in records.iter().zip(["sql", "mcp"]) {
+            assert_eq!(r["surface"], surface, "{r}");
+            assert_eq!(r["nest"], name, "{r}");
+            assert_eq!(r["statement_sha256"], hash, "{r}");
+            assert_eq!(r["rows"], 2, "{r}");
+            assert_eq!(r["outcome"], "ok", "{r}");
+        }
+        assert_eq!(records[0]["identity"], "team-a");
+        assert_eq!(records[1]["tool"], "tools/call:sql");
+        crate::audit_log::verify(logs.path(), None).unwrap();
     }
 
     /// #2944: a bundle made from one nest verifies against it over HTTP, and fails by name when its rows,
