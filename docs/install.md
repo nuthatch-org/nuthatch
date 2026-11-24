@@ -81,6 +81,28 @@ release you downloaded: `refs/tags/v5.17.2` for 5.17.2. The release workflow run
 against its own assets before it publishes, so a release whose provenance does not verify never
 becomes public, and it refuses a tag whose commit is on neither `main` nor its release branch.
 
+### Software bill of materials
+
+Every binary tarball and the embeddable engine's module ship a CycloneDX 1.5 JSON SBOM beside them:
+`nuthatch-x86_64-unknown-linux-gnu.cdx.json` for `nuthatch-x86_64-unknown-linux-gnu.tar.gz`,
+`nuthatch-events.cdx.json` for `nuthatch-events.wasm`. It lists what that build compiles and links,
+read from the graph Cargo resolves for its target and features, so the `scaled`, `graph` and `flight`
+SBOMs each name their own crates. Each crate carries its declared licence and, from crates.io,
+Cargo.lock's SHA-256; a crate only a build script or a proc macro uses has scope `excluded`. The Rust
+standard library of the pinned toolchain is listed too. One commit yields the same SBOM byte for byte,
+and the release refuses to write one naming a licence `deny.toml` does not allow.
+
+The SBOM is a subject of the same attestation as its tarball, so it verifies the same way:
+
+```sh
+gh attestation verify nuthatch-x86_64-unknown-linux-gnu.cdx.json --repo nuthatch-org/nuthatch \
+  --signer-workflow nuthatch-org/nuthatch/.github/workflows/release.yml --source-ref refs/tags/v<version>
+```
+
+`nuthatch-engine.js` has no SBOM: it is the project's own host files joined together, with nothing
+installed or fetched. To produce one for a build of your own, run
+`cargo run --release --manifest-path tools/sbom/Cargo.toml -- --manifest-path Cargo.toml --target <triple> --out sbom.cdx.json -- <feature flags>`.
+
 ## Building from source
 
 This is the only route on a platform without a prebuilt binary, and for the `scaled`, `graph` and

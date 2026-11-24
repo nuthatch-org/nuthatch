@@ -88,6 +88,7 @@ fn current_tenant() -> Option<Arc<str>> {
 
 /// A session bounded and locked to `dir`, counted so a test can see the cache reuse one.
 fn open_session(dir: &Path, tenant: Option<&Arc<str>>) -> Result<Box<dyn Session>> {
+    #[cfg(test)]
     note_session_open(dir, tenant);
     let session = engine().open(dir, tenant.map(|t| &**t))?;
     if tenant.is_some() {
@@ -161,10 +162,14 @@ fn content_stamp(path: &Path) -> Option<InputStamp> {
 type SessionKey = (PathBuf, Option<Arc<str>>, u64);
 
 /// Opens are counted per dataset and tenant, across every watermark.
+#[cfg(test)]
 type SessionOpensKey = (PathBuf, Option<Arc<str>>);
 
 static SESSION_CACHE: OnceLock<Mutex<std::collections::HashMap<SessionKey, SessionCache>>> =
     OnceLock::new();
+/// Only tests read it, so only test builds keep it: in a shared runtime it gained an entry for every
+/// (dataset, tenant) that ever opened a session and dropped none, whatever was unmounted (#3093).
+#[cfg(test)]
 static SESSION_OPENS: OnceLock<Mutex<std::collections::HashMap<SessionOpensKey, u64>>> =
     OnceLock::new();
 static SESSION_USE: AtomicU64 = AtomicU64::new(0);
@@ -208,6 +213,7 @@ fn session_cache_lock(
         .unwrap_or_else(|p| p.into_inner())
 }
 
+#[cfg(test)]
 fn note_session_open(dir: &Path, tenant: Option<&Arc<str>>) {
     *SESSION_OPENS
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -7662,8 +7668,25 @@ template="pool"
         );
     }
 
-    /// macOS reports bytes. Other targets report kilobytes.
+    /// This process's peak resident size, in bytes.
+    ///
+    /// On Linux it is `VmHWM`, the high-water mark of the memory map `execve` gave this process,
+    /// and not `getrusage`: Linux keeps `ru_maxrss` across `execve`, and `Command` spawns with a
+    /// vfork-style clone that shares the parent's map until the exec, so a child's `ru_maxrss` starts
+    /// at its parent's peak. Spawned from a test harness running the whole lib suite in parallel,
+    /// `a_wide_batch_stays_under_the_cursor`'s child reported 791 MB while its own peak was 411 MB.
+    ///
+    /// Elsewhere `getrusage`: macOS reports bytes, other targets kilobytes.
     fn resident_bytes() -> u64 {
+        if cfg!(target_os = "linux") {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let kb: u64 = status
+                .lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+                .expect("VmHWM in /proc/self/status");
+            return kb.saturating_mul(1024);
+        }
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
         let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
         assert_eq!(rc, 0);

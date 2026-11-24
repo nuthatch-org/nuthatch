@@ -76,10 +76,11 @@ async fn xatu_bench() {
     let t = Instant::now();
     let b = run(x.clone(), &f, from, n).await;
     println!(
-        "xatu  : {:.1}s, {} logs, {} windows, {} http requests, digest {} ({} chunks, {} MB downloaded, {} fallbacks)",
+        "xatu  : {:.1}s, {} logs, {} windows, {} http requests, digest {} ({} chunks, {} MB downloaded, {} fallbacks, {} anchor calls, {} spot checks, {} mismatches)",
         t.elapsed().as_secs_f32(), b.0, b.1, rpc.request_count(), b.2,
         x.stats.chunks_loaded.load(Ordering::SeqCst), x.stats.bytes.load(Ordering::SeqCst) / 1_000_000,
-        x.stats.fallbacks.load(Ordering::SeqCst)
+        x.stats.fallbacks.load(Ordering::SeqCst), x.stats.anchor_calls.load(Ordering::SeqCst),
+        x.stats.spot_checks.load(Ordering::SeqCst), x.stats.mismatches.load(Ordering::SeqCst)
     );
     println!("identical output: {}", a.0 == b.0 && a.2 == b.2);
 }

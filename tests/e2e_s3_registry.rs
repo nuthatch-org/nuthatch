@@ -271,6 +271,123 @@ impl Drop for Killed {
     }
 }
 
+/// RFC-0073 FR15's last leg (#3093): FR10's endpoints against a private S3 bucket, as a platform
+/// that never runs the binary drives them. A bundle published by `POST /_admin/bundles?as=` is held
+/// by `GET /_admin/bundles/<nid>` and mounts by NID; a prune through `POST /_admin/bundles/prune`
+/// keeps the mounted one and deletes the one nothing reaches, leaving no ref naming a missing blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_s3_registry_publishes_and_prunes_through_the_admin_api() {
+    use crate::e2e_runtime_lifecycle::{a_bundle, graceless, post_bundle, OPEN};
+    use axum::http::StatusCode;
+    let Some(_) = endpoint() else { return };
+    let bucket = bucket();
+    let prefix = format!(
+        "fr10-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let registry = format!("s3://{bucket}/{prefix}");
+    let work = tempfile::tempdir().unwrap();
+    let (usdc, usdc_nid) = a_bundle(work.path(), "usdc", USDC);
+    let (arb, arb_nid) = a_bundle(work.path(), "arb", ARB);
+
+    let roost = tempfile::tempdir().unwrap();
+    let (mut handles, _tape, _intake) = empty_runtime(roost.path(), &usdc_nid).await;
+    std::fs::remove_dir_all(runtime::MountTable::data_dir(roost.path(), &usdc_nid)).unwrap();
+    handles.mount_ctx.registry = Some(registry.clone());
+    let handles = Arc::new(tokio::sync::Mutex::new(handles));
+    let jobs = runtime::start_mount_jobs(roost.path(), &handles, true)
+        .await
+        .unwrap();
+    let routes = runtime::lifecycle_routes(handles.clone(), jobs.clone(), true, Some(OPEN.into()))
+        .merge(runtime::bundle_routes(
+            handles.clone(),
+            jobs,
+            true,
+            Some(OPEN.into()),
+            Some(registry.clone()),
+            graceless(),
+        ));
+
+    let mut published = Vec::new();
+    for (file, r) in [(&usdc, "usdc@1"), (&arb, "arb@1")] {
+        let bytes = std::fs::read(file).unwrap();
+        let (status, out) = post_bundle(&routes, &format!("/_admin/bundles?as={r}"), bytes).await;
+        assert_eq!(status, StatusCode::OK, "publish {r} to S3: {out}");
+        published.push(out);
+    }
+    assert_eq!(published[0]["nid"], usdc_nid.as_str());
+    let (status, held) = call(
+        &routes,
+        "GET",
+        &format!("/_admin/bundles/{arb_nid}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    let held: serde_json::Value = serde_json::from_str(&held).unwrap();
+    assert_eq!(held["held"], true, "{held}");
+    assert_eq!(held["blob_hash"], published[1]["blob_hash"]);
+
+    let (status, body) = call(
+        &routes,
+        "POST",
+        "/_admin/nests",
+        None,
+        Some(&format!(r#"{{"name":"usdc","nid":"{usdc_nid}"}}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let job = wait_for_phase(&routes, "usdc", "live").await;
+    assert_eq!(job["phase"], "live", "{job}");
+
+    let (status, done) = call(
+        &routes,
+        "POST",
+        "/_admin/bundles/prune",
+        None,
+        Some(r#"{"keep":[]}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    let done: serde_json::Value = serde_json::from_str(&done).unwrap();
+    assert_eq!(done["deleted_nids"], serde_json::json!([arb_nid]), "{done}");
+    assert_eq!(
+        done["deleted_blobs"],
+        serde_json::json!([published[1]["blob_hash"]]),
+        "{done}"
+    );
+    let (status, gone) = call(
+        &routes,
+        "GET",
+        &format!("/_admin/bundles/{arb_nid}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{gone}");
+
+    let store = nuthatch::distribution::open(&registry).unwrap();
+    let blobs = store.list_blobs().await.unwrap();
+    assert_eq!(
+        blobs,
+        vec![published[0]["blob_hash"].as_str().unwrap().to_string()],
+        "the mounted usdc is all that survives"
+    );
+    nuthatch::distribution::pull_by_nid(store.as_ref(), &usdc_nid)
+        .await
+        .unwrap();
+    for (name, version, hash) in store.list_refs().await.unwrap() {
+        assert!(
+            blobs.contains(&hash),
+            "{name}@{version} names missing {hash}"
+        );
+    }
+}
+
 /// #2712: against a real S3 server, a prune removes a ref by a put conditional on the ETag it read,
 /// so a removed ref reads as absent, and a write that lands after the read is not overwritten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

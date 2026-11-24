@@ -1,5 +1,6 @@
 //! The [`Source`] impl: the handoff between the dataset and the RPC, request by request.
 
+use super::chunks::{Distrusted, Unchecked};
 use super::{Log, XatuSource};
 use crate::source::{LogFilter, Source};
 use anyhow::Result;
@@ -125,6 +126,21 @@ impl Source for XatuSource {
             let served = match self.chunk(s).await {
                 Some(c) => match self.read_chunk(&c, filter, a, b).await {
                     Ok(rows) => Some(rows),
+                    // The RPC would not answer the spot check: this window from the RPC, and
+                    // the check again next time.
+                    Err(e) if e.is::<Unchecked>() => {
+                        self.stats.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            "xatu: could not spot-check blocks {a}..={b} ({e:#}); asking the RPC \
+                             for them"
+                        );
+                        None
+                    }
+                    // Another window's check failed while this one read: already logged.
+                    Err(e) if e.is::<Distrusted>() => {
+                        self.stats.fallbacks.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
                     Err(e) => {
                         self.mark_bad(s, &e);
                         None

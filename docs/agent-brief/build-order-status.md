@@ -225,6 +225,20 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > null is only for chains whose endpoints do not. An indexed nest is refused if it switches to or from
 > null, and eager and timestamp-free nests keep their sealed bytes and content addresses.
 > **null = timestamps always null, deterministic by construction; use eager for timestamps.**
+>
+> **#3094 (optional authN/Z) is a reference gateway, not a binary feature.** Recorded with the PR that
+> lands it; it stands when Chief merges that PR. [`tools/gateway`](../../tools/gateway/README.md) is its
+> own crate with its own lockfile, outside the root crate's dependency graph: it verifies an OIDC/JWT
+> bearer token (RS256, ES256, EdDSA or HS256, keys from an operator-set `jwks_url` or a local file) and
+> holds HTTP, `/sql`, `/q/*` and MCP requests to `read:<nest>`, `read:<nest>/table/<t>` and
+> `read:<nest>/q/<n>` scopes before forwarding to a nuthatch only it can reach. Chosen over a built-in
+> feature because authentication is on the out-of-scope list as the gateway's job, a built-in would have
+> needed Chief to amend that list first, and the gateway leaves a default build byte-identical by
+> construction: no route, flag, config key or dependency of the binary changes. **Free-form SQL needs
+> the nest scope**: which relations a statement reads is known only to the engine that binds it, so a
+> token scoped to tables is refused `/sql`, `/explain` and the MCP `sql`/`explain` tools by name rather
+> than judged by guessing from the SQL text. Table-scoped SQL would need the engine to report the
+> relations a statement binds, a public API change for Chief to decide.
 
 >
 > **What is still deferred, and stays deferred.** Lifting the freeze is not a blanket reopening.

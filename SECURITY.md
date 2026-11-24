@@ -50,6 +50,10 @@ operator on the same terms, and it is not a support contract.
 
 Releases are cut from tagged commits on `main` or a `release/<major>.<minor>` branch,
 published to GitHub Releases with per-artifact SHA-256, and reproducible from the pinned toolchain (see
+[GOVERNANCE.md § Release integrity](GOVERNANCE.md#release-integrity--key-custody)). Each binary and
+the engine's module carry a build provenance attestation and a CycloneDX SBOM (`<artifact>.cdx.json`)
+under that same attestation, so an inventory of what you run comes from the release itself; how to
+verify both is in [docs/install.md](docs/install.md#software-bill-of-materials).
 [GOVERNANCE.md § Release integrity](GOVERNANCE.md#release-integrity--key-custody)).
 
 ## Long-term support

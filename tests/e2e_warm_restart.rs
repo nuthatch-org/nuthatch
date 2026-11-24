@@ -90,8 +90,14 @@ fn balances_of(rt: &indexer::NestRuntime) -> Vec<(String, i128)> {
 }
 
 /// Wait for the nest to reach `last_block == 11`.
+///
+/// On [`SEAL_POLL_TIMEOUT`], not [`POLL_TIMEOUT`]: block 5 is padded to
+/// [`indexer::SEAL_DIRECT_BATCH`] rows so the tip path will seal it, and `last_block` does not move
+/// until that window commits (#1989, #2017). Decoding and writing 20,000 rows takes ~7 s on an idle
+/// debug build and well past 20 s beside the other tests in this file, which is how 3 runs in 10
+/// failed "did not reach the tip" here with nothing wrong in the nest.
 async fn wait_indexed(store: &dyn nuthatch::store::HotStore) -> bool {
-    wait_until(POLL_TIMEOUT, || {
+    wait_until(SEAL_POLL_TIMEOUT, || {
         store.get_meta("last_block").ok().flatten().as_deref() == Some("11")
     })
     .await
@@ -148,7 +154,8 @@ async fn a_warm_restart_rebuilds_balances_identically_to_a_clean_replay() {
     clean_tape.advance_tip_to(12);
     let clean = spawn(clean_dir.path(), clean_tape).await;
     let clean_store = clean.state.store.clone();
-    let clean_caught_up = wait_until(POLL_TIMEOUT, || {
+    // The padded window again, from an empty directory: the seal budget, as in `wait_indexed`.
+    let clean_caught_up = wait_until(SEAL_POLL_TIMEOUT, || {
         clean_store.get_meta("last_block").ok().flatten().as_deref() == Some("12")
     })
     .await;

@@ -4185,6 +4185,96 @@ mod tests {
         assert_eq!(hash, fresh_hash);
     }
 
+    /// Run `f` on a thread of its own and fail the test, rather than hang it, if it has not returned in
+    /// `limit`. The pacing and verifier code sleeps and loops; a broken one must read as a failed
+    /// assertion, because a test that never ends costs the mutation sweep the full slow timeout (15 minutes under
+    /// the `mutants` profile) per mutant, and is slow to read as a failure. The
+    /// stuck thread is left behind and dies with the test process.
+    fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(limit) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("did not finish within {limit:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the closure panicked before it returned")
+            }
+        }
+    }
+
+    /// `handle.join()` that fails, rather than waits for ever, when the thread does not end.
+    fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) {
+        let start = Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < limit,
+                "the thread did not end within {limit:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn the_process_throttle_draws_on_the_shared_budget() {
+        let t = Throttle::process();
+        assert!(
+            t.shared,
+            "a pass or request would not queue behind the others"
+        );
+        assert_eq!(t.per_sec, BACKGROUND_VERIFY_BYTES_PER_SEC);
+        assert!(!Throttle::new(1).shared);
+    }
+
+    /// A segment the pass cannot read, as against one that is gone, is taken aside as unreadable.
+    #[test]
+    fn a_background_pass_quarantines_a_segment_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        test_set_table_floor(dir.path(), 0);
+        seal_range(dir.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
+        let path = segment_path(dir.path(), &seg.file, &seg.hash);
+        // Opens, then fails to read: not `NotFound`.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let root = dir.path().to_path_buf();
+        let moved = within(Duration::from_secs(30), move || {
+            background_pass(&root, &|| true).unwrap()
+        });
+        assert_eq!(moved, Some(1));
+        assert!(!path.exists());
+        assert!(dir.path().join(QUARANTINE_DIR).join(&seg.file).exists());
+    }
+
+    /// A catalogue past the bound is handed back uncached, and must not push out the ones that fit.
+    #[test]
+    fn an_oversized_catalogue_does_not_evict_the_cache() {
+        let _cache = catalogue_cache_test_lock();
+        let small = tempfile::tempdir().unwrap();
+        seal_range(small.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        shared_manifest(small.path()).unwrap();
+        let big = tempfile::tempdir().unwrap();
+        seal_range(big.path(), &[transfer(100, 0, "5")], 100, 100).unwrap();
+        let path = manifest_path(big.path());
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.resize(PARSED_CATALOGUE_BYTES + 1, b' ');
+        std::fs::write(&path, raw).unwrap();
+        shared_manifest(big.path()).unwrap();
+
+        let before = catalogue_parses_of(small.path());
+        shared_manifest(small.path()).unwrap();
+        assert_eq!(
+            catalogue_parses_of(small.path()),
+            before,
+            "an uncacheable catalogue evicted a cached one"
+        );
+    }
+
     /// Readers on one budget queue behind each other: eight threads reserving a second's worth each
     /// are paid for over eight seconds, not one.
     #[test]
@@ -4197,6 +4287,7 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        // `reserve` itself never sleeps, so a wrong cost shows here and not as a hang.
         let last = ends.iter().max().unwrap().duration_since(start);
         assert!(last >= Duration::from_secs(8), "{last:?}");
         assert!(last < Duration::from_secs(9), "{last:?}");
@@ -4226,7 +4317,7 @@ mod tests {
         // Ends before its next step, so it never serves this from its loop.
         alive.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(request_verify(dir.path(), "usdc__transfer", &seg));
-        verifier.join().unwrap();
+        join_within(verifier, Duration::from_secs(30));
         assert!(!path.exists(), "the request was dropped with the verifier");
         assert!(!request_verify(dir.path(), "usdc__transfer", &seg));
     }
@@ -4446,7 +4537,11 @@ mod tests {
         let path = |s: &Segment| segment_path(dir.path(), &s.file, &s.hash);
         flip_middle_byte(&path(&segs[1]));
 
-        assert_eq!(background_pass(dir.path(), &|| true).unwrap(), Some(1));
+        let root = dir.path().to_path_buf();
+        let moved = within(Duration::from_secs(30), move || {
+            background_pass(&root, &|| true).unwrap()
+        });
+        assert_eq!(moved, Some(1));
         assert!(path(&segs[0]).exists(), "an intact segment was moved");
         assert!(dir.path().join(QUARANTINE_DIR).join(&segs[1].file).exists());
         let record = verified_record(dir.path());
@@ -4464,7 +4559,11 @@ mod tests {
         let seg = only(&load_manifest(dir.path()).unwrap(), "usdc__transfer");
         std::fs::remove_file(segment_path(dir.path(), &seg.file, &seg.hash)).unwrap();
 
-        assert_eq!(background_pass(dir.path(), &|| true).unwrap(), Some(0));
+        let root = dir.path().to_path_buf();
+        let moved = within(Duration::from_secs(30), move || {
+            background_pass(&root, &|| true).unwrap()
+        });
+        assert_eq!(moved, Some(0));
         assert!(
             !dir.path().join(QUARANTINE_DIR).exists(),
             "a missing segment took the unreadable arm"
@@ -4484,9 +4583,11 @@ mod tests {
     #[test]
     fn a_throttle_paces_reads_to_its_rate() {
         let start = Instant::now();
-        let mut throttle = Throttle::new(1 << 20);
-        throttle.read(1 << 19);
-        throttle.read(1 << 19);
+        within(Duration::from_secs(10), || {
+            let mut throttle = Throttle::new(1 << 20);
+            throttle.read(1 << 19);
+            throttle.read(1 << 19);
+        });
         let took = start.elapsed();
         assert!(took >= Duration::from_millis(900), "{took:?}");
     }

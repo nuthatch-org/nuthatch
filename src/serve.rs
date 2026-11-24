@@ -591,7 +591,12 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
             .route("/", get(summary))
             .route("/health", get(|| async { "ok" }))
             .route("/ready", get(ready))
-            .route("/metrics", get(metrics_handler))
+            .route("/metrics", {
+                // The route this is mounted at, not the dataset's: an alias's state is its holder's
+                // clone, holder's name and all (#3093).
+                let own: Arc<str> = Arc::from(label);
+                get(move |state: State<AppState>| metrics_handler(state, own.clone()))
+            })
             .route("/tables", get(tables))
             .route("/schema", get(schema_doc))
             .route("/table/{name}", get(table))
@@ -623,7 +628,9 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
         let ring = std::sync::Arc::new(crate::requests::RequestRing::default());
         let backing = backing.clone();
         let serving = crate::metrics::METRICS.serving(label);
+        let nest: Arc<str> = Arc::from(label);
         move |req, next| {
+            crate::audit_log::nest(&nest);
             crate::metrics::serve_for(
                 serving.clone(),
                 count_request(ring.clone(), backing.clone(), req, next),
@@ -1307,8 +1314,14 @@ pub fn compose_listener(
     hosts: HostNames,
 ) -> Router {
     let app = crate::host_names::guard(app, loopback, hosts);
-    match cors {
+    let app = match cors {
         Some(layer) => cors_outside_admin(app, layer),
+        None => app,
+    };
+    // Outermost, so a call any layer inside refuses is still recorded (#3095). Absent, as it is by
+    // default, the app is exactly what it was.
+    match crate::audit_log::installed() {
+        Some(log) => crate::audit_log::wrap(app, log),
         None => app,
     }
 }
@@ -1351,6 +1364,7 @@ pub async fn bind_and_serve(
     )
     .await;
     tracing::info!("shutdown signal received; API stopped");
+    crate::audit_log::flush().await;
     Ok(())
 }
 
@@ -1364,6 +1378,10 @@ pub async fn serve_bound(
         Some(layer) => cors_outside_admin(app, layer),
         None => app,
     };
+    let app = match crate::audit_log::installed() {
+        Some(log) => crate::audit_log::wrap(app, log),
+        None => app,
+    };
     tracing::info!("API live on http://{}", listener.local_addr()?);
     serve_until(
         listener,
@@ -1374,6 +1392,7 @@ pub async fn serve_bound(
     )
     .await;
     tracing::info!("shutdown signal received; API stopped");
+    crate::audit_log::flush().await;
     Ok(())
 }
 
@@ -1722,7 +1741,7 @@ fn runtime_metrics(
     )
 }
 
-async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+async fn metrics_handler(State(s): State<AppState>, own: Arc<str>) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     // In a runtime, append the health series (RFC-0026 §5) so an operator can alert on "anything
     // quarantined" without polling `/nests`. Like the existing per-nest series, these describe the
@@ -1731,17 +1750,17 @@ async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         body.push_str(&health.render_metrics());
     }
     // A strict mount answers its own tenant, so it carries only the samples labelled with itself
-    // (#2714). The root `/metrics` keeps the whole runtime for the operator.
-    if s.isolation.is_some() {
-        let own = match &s.runtime_health {
-            Some((name, _)) => name.as_str(),
-            None => s.nest_info["name"].as_str().unwrap_or_default(),
-        };
-        body = own_series(&body, own);
+    // (#2714). The root `/metrics` keeps the whole runtime for the operator. "Itself" is the route it
+    // is mounted at: a mount sharing another tenant's dataset holds that mount's name as its health
+    // name, and filtering on it served the other tenant's series (#3093). The dataset's ingestion
+    // series are labelled with the holder alone, so such a mount does without them.
+    let strict = s.isolation.is_some();
+    if strict {
+        body = own_series(&body, &own);
     }
     body.push_str(&entity_metrics(&s));
     body.push_str(&snapshot_metrics(&s));
-    body.push_str(&integrity_metrics(&s));
+    body.push_str(&integrity_metrics(&s, strict.then_some(&*own)));
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -1845,10 +1864,12 @@ fn snapshot_metrics(s: &AppState) -> String {
 
 /// What the integrity passes took from this nest since its segments were last whole, as gauges an
 /// operator can alert on; zero on a healthy nest.
-fn integrity_metrics(s: &AppState) -> String {
-    let nest = match &s.runtime_health {
-        Some((name, _)) => name.as_str(),
-        None => s
+/// Labelled `own` when given, the strict mount's own route (#3093).
+fn integrity_metrics(s: &AppState, own: Option<&str>) -> String {
+    let nest = match (own, &s.runtime_health) {
+        (Some(own), _) => own,
+        (None, Some((name, _))) => name.as_str(),
+        (None, None) => s
             .nest_info
             .get("name")
             .and_then(Value::as_str)
@@ -5261,7 +5282,7 @@ fn json_len(value: &serde_json::Value) -> u64 {
 /// The relations `sql` reads, last name part lowercased, less the CTEs it defines; any
 /// `information_schema` relation adds `information_schema`. A statement that will not parse falls
 /// back to every identifier in it, which can only copy more.
-fn relations_read(sql: &str) -> std::collections::HashSet<String> {
+pub(crate) fn relations_read(sql: &str) -> std::collections::HashSet<String> {
     use sqlparser::ast::{Query, Visit, Visitor};
     use std::ops::ControlFlow;
     struct Ctes(std::collections::HashSet<String>);
@@ -5496,6 +5517,7 @@ fn sql_body(body: &[u8], explain: bool) -> Result<SqlQuery, Box<axum::response::
 
 async fn sql_answer(s: AppState, q: SqlQuery, arrow: bool) -> axum::response::Response {
     use crate::metrics::METRICS;
+    crate::audit_log::statement(&q.q);
     if !s.surface.free_form_allowed() {
         return refuse_free_form(&s.surface);
     }
@@ -5716,7 +5738,8 @@ async fn run_sql_query_at(
         };
         let (st, sql) = (s.clone(), q.q.clone());
         let scope = crate::metrics::serving_scope();
-        match crate::seal::spawn_blocking(move || {
+        // `cost::`'s, so a remembered answer's rows reach the request's meter (#3095).
+        match crate::cost::spawn_blocking(move || {
             let _slot = slot;
             crate::metrics::within_serving_scope(scope, || remembered(&st, &sql, max_rows))
         })
@@ -6521,6 +6544,7 @@ fn sql_facts_envelope(
     cached: bool,
     rows: Value,
 ) -> Value {
+    crate::cost::result_rows(count as u64);
     // #1437, RFC-0045 stage 1's "provenance visible in the result": an answer that read an offchain
     // table, directly or through an entity, is reproducible by snapshot and says which snapshots.
     let read = out.offchain.as_ref().and_then(read_offchain_json);
@@ -9860,6 +9884,53 @@ mod tests {
         assert!(strict.contains("# TYPE nuthatch_nest_health"), "{strict}");
     }
 
+    /// #3093: a second tenant's mount of a NID another tenant already holds is served through a clone
+    /// of the holder's state, whose health name is the holder's. Its strict `/metrics` filtered on
+    /// that name, so `globex/usdc` was served every series labelled `acme/usdc`. It answers under the
+    /// route it is mounted at.
+    #[tokio::test]
+    async fn a_strict_alias_of_another_tenants_dataset_does_not_see_the_holders_series() {
+        let (holder, alias) = ("acme/usdc-3093", "globex/usdc-3093");
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register(holder, "mainnet");
+        health.register_alias(alias, holder, "mainnet");
+        crate::metrics::METRICS.nest(holder).set_tip(7);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        held.runtime_health = Some((holder.to_string(), health.clone()));
+        held.isolation = Some(Arc::from("acme"));
+        // What `begin_mount` and `fan_out_aliases` install for the alias: the holder's state, cloned,
+        // reseated on its own tenant.
+        let mut aliased = held.clone();
+        aliased.isolation = Some(Arc::from("globex"));
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![(holder.to_string(), held), (alias.to_string(), aliased)],
+            health,
+        );
+
+        let (_, body) = get(app.clone(), &format!("/{alias}/metrics")).await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("acme"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "nuthatch_nest_health{{nest=\"{alias}\",chain=\"mainnet\"}} 1"
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "nuthatch_quarantined_segments{{nest=\"{alias}\"}} 0"
+            )),
+            "{body}"
+        );
+        let (_, own) = get(app, &format!("/{holder}/metrics")).await;
+        let own = String::from_utf8(own.to_vec()).unwrap();
+        assert!(own.contains(&format!("nest=\"{holder}\"")), "{own}");
+        assert!(!own.contains("globex"), "{own}");
+    }
+
     /// A kept sample carries its own family's header and no other's, and a name that only shares
     /// a prefix is not this mount.
     #[test]
@@ -10571,6 +10642,83 @@ mod tests {
         assert_eq!(out["result"]["isError"], false, "{out}");
         let resp = app.oneshot(call("/mcp".into())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #3095: through the real runtime router, `/<nest>/sql` and an MCP `sql` tool call are each one
+    /// record, with the nest, the statement's hash, the tables it reads and its rows - and a caller
+    /// that asked for `Nuthatch-Cost` still gets the header.
+    #[tokio::test]
+    async fn the_audit_log_records_sql_and_mcp_through_the_real_routes() {
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        let name = "audit-mount-3095";
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        let roster = json!({"runtime": "t", "nests": [{"name": name}]});
+        let health = Arc::new(crate::health::RuntimeHealth::new());
+        let nests = vec![(name.to_string(), test_state(&dir.path().join(name), 4))];
+        let log = crate::audit_log::AuditLog::open(crate::audit_log::Settings {
+            dir: logs.path().to_path_buf(),
+            identity_header: Some(axum::http::HeaderName::from_static("x-user")),
+            statements: crate::audit_log::Statements::Hash,
+            fsync: crate::audit_log::Fsync::PerRecord,
+            rotate_bytes: 1 << 20,
+            keep_files: 0,
+        })
+        .unwrap();
+        let app = crate::audit_log::wrap(compose_runtime(roster, nests, health), log.clone());
+
+        let sql = "SELECT 7 AS n UNION ALL SELECT 8";
+        let req = axum::http::Request::get(format!("/{name}/sql?q={}", url_encode(sql)))
+            .header("x-user", "team-a")
+            .header(crate::cost::HEADER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(crate::cost::HEADER));
+
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "sql", "arguments": {"query": sql}}});
+        let req = axum::http::Request::post(format!("/{name}/mcp"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = axum::http::Request::get(format!("/{name}/tables"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        log.flush().await;
+
+        let file = std::fs::read_dir(logs.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .unwrap();
+        let records: Vec<Value> = std::fs::read_to_string(&file)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "{records:?}");
+        let hash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(sql.as_bytes()))
+        };
+        for (r, surface) in records.iter().zip(["sql", "mcp"]) {
+            assert_eq!(r["surface"], surface, "{r}");
+            assert_eq!(r["nest"], name, "{r}");
+            assert_eq!(r["statement_sha256"], hash, "{r}");
+            assert_eq!(r["rows"], 2, "{r}");
+            assert_eq!(r["outcome"], "ok", "{r}");
+        }
+        assert_eq!(records[0]["identity"], "team-a");
+        assert_eq!(records[1]["tool"], "tools/call:sql");
+        crate::audit_log::verify(logs.path(), None).unwrap();
     }
 
     /// #2944: a bundle made from one nest verifies against it over HTTP, and fails by name when its rows,

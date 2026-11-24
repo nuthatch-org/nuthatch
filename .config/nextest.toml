@@ -37,3 +37,14 @@ priority = 100
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The weekly mutation sweep (.github/workflows/mutants.yml, #3084). A mutant is scored on whether the
+# suite fails, not on which test fails, so the first failure ends the run: most mutants are caught,
+# and under `cargo test` each of them paid for the whole lib suite anyway. `terminate = "immediate"`
+# stops the other running tests at once rather than waiting on them. A mutant that hangs a test the
+# suite does not bound itself (a throttle that sleeps for days, a verifier that never ends) is
+# terminated at the slow timeout (inherited from `default`, 60s x 15) and counts as caught, as it would in CI. Under `cargo test` it
+# held the whole test process to cargo-mutants' own timeout and was reported TIMEOUT, neither caught
+# nor missed.
+[profile.mutants]
+fail-fast = { max-fail = 1, terminate = "immediate" }

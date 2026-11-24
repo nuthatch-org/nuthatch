@@ -1,0 +1,29 @@
+[package]
+name = "nuthatch-gateway"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "Reference read gateway for nuthatch: OIDC/JWT bearer tokens and per-nest/table read scopes (#3094)"
+publish = false
+
+# Its own crate, outside the binary and outside the root crate's dependency graph: a default nuthatch
+# build is what it would be had this never been written (#3094). Every dependency below is one the
+# root crate's Cargo.lock already carries, at the same version.
+[[bin]]
+name = "nuthatch-gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+toml = "0.8"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["process"] }

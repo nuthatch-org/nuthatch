@@ -64,7 +64,7 @@ seal line and the tail always comes from the RPC. You do not configure the hando
 
 ## How it stays honest
 
-A file is used only after three checks, and any failure falls back to the RPC for that 1,000-block
+A file is used only after three checks (and its logs after a spot check, below), and any failure falls back to the RPC for that 1,000-block
 range with a `WARN xatu:` log line saying why:
 
 1. The block file has exactly one row per block, and, where it carries parent hashes, an unbroken
@@ -84,15 +84,50 @@ compares the stored checkpoint with the RPC, sees a mismatch, and rolls the nest
 block where they agree. The block timestamp is checked at the same blocks as the hash; between them, timestamps are the
 dataset's word too, checked only to rise block by block, as the chain requires.
 
-What it cannot check: that every log of a block is *present*. The dataset carries no receipts root.
-The equality below is measured on the sample it was measured on; if you need proof for a range you
-care about, compare a few `eth_getLogs` answers against it, or leave the flag off.
+### Log content: the trust model
+
+The checks above vouch for blocks, not for the logs in them. The dataset carries no receipts root
+and no logs bloom, so no file can prove its own logs. What is done instead (#3091):
+
+- **Random damage is caught for free.** The public files are written by ClickHouse as zstd frames
+  with content checksums, so a flipped bit in a file fails its decode, and the range goes to the RPC.
+  Measured on a real 50 MB mainnet logs file (blocks 26,462,000 on): of 40 random single-bit flips,
+  nuthatch's reader refused all 40; none decoded into different logs. (The CI fixtures are re-encoded
+  without those checksums, which is why flips there mostly decode into other logs.)
+- **A wrong but well-formed file is spot-checked.** The first time a filter reads a file, two of
+  its blocks are asked of the RPC with the same filter (`eth_getLogs`, one block each) and must equal
+  the dataset's rows for them, every field of a log: address, topics, data, transaction hash, log
+  index, block hash (the block number is the one asked), and the count. One block is drawn uniformly, so a block the dataset left empty can be drawn;
+  the other is drawn by matched row, so the logs your nest stores are what gets checked (for a filter
+  so dense its matches in a file are not held whole, both are drawn uniformly; most of its blocks
+  have rows anyway). The draw is
+  random per run, so a file's author cannot know which blocks will be asked. Cost: **two RPC calls
+  per 1,000 blocks**, per filter (more only if the RPC client splits a large address set into
+  groups).
+- **A mismatch ends the dataset for the run.** It is logged at `ERROR` (`xatu: the dataset disagrees
+  with the RPC (block N: log I differs in data)`), that range and every later one come from the RPC,
+  and nothing more is read from the dataset until restart: a window that was already reading a
+  chunk when another window's check failed is answered by the RPC too. A file that lied once is evidence against
+  the source, not one block. If the RPC cannot answer a spot check, that window goes to the RPC and
+  the check is tried again on the next; a refusal is not a mismatch.
+
+What this is not: a proof. It reliably catches a fault that touches a fair share of a file's logs
+(a writer bug, a stale or reordered export, the wrong table): the draw by matched row lands on one
+almost surely. It will usually *not* catch one edited log in a file of 1,000 blocks (about 1 in 500
+per file if the edited block still has matching logs; if every matching log of a block was dropped, only
+the uniform draw can land on it, about 1 in 1,000), so a mirror that edits a few logs on purpose can get them past it. Blocks served before a
+mismatch was found passed the same checks and stay served; the `ERROR` line says to re-index without
+the flag to be certain of them. Proving every block (header hash, receipts root, every log against
+it) is the optional verify mode tracked in #3096; on mainnet it costs about a header per block plus
+the dataset's transaction file, which is the RPC bill this source exists to avoid, so it is not on
+by default here.
 
 This is also where determinism rests on the dataset. A run without the flag is the reference: if the
-dataset ever lacked a log that the node has, a nest backfilled with the flag would seal different
-rows from one backfilled without it, and nothing in the segment records which source served a range.
-Nothing like that has been observed, but it cannot be ruled out, so for state you will need to
-re-derive bit for bit from a node alone, backfill without the flag.
+dataset ever lacked a log that the node has in a block no check drew, a nest backfilled with the
+flag would seal different rows from one backfilled without it, and nothing in the segment records
+which source served a range. Nothing like that has been observed, but it cannot be ruled out, so
+for state you will need to re-derive bit for bit from a node alone, or for a mirror you do not
+control, backfill without the flag.
 
 Memory is bounded at about 0.5 GB, inside the 2 GB per-cursor budget: the compressed bytes of four
 logs files (up to about 200 MB); the hashes and timestamps of the last 128 files (about 13 MB), so a
@@ -106,7 +141,8 @@ turns decoding it.
 Fixtures in CI (`tests/fixtures/xatu`) are real mainnet files for blocks 26,462,624 to 26,462,635
 beside the recorded `eth_getLogs` and header answers for the same blocks; the tests assert the logs
 and timestamps are identical field for field, and cover the handoff, a corrupt file, a hash
-mismatch and a reorg notice.
+mismatch, a reorg notice, and a re-encoded file with one log's amount edited or one log dropped
+(caught by the spot check, and served by the RPC instead).
 
 ## Options
 
@@ -133,7 +169,11 @@ produced the same bytes: a digest over every log and its timestamp is equal in b
 | | Xatu + RPC | 267.2 s | 83 | 4,161,008 |
 
 The 50,000-block row downloaded 1,899 MB (50 files); the 5,000-block row 176 MB. The remaining RPC
-requests are the hash checks above. How to read it:
+requests are the hash checks above. Both rows predate the spot check of log content. Re-measured
+with it on 2026-11-23, same 50,000 blocks: **184** HTTP requests to the RPC (83 anchors, 100 spot
+checks, two per file, and the finality check), against 4,176 for the RPC alone. Same 4,161,008
+logs, no mismatch, 1,899 MB downloaded (`xatu_bench`, Alchemy; the `anchor calls` and `spot checks`
+counters it prints give the split). How to read it:
 
 - Alchemy puts `blockTimestamp` on logs, so this run never paid for headers. On a provider that does
   not, the RPC-only column also carries up to one header lookup per log-bearing block (here, every

@@ -35,12 +35,14 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `crate-count-receiver` |  |  | cached on its inputs |
 | `crate-eval-runner` |  |  | cached on its inputs |
 | `crate-fixture-rpc` |  |  | cached on its inputs |
+| `crate-gateway` | fmt, clippy and test for the reference read gateway (#3094) |  | cached on its inputs |
 | `crate-identity` |  |  | cached on its inputs |
 | `crate-lodestar-parity` |  |  | cached on its inputs |
+| `crate-sbom` |  |  | cached on its inputs |
 | `crate-scaffold` |  |  | cached on its inputs |
 | `crate-seal` |  |  | cached on its inputs |
 | `crate-timelapse` |  |  | cached on its inputs |
-| `crates` | fmt, clippy and test for the path crates CI checks beside decode | `crate-count-receiver`, `crate-fixture-rpc`, `crate-lodestar-parity`, `crate-seal`, `crate-identity`, `crate-scaffold`, `crate-timelapse`, `crate-eval-runner` | runs its dependencies only |
+| `crates` | fmt, clippy and test for the path crates CI checks beside decode | `crate-count-receiver`, `crate-fixture-rpc`, `crate-lodestar-parity`, `crate-gateway`, `crate-sbom`, `crate-seal`, `crate-identity`, `crate-scaffold`, `crate-timelapse`, `crate-eval-runner` | runs its dependencies only |
 | `decode` | fmt, clippy and test for the decode crate (its own workspace, so the root cargo never runs its tests) |  | cached on its inputs |
 | `deny` | cargo-deny: advisories, licences, bans, sources, for each manifest CI checks |  | always runs |
 | `doc` | Build the API docs |  | cached on its inputs |
@@ -83,6 +85,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `tab-module` | The tab module, nodejs target, into embed/pkg (needs wasm-bindgen, wasm-opt and the wasm32 C toolchain) |  | cached on its inputs |
 | `test` | Run the test suite (needs cargo-nextest, as CI does) | `doctest`, `parity-bin` | cached on its inputs |
 | `test-features` | The suite with every optional feature on | `doctest-features`, `parity-bin`, `test` | cached on its inputs |
+| `test-sbom` | The release SBOM tests, which need a toolchain (CI's shards skip them) |  | always runs |
 | `tip-lag` | Tip lag against MAX_SEEN_P50_MS |  | always runs |
 | `trino-contract` | Trino over the published prefix matches $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |
 | `trino-fixture` | Publish the drifted nest and record the local numbers to $NUTHATCH_TRINO_FIXTURE_OUT |  | always runs |
