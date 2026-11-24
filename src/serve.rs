@@ -1728,9 +1728,15 @@ fn runtime_metrics(
 ) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     body.push_str(&health.render_metrics());
+    // A holder and its aliases share one state and so one name; emit each name's series once, or a
+    // scrape sees duplicate samples (#3112).
+    let mut seen = std::collections::HashSet::new();
     for (_, nest) in nests {
-        body.push_str(&entity_metrics(&nest.current()));
-        body.push_str(&snapshot_metrics(&nest.current()));
+        let state = nest.current();
+        if seen.insert(nest_label(&state, None).to_string()) {
+            body.push_str(&entity_metrics(&state, None));
+            body.push_str(&snapshot_metrics(&state, None));
+        }
     }
     (
         [(
@@ -1758,8 +1764,8 @@ async fn metrics_handler(State(s): State<AppState>, own: Arc<str>) -> impl IntoR
     if strict {
         body = own_series(&body, &own);
     }
-    body.push_str(&entity_metrics(&s));
-    body.push_str(&snapshot_metrics(&s));
+    body.push_str(&entity_metrics(&s, strict.then_some(&*own)));
+    body.push_str(&snapshot_metrics(&s, strict.then_some(&*own)));
     body.push_str(&integrity_metrics(&s, strict.then_some(&*own)));
     (
         [(
@@ -1768,6 +1774,16 @@ async fn metrics_handler(State(s): State<AppState>, own: Arc<str>) -> impl IntoR
         )],
         body,
     )
+}
+
+/// The `nest` label of a state's series: `own` (a strict mount's route, #3113) or its configured name.
+fn nest_label<'a>(s: &'a AppState, own: Option<&'a str>) -> &'a str {
+    own.unwrap_or_else(|| {
+        s.nest_info
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    })
 }
 
 /// The samples of a text exposition labelled `nest="<nest>"`, each with its family's `# HELP` and
@@ -1848,12 +1864,8 @@ pub const ENTITY_SERIES: &[(&str, &str)] = &[
 ];
 
 /// What versions of the hot copy and derived state requests still read hold beside the latest (#2467).
-fn snapshot_metrics(s: &AppState) -> String {
-    let nest = s
-        .nest_info
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn snapshot_metrics(s: &AppState, own: Option<&str>) -> String {
+    let nest = nest_label(s, own);
     let bytes = s.retained_bytes() + s.entities.iter().map(|e| e.retained_bytes()).sum::<u64>();
     format!(
         "# HELP nuthatch_snapshot_retained_bytes Bytes that versions still being read hold beside the latest.\n\
@@ -1888,15 +1900,11 @@ fn integrity_metrics(s: &AppState, own: Option<&str>) -> String {
     )
 }
 
-fn entity_metrics(s: &AppState) -> String {
+fn entity_metrics(s: &AppState, own: Option<&str>) -> String {
     if s.entities.is_empty() {
         return String::new();
     }
-    let nest = s
-        .nest_info
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let nest = nest_label(s, own);
     let head = dataset_head(s);
     let now = crate::metrics::now_unix();
 
@@ -9929,6 +9937,72 @@ mod tests {
         let own = String::from_utf8(own.to_vec()).unwrap();
         assert!(own.contains(&format!("nest=\"{holder}\"")), "{own}");
         assert!(!own.contains("globex"), "{own}");
+    }
+
+    /// #3112: a holder and its alias share a state and a configured name, so the root `/metrics`
+    /// emitted the same per-dataset sample twice, which Prometheus rejects as a scrape error.
+    #[tokio::test]
+    async fn root_metrics_emit_each_series_once_for_a_holder_and_its_alias() {
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register("holder-3112", "mainnet");
+        health.register_alias("alias-3112", "holder-3112", "mainnet");
+        let dir = tempfile::tempdir().unwrap();
+        let mut held = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        held.nest_info = Arc::new(json!({ "name": "cfgname-3112" }));
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![
+                ("holder-3112".to_string(), held.clone()),
+                ("alias-3112".to_string(), held),
+            ],
+            health,
+        );
+        let (_, body) = get(app, "/metrics").await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let series: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.rsplit_once(' ').map(|(s, _)| s))
+            .collect();
+        let mut unique = series.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(series.len(), unique.len(), "duplicate series in:\n{body}");
+        assert!(
+            body.contains("nuthatch_snapshot_retained_bytes{nest=\"cfgname-3112\"}"),
+            "{body}"
+        );
+    }
+
+    /// #3113: a strict mount's samples all carry one `nest` value, its route, so a dashboard can join
+    /// the families; the configured name used to label the entity and snapshot series.
+    #[tokio::test]
+    async fn a_strict_mounts_metrics_use_its_route_as_the_only_nest_label() {
+        let route = "acme/route-3113";
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register(route, "mainnet");
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = test_state(dir.path(), SQL_MAX_CONCURRENCY);
+        st.nest_info = Arc::new(json!({ "name": "cfgname-3113" }));
+        st.runtime_health = Some((route.to_string(), health.clone()));
+        st.isolation = Some(Arc::from("acme"));
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![(route.to_string(), st)],
+            health,
+        );
+        let (_, body) = get(app, &format!("/{route}/metrics")).await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("cfgname-3113"), "{body}");
+        let mut values: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.split_once("nest=\"")?.1.split_once('"').map(|(v, _)| v))
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values, vec![route], "{body}");
+        assert!(body.contains("nuthatch_snapshot_retained_bytes"), "{body}");
     }
 
     /// A kept sample carries its own family's header and no other's, and a name that only shares
