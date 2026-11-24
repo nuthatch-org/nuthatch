@@ -569,3 +569,173 @@ prefix = ""
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// An IdP that answers the first JWKS fetch and then accepts connections and never replies: a
+/// token with an unknown `kid` must not make every other token wait, and the fetch is cut off.
+#[tokio::test]
+async fn a_stalled_jwks_fetch_blocks_neither_other_tokens_nor_itself_for_long() {
+    let (upstream, _) = stub_nuthatch().await;
+    let signer = Signer::new();
+    let jwks = signer.jwks();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let n = calls.clone();
+    let idp = serve(axum::Router::new().route(
+        "/jwks.json",
+        axum::routing::get(move || {
+            let first = n.fetch_add(1, Ordering::SeqCst) == 0;
+            let jwks = jwks.clone();
+            async move {
+                if !first {
+                    std::future::pending::<()>().await;
+                }
+                axum::Json(jwks)
+            }
+        }),
+    ))
+    .await;
+    let cfg = Config::parse(&format!(
+        r#"
+        listen = "127.0.0.1:0"
+        upstream = "{upstream}"
+        issuer = "https://idp.test"
+        audience = "nuthatch"
+        jwks_url = "{idp}/jwks.json"
+        jwks_timeout_secs = 2
+        jwks_min_refetch_secs = 0
+        [[nest]]
+        name = "usdc"
+        prefix = "/usdc"
+        "#
+    ))
+    .unwrap();
+    let base = serve(Gateway::new(cfg).await.unwrap().router()).await;
+    let http = reqwest::Client::new();
+    let unknown = signer.sign("rotated", claims("read:usdc"));
+    let good = signer.sign("es", claims("read:usdc"));
+
+    let stalled = {
+        let (http, base) = (http.clone(), base.clone());
+        tokio::spawn(async move {
+            let t = std::time::Instant::now();
+            let r = http
+                .get(format!("{base}/usdc/table/t"))
+                .bearer_auth(unknown)
+                .send()
+                .await
+                .unwrap();
+            (r.status().as_u16(), t.elapsed())
+        })
+    };
+    // Let the unknown-kid request start its (stalled) fetch.
+    while calls.load(Ordering::SeqCst) < 2 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let t = std::time::Instant::now();
+    let ok = http
+        .get(format!("{base}/usdc/table/t"))
+        .bearer_auth(&good)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    assert!(
+        t.elapsed() < std::time::Duration::from_millis(1500),
+        "a good token waited behind the stalled JWKS fetch: {:?}",
+        t.elapsed()
+    );
+    let (status, took) = stalled.await.unwrap();
+    assert_eq!(
+        status, 401,
+        "the unknown kid is refused once the fetch gives up"
+    );
+    assert!(
+        took < std::time::Duration::from_secs(8),
+        "unbounded: {took:?}"
+    );
+}
+
+/// nuthatch down: the gateway answers 502 and its log carries neither the query string (which can
+/// be SQL) nor a token.
+#[tokio::test]
+async fn the_binary_does_not_log_the_query_string_when_upstream_is_down() {
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let dir = std::env::temp_dir().join(format!("nuthatch-gateway-down-{port}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("gateway.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"listen = "127.0.0.1:{port}"
+upstream = "http://127.0.0.1:{dead}"
+issuer = "https://idp.test"
+audience = "nuthatch"
+hs256_secret_env = "GATEWAY_TEST_SECRET"
+[[nest]]
+name = "usdc"
+prefix = ""
+"#
+        ),
+    )
+    .unwrap();
+    let secret = "a-test-secret-of-at-least-thirty-two-bytes";
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nuthatch-gateway"))
+        .arg(&cfg)
+        .env("GATEWAY_TEST_SECRET", secret)
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let mut up = false;
+    for _ in 0..100 {
+        if http
+            .get(format!("{base}/_gateway/health"))
+            .send()
+            .await
+            .is_ok()
+        {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(up, "the gateway never answered");
+    let token = {
+        let h = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let p = URL_SAFE_NO_PAD.encode(claims("read:usdc/table/t").to_string());
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        let tag = ring::hmac::sign(&key, format!("{h}.{p}").as_bytes());
+        format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(tag.as_ref()))
+    };
+    let status = http
+        .get(format!("{base}/table/t?q=SELECT%20secret_column"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(status, 502);
+    child.start_kill().unwrap();
+    let out = child.wait_with_output().await.unwrap();
+    let log = String::from_utf8(out.stderr).unwrap();
+    assert!(log.contains("upstream unreachable"), "{log}");
+    let dead = dead.to_string();
+    for leaked in [
+        "SELECT",
+        "secret_column",
+        dead.as_str(),
+        token.as_str(),
+        secret,
+    ] {
+        assert!(!log.contains(leaked), "the log carries {leaked:?}: {log}");
+    }
+}

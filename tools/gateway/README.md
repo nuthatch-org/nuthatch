@@ -103,7 +103,9 @@ replayed as an HMAC secret. Signatures are checked before any claim is read.
 Two, both named in the config: `upstream`, and `jwks_url` when it is set. The JWKS is fetched at
 start (the gateway refuses to start without keys), again when a token names an unknown `kid` (at most
 every 30 s, for key rotation), and when the held keys are an hour old; a failed refresh keeps the
-keys held. Neither client follows redirects or reads `HTTP(S)_PROXY` from the environment. No
+keys held. Each JWKS fetch is cut off after `jwks_timeout_secs` (default 10) and runs outside the
+key lock, so a stalled IdP never delays a token that verifies against the keys held;
+`jwks_min_refetch_secs` (default 30) sets the rotation interval. Neither client follows redirects or reads `HTTP(S)_PROXY` from the environment. No
 telemetry, nothing else.
 
 ## Logs

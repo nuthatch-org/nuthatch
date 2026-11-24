@@ -33,6 +33,7 @@ const MAX_BODY: usize = 4 << 20;
 const JWKS_MIN_REFETCH: Duration = Duration::from_secs(30);
 /// Keys older than this are re-fetched before use; on failure the old ones are kept.
 const JWKS_MAX_AGE: Duration = Duration::from_secs(3600);
+const JWKS_DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,10 +58,25 @@ pub struct Config {
     pub leeway_secs: u64,
     pub jwks_url: Option<String>,
     pub jwks_file: Option<PathBuf>,
+    /// Total time one JWKS fetch may take (connect, headers and body). A stalled IdP is cut off
+    /// here and the keys already held stay in use.
+    #[serde(default = "default_jwks_timeout")]
+    pub jwks_timeout_secs: u64,
+    /// An unknown `kid` re-fetches the JWKS at most this often.
+    #[serde(default = "default_jwks_min_refetch")]
+    pub jwks_min_refetch_secs: u64,
     /// The name of the environment variable holding an HS256 secret (never the secret itself).
     pub hs256_secret_env: Option<String>,
     #[serde(rename = "nest", default)]
     pub nests: Vec<NestConf>,
+}
+
+fn default_jwks_timeout() -> u64 {
+    JWKS_DEFAULT_TIMEOUT_SECS
+}
+
+fn default_jwks_min_refetch() -> u64 {
+    JWKS_MIN_REFETCH.as_secs()
 }
 
 fn default_leeway() -> u64 {
@@ -115,6 +131,9 @@ enum Keys {
         url: String,
         client: reqwest::Client,
         held: RwLock<(KeySet, Instant)>,
+        min_refetch: Duration,
+        /// Held by the one request that is fetching. The network wait never holds `held`.
+        refreshing: tokio::sync::Mutex<()>,
     },
 }
 
@@ -123,24 +142,26 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<KeySet, Strin
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("JWKS fetch from jwks_url failed: {e}"))?;
+        .map_err(|e| format!("JWKS fetch from jwks_url failed: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("JWKS fetch from jwks_url: HTTP {}", resp.status()));
     }
     let body = resp
         .bytes()
         .await
-        .map_err(|e| format!("JWKS fetch from jwks_url failed: {e}"))?;
+        .map_err(|e| format!("JWKS fetch from jwks_url failed: {}", e.without_url()))?;
     KeySet::from_jwks(&body)
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn client(total_timeout: Option<Duration>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .expect("reqwest client")
+        .connect_timeout(Duration::from_secs(10));
+    if let Some(t) = total_timeout {
+        b = b.timeout(t);
+    }
+    b.build().expect("reqwest client")
 }
 
 pub struct Gateway {
@@ -156,12 +177,14 @@ impl Gateway {
     /// Load the keys (fetching the JWKS once: a gateway that cannot verify should not start).
     pub async fn new(mut cfg: Config) -> Result<Gateway, String> {
         let keys = if let Some(url) = cfg.jwks_url.take() {
-            let client = client();
+            let client = client(Some(Duration::from_secs(cfg.jwks_timeout_secs.max(1))));
             let set = fetch_jwks(&client, &url).await?;
             Keys::Jwks {
                 url,
                 client,
                 held: RwLock::new((set, Instant::now())),
+                min_refetch: Duration::from_secs(cfg.jwks_min_refetch_secs),
+                refreshing: Default::default(),
             }
         } else if let Some(path) = &cfg.jwks_file {
             let doc =
@@ -186,7 +209,7 @@ impl Gateway {
                 leeway: cfg.leeway_secs,
             },
             keys,
-            client: client(),
+            client: client(None),
             nests: cfg.nests,
         })
     }
@@ -204,29 +227,39 @@ impl Gateway {
             .unwrap_or(0);
         match &self.keys {
             Keys::Static(set) => jwt::verify(token, set, &self.expect, now),
-            Keys::Jwks { url, client, held } => {
+            Keys::Jwks {
+                url,
+                client,
+                held,
+                min_refetch,
+                refreshing,
+            } => {
                 let (stale, first) = {
                     let h = held.read().await;
                     let first = jwt::verify(token, &h.0, &self.expect, now);
                     let age = h.1.elapsed();
-                    let rotate =
-                        matches!(first, Err(Refusal::UnknownKey)) && age >= JWKS_MIN_REFETCH;
+                    let rotate = matches!(first, Err(Refusal::UnknownKey)) && age >= *min_refetch;
                     (rotate || age >= JWKS_MAX_AGE, first)
                 };
                 if !stale {
                     return first;
                 }
-                let mut h = held.write().await;
-                // Another request may have refreshed while this one waited.
-                if h.1.elapsed() >= JWKS_MIN_REFETCH {
-                    match fetch_jwks(client, url).await {
-                        Ok(set) => *h = (set, Instant::now()),
-                        Err(e) => {
-                            eprintln!("nuthatch-gateway: keeping the keys held: {e}");
-                            h.1 = Instant::now();
+                // One request fetches, outside the key lock; the rest verify against the keys held.
+                if let Ok(_turn) = refreshing.try_lock() {
+                    let due = held.read().await.1.elapsed() >= *min_refetch;
+                    if due {
+                        let fetched = fetch_jwks(client, url).await;
+                        let mut h = held.write().await;
+                        match fetched {
+                            Ok(set) => *h = (set, Instant::now()),
+                            Err(e) => {
+                                eprintln!("nuthatch-gateway: keeping the keys held: {e}");
+                                h.1 = Instant::now();
+                            }
                         }
                     }
                 }
+                let h = held.read().await;
                 jwt::verify(token, &h.0, &self.expect, now)
             }
         }
@@ -409,7 +442,11 @@ async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) ->
     let resp = match out.body(body).send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("nuthatch-gateway: upstream unreachable: {e}");
+            // Never the URL: it carries the query string, which can be SQL.
+            eprintln!(
+                "nuthatch-gateway: upstream unreachable: {}",
+                e.without_url()
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 axum::Json(json!({ "error": "upstream_unreachable" })),
