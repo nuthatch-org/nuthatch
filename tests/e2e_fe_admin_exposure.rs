@@ -129,6 +129,7 @@ async fn start_fe_on(
         cors: Vec::new(),
         public_host: Vec::new(),
         local_host: Vec::new(),
+        audit: Default::default(),
         dir: dir.to_string_lossy().into_owned(),
         listen: listen.clone(),
         hot_store: None,

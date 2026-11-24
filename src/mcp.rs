@@ -380,8 +380,19 @@ pub(crate) async fn http(
     let Ok(req) = serde_json::from_slice::<Value>(&body) else {
         return refuse(StatusCode::BAD_REQUEST, -32700, "Parse error");
     };
+    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == "tools/call" {
+        let params = &req["params"];
+        crate::audit_log::mcp(method, params["name"].as_str(), params.get("arguments"));
+    } else {
+        crate::audit_log::mcp(method, None, None);
+    }
     match handle(&req, &Session::new(&routes, "")).await {
         None => StatusCode::ACCEPTED.into_response(),
+        Some(resp) if resp["result"]["isError"] == Value::Bool(true) => {
+            crate::audit_log::tool_error();
+            axum::Json(resp).into_response()
+        }
         Some(resp) if resp["id"].is_null() && resp.get("error").is_some() => {
             (StatusCode::BAD_REQUEST, axum::Json(resp)).into_response()
         }

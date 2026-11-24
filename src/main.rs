@@ -152,6 +152,8 @@ async fn run(command: cli::Command) -> Result<()> {
                 )
                 .await;
             }
+            // Before anything binds, so every listener this process opens is recorded (#3095).
+            nuthatch::audit_log::install(&args.audit)?;
             nuthatch::analytics::check_engine_choice(
                 std::env::var(nuthatch::analytics::ENV_ENGINE).ok().as_deref(),
             )?;
@@ -220,9 +222,13 @@ async fn run(command: cli::Command) -> Result<()> {
             }
         }
         cli::Command::Serve(args) if args.runtime.is_some() || args.follow.is_some() => {
+            nuthatch::audit_log::install(&args.audit)?;
             nuthatch::reader::serve(args).await
         }
-        cli::Command::Serve(args) => indexer::serve_role(args).await,
+        cli::Command::Serve(args) => {
+            nuthatch::audit_log::install(&args.audit)?;
+            indexer::serve_role(args).await
+        }
         #[cfg(feature = "postgres-store")]
         cli::Command::Worker(args) => {
             let id = match args.id {

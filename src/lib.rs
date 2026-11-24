@@ -33,6 +33,7 @@ pub mod analytics_budget;
 #[cfg(feature = "graph")]
 mod analytics_scalars;
 pub mod audit;
+pub mod audit_log;
 pub mod bench;
 pub mod blob;
 pub mod calldata;
