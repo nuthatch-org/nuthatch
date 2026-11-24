@@ -590,6 +590,10 @@ const NOT_OPERATOR_CONFIG: &[(&str, &str)] = &[
     ("src/detach.rs", "the record of a detached dev, kept outside the nest, not nest config"),
     ("src/address_mode.rs", "the /api/watch request body, not nest config"),
     (
+        "src/audit_log.rs",
+        "the audit log's own records, read back by `audit verify`, not nest config",
+    ),
+    (
         "src/address_partitions.rs",
         "the partition manifest a publisher writes, not nest config",
     ),
