@@ -182,7 +182,14 @@ mod tests {
             for name in *names {
                 let occurrences = rendered
                     .lines()
-                    .filter(|l| l.trim_start().starts_with(name) && l.starts_with("  "))
+                    .filter(|l| {
+                        // Entry lines only (exactly two spaces, then a non-space), matching
+                        // `render_top_level_help`; wrapped about-text can begin with `checks`.
+                        l.len() > 2
+                            && l.as_bytes()[..2] == *b"  "
+                            && l.as_bytes()[2] != b' '
+                            && l.split_whitespace().next() == Some(*name)
+                    })
                     .count();
                 assert_eq!(
                     occurrences, 1,
