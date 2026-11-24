@@ -23,8 +23,18 @@ Add another contract to a nest that has not indexed yet - resolve its ABI and gr
 
 ## `nuthatch audit`
 
-Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a second endpoint, `verify` checks an `--audit-log` directory's hash chain
+Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a second endpoint, `chain` checks it against what each block commits to, `verify` checks an `--audit-log` directory's hash chain
 
+
+## `nuthatch audit chain`
+
+Check sealed blocks against the chain: recompute each block's hash and its transactions, receipts and logs-bloom commitments from an RPC, and compare the sealed rows with the receipts' logs. Two requests per block; reports, never repairs (#3096)
+
+- `--dir <DIR>` - Nest directory
+- `--from <FROM>` - First block to check. The range must be sealed
+- `--to <TO>` - Last block to check (inclusive)
+- `--rpc <RPC>` - The endpoint to read blocks and receipts from. Defaults to the nest's own `rpc_urls`; the check proves the rows are what that endpoint's blocks commit to, so name one you trust
+- `--json` - Print the report as JSON, every difference included
 
 ## `nuthatch audit report`
 

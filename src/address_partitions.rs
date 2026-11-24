@@ -132,16 +132,66 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Published>> {
 /// Whether a chain's `withdrawalsRoot` commits to beacon withdrawals. On the OP stack it is the
 /// message passer's storage root from Isthmus on, and the block lists no withdrawals.
 pub fn beacon_withdrawals(chain_id: u64) -> bool {
-    !matches!(chain_id, 10 | 8453)
+    !op_stack(chain_id)
 }
 
-/// One block for publication, read from `rpc` and checked against itself: its fields must hash to
-/// the hash the RPC gave, and its withdrawals to its withdrawals root.
-pub async fn fetch(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Published> {
-    let v = rpc
-        .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
-        .await
-        .with_context(|| format!("block {b}"))?;
+/// The OP-stack chains nuthatch knows by id: Optimism and Base.
+pub fn op_stack(chain_id: u64) -> bool {
+    matches!(chain_id, 10 | 8453)
+}
+
+/// The first Ethereum mainnet block whose receipts carry a `status` (EIP-658). Before it a receipt
+/// commits to a post-state `root`, which an endpoint may not serve.
+pub const BYZANTIUM_MAINNET: u64 = 4_370_000;
+
+/// A commitment in a block's header that the data served for the block does not keep (#3096).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Commitment {
+    /// The header's fields do not hash to the hash the RPC gave for it.
+    Hash,
+    TransactionsRoot,
+    ReceiptsRoot,
+}
+
+impl Commitment {
+    /// The header field's name, as a report names it.
+    pub fn field(self) -> &'static str {
+        match self {
+            Commitment::Hash => "hash",
+            Commitment::TransactionsRoot => "transactions_root",
+            Commitment::ReceiptsRoot => "receipts_root",
+        }
+    }
+}
+
+/// Block `block` broke `commitment`: an error a caller can tell apart from an unreadable answer.
+#[derive(Debug)]
+pub struct Broken {
+    pub block: u64,
+    pub commitment: Commitment,
+}
+
+impl std::fmt::Display for Broken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.block;
+        match self.commitment {
+            Commitment::Hash => write!(f, "block {n}'s header fields do not hash to its hash"),
+            Commitment::TransactionsRoot => write!(
+                f,
+                "block {n}'s transactions do not hash to its transactions root"
+            ),
+            Commitment::ReceiptsRoot => {
+                write!(f, "block {n}'s receipts do not hash to its receipts root")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Broken {}
+
+/// Block `b`'s header from the RPC's answer `v`, refused unless it is block `b` and its fields hash
+/// to the hash the RPC gave.
+pub fn served_header(v: &Value, b: u64) -> Result<(Header, B256)> {
     if v.is_null() {
         bail!("the RPC has no block {b}");
     }
@@ -156,8 +206,23 @@ pub async fn fetch(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Published> {
         );
     }
     if header.hash_slow() != claimed {
-        bail!("block {b}'s header fields do not hash to {claimed}");
+        return Err(Broken {
+            block: b,
+            commitment: Commitment::Hash,
+        }
+        .into());
     }
+    Ok((header, claimed))
+}
+
+/// One block for publication, read from `rpc` and checked against itself: its fields must hash to
+/// the hash the RPC gave, and its withdrawals to its withdrawals root.
+pub async fn fetch(rpc: &impl Rpc, chain_id: u64, b: u64) -> Result<Published> {
+    let v = rpc
+        .call("eth_getBlockByNumber", json!([format!("0x{b:x}"), false]))
+        .await
+        .with_context(|| format!("block {b}"))?;
+    let (header, _) = served_header(&v, b)?;
     let withdrawals = match header.withdrawals_root {
         Some(_) if !beacon_withdrawals(chain_id) => {
             if v["withdrawals"].as_array().is_some_and(|w| !w.is_empty()) {
@@ -269,6 +334,91 @@ pub fn verify(
     Ok(out)
 }
 
+/// A block's transactions and receipts, each list as its header commits to it.
+pub struct Body {
+    pub txs: Vec<TxEnvelope>,
+    pub receipts: Vec<alloy_consensus::ReceiptEnvelope>,
+    /// The receipts could not be hashed to the header's receipts root: a pre-Byzantium block whose
+    /// endpoint serves `status` where the chain committed to a post-state `root`. Not a forgery.
+    pub receipts_unverified: bool,
+}
+
+/// The transactions in `block`, the RPC's answer for the block `header` hashes to `hash` with full
+/// transactions, and the block's receipts asked of `rpc`, each checked against its root in `header`.
+pub async fn checked_body(
+    rpc: &impl Rpc,
+    header: &Header,
+    hash: B256,
+    block: &Value,
+) -> Result<Body> {
+    let body = served_body(rpc, 0, header, hash, block).await?;
+    if body.receipts_unverified {
+        return Err(Broken {
+            block: header.number,
+            commitment: Commitment::ReceiptsRoot,
+        }
+        .into());
+    }
+    Ok(body)
+}
+
+/// [`checked_body`], except that on Ethereum mainnet (`chain_id` 1) before Byzantium receipts that
+/// carry no post-state `root` come back as [`Body::receipts_unverified`] rather than as a broken
+/// receipts root: the endpoint dropped what the root is built from, which says nothing of forgery.
+pub async fn served_body(
+    rpc: &impl Rpc,
+    chain_id: u64,
+    header: &Header,
+    hash: B256,
+    block: &Value,
+) -> Result<Body> {
+    let n = header.number;
+    let txs: Vec<alloy_rpc_types_eth::Transaction> =
+        serde_json::from_value(block["transactions"].clone())
+            .with_context(|| format!("block {n}'s transactions"))?;
+    let txs: Vec<TxEnvelope> = txs.into_iter().map(|t| t.into_inner()).collect();
+    let broken = |commitment| Broken {
+        block: n,
+        commitment,
+    };
+    if proofs::calculate_transaction_root(&txs) != header.transactions_root {
+        return Err(broken(Commitment::TransactionsRoot).into());
+    }
+    let receipts: Vec<alloy_rpc_types_eth::TransactionReceipt> = serde_json::from_value(
+        rpc.call("eth_getBlockReceipts", json!([format!("{hash:#x}")]))
+            .await
+            .with_context(|| format!("block {n}'s receipts"))?,
+    )
+    .with_context(|| format!("block {n}'s receipts"))?;
+    let receipts: Vec<_> = receipts
+        .into_iter()
+        .map(|r| r.into_primitives_receipt().inner)
+        .collect();
+    if receipts.len() != txs.len() {
+        return Err(broken(Commitment::ReceiptsRoot).into());
+    }
+    let mut receipts_unverified = false;
+    if proofs::calculate_receipt_root(&receipts) != header.receipts_root {
+        use alloy_consensus::TxReceipt;
+        let no_root = receipts.iter().all(|r| {
+            matches!(
+                r.status_or_post_state(),
+                alloy_consensus::Eip658Value::Eip658(_)
+            )
+        });
+        if chain_id == 1 && n < BYZANTIUM_MAINNET && no_root {
+            receipts_unverified = true;
+        } else {
+            return Err(broken(Commitment::ReceiptsRoot).into());
+        }
+    }
+    Ok(Body {
+        txs,
+        receipts,
+        receipts_unverified,
+    })
+}
+
 /// What Etherscan's `getminedblocks` calls `blockReward`, from the block's own transactions,
 /// receipts and ommers, each checked against the verified header before it is used.
 pub async fn verified_reward(rpc: &impl Rpc, block: &VerifiedBlock) -> Result<U256> {
@@ -282,26 +432,7 @@ pub async fn verified_reward(rpc: &impl Rpc, block: &VerifiedBlock) -> Result<U2
     if body.is_null() {
         bail!("the RPC has no block {hash}");
     }
-    let txs: Vec<alloy_rpc_types_eth::Transaction> =
-        serde_json::from_value(body["transactions"].clone())
-            .with_context(|| format!("block {n}'s transactions"))?;
-    let txs: Vec<TxEnvelope> = txs.into_iter().map(|t| t.into_inner()).collect();
-    if proofs::calculate_transaction_root(&txs) != h.transactions_root {
-        bail!("block {n}'s transactions do not hash to its transactions root");
-    }
-    let receipts: Vec<alloy_rpc_types_eth::TransactionReceipt> = serde_json::from_value(
-        rpc.call("eth_getBlockReceipts", json!([hash]))
-            .await
-            .with_context(|| format!("block {n}'s receipts"))?,
-    )
-    .with_context(|| format!("block {n}'s receipts"))?;
-    let receipts: Vec<_> = receipts
-        .into_iter()
-        .map(|r| r.into_primitives_receipt().inner)
-        .collect();
-    if receipts.len() != txs.len() || proofs::calculate_receipt_root(&receipts) != h.receipts_root {
-        bail!("block {n}'s receipts do not hash to its receipts root");
-    }
+    let Body { txs, receipts, .. } = checked_body(rpc, h, block.hash, &body).await?;
     let uncles = body["uncles"].as_array().map_or(0, Vec::len);
     let mut ommers = Vec::with_capacity(uncles);
     for i in 0..uncles {

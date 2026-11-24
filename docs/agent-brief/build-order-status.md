@@ -279,3 +279,12 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 6. ExEx ingestion mode (colocated reth), then scaled mode (Postgres/DataFusion).
 
 Do not start slice N+1 while slice N has failing tests or an unmet budget.
+
+### `nuthatch audit chain` (#3096, PR #3105): proposed, awaiting Chief
+
+2026-11-24. A by-hand subcommand that re-reads a sealed range from one RPC endpoint and checks each
+block's header hash, parent link, transaction and receipt roots, logs bloom and the sealed event rows
+against the receipts. It is opt-in, makes no call unless an operator runs it, and nothing in the
+default path depends on it, so the deletion test holds. **It is a new public subcommand, so whether it
+ships is Chief's decision; this entry records the proposal, not an acceptance.** The first slice is
+over the ~400-line worker guideline (about 900 lines), flagged in the PR.

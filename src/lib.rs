@@ -38,6 +38,7 @@ pub mod bench;
 pub mod blob;
 pub mod calldata;
 pub mod calls;
+pub mod chain_verify;
 pub mod chains;
 pub mod check;
 pub mod chunker;

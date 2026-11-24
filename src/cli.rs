@@ -115,7 +115,8 @@ pub enum Command {
     /// Build, sign, and verify the signed compliance-pack manifest (RFC-0008 C6).
     Pack(PackArgs),
     /// Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a
-    /// second endpoint, `verify` checks an `--audit-log` directory's hash chain.
+    /// second endpoint, `chain` checks it against what each block commits to, `verify` checks an
+    /// `--audit-log` directory's hash chain.
     Audit(AuditArgs),
     /// An answer as of a sealed block, with what someone else needs to get it again: `make` asks a
     /// running nest, `verify` asks another nest of the same NID (#2944).
@@ -903,6 +904,10 @@ pub enum AuditWhat {
     Sealed(AuditSealedArgs),
     /// Check an `--audit-log` directory's hash chain: a deleted, edited or reordered record fails.
     Verify(AuditVerifyArgs),
+    /// Check sealed blocks against the chain: recompute each block's hash and its transactions,
+    /// receipts and logs-bloom commitments from an RPC, and compare the sealed rows with the
+    /// receipts' logs. Two requests per block; reports, never repairs (#3096).
+    Chain(AuditChainArgs),
 }
 
 #[derive(Args)]
@@ -969,6 +974,26 @@ pub struct AuditLogArgs {
         requires = "audit_log"
     )]
     pub audit_keep: usize,
+}
+
+#[derive(Args)]
+pub struct AuditChainArgs {
+    /// Nest directory.
+    #[arg(long, default_value = ".")]
+    pub dir: String,
+    /// First block to check. The range must be sealed.
+    #[arg(long)]
+    pub from: u64,
+    /// Last block to check (inclusive).
+    #[arg(long)]
+    pub to: u64,
+    /// The endpoint to read blocks and receipts from. Defaults to the nest's own `rpc_urls`; the
+    /// check proves the rows are what that endpoint's blocks commit to, so name one you trust.
+    #[arg(long, value_name = "URL")]
+    pub rpc: Option<String>,
+    /// Print the report as JSON, every difference included.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]

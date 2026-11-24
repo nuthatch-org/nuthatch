@@ -64,6 +64,7 @@ pub async fn run(args: crate::cli::AuditArgs) -> Result<()> {
     match args.what {
         crate::cli::AuditWhat::Sealed(a) => crate::sealed_audit::run_cli(a).await,
         crate::cli::AuditWhat::Verify(a) => crate::audit_log::verify_cli(&a),
+        crate::cli::AuditWhat::Chain(a) => crate::chain_verify::run_cli(a).await,
         crate::cli::AuditWhat::Report(a) => {
             let dir = PathBuf::from(&a.dir);
             let flags_on = crate::config::Config::load(&dir)?
