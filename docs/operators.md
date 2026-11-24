@@ -1653,9 +1653,14 @@ nothing is added to the request path. With it, every call to `/sql`, `/q/{name}`
 
 - **Identity** is recorded as an opaque string. nuthatch authenticates nobody here. It comes from
   `--audit-log-identity-header <name>`, a header your gateway sets (and must strip from what clients
-  send), or from a token check running in the process, whose verified subject wins and is marked
-  `"identity_from":"token"`. A credential header (`Authorization`, `Cookie`…) is refused as the
-  identity header.
+  send); it is marked `"identity_from":"header"`. Without that flag a record has no identity. A
+  verified token subject (`"identity_from":"token"`) is not recorded yet: that waits on the token
+  check of [#3094](https://github.com/nuthatch-org/nuthatch/issues/3094) calling the audit log's
+  `caller()` hook, which nothing does today. A credential header is refused as the identity header:
+  `Authorization`, `Proxy-Authorization`, `X-Forwarded-Authorization`, `Cookie`, `Set-Cookie`,
+  `Nuthatch-Admin-Token`, `X-Api-Key`, `Api-Key`, `Apikey`, `X-Apikey`, `X-Api-Token`,
+  `X-Auth-Token`, `X-Access-Token`, `X-Token`, `X-Csrf-Token`, `X-Goog-Api-Key` and
+  `X-Amz-Security-Token`.
 - **What is never recorded:** a query string, a header other than the identity header, a bearer or
   admin token, an admin request body. An admin or `/q` body gets a SHA-256 (`arguments_sha256`),
   because a mount's RPC URL may carry a key. A statement is recorded as `statement_sha256`, plus the
@@ -1669,9 +1674,15 @@ nothing is added to the request path. With it, every call to `/sql`, `/q/{name}`
 - **fsync:** `--audit-log-fsync batch` (the default) has one writer thread that fsyncs after each batch
   it drains, and a response does not wait for it. A crash can lose the records queued or written
   since the last fsync. `per-record` holds each response until its record is fsynced (group commit,
-  so concurrent calls share an fsync). A record that cannot be written turns that call's answer into
-  `503 audit_unwritable`. Either way the queue is bounded (1024), so a writer that falls behind slows
-  calls down rather than dropping their records. A record torn by a crash is cut at the next start,
+  so concurrent calls share an fsync). Each audited call reserves its place in the queue before its
+  handler runs. If it cannot (the writer is gone), `per-record` refuses the call with
+  `503 audit_unwritable` and the handler does not run. If the record then fails to fsync, a read is
+  answered `503 audit_unwritable`, but an admin call that changes something (a non-`GET` under
+  `/_admin`, lifecycle routes included) has already taken effect: it keeps its own response, with a
+  `nuthatch-audit: unwritable` header, and the failure is logged, so a client that retries on 503
+  never repeats it. Either way the queue is bounded (1024), so a writer that falls behind slows
+  calls down at their start rather than dropping their records, including the record of a call whose
+  client hung up (it goes on the slot the call already holds). A record torn by a crash is cut at the next start,
   and the cut is recorded as an `"event":"recovered"` record. One process holds a log directory at a
   time; a second is refused.
 - **Rotation and retention:** a new file starts once the current one would pass

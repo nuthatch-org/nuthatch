@@ -171,9 +171,9 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--audit-span <AUDIT_SPAN>` - Blocks in each range the background audit samples
 - `--audit-seed <AUDIT_SEED>` - Seed for the background audit's samples. Defaults to the start time; it is logged with every sample, as is the range, which `nuthatch audit sealed --from --to` re-checks
 - `--audit-log <AUDIT_LOG>` - Record every `/sql`, `/q/{name}`, admin and MCP call, refused ones included, as hash-chained JSON lines in this directory (`audit-<seq>.jsonl`). Check it with `nuthatch audit verify`
-- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent. A verified token's subject wins over it
+- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent
 - `--audit-log-statements <AUDIT_STATEMENTS>` - How a statement is recorded: `hash` (SHA-256 only) or `text` (also its text, and MCP tool arguments)
-- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync, and is answered 503 if it cannot be written
+- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync; a call that cannot be recorded is refused 503 before it runs, and a read whose record fails to fsync is answered 503. A mutating admin call that already ran keeps its answer
 - `--audit-log-rotate-mb <AUDIT_ROTATE_MB>` - Start a new file once the current one would pass this size
 - `--audit-log-keep <AUDIT_KEEP>` - Keep this many files, deleting the oldest at rotation. 0 keeps all of them
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or `Authorization: Bearer`: `NUTHATCH_ADMIN_TOKEN`, or on localhost without it the one made in `<dir>/.admin-token`. Off-localhost without the variable the UI self-disables with a log line
@@ -532,9 +532,9 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--public-host <PUBLIC_HOST>` - A `Host` name this process on a loopback bind answers as the public behind your proxy (repeatable). On a loopback bind any other name but loopback is refused, which keeps a page that rebinds its DNS name to 127.0.0.1 out
 - `--local-host <LOCAL_HOST>` - A `Host` name this process on a loopback bind answers as this machine (repeatable), such as `host.docker.internal` for a client in a container
 - `--audit-log <AUDIT_LOG>` - Record every `/sql`, `/q/{name}`, admin and MCP call, refused ones included, as hash-chained JSON lines in this directory (`audit-<seq>.jsonl`). Check it with `nuthatch audit verify`
-- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent. A verified token's subject wins over it
+- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent
 - `--audit-log-statements <AUDIT_STATEMENTS>` - How a statement is recorded: `hash` (SHA-256 only) or `text` (also its text, and MCP tool arguments)
-- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync, and is answered 503 if it cannot be written
+- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync; a call that cannot be recorded is refused 503 before it runs, and a read whose record fails to fsync is answered 503. A mutating admin call that already ran keeps its answer
 - `--audit-log-rotate-mb <AUDIT_ROTATE_MB>` - Start a new file once the current one would pass this size
 - `--audit-log-keep <AUDIT_KEEP>` - Keep this many files, deleting the oldest at rotation. 0 keeps all of them
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on

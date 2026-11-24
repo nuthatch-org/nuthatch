@@ -927,7 +927,7 @@ pub struct AuditLogArgs {
     #[arg(long = "audit-log", value_name = "DIR")]
     pub audit_log: Option<std::path::PathBuf>,
     /// The request header your gateway sets to the caller's identity, recorded as an opaque string.
-    /// The gateway must strip a copy the client sent. A verified token's subject wins over it.
+    /// The gateway must strip a copy the client sent.
     #[arg(
         long = "audit-log-identity-header",
         value_name = "HEADER",
@@ -944,7 +944,8 @@ pub struct AuditLogArgs {
     )]
     pub audit_statements: crate::audit_log::Statements,
     /// `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its
-    /// record's fsync, and is answered 503 if it cannot be written.
+    /// record's fsync; a call that cannot be recorded is refused 503 before it runs, and a read whose
+    /// record fails to fsync is answered 503. A mutating admin call that already ran keeps its answer.
     #[arg(
         long = "audit-log-fsync",
         value_enum,

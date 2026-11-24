@@ -11,8 +11,8 @@
 //! hash unless the operator asks for its text with `--audit-log-statements text`.
 //!
 //! **Identity.** nuthatch authenticates nobody here; it records the string it is given. Either a
-//! header the operator's gateway sets (`--audit-log-identity-header`), or, when a token check runs in
-//! this process, the subject it verified, handed over with [`caller`]. The audit layer sits outside
+//! header the operator's gateway sets (`--audit-log-identity-header`). [`caller`] is the hook a token
+//! check will hand its verified subject to (#3094); nothing calls it yet. The audit layer sits outside
 //! every route and every layer a router adds, so a check that refuses a call still leaves a record
 //! of the refusal; [`refused`] names why.
 
@@ -46,8 +46,10 @@ pub enum Fsync {
     /// most the records still queued or written since the last fsync.
     #[default]
     Batch,
-    /// A response is sent only once its record is fsynced (group commit). If it cannot be, the call
-    /// is answered `503 audit_unwritable` instead.
+    /// A response is sent only once its record is fsynced (group commit). A call that cannot get a
+    /// slot to be recorded is refused `503 audit_unwritable` before it runs. A read whose record
+    /// then fails to fsync is answered 503 too; a mutating admin call that already ran keeps its
+    /// own response (with `nuthatch-audit: unwritable`), since a retry could repeat it.
     PerRecord,
 }
 
@@ -64,17 +66,30 @@ pub struct Settings {
 }
 
 /// Headers that carry a credential rather than a name. Recording one would put a secret in the log.
-const CREDENTIAL_HEADERS: [&str; 5] = [
+const CREDENTIAL_HEADERS: [&str; 17] = [
     "authorization",
     "proxy-authorization",
+    "x-forwarded-authorization",
     "cookie",
     "set-cookie",
     "nuthatch-admin-token",
+    "x-api-key",
+    "api-key",
+    "apikey",
+    "x-apikey",
+    "x-api-token",
+    "x-auth-token",
+    "x-access-token",
+    "x-token",
+    "x-csrf-token",
+    "x-goog-api-key",
+    "x-amz-security-token",
 ];
 
 /// The longest identity kept; a longer one is cut there.
 const IDENTITY_MAX: usize = 512;
-/// Records queued for the writer. A full queue makes a response wait rather than lose its record.
+/// Records queued for the writer. Each audited call reserves a slot before its handler runs, so a
+/// full queue makes a call wait to start rather than lose its record, an abandoned one included.
 const QUEUE: usize = 1024;
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -283,12 +298,16 @@ impl futures::Stream for Hashed {
 /// the call's future - it still queues what it knows, as `abandoned`: a call that ran must not go
 /// unrecorded because nobody waited for its answer.
 struct Pending {
-    log: Arc<AuditLog>,
     entry: Option<Entry>,
     note: Arc<Mutex<Note>>,
     meter: crate::cost::Meter,
     body: Option<Arc<Mutex<Digesting>>>,
     started: Instant,
+    /// A queue slot reserved before the handler ran, so the record can always be sent: by
+    /// `finish`, or by `drop` for an abandoned call. `None` only when the writer is gone.
+    slot: Option<tokio::sync::mpsc::OwnedPermit<Msg>>,
+    /// A non-read call to `/_admin`: its effect cannot be taken back by withholding the answer.
+    mutating: bool,
 }
 
 impl Pending {
@@ -329,10 +348,14 @@ impl Pending {
 impl Drop for Pending {
     fn drop(&mut self) {
         if let Some(e) = self.complete(None) {
-            if self.log.tx.try_send(Msg::Entry(Box::new(e), None)).is_err() {
-                tracing::error!(
-                    "audit log: an abandoned call went unrecorded (queue full or writer gone)"
-                );
+            match self.slot.take() {
+                // The slot was reserved before the call ran, so this never blocks or fails.
+                Some(slot) => {
+                    slot.send(Msg::Entry(Box::new(e), None));
+                }
+                None => {
+                    tracing::error!("audit log: an abandoned call went unrecorded (writer gone)")
+                }
             }
         }
     }
@@ -349,6 +372,26 @@ async fn record(
     if req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
+    // A slot before the handler runs. A call that cannot be recorded is refused here, before it has
+    // done anything, so a client that retries on 503 never repeats an action.
+    let slot = match log.tx.clone().reserve_owned().await {
+        Ok(slot) => Some(slot),
+        Err(_) if log.settings.fsync == Fsync::PerRecord => {
+            tracing::error!("audit log writer is gone: a call is refused");
+            return unwritable(
+                "this call could not be recorded in the audit log, so it was not run",
+            );
+        }
+        Err(_) => {
+            tracing::error!("audit log writer is gone: a call went unrecorded");
+            None
+        }
+    };
+    let mutating = surface == "admin"
+        && !matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        );
     let started = Instant::now();
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -392,7 +435,6 @@ async fn record(
     let note = Arc::new(Mutex::new(Note::default()));
     let meter = crate::cost::Meter::default();
     let pending = Pending {
-        log: log.clone(),
         entry: Some(Entry {
             ts_ms,
             identity: header.map(|h| (h, "header")),
@@ -411,6 +453,8 @@ async fn record(
         meter: meter.clone(),
         body,
         started,
+        slot,
+        mutating,
     };
     let resp = NOTE
         .scope(note, crate::cost::within(meter, next.run(req)))
@@ -457,40 +501,43 @@ impl AuditLog {
         resp: axum::response::Response,
     ) -> axum::response::Response {
         let per_record = self.settings.fsync == Fsync::PerRecord;
-        // A slot first: waiting for one is cancellation-safe, and `pending` still holds the record
-        // if this future is dropped while it waits.
-        let durable = match self.tx.reserve().await {
-            Err(_) => {
-                tracing::error!("audit log writer is gone: a call went unrecorded");
-                pending.entry = None;
-                false
-            }
-            Ok(slot) => {
-                let Some(entry) = pending.complete(Some(resp.status().as_u16())) else {
-                    return resp;
-                };
-                if !per_record {
-                    slot.send(Msg::Entry(Box::new(entry), None));
-                    return resp;
-                }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                slot.send(Msg::Entry(Box::new(entry), Some(tx)));
-                rx.await.unwrap_or(false)
-            }
+        let Some(slot) = pending.slot.take() else {
+            pending.entry = None;
+            return resp;
         };
-        if durable || !per_record {
+        let Some(entry) = pending.complete(Some(resp.status().as_u16())) else {
+            return resp;
+        };
+        if !per_record {
+            slot.send(Msg::Entry(Box::new(entry), None));
             return resp;
         }
-        use axum::response::IntoResponse;
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "error": "audit_unwritable",
-                "why": "this call could not be recorded in the audit log, so its answer is withheld",
-            })),
-        )
-            .into_response()
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        slot.send(Msg::Entry(Box::new(entry), Some(tx)));
+        if rx.await.unwrap_or(false) {
+            return resp;
+        }
+        if pending.mutating {
+            // The action has run. Answering 503 would invite a retry that repeats it.
+            tracing::error!("audit log: a mutating admin call ran but its record was not written");
+            let mut resp = resp;
+            resp.headers_mut().insert(
+                "nuthatch-audit",
+                axum::http::HeaderValue::from_static("unwritable"),
+            );
+            return resp;
+        }
+        unwritable("this call could not be recorded in the audit log, so its answer is withheld")
     }
+}
+
+fn unwritable(why: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({ "error": "audit_unwritable", "why": why })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]
@@ -1143,6 +1190,112 @@ mod tests {
         assert!(r[0].get("status").is_none());
     }
 
+    /// An `AuditLog` over a hand-made channel, with no real writer behind it.
+    fn log_over(dir: &Path, cap: usize) -> (Arc<AuditLog>, tokio::sync::mpsc::Receiver<Msg>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let log = Arc::new(AuditLog {
+            settings: settings(dir),
+            tx,
+        });
+        (log, rx)
+    }
+
+    /// Routes that say whether their handler ran.
+    fn effect_app(log: Arc<AuditLog>, ran: Arc<std::sync::atomic::AtomicBool>) -> axum::Router {
+        let r = ran.clone();
+        wrap(
+            axum::Router::new()
+                .route(
+                    "/_admin/mounts",
+                    post(move || {
+                        let r = r.clone();
+                        async move {
+                            r.store(true, std::sync::atomic::Ordering::SeqCst);
+                            "mounted"
+                        }
+                    }),
+                )
+                .route("/sql", get(|| async { "rows" }))
+                .route("/_admin/stuck", get(std::future::pending::<&str>)),
+            log,
+        )
+    }
+
+    fn post_mount() -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::post("/_admin/mounts")
+            .body(axum::body::Body::from("{}"))
+            .unwrap()
+    }
+
+    /// With no way to take a record, a mutating call is refused before its handler runs.
+    #[tokio::test]
+    async fn a_call_the_log_cannot_take_is_refused_before_it_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log, rx) = log_over(tmp.path(), 4);
+        drop(rx);
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = effect_app(log, ran.clone());
+        assert_eq!(send(&app, post_mount()).await, 503);
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the action ran"
+        );
+    }
+
+    /// A record that fails to fsync after a mutating call ran must not turn its answer into 503;
+    /// a read in the same state is still withheld.
+    #[tokio::test]
+    async fn a_mutating_call_is_not_answered_503_once_it_has_taken_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log, mut rx) = log_over(tmp.path(), 4);
+        // A writer whose every fsync fails.
+        tokio::spawn(async move {
+            while let Some(m) = rx.recv().await {
+                match m {
+                    Msg::Entry(_, Some(ack)) | Msg::Flush(ack) => {
+                        let _ = ack.send(false);
+                    }
+                    Msg::Entry(_, None) => {}
+                }
+            }
+        });
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = effect_app(log, ran.clone());
+        let resp = app.clone().oneshot(post_mount()).await.unwrap();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.headers()["nuthatch-audit"], "unwritable");
+        let read = axum::http::Request::get("/sql")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, read).await, 503);
+    }
+
+    /// A call dropped while the queue is otherwise full still gets its record, on its own slot.
+    #[tokio::test]
+    async fn an_abandoned_call_is_queued_even_when_the_queue_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (log, mut rx) = log_over(tmp.path(), 1);
+        let req = axum::http::Request::get("/_admin/stuck")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let call = effect_app(log, ran).oneshot(req);
+        // The only slot is held by this call; it is dropped mid-flight.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), call)
+                .await
+                .is_err()
+        );
+        match rx.try_recv() {
+            Ok(Msg::Entry(e, _)) => {
+                assert_eq!(e.outcome, "abandoned");
+                assert!(e.status.is_none());
+            }
+            _ => panic!("the abandoned record was dropped"),
+        }
+    }
+
     #[tokio::test]
     async fn text_mode_records_the_statement_and_arguments_but_still_no_credential() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1162,7 +1315,20 @@ mod tests {
 
     #[test]
     fn a_credential_header_is_refused_as_the_identity_header() {
-        for h in ["Authorization", "cookie", "Proxy-Authorization"] {
+        for h in [
+            "Authorization",
+            "cookie",
+            "Proxy-Authorization",
+            "Set-Cookie",
+            "Nuthatch-Admin-Token",
+            "X-Api-Key",
+            "Api-Key",
+            "X-Auth-Token",
+            "X-Access-Token",
+            "X-Api-Token",
+            "X-Token",
+            "X-Goog-Api-Key",
+        ] {
             let args = crate::cli::AuditLogArgs {
                 audit_log: Some("/tmp/x".into()),
                 audit_identity_header: Some(h.into()),
