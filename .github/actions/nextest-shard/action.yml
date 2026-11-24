@@ -37,12 +37,14 @@ runs:
         FILTER: ${{ inputs.filter }}
       run: |
         set -euo pipefail
+        # A shard has no toolchain, and tests/release_sbom.rs runs rustc and `cargo tree`; the
+        # build job runs those (`yatr test-sbom`).
         cargo-nextest nextest run --profile ci \
           --archive-file "$ARCHIVE" \
           --workspace-remap "$GITHUB_WORKSPACE" \
           --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
           --partition "count:$PARTITION" \
-          -E "$FILTER" \
+          -E "($FILTER) and not test(/^release_sbom::/)" \
           --no-tests=fail
     - name: upload the JUnit report
       if: always()

@@ -48,6 +48,13 @@ run = ["cargo nextest run --locked"]
 sources = ["**/*"]
 watch = ["src/**/*.rs", "tests/**/*.rs"]
 
+# #3097: tests/release_sbom.rs runs rustc and `cargo tree`, which the toolchain-less shards cannot.
+[tasks.test-sbom]
+desc = "The release SBOM tests, which need a toolchain (CI's shards skip them)"
+run = ["cargo nextest run --locked --test it -E 'test(/^release_sbom::/)'"]
+sources = ["**/*"]
+no_cache = true
+
 [tasks.doctest]
 desc = "Doctests, which nextest does not run"
 run = ["cargo test --doc --locked"]
@@ -174,6 +181,7 @@ depends = [
   "crate-count-receiver",
   "crate-fixture-rpc",
   "crate-lodestar-parity",
+  "crate-sbom",
   "crate-seal",
   "crate-identity",
   "crate-scaffold",
@@ -203,6 +211,14 @@ run = [
   "cargo clippy --locked --all-targets --manifest-path tools/lodestar-parity/Cargo.toml -- -D warnings",
 ]
 sources = ["tools/lodestar-parity/**", "rust-toolchain.toml"]
+
+# #3097: the release SBOM generator. Its logic is also compiled into tests/release_sbom.rs.
+[tasks.crate-sbom]
+run = [
+  "cargo fmt --check --manifest-path tools/sbom/Cargo.toml",
+  "cargo clippy --locked --all-targets --manifest-path tools/sbom/Cargo.toml -- -D warnings",
+]
+sources = ["tools/sbom/**", "rust-toolchain.toml"]
 
 [tasks.crate-seal]
 run = [

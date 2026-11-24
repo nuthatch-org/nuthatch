@@ -43,60 +43,50 @@ fn release_yml() -> String {
     stripped
 }
 
-/// Tarball names referenced anywhere in the workflow, with `${{ … }}` expressions left intact - the
-/// comparison only needs the two sets to be written the same way, not to be resolved.
-fn tarballs_in(section: &str) -> BTreeSet<String> {
-    section
-        .lines()
-        .map(str::trim)
-        .filter_map(|l| l.strip_prefix("- ").or(Some(l)))
-        .map(str::trim)
-        .filter(|l| l.ends_with(".tar.gz"))
-        .map(|l| l.trim_start_matches("subject-path:").trim().to_string())
-        .collect()
-}
-
-/// Everything the workflow *attaches* to the release, from the `files:` blocks.
-fn attached() -> BTreeSet<String> {
+/// The file names under every `key:` in the workflow, the inline value or a `|` block scalar's lines,
+/// with `${{ … }}` expressions left intact - the comparison only needs the sets to be written the same
+/// way, not to be resolved. A block ends at its first line holding a `:` outside an expression.
+fn files_under(key: &str) -> Vec<String> {
     let s = release_yml();
-    let mut out = BTreeSet::new();
-    let mut in_files = false;
-    for line in s.lines() {
-        let t = line.trim();
-        if t.starts_with("files:") {
-            in_files = true;
+    let lines: Vec<&str> = s.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim().strip_prefix(key) else {
+            continue;
+        };
+        let rest = rest.trim();
+        if !rest.is_empty() && rest != "|" {
+            out.push(rest.to_string());
             continue;
         }
-        if in_files {
-            if t.ends_with(".tar.gz") {
-                out.insert(t.to_string());
-            } else if !t.ends_with(".tar.gz.sha256") {
-                in_files = false;
-            }
-        }
+        out.extend(
+            lines[i + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .take_while(|l| {
+                    !l.is_empty() && !l.starts_with('#') && !l.replace("${{", "").contains(':')
+                })
+                .map(str::to_string),
+        );
     }
     out
+}
+
+/// Not a release artifact: the module's README, attached so the release page explains the module.
+const DOCUMENTATION: &str = "nuthatch-events-README.md";
+
+/// Everything the workflow *attaches* to the release, from the `files:` blocks, less the checksum
+/// sidecars and the README.
+fn attached() -> BTreeSet<String> {
+    files_under("files:")
+        .into_iter()
+        .filter(|f| !f.ends_with(".sha256") && f != DOCUMENTATION)
+        .collect()
 }
 
 /// Everything the workflow *attests*, from `subject-path:`.
 fn attested() -> BTreeSet<String> {
-    let s = release_yml();
-    let mut out = BTreeSet::new();
-    for (i, line) in s.lines().enumerate() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("subject-path:") {
-            let rest = rest.trim();
-            if rest.is_empty() || rest == "|" {
-                // A block scalar: take the indented lines that follow.
-                out.extend(tarballs_in(
-                    &s.lines().skip(i + 1).take(6).collect::<Vec<_>>().join("\n"),
-                ));
-            } else {
-                out.insert(rest.to_string());
-            }
-        }
-    }
-    out
+    files_under("subject-path:").into_iter().collect()
 }
 
 /// The permissions an attestation needs. `id-token: write` is what lets the job obtain the
@@ -113,21 +103,23 @@ fn the_release_workflow_may_mint_attestations() {
     }
 }
 
-/// **The one that matters.** Every artifact the release publishes must carry provenance. A new target
-/// or a new flavour added to `files:` and not to `subject-path:` would publish unattested, and nothing
+/// **The one that matters.** Every artifact the release publishes must carry provenance: tarballs,
+/// the engine's module and host package, and their SBOMs (#3097). A new target, a new flavour or a
+/// new kind of file added to `files:` and not to `subject-path:` would publish unattested, and nothing
 /// else in the repo would notice.
 #[test]
-fn every_published_tarball_is_attested() {
+fn every_published_artifact_is_attested() {
     let attached = attached();
     let attested = attested();
 
     // One templated name since #2035 made each (target, variant) its own matrix job.
     assert!(
-        !attached.is_empty(),
-        "found only {} attached tarball(s) in release.yml - the parser has stopped matching the \
-         workflow, so this gate would pass vacuously (#913 shape 1). Fix the scan, do not relax \
-         this floor.\nattached: {attached:?}",
-        attached.len()
+        attached.iter().any(|f| f.ends_with(".tar.gz"))
+            && attached.contains("nuthatch-events.wasm")
+            && attached.iter().any(|f| f.ends_with(".cdx.json")),
+        "the attached set lacks a tarball, the module or an SBOM - the parser has stopped matching \
+         the workflow, so this gate would pass vacuously (#913 shape 1). Fix the scan, do not relax \
+         this floor.\nattached: {attached:?}"
     );
 
     let unattested: Vec<&String> = attached.difference(&attested).collect();
@@ -172,6 +164,55 @@ fn publication_is_gated_on_verifying_provenance() {
         publish.contains("gh attestation verify") && publish.contains("--repo"),
         "`gh attestation verify` without `--repo` accepts an attestation from any repository, which \
          is most of the property being established"
+    );
+}
+
+/// #3097: every binary tarball and the engine's module ship a CycloneDX SBOM of the same name, and
+/// so, by the gate above, under the same attestation. The SBOM is written by tools/sbom in the job
+/// that built the artifact, before anything is attached, and `publish` refuses a release missing one
+/// and verifies each like the artifact it describes.
+#[test]
+fn every_binary_and_the_module_ship_their_sbom() {
+    let attached = attached();
+    let wanted: Vec<String> = attached
+        .iter()
+        .filter_map(|f| {
+            f.strip_suffix(".tar.gz")
+                .or_else(|| f.strip_suffix(".wasm"))
+                .map(|stem| format!("{stem}.cdx.json"))
+        })
+        .collect();
+    assert!(
+        wanted.len() >= 2,
+        "no tarball or module found: {attached:?}"
+    );
+    let missing: Vec<&String> = wanted.iter().filter(|w| !attached.contains(*w)).collect();
+    assert!(
+        missing.is_empty(),
+        "these SBOMs are not attached beside their artifact (#3097): {missing:?}"
+    );
+
+    let s = release_yml();
+    for job in ["\n  build:", "\n  engine:"] {
+        let body = s.split_once(job).expect("release.yml lost a job").1;
+        let body = body.split("\n  container:").next().unwrap();
+        let generate = body
+            .find("--manifest-path tools/sbom/Cargo.toml")
+            .unwrap_or_else(|| panic!("{job} does not run tools/sbom (#3097)"));
+        let attach = body.find("softprops/action-gh-release").unwrap();
+        assert!(
+            generate < attach && body[generate..attach].contains("--deny deny.toml"),
+            "{job} must write its SBOM before attaching, with deny.toml's licence check"
+        );
+    }
+
+    let publish = s.split_once("\n  publish:").unwrap().1;
+    let verify = publish.find("gh attestation verify").unwrap();
+    assert!(
+        publish[..verify].contains("--pattern '*.cdx.json'")
+            && publish[..verify]
+                .contains("files+=(nuthatch-events.wasm nuthatch-engine.js *.cdx.json)"),
+        "publish does not download and verify the SBOMs before undrafting (#3097)"
     );
 }
 
