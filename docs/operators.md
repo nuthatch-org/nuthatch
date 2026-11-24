@@ -1951,7 +1951,8 @@ transactions and for its receipts, and checks, naming the block and the field on
   Transaction hashes are recomputed from the transactions' bytes, never read from the answer.
 
 What is compared is what `audit sealed` compares: the contract event tables, every column except
-`block_timestamp` and `block_hash` (checked on its own). Factory children, `[extract] blocks` rows and
+`block_timestamp` (not checked by this command) and `block_hash` (checked on its own, as the `block_hash`
+field above). Factory children, `[extract] blocks` rows and
 `[[calls]]` rows are not compared.
 
 - **Trust.** The check shows the sealed rows are what the endpoint's blocks commit to, linked block to
@@ -1962,6 +1963,10 @@ What is compared is what `audit sealed` compares: the contract event tables, eve
   `eth_getBlockReceipts`) plus one `eth_chainId`. Eight blocks are asked for at a time. The endpoint
   must serve `eth_getBlockReceipts`.
 - **Memory.** The sealed rows of 100 blocks and the bodies of eight blocks at a time.
+- **Time.** Sealed rows are read once per 100-block chunk, and a read decodes every row group of each
+  segment overlapping the chunk before dropping rows outside it. A range inside one large segment
+  therefore re-reads that segment once per chunk: audit a long range in a few runs of a few thousand
+  blocks, not as one run, when the segments are large. Caching reads across chunks is not done yet.
 - **Never repairs.** A difference is reported and the command exits 1; sealed segments are immutable.
   To repair a range that really differs, re-index it from an endpoint that serves it.
 

@@ -128,8 +128,12 @@ fn decoded_logs(auditor: &Auditor, b: u64, hash: B256, body: &Body) -> BTreeMap<
             };
             index += 1;
             // `decode` matches the nest's contract decoders only, as the indexer's own decode does.
+            // Only rows of the audited tables, so a row kind the sealed side is not read for can
+            // never show as a receipt log "no sealed row holds".
             if let Ok(Some(row)) = auditor.registry.decode(&log) {
-                out.insert(row.log_index, row_text(&row));
+                if auditor.schema.iter().any(|t| t.table == row.table) {
+                    out.insert(row.log_index, row_text(&row));
+                }
             }
         }
     }
@@ -216,14 +220,16 @@ fn compare(
     }
     *parent = Some(hash);
     let ours = format!("{hash:#x}");
-    let elsewhere = stored.iter().filter(|r| r.block_hash != ours).count();
+    // Hex is compared without regard to case: a writer's casing is not a difference of block.
+    let other = |r: &&DecodedRow| !r.block_hash.eq_ignore_ascii_case(&ours);
+    let elsewhere = stored.iter().filter(other).count();
     if elsewhere > 0 {
-        let theirs = stored.iter().find(|r| r.block_hash != ours).unwrap();
+        let theirs = stored.iter().find(other).unwrap();
         problem(
             "block_hash",
             format!(
                 "{elsewhere} sealed row(s) came from block {}, and the chain's block {b} is {ours}: \
-                 they were indexed from a block that is no longer canonical",
+                 the endpoint does not serve that block at height {b}",
                 theirs.block_hash
             ),
         );
