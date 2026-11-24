@@ -4194,8 +4194,15 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(f());
         });
-        rx.recv_timeout(limit)
-            .unwrap_or_else(|_| panic!("did not finish within {limit:?}"))
+        match rx.recv_timeout(limit) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("did not finish within {limit:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the closure panicked before it returned")
+            }
+        }
     }
 
     /// `handle.join()` that fails, rather than waits for ever, when the thread does not end.

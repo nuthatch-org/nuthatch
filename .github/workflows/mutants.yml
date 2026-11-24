@@ -68,12 +68,24 @@ jobs:
           # and 12 to 19 minutes each, two of eight shards were cancelled at 330 minutes.
           #
           # Twenty-four since #3084. By the 2026-11-22 run seal.rs had grown to 457 mutants, 29 a
-          # shard, and shards 8 and 9 were cancelled at 330 minutes with nothing hung: every mutant in
-          # them was viable and each held a slot for about 22 minutes (6 build + 16 test, at -j 2 the
-          # suite takes twice its unmutated 8 minutes), so 29 of them need ~320 minutes after a
-          # 17-minute baseline. Shards that finished had unviable mutants, which skip the test phase.
-          # At 19 a shard the same worst case is ~225 minutes. Keep a seal.rs shard under about 22
-          # mutants (`cargo mutants --list --file src/seal.rs | wc -l`, divided by the shard count).
+          # shard, and shards 8 and 9 were cancelled at 330 minutes with nothing hung. Under
+          # `cargo test` every viable mutant held a slot for about 22 minutes on the runner (6 build
+          # + 16 test), so 29 viable mutants alone are ~640 minutes; only the unviable ones, which
+          # skip the test phase, let the other shards finish.
+          #
+          # Under the nextest `mutants` profile a caught mutant stops at the first failing test.
+          # Measured locally (32 cores, warm cache, `-j 2`, shard 1/24, 2026-11-24): baseline 414 s
+          # build + 150 s test; 16 caught mutants averaged 98 s build (median 77) + 63 s test (max
+          # 124 s), 3 unviable skipped the test, 0 missed, 0 TIMEOUT. The runner is slower than that
+          # machine (its baseline was 17 minutes against 9.4 here, about 1.8x), so a caught mutant is
+          # ~8 minutes there (6 build + ~2 test), a survivor still ~22 (it runs the whole suite).
+          # A shard of 19 therefore costs 17 + 19 x 8 = ~170 minutes if all are caught, and ~210
+          # at the 15% survivor rate seal.rs has (8 baselined of 52 on the last full local run). It
+          # only passes 330 minutes if more than about 14 of its 19 mutants survive (17 + n x 22 >
+          # 330), which would be a test-quality failure the sweep should report anyway. The ~22-mutant
+          # ceiling below is an estimate from these figures, not a measured limit; the first scheduled
+          # run under the profile is the check on it. Keep a seal.rs shard under about 22 mutants
+          # (`cargo mutants --list --file src/seal.rs | wc -l`, divided by the shard count).
           - { file: src/chunker.rs, shard: 0/2, timeout: 330 }
           - { file: src/chunker.rs, shard: 1/2, timeout: 330 }
           - { file: src/seal.rs, shard: 0/24, timeout: 330 }
