@@ -1017,7 +1017,7 @@ mod tests {
                 }),
             )
             .route("/entity/{id}", get(|| async { "not audited" }))
-            .route("/_admin/stuck", get(|| std::future::pending::<&str>()));
+            .route("/_admin/stuck", get(std::future::pending::<&str>));
         wrap(routes, log)
     }
 

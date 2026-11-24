@@ -23,7 +23,7 @@ Add another contract to a nest that has not indexed yet - resolve its ABI and gr
 
 ## `nuthatch audit`
 
-Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a second endpoint
+Audit a nest: `report` summarises its flags, `sealed` re-checks sealed history against a second endpoint, `verify` checks an `--audit-log` directory's hash chain
 
 
 ## `nuthatch audit report`
@@ -46,6 +46,14 @@ Re-fetch a sample of sealed ranges from a second endpoint and compare them row b
 - `--span <SPAN>` - Blocks in each sampled range
 - `--from <FROM>` - Audit exactly `--from..=--to` instead of sampling, to re-check a reported range
 - `--to <TO>` - 
+
+## `nuthatch audit verify`
+
+Check an `--audit-log` directory's hash chain: a deleted, edited or reordered record fails
+
+- `<PATH>` - The `--audit-log` directory, or one `audit-<seq>.jsonl` file in it
+- `--head <HEAD>` - The head an earlier `verify` printed (`<seq>:<hash>`), kept off this host: also catches a cut or rewritten tail, which the chain alone cannot
+- `--json` - Emit JSON
 
 ## `nuthatch bench`
 
@@ -162,6 +170,12 @@ Run the indexer: poll logs, store entities, and serve the API
 - `--audit-per-day <AUDIT_PER_DAY>` - Ranges the background audit samples a day, spread evenly
 - `--audit-span <AUDIT_SPAN>` - Blocks in each range the background audit samples
 - `--audit-seed <AUDIT_SEED>` - Seed for the background audit's samples. Defaults to the start time; it is logged with every sample, as is the range, which `nuthatch audit sealed --from --to` re-checks
+- `--audit-log <AUDIT_LOG>` - Record every `/sql`, `/q/{name}`, admin and MCP call, refused ones included, as hash-chained JSON lines in this directory (`audit-<seq>.jsonl`). Check it with `nuthatch audit verify`
+- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent. A verified token's subject wins over it
+- `--audit-log-statements <AUDIT_STATEMENTS>` - How a statement is recorded: `hash` (SHA-256 only) or `text` (also its text, and MCP tool arguments)
+- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync, and is answered 503 if it cannot be written
+- `--audit-log-rotate-mb <AUDIT_ROTATE_MB>` - Start a new file once the current one would pass this size
+- `--audit-log-keep <AUDIT_KEEP>` - Keep this many files, deleting the oldest at rotation. 0 keeps all of them
 - `--no-admin` - Disable the built-in admin UI (`/_admin/`) entirely - no routes, for hosted deployments that front their own dashboard (RFC-0010 Part A). Every request presents a token as `?token=…` or `Authorization: Bearer`: `NUTHATCH_ADMIN_TOKEN`, or on localhost without it the one made in `<dir>/.admin-token`. Off-localhost without the variable the UI self-disables with a log line
 - `--registry <REGISTRY>` - A runtime (`--dir` holding a `mounts.toml`): the registry a live mount fetches a NID from when this runtime does not hold it (RFC-0019, #1543). A filesystem path, or `s3://bucket/prefix`
 - `--max-bundle-mb <MAX_BUNDLE_MB>` - A runtime: the largest bundle `POST /_admin/bundles` accepts, in MiB (RFC-0073 FR10). A larger body is answered `413`
@@ -517,6 +531,12 @@ Serve a nest without indexing it (RFC-0022 slice 3)
 - `--cors <CORS>` - Allow browser front ends on these origins to call this nest directly (repeatable, or `*`)
 - `--public-host <PUBLIC_HOST>` - A `Host` name this process on a loopback bind answers as the public behind your proxy (repeatable). On a loopback bind any other name but loopback is refused, which keeps a page that rebinds its DNS name to 127.0.0.1 out
 - `--local-host <LOCAL_HOST>` - A `Host` name this process on a loopback bind answers as this machine (repeatable), such as `host.docker.internal` for a client in a container
+- `--audit-log <AUDIT_LOG>` - Record every `/sql`, `/q/{name}`, admin and MCP call, refused ones included, as hash-chained JSON lines in this directory (`audit-<seq>.jsonl`). Check it with `nuthatch audit verify`
+- `--audit-log-identity-header <AUDIT_IDENTITY_HEADER>` - The request header your gateway sets to the caller's identity, recorded as an opaque string. The gateway must strip a copy the client sent. A verified token's subject wins over it
+- `--audit-log-statements <AUDIT_STATEMENTS>` - How a statement is recorded: `hash` (SHA-256 only) or `text` (also its text, and MCP tool arguments)
+- `--audit-log-fsync <AUDIT_FSYNC>` - `batch`: fsync after each batch, responses do not wait. `per-record`: a response waits for its record's fsync, and is answered 503 if it cannot be written
+- `--audit-log-rotate-mb <AUDIT_ROTATE_MB>` - Start a new file once the current one would pass this size
+- `--audit-log-keep <AUDIT_KEEP>` - Keep this many files, deleting the oldest at rotation. 0 keeps all of them
 - `--admin` - Serve the admin UI. Off by default and deliberately *not* symmetrical with `dev`: an FE node owns no cursor, so the lifecycle routes it would expose have nothing to act on
 - `--publish-target <PUBLISH_TARGET>` - Mirror sealed segments to this prefix as they seal (RFC-0052), exactly as on `dev`
 - `--publish-interval <PUBLISH_INTERVAL>` - How often the mirror reconciles when no seal has woken it
