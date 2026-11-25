@@ -722,6 +722,16 @@ async fn a_bare_runtime_starts_with_no_chain_and_takes_one_live() {
         "[runtime]\nname = \"r\"\n",
     )
     .unwrap();
+    let nid = "cafe".repeat(16);
+    let nest_dir = runtime::MountTable::data_dir(roost.path(), &nid);
+    scaffold_nest(&nest_dir, "usdc", USDC);
+    let nest_toml = nest_dir.join("nuthatch.toml");
+    let moved = std::fs::read_to_string(&nest_toml).unwrap().replace(
+        "chain = \"arbitrum-one\"\nchain_id = 42161",
+        &format!("chain = \"devnet\"\nchain_id = {DEVNET_ID}"),
+    );
+    assert!(moved.contains("devnet"), "premise: the nest moved chain");
+    std::fs::write(&nest_toml, moved).unwrap();
     let devnet = fake_chain(DEVNET_ID, 10).await;
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -734,6 +744,7 @@ async fn a_bare_runtime_starts_with_no_chain_and_takes_one_live() {
             .args(["dev", "--dir"])
             .arg(roost.path())
             .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--poll-interval", "1s"])
             .env("NUTHATCH_ADMIN_TOKEN", OPEN)
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
@@ -778,6 +789,48 @@ async fn a_bare_runtime_starts_with_no_chain_and_takes_one_live() {
     let chains = chains_in_table(roost.path());
     assert_eq!(chains.len(), 1, "the declaration is in mounts.toml");
     assert_eq!(chains[0].chain, "devnet");
+
+    // The point of a bare boot: a nest mounts onto the chain just declared and serves.
+    let resp = client
+        .post(format!("{base}/_admin/nests?wait=true"))
+        .bearer_auth(OPEN)
+        .header("content-type", "application/json")
+        .body(json!({"name": "usdc", "nid": nid}).to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let ready = client.get(format!("{base}/usdc/ready")).send().await;
+        if matches!(&ready, Ok(r) if r.status() == 200) {
+            break;
+        }
+        let exited = child.0.try_wait().unwrap();
+        assert!(
+            exited.is_none() && std::time::Instant::now() < deadline,
+            "the nest mounted on a bare runtime never served ({exited:?}, {:?}): {}",
+            ready.map(|r| r.status()),
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        wait_until(POLL_TIMEOUT, || devnet.calls("eth_getLogs") > 0).await,
+        "the mounted nest's cursor never indexed through the declared chain"
+    );
+    let view: Value = client
+        .get(format!("{base}/_admin/chains"))
+        .bearer_auth(OPEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(view["chains"][0]["state"], "running", "{view}");
 }
 
 /// Boot `nuthatch dev --dir` over two mounts on one fake chain, the second broken by `break_it`,
