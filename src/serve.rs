@@ -1730,9 +1730,10 @@ fn runtime_metrics(
     body.push_str(&health.render_metrics());
     // A holder and its aliases share one state, so one dataset: emit its series once, or a scrape
     // sees duplicate samples (#3112). A dataset is its NID (a state without one is told apart by
-    // name). Two *distinct* datasets can still share a configured name; the later one is labelled by
-    // its route, as a strict mount is (#3113), so both stay visible and no sample collides.
-    let (mut datasets, mut names) = (
+    // name). Two *distinct* datasets can share a configured name, so the label is chosen against the
+    // set of labels already emitted: the name if free, else the route, else the route with `-2`,
+    // `-3`, ... until unused. Every emitted label is therefore unique by construction.
+    let (mut datasets, mut labels) = (
         std::collections::HashSet::new(),
         std::collections::HashSet::new(),
     );
@@ -1748,7 +1749,17 @@ fn runtime_metrics(
         if !datasets.insert(identity) {
             continue;
         }
-        let own = (!names.insert(name.to_string())).then_some(route.as_str());
+        let mut label = name.to_string();
+        if labels.contains(&label) {
+            label = route.clone();
+            let mut n = 1u64;
+            while labels.contains(&label) {
+                n += 1;
+                label = format!("{route}-{n}");
+            }
+        }
+        labels.insert(label.clone());
+        let own = (label != name).then_some(label.as_str());
         body.push_str(&entity_metrics(&state, own));
         body.push_str(&snapshot_metrics(&state, own));
     }
@@ -9986,6 +9997,49 @@ mod tests {
             body.contains("nuthatch_snapshot_retained_bytes{nest=\"cfgname-3112\"}"),
             "{body}"
         );
+    }
+
+    /// Jules' arrangement (#3120): two distinct NIDs both named `shared`, mounted at routes `first`
+    /// and `shared`. The second's name is taken and its route is too, so it must still get a unique
+    /// label rather than repeating the first's samples.
+    #[tokio::test]
+    async fn root_metrics_labels_stay_unique_when_a_route_equals_a_taken_name() {
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register("first", "mainnet");
+        health.register("shared", "mainnet");
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mk = |dir: &std::path::Path, nid: &str| {
+            let mut st = test_state(dir, SQL_MAX_CONCURRENCY);
+            st.nest_info = Arc::new(json!({ "name": "shared", "nid": nid }));
+            st
+        };
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![
+                ("first".to_string(), mk(d1.path(), "nid-a")),
+                ("shared".to_string(), mk(d2.path(), "nid-b")),
+            ],
+            health,
+        );
+        let (_, body) = get(app, "/metrics").await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let series: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.rsplit_once(' ').map(|(s, _)| s))
+            .collect();
+        let mut unique = series.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(series.len(), unique.len(), "duplicate series in:\n{body}");
+        for nest in ["shared", "shared-2"] {
+            assert!(
+                body.contains(&format!(
+                    "nuthatch_snapshot_retained_bytes{{nest=\"{nest}\"}}"
+                )),
+                "missing {nest}:\n{body}"
+            );
+        }
     }
 
     /// Two different NIDs that share a configured name are two datasets: the root `/metrics` keeps
