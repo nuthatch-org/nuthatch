@@ -165,7 +165,10 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
     // Reserved word: `Parser Error: syntax error at or near …` when a reserved-word column appears
     // unquoted in the query. The token the parser names is not reliably the column, so we detect via
     // the schema: a reserved-word column mentioned bare is the culprit.
-    if raw.contains("syntax error") {
+    // The engine words it two ways: DuckDB's `syntax error at or near`, and the DataFusion parser's
+    // `sql parser error: Expected an expression, found: from`. A bare `SELECT from, to …` on any
+    // ERC-20 is the second, and used to get the raw message with no hint.
+    if raw.contains("syntax error") || raw.contains("sql parser error") {
         for t in schema {
             for rc in derive_footguns(t).reserved_words {
                 if mentions_unquoted(query, &rc) {
@@ -725,6 +728,14 @@ mod tests {
         let hint = enrich(raw, "SELECT from FROM usdc__transfer", &schema()).unwrap();
         assert!(hint.contains("reserved word"));
         assert!(hint.contains("\"from\""), "shows the quoted form");
+    }
+
+    #[test]
+    fn reserved_word_column_is_told_to_double_quote_on_the_datafusion_parser_message() {
+        let raw = "Parser Error: sql parser error: Expected an expression, found: from at Line: 1, Column: 12";
+        let hint = enrich(raw, "SELECT from, to, value FROM usdc__transfer", &schema()).unwrap();
+        assert!(hint.contains("reserved word"), "{hint}");
+        assert!(hint.contains("\"from\""), "shows the quoted form: {hint}");
     }
 
     #[test]

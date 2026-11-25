@@ -17,6 +17,7 @@
 | Code or config typed | none | about 110 lines | 5 lines | 2 lines |
 | Time to first query | 1.0 s | 2.9 s | 26 s | 189 s |
 
+**Your own contract:** [its event history as SQL, and over MCP to your agent, in 10 minutes](docs/quickstart-your-contract.md), with the RPC choice in plain words.
 **No install?** `npx -y nuthatch-indexer` downloads the release for your platform and runs it.
 **Headless:** `nuthatch dev --backfill 300 --detach` returns once `/ready` reports a first poll, and
 `nuthatch stop` stops it. Exit codes: [docs/cli-errors.md](docs/cli-errors.md).
