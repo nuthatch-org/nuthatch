@@ -1728,15 +1728,29 @@ fn runtime_metrics(
 ) -> impl IntoResponse {
     let mut body = crate::metrics::METRICS.render();
     body.push_str(&health.render_metrics());
-    // A holder and its aliases share one state and so one name; emit each name's series once, or a
-    // scrape sees duplicate samples (#3112).
-    let mut seen = std::collections::HashSet::new();
-    for (_, nest) in nests {
+    // A holder and its aliases share one state, so one dataset: emit its series once, or a scrape
+    // sees duplicate samples (#3112). A dataset is its NID (a state without one is told apart by
+    // name). Two *distinct* datasets can still share a configured name; the later one is labelled by
+    // its route, as a strict mount is (#3113), so both stay visible and no sample collides.
+    let (mut datasets, mut names) = (
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+    for (route, nest) in nests {
         let state = nest.current();
-        if seen.insert(nest_label(&state, None).to_string()) {
-            body.push_str(&entity_metrics(&state, None));
-            body.push_str(&snapshot_metrics(&state, None));
+        let name = nest_label(&state, None);
+        let identity = state
+            .nest_info
+            .get("nid")
+            .and_then(Value::as_str)
+            .unwrap_or(name)
+            .to_string();
+        if !datasets.insert(identity) {
+            continue;
         }
+        let own = (!names.insert(name.to_string())).then_some(route.as_str());
+        body.push_str(&entity_metrics(&state, own));
+        body.push_str(&snapshot_metrics(&state, own));
     }
     (
         [(
@@ -9972,6 +9986,48 @@ mod tests {
             body.contains("nuthatch_snapshot_retained_bytes{nest=\"cfgname-3112\"}"),
             "{body}"
         );
+    }
+
+    /// Two different NIDs that share a configured name are two datasets: the root `/metrics` keeps
+    /// both, the second labelled by its route, with no duplicate sample.
+    #[tokio::test]
+    async fn root_metrics_keep_distinct_datasets_that_share_a_name() {
+        let health = Arc::new(crate::health::RuntimeHealth::default());
+        health.register("first-3120", "mainnet");
+        health.register("second-3120", "mainnet");
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mk = |dir: &std::path::Path, nid: &str| {
+            let mut st = test_state(dir, SQL_MAX_CONCURRENCY);
+            st.nest_info = Arc::new(json!({ "name": "shared-3120", "nid": nid }));
+            st
+        };
+        let app = compose_runtime(
+            json!({"runtime": "t", "nests": []}),
+            vec![
+                ("first-3120".to_string(), mk(d1.path(), "nid-a")),
+                ("second-3120".to_string(), mk(d2.path(), "nid-b")),
+            ],
+            health,
+        );
+        let (_, body) = get(app, "/metrics").await;
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let series: Vec<&str> = body
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| l.rsplit_once(' ').map(|(s, _)| s))
+            .collect();
+        let mut unique = series.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(series.len(), unique.len(), "duplicate series in:\n{body}");
+        for nest in ["shared-3120", "second-3120"] {
+            assert!(
+                body.contains(&format!(
+                    "nuthatch_snapshot_retained_bytes{{nest=\"{nest}\"}}"
+                )),
+                "missing {nest}:\n{body}"
+            );
+        }
     }
 
     /// #3113: a strict mount's samples all carry one `nest` value, its route, so a dashboard can join
