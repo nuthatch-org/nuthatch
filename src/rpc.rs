@@ -1527,7 +1527,7 @@ mod tests {
         let headers = c.block_headers(&[5, 6]).await.unwrap();
         for h in headers.values() {
             assert!(h.get("transactions").is_none(), "hashes held: {h}");
-            let row = crate::registry::block_row(5, h, true).unwrap();
+            let row = crate::registry::block_row(5, h, true, false).unwrap();
             let count = row.params.iter().find(|(k, _)| k == "transaction_count");
             assert_eq!(
                 count.map(|(_, v)| v.clone()),

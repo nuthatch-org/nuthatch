@@ -525,7 +525,7 @@ pub fn count_header_transactions(header: &mut Json) {
 /// none of the three, so: `log_index` is 0 (one row per block makes it unique by construction),
 /// `tx_hash` is the block's own hash, and `address` is empty. The alternative - reshaping the key for
 /// one table - would touch the storage layer this design exists to leave alone.
-pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<DecodedRow> {
+pub fn block_row(number: u64, header: &Json, timestamps: bool, null: bool) -> Option<DecodedRow> {
     let hex = |k: &str| -> u64 {
         header
             .get(k)
@@ -585,7 +585,12 @@ pub fn block_row(number: u64, header: &Json, timestamps: bool) -> Option<Decoded
         params,
         block_number: number,
         block_hash: hash.clone(),
-        block_timestamp: hex("timestamp"),
+        // A null-mode nest promises null on every row, whatever the header carried (#3173).
+        block_timestamp: if null {
+            UNKNOWN_TIMESTAMP
+        } else {
+            hex("timestamp")
+        },
         timestamps,
         log_index: BLOCK_ROW_LOG_INDEX,
         tx_hash: hash,
@@ -2251,8 +2256,8 @@ mod tests {
             "l1BlockNumber": "0x18b23d3",
             "transactions": [],
         });
-        let row =
-            block_row(501_277_084, &arbitrum, true).expect("a header with a hash yields a row");
+        let row = block_row(501_277_084, &arbitrum, true, false)
+            .expect("a header with a hash yields a row");
         let l1 = row
             .params
             .iter()
@@ -2265,7 +2270,7 @@ mod tests {
         // the honest value for "the field did not exist", not a failure of the whole window.
         let mut mainnet = arbitrum.clone();
         mainnet.as_object_mut().unwrap().remove("l1BlockNumber");
-        let row = block_row(1, &mainnet, true).expect("row");
+        let row = block_row(1, &mainnet, true, false).expect("row");
         assert_eq!(
             row.params
                 .iter()
@@ -2286,7 +2291,7 @@ mod tests {
         let mut counted = full.clone();
         count_header_transactions(&mut counted);
         assert!(counted.get("transactions").is_none());
-        let row = |h: &Json| block_row(1, h, true).unwrap().to_json().to_string();
+        let row = |h: &Json| block_row(1, h, true, false).unwrap().to_json().to_string();
         assert_eq!(row(&counted), row(&full));
         assert!(
             row(&full).contains("\"transaction_count\":3"),
@@ -2301,7 +2306,7 @@ mod tests {
     #[test]
     fn every_declared_block_column_is_emitted_by_the_row_builder() {
         let header = serde_json::json!({ "hash": "0xaa", "transactions": [] });
-        let row = block_row(1, &header, false).expect("row");
+        let row = block_row(1, &header, false, false).expect("row");
         let emitted: Vec<&str> = row.params.iter().map(|(k, _)| k.as_str()).collect();
         let declared: Vec<&str> = BLOCK_COLUMNS.iter().map(|(n, _, _)| *n).collect();
         assert_eq!(
