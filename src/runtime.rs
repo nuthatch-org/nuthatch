@@ -1650,6 +1650,18 @@ pub fn load_mounted(
     let mut out = Vec::with_capacity(datasets.len());
     let mut failed = Vec::new();
     for ds in datasets {
+        // Links are refused before `prepare_dataset` copies anything into or out of the directory.
+        if let Err(e) = crate::blob::refuse_symlinks_in_state(&ds.dir) {
+            failed.push((
+                ds.canonical().route_key(default_tenant),
+                format!(
+                    "loading mounted nest '{}' from {}: {e:#}",
+                    ds.canonical(),
+                    ds.dir.display()
+                ),
+            ));
+            continue;
+        }
         // The cutoff, and the warn-and-carry-on policy behind it, now live in `prepare_dataset` so
         // the mount path gets the same treatment without re-deriving it (#414).
         let _prepared = prepare_dataset(
@@ -7130,6 +7142,8 @@ impl RuntimeHandles {
                 (state, None, 0, cursor_key)
             }
             None => {
+                crate::blob::refuse_symlinks_in_state(&dir)
+                    .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
                 let mut config = Config::load(&dir)
                     .with_context(|| format!("loading nest '{name}' from {}", dir.display()))?;
                 let dial = self

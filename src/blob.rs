@@ -161,6 +161,52 @@ pub fn refuse_symlinked_state(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The full start-time refusal: [`refuse_symlinked_state`]'s top-level names, then a recursive walk of
+/// every directory the process writes into (`segments/`, the quarantine and maintained-copy dirs, the
+/// spill dirs), not following links. Run once by each start path, before anything is opened; it is
+/// not part of [`Config::load`], which is called from many places.
+pub fn refuse_symlinks_in_state(dir: &Path) -> Result<()> {
+    refuse_symlinked_state(dir)?;
+    let mut stack = Vec::new();
+    for name in [
+        "segments",
+        crate::seal::QUARANTINE_DIR,
+        crate::maintained::COPIES_DIR,
+    ] {
+        stack.push(dir.join(name));
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_name()
+                .to_str()
+                .is_some_and(crate::spill::is_spill_dir_name)
+            {
+                stack.push(e.path());
+            }
+        }
+    }
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue; // absent (or not a directory): nothing is written through it
+        };
+        for entry in rd {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if ft.is_symlink() {
+                bail!(
+                    "{} is a symbolic link: a nest's files must be regular files, so the nest is not \
+                     started. Replace the link with a real file or directory",
+                    entry.path().display()
+                );
+            }
+            if ft.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the manifest for the nest at `dir` without writing anything - hashes every authored input and
 /// records the regenerated `registry_hash`. Shared by `pack` and (later) `mount`'s verify.
 pub fn build_manifest(dir: &Path, skip_out: Option<&Path>) -> Result<Manifest> {
@@ -967,6 +1013,34 @@ mod tests {
 
     use super::*;
     use crate::config::CONFIG_FILE;
+
+    /// A link below a derived-state directory refuses the start, and a real tree there does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_a_state_directory_refuses_the_start() {
+        let outside = tempfile::tempdir().unwrap();
+        for rel in [
+            "segments/verified.json.tmp",
+            "segments/blocks/x.parquet",
+            "quarantine/x",
+            "maintained/v/x",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let link = dir.path().join(rel);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            refuse_symlinks_in_state(dir.path()).expect("real directories are fine");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let err = format!("{:#}", refuse_symlinks_in_state(dir.path()).unwrap_err());
+            assert!(err.contains("symbolic link"), "{rel}: {err}");
+        }
+        // A nest directory reached through a link is not refused: only what is under it is checked.
+        let real = tempfile::tempdir().unwrap();
+        std::fs::create_dir(real.path().join("segments")).unwrap();
+        let via = tempfile::tempdir().unwrap();
+        let linked = via.path().join("nest");
+        std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+        refuse_symlinks_in_state(&linked).expect("a linked nest dir keeps working");
+    }
 
     /// SEC-1: a blob is untrusted, distributable input - `mount` must refuse a manifest whose file
     /// paths would escape the target (zip-slip `../` or an absolute path, which `Path::join` would let

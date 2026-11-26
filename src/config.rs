@@ -240,8 +240,9 @@ impl From<Alert> for nuthatch_core::alerts::AlertSink {
 
 impl Config {
     pub fn load(dir: &Path) -> Result<Config> {
-        // Every start path (`dev`, `serve`, a runtime's mounts) loads the config before it opens the
-        // store, the segments or the admin token, so this is the one place to refuse a linked path.
+        // The cheap, top-level half of the link refusal, for every caller. The start paths (`dev`,
+        // `serve`, a runtime's mounts) additionally run `blob::refuse_symlinks_in_state`, the recursive
+        // walk, before they open anything.
         crate::blob::refuse_symlinked_state(dir)?;
         // RFC-0018 §2's Starlark front-end was retired on 2026-07-21 (one graph nest, plain TOML) and
         // the loader is removed in 2.0. A directory still carrying `nest.star` is told so rather than

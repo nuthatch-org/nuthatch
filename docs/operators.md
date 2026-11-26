@@ -2440,9 +2440,12 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
 
 - **A new version is a new NID**, because the NID is a content address: any edit to the nest's
   inputs, a view or a description included, yields a different NID. Its files must be regular files:
-  a symbolic link anywhere in the nest, `nuthatch.redb` and `segments/` included, is refused by `dev`,
-  `init --from`, every command that loads the nest and every command that computes the NID, because the NID
-  cannot see what it points to and the nest must not write through one. To keep the store or `segments/` on
+  a symbolic link anywhere in the nest, `nuthatch.redb` and `segments/` included, is refused by
+  `init --from` and every command that computes the NID, because the NID cannot see what it points to.
+  `dev`, `serve` and a runtime's mounts also refuse a link among the nest's top-level state names (`nuthatch.redb`,
+  `segments`, the admin token and the spill directories) and anywhere inside `segments/`, `quarantine/`, `maintained/`
+  and the spill directories, checked before anything is opened; the nest directory itself may be reached through a
+  link. A runtime's shared `<root>/segments` is the operator's own and is not checked: keep it a real directory too. To keep the store or `segments/` on
   another disk, mount that disk at the path (a bind mount) rather than linking to it. Whether it is indexed again
   depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt`, `AGENTS.md` and the
   scaffolded skill are outside the **data identity**. Label sets are outside both it and the NID (#2946), so

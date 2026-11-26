@@ -72,8 +72,8 @@ else
 fi
 
 # After the clone or copy of a nest source, before anything starts: no symbolic link anywhere but .git.
-# Printed into the checklist for the operator, who runs it; it prints the links and aborts if any.
-link_check="links=\$(sudo find $nestdir -path $nestdir/.git -prune -o -type l -print); [ -z \"\$links\" ] || { echo \"refusing: symbolic link(s) in the nest:\" \"\$links\" >&2; sudo rm -rf $nestdir; false; }"
+# Printed into the checklist for the operator, who runs it; it prints any link it finds.
+link_check="links=\$(sudo find $nestdir -path $nestdir/.git -prune -o -type l -print); [ -z \"\$links\" ] || { echo \"STOP: symbolic link(s) in the nest, do not continue the checklist:\" \"\$links\" >&2; sudo rm -rf $nestdir; false; }"
 
 # ---- ports: reuse this nest's own if its unit exists, else the next free pair (nest 81xx, proxy 84xx)
 used=$( { grep -rhoE '127\.0\.0\.1:(81|84)[0-9]{2}' "$tpl" "$ROOT/etc/systemd/system" "$ROOT/etc/nuthatch-public" "$ROOT/etc/caddy" 2>/dev/null || true
@@ -254,7 +254,7 @@ cat <<EOT
   [ ] 1. nest dir:   sudo install -d -o $SVC_USER -g $SVC_USER -m 0700 /var/lib/nuthatch-public   # once; skip if it exists
                      sudo -u $SVC_USER -H $nest_cmd
                      (then: sudo chmod 0700 $nestdir)
-                     then refuse a symbolic link anywhere in the nest (a nest's files must be regular files):
+                     then check for a symbolic link anywhere in the nest (its files must be regular files). If this prints any link, STOP here: do not continue the checklist:
                      $link_check
   [ ] 2. review the files above$([ $apply = 1 ] && echo ' (now on disk)'), then:  sudo systemd-analyze verify /etc/systemd/system/$unit*.service
   [ ] 3. sudo caddy validate --config $caddyfile && sudo systemctl reload caddy

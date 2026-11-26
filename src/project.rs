@@ -1678,6 +1678,7 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         );
     }
 
+    let created = !target.exists();
     let fetched = if is_git_source(source) {
         say!("→ cloning nest from {source} …");
         let r = clone_repo(source, target);
@@ -1696,8 +1697,20 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
             .and_then(|()| copy_dir_except(&src, target, &crate::blob::is_excluded))
     };
     if let Err(e) = fetched {
-        // Remove the half-made target (it was absent or empty on entry).
-        let _ = std::fs::remove_dir_all(target);
+        // Remove the half-made target only if this call made it; an empty directory that was
+        // already there is left as it was.
+        if created {
+            let _ = std::fs::remove_dir_all(target);
+        } else if let Ok(rd) = std::fs::read_dir(target) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let _ = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+            }
+        }
         return Err(e);
     }
     // Belt and braces: the copy is itself link-free (#2355).
@@ -3507,6 +3520,55 @@ mod tests {
             let n = std::fs::read_dir(outside.path()).unwrap().count();
             assert!(n <= 1, "nothing written to the link target");
         }
+    }
+
+    /// A committed link survives `git clone`; it is refused and the target is not left behind.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_a_git_repo_refuses_a_committed_link() {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("nest.git");
+        std::fs::create_dir(&repo).unwrap();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+            &repo,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(tmp.path(), repo.join("segments")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "nest"]);
+
+        let target = tmp.path().join("out");
+        let source = repo.to_str().unwrap();
+        assert!(is_git_source(source));
+        let err = format!("{:#}", init_from(source, &target).unwrap_err());
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(!target.exists(), "half-made target removed");
+    }
+
+    /// A failed `--from` into a directory that was already there (empty) leaves that directory.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_keeps_a_target_directory_it_did_not_create() {
+        let src = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(src.path(), src.path().join("segments")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("existing");
+        std::fs::create_dir(&target).unwrap();
+        init_from(src.path().to_str().unwrap(), &target).unwrap_err();
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]

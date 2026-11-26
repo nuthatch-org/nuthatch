@@ -70,6 +70,7 @@ pub async fn dev(args: DevArgs) -> Result<()> {
     if let Some(chains) = crate::address_mode::chain_dirs(&dir)? {
         return crate::address_mode::dev_chains(chains, &args, cors).await;
     }
+    crate::blob::refuse_symlinks_in_state(&dir)?;
     let mut config = Config::load(&dir)?;
     // RFC-0063: an address-history nest runs its own light path and none of what follows.
     if config.address_history.is_some() {
@@ -3993,6 +3994,7 @@ pub async fn serve_role(args: crate::cli::ServeArgs) -> Result<()> {
     let cors = crate::serve::cors_layer(&args.cors)?;
     let hosts = crate::host_names::HostNames::declared(&args.local_host, &args.public_host)?;
     let dir = PathBuf::from(&args.dir);
+    crate::blob::refuse_symlinks_in_state(&dir)?;
     let mut config = Config::load(&dir)
         .with_context(|| format!("no nest at '{}' (run `nuthatch init` first)", dir.display()))?;
     // #1167: this role samples no calls, so `build_nest` must not demand the archive endpoint `dev` needs.
