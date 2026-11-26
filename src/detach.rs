@@ -48,13 +48,51 @@ pub fn state_dir_from(
     Some(base.join("nuthatch").join("dev").join(key))
 }
 
-fn state_dir(nest: &Path) -> Result<PathBuf> {
+pub(crate) fn state_dir(nest: &Path) -> Result<PathBuf> {
     state_dir_from(
         std::env::var_os("XDG_STATE_HOME"),
         std::env::var_os("HOME"),
         nest,
     )
     .context("--detach keeps its log in $XDG_STATE_HOME or $HOME, and neither is set")
+}
+
+/// Creates `dir` (and parents) if missing, owner-only, and refuses one another user owns; one this
+/// user owns but left open is closed to `0700`. What lives in it (a log that can hold an admin
+/// token, a pid to signal) is never readable or plantable by another account.
+pub(crate) fn ensure_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+        bail!("{} is not a directory owned by this user", dir.display());
+    }
+    if meta.mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// A new file for `path`, mode `0600`, replacing whatever was there rather than writing through it.
+pub(crate) fn create_private_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("replacing {}", path.display())),
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
 }
 
 fn nest_path(dir: &str) -> Result<PathBuf> {
@@ -99,7 +137,7 @@ fn read_record(state: &Path) -> Option<Record> {
 
 /// What the pid in a record is now. A recycled pid running something else is not ours to stop.
 #[derive(Debug, PartialEq)]
-enum Identity {
+pub(crate) enum Identity {
     /// No such process, a zombie, another user's, or a later process given the same pid.
     Gone,
     /// The process started then, running the executable the record names.
@@ -109,7 +147,7 @@ enum Identity {
     Unconfirmed(String),
 }
 
-fn identify(pid: u32, exe: &Path, started: u64) -> Identity {
+pub(crate) fn identify(pid: u32, exe: &Path, started: u64) -> Identity {
     let Ok(pid_t) = libc::pid_t::try_from(pid) else {
         return Identity::Gone;
     };
@@ -133,7 +171,7 @@ fn identify(pid: u32, exe: &Path, started: u64) -> Identity {
 /// When the process started, in the kernel's own units, or `None` for a zombie: it has exited, and
 /// waits only for a parent that may never reap it.
 #[cfg(target_os = "linux")]
-fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+pub(crate) fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|e| format!("/proc/{pid}/stat could not be read: {e}"))?;
     // The command name may hold spaces and parentheses; the fields after its last `)` do not.
@@ -154,7 +192,7 @@ fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+pub(crate) fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: the buffer is a proc_bsdinfo, and its size is the size passed.
@@ -186,7 +224,7 @@ fn process_start(pid: libc::pid_t) -> std::result::Result<Option<u64>, String> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn process_start(_: libc::pid_t) -> std::result::Result<Option<u64>, String> {
+pub(crate) fn process_start(_: libc::pid_t) -> std::result::Result<Option<u64>, String> {
     Err("this platform gives no way to read when a process started".into())
 }
 
@@ -366,7 +404,7 @@ async fn first_rows(client: &reqwest::Client, url: &str) -> Option<Option<u64>> 
 pub async fn start(dir: &str, listen: &str, json: bool, wait_rows: Option<Duration>) -> Result<()> {
     let nest = nest_path(dir)?;
     let state = state_dir(&nest)?;
-    std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
+    ensure_private_dir(&state)?;
     let record_path = state.join(RECORD);
     if let Some(r) = read_record(&state) {
         if still_ours(&r, &record_path)? {
@@ -390,8 +428,7 @@ pub async fn start(dir: &str, listen: &str, json: bool, wait_rows: Option<Durati
         }
     }
     let log_path = state.join(LOG);
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating {}", log_path.display()))?;
+    let log = create_private_file(&log_path)?;
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     let mut skip_value = false;
     for a in std::env::args_os().skip(1) {

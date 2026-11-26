@@ -898,10 +898,15 @@ pub fn admin_required_token(
         return Ok(Some(token));
     }
     let token = crate::admin_token::load_or_create(dir)?;
-    tracing::info!(
-        "admin token in {}; open http://{listen}{ui}?token={token}",
-        crate::admin_token::path(dir).display()
-    );
+    // The URL carries the token, so it goes only to a person at a terminal, never to a log file.
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        tracing::info!(
+            "admin token in {}; open http://{listen}{ui}?token={token}",
+            crate::admin_token::path(dir).display()
+        );
+    } else {
+        tracing::info!("admin token in {}", crate::admin_token::path(dir).display());
+    }
     Ok(Some(token))
 }
 

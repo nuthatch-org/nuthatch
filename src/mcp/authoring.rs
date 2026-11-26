@@ -67,8 +67,10 @@ pub struct Authoring {
     exe: PathBuf,
     base: String,
     listen: String,
+    /// The per-user 0700 directory holding the log and the pidfile.
+    state: PathBuf,
     log: PathBuf,
-    /// The indexer's pid and nest, outside the nest (every file in it counts toward its NID), so a
+    /// The indexer's pid, nest, start time and executable, outside the nest (every file in it counts toward its NID), so a
     /// server started after this one dies can find and stop what it left running.
     pidfile: PathBuf,
     client: reqwest::Client,
@@ -80,21 +82,28 @@ impl Authoring {
     pub fn new(dir: PathBuf, base: &str) -> Result<Self> {
         let listen = loopback_listen(base)?;
         let exe = std::env::current_exe().context("finding this nuthatch binary")?;
-        Ok(Self::with_exe(dir, exe, base, listen))
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+        // The per-user 0700 state directory `dev --detach` uses, never the shared temp dir.
+        let nest = std::path::absolute(&dir).unwrap_or_else(|_| dir.clone());
+        let state = crate::detach::state_dir(&nest)
+            .context("--authoring keeps its log in $XDG_STATE_HOME or $HOME, and neither is set")?
+            .join("mcp");
+        Ok(Self::with_exe(dir, exe, base, listen, state))
     }
 
-    fn with_exe(dir: PathBuf, exe: PathBuf, base: &str, listen: String) -> Self {
-        let log = std::env::temp_dir().join(format!("nuthatch-mcp-{}-dev.log", std::process::id()));
+    fn with_exe(dir: PathBuf, exe: PathBuf, base: &str, listen: String, state: PathBuf) -> Self {
+        let log = state.join(format!("mcp-{}-dev.log", std::process::id()));
         let key: String = listen
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
-        let pidfile = std::env::temp_dir().join(format!("nuthatch-mcp-dev-{key}.pid"));
+        let pidfile = state.join(format!("mcp-dev-{key}.pid"));
         Authoring {
             dir,
             exe,
             base: base.trim_end_matches('/').to_string(),
             listen,
+            state,
             log,
             pidfile,
             client: reqwest::Client::builder()
@@ -225,20 +234,22 @@ impl Authoring {
             cmd.arg(format!("--backfill={n}"));
         }
         if let Some(rpc) = args["rpc"].as_str() {
-            cmd.arg(format!("--rpc={}", rpc_url(rpc)?));
+            // The URL may carry a key; argv is world-readable in /proc, the environment is not.
+            cmd.env("NUTHATCH_RPC", rpc_url(rpc)?);
         }
         if let Some(secs) = args["poll_interval"].as_u64() {
             cmd.arg(format!("--poll-interval={}", secs.max(1)));
         }
-        let log = std::fs::File::create(&self.log)
-            .with_context(|| format!("creating {}", self.log.display()))?;
+        crate::detach::ensure_private_dir(&self.state)?;
+        let log = crate::detach::create_private_file(&self.log)?;
         // stdout is this server's protocol channel, so the indexer must never write to it.
         cmd.stdin(std::process::Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
         let mut child = cmd.spawn().context("starting `nuthatch dev`")?;
-        if let Some(pid) = child.id() {
-            let _ = std::fs::write(&self.pidfile, format!("{pid}\n{}\n", self.dir.display()));
+        if let Err(e) = self.record(&child) {
+            let _ = child.kill().await;
+            return Err(e.context("recording the indexer's pid"));
         }
         let deadline = tokio::time::Instant::now() + SERVING_WAIT;
         loop {
@@ -358,14 +369,39 @@ impl Authoring {
         ))
     }
 
-    /// The pid recorded for this directory, if that process is still alive.
+    /// Records the child: pid, nest, start time and executable, in a fresh `0600` file.
+    fn record(&self, child: &tokio::process::Child) -> Result<()> {
+        use std::io::Write as _;
+        let Some(pid) = child.id() else { return Ok(()) };
+        let Ok(Some(started)) = crate::detach::process_start(pid as libc::pid_t) else {
+            bail!("the indexer's start time could not be read");
+        };
+        let mut f = crate::detach::create_private_file(&self.pidfile)?;
+        write!(
+            f,
+            "{pid}\n{}\n{started}\n{}\n",
+            self.dir.display(),
+            self.exe.display()
+        )?;
+        Ok(())
+    }
+
+    /// The pid recorded for this directory, if that process is still the indexer recorded: the
+    /// file is this user's alone, and the pid's start time and executable match what it names.
     fn left_running(&self) -> Option<u32> {
+        let meta = std::fs::symlink_metadata(&self.pidfile).ok()?;
+        // SAFETY: geteuid has no preconditions.
+        if !owned_privately(&meta, unsafe { libc::geteuid() }) {
+            return None;
+        }
         let recorded = std::fs::read_to_string(&self.pidfile).ok()?;
         let mut lines = recorded.lines();
         let pid: u32 = lines.next()?.trim().parse().ok()?;
         (lines.next()? == self.dir.display().to_string()).then_some(())?;
-        // SAFETY: signal 0 only asks whether the pid exists and may be signalled.
-        (unsafe { libc::kill(pid as libc::pid_t, 0) } == 0).then_some(pid)
+        let started: u64 = lines.next()?.trim().parse().ok()?;
+        let exe = PathBuf::from(lines.next()?);
+        (crate::detach::identify(pid, &exe, started) == crate::detach::Identity::Ours)
+            .then_some(pid)
     }
 
     async fn serving(&self) -> bool {
@@ -389,6 +425,13 @@ impl Drop for Authoring {
             }
         }
     }
+}
+
+/// Whether a pidfile is a plain file of `uid`'s that no one else can write: a file anyone else
+/// created or can edit may name any pid.
+fn owned_privately(meta: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.is_file() && meta.uid() == uid && meta.mode() & 0o022 == 0
 }
 
 /// `--name=value`, so a value beginning with `-` is never read as a flag.
@@ -491,6 +534,7 @@ mod tests {
             PathBuf::from("/nonexistent/nuthatch"),
             "http://127.0.0.1:1",
             "127.0.0.1:1".into(),
+            dir.path().join("state"),
         );
         let err = a.call("start_indexing", &json!({})).await.unwrap_err();
         assert!(err.to_string().contains("call `init_nest` first"), "{err}");
@@ -524,6 +568,7 @@ mod tests {
             PathBuf::from("/nonexistent/nuthatch"),
             "http://127.0.0.1:1",
             "127.0.0.1:1".into(),
+            dir.path().join("state"),
         );
         let err = a
             .call(
@@ -550,6 +595,8 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = orphan.id();
+        let sleep_exe = std::fs::canonicalize(format!("/proc/{pid}/exe")).unwrap();
+        let state = dir.path().join("state");
         let gone = std::sync::Arc::new(AtomicBool::new(false));
         let (tx, exited) = std::sync::mpsc::channel();
         {
@@ -567,10 +614,22 @@ mod tests {
                 PathBuf::from("/nonexistent/nuthatch"),
                 &format!("http://127.0.0.1:{port}"),
                 format!("127.0.0.1:{port}"),
+                state.clone(),
             )
         };
         let record = |a: &Authoring| {
-            std::fs::write(&a.pidfile, format!("{pid}\n{}\n", dir.path().display())).unwrap()
+            crate::detach::ensure_private_dir(&a.state).unwrap();
+            let started = crate::detach::process_start(pid as libc::pid_t)
+                .unwrap()
+                .unwrap();
+            write_pidfile(
+                &a.pidfile,
+                format!(
+                    "{pid}\n{}\n{started}\n{}\n",
+                    dir.path().display(),
+                    sleep_exe.display()
+                ),
+            )
         };
 
         // Nothing listens on a port freed at once, so the nest is not served.
@@ -619,5 +678,134 @@ mod tests {
             "the orphan was signalled, not left to finish"
         );
         assert!(!a.pidfile.exists());
+    }
+
+    /// Writes a pidfile as `record` does: `0600`, whatever the umask.
+    fn write_pidfile(path: &Path, body: String) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn at_port(dir: &Path, state: PathBuf, port: u16) -> Authoring {
+        Authoring::with_exe(
+            dir.to_path_buf(),
+            PathBuf::from("/nonexistent/nuthatch"),
+            &format!("http://127.0.0.1:{port}"),
+            format!("127.0.0.1:{port}"),
+            state,
+        )
+    }
+
+    /// A pidfile this user did not make, or can share the writing of, names no pid to signal; nor
+    /// does one whose pid is not the process it recorded.
+    #[tokio::test]
+    async fn a_planted_pidfile_aims_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = victim.id();
+        let mut victim = victim;
+        let a = at_port(dir.path(), dir.path().join("state"), 1);
+        crate::detach::ensure_private_dir(&a.state).unwrap();
+        let exe = std::fs::canonicalize(format!("/proc/{pid}/exe")).unwrap();
+        let started = crate::detach::process_start(pid as libc::pid_t)
+            .unwrap()
+            .unwrap();
+        let body = |started: u64| {
+            format!(
+                "{pid}\n{}\n{started}\n{}\n",
+                dir.path().display(),
+                exe.display()
+            )
+        };
+
+        // The old format, which a planter can write without knowing a start time.
+        write_pidfile(&a.pidfile, format!("{pid}\n{}\n", dir.path().display()));
+        assert_eq!(a.left_running(), None);
+        // A start time that is not the process's.
+        write_pidfile(&a.pidfile, body(started + 1));
+        assert_eq!(a.left_running(), None);
+        // Right on every count: recognised.
+        write_pidfile(&a.pidfile, body(started));
+        assert_eq!(a.left_running(), Some(pid));
+        // Writable by others: refused.
+        std::fs::set_permissions(&a.pidfile, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(a.left_running(), None);
+        // A symlink to a good file: refused.
+        std::fs::set_permissions(&a.pidfile, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let real = dir.path().join("real.pid");
+        std::fs::rename(&a.pidfile, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &a.pidfile).unwrap();
+        assert_eq!(a.left_running(), None);
+        // Another user's file, as far as this user can tell.
+        let meta = std::fs::symlink_metadata(&real).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        assert!(owned_privately(&meta, me));
+        assert!(!owned_privately(&meta, me + 1));
+
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    /// The log and pidfile are created `0600` in a `0700` directory, and replace what was there.
+    #[test]
+    fn the_log_and_pidfile_are_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("a").join("mcp");
+        crate::detach::ensure_private_dir(&state).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o700);
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::detach::ensure_private_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o700);
+
+        let planted = state.join("x.log");
+        std::fs::write(&planted, "planted").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(crate::detach::create_private_file(&planted).unwrap());
+        assert_eq!(mode(&planted), 0o600);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "");
+    }
+
+    /// A keyed RPC URL reaches the indexer in its environment, never in its argv.
+    #[tokio::test]
+    async fn the_rpc_url_goes_by_environment_not_argv() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nuthatch.toml"), "").unwrap();
+        let out = dir.path().join("seen");
+        let fake = dir.path().join("fake-nuthatch");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$NUTHATCH_RPC\" > {out}.env\nprintf '%s\\n' \"$@\" > {out}.argv\nexit 1\n",
+                out = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Authoring::with_exe(
+            dir.path().to_path_buf(),
+            fake,
+            "http://127.0.0.1:1",
+            "127.0.0.1:1".into(),
+            dir.path().join("state"),
+        );
+        let url = "https://rpc.example/v2/KEYVALUE";
+        let _ = a.call("start_indexing", &json!({ "rpc": url })).await;
+        let env = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+        let argv = std::fs::read_to_string(format!("{}.argv", out.display())).unwrap();
+        assert_eq!(env.trim(), url);
+        assert!(
+            !argv.contains("KEYVALUE") && !argv.contains("--rpc"),
+            "{argv}"
+        );
+        assert!(argv.contains("dev"), "{argv}");
     }
 }
