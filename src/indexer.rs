@@ -7503,6 +7503,7 @@ impl NestIngest {
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
+                            prog.note_window(blk, window);
                             prog.tick(blk, n);
                         },
                     )
@@ -7538,6 +7539,7 @@ impl NestIngest {
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
+                            prog.note_window(blk, window);
                             prog.tick(blk, n);
                         },
                     )

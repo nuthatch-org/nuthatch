@@ -26,7 +26,15 @@ pub struct Backfill {
     tty: bool,
     /// True once we've drawn at least one TTY line (so `finish` knows to clear it).
     drew_line: bool,
+    /// The narrow-window warning is given once per backfill (#3122).
+    window_warned: bool,
 }
+
+/// At or under this many blocks, a provider's learned `eth_getLogs` window is the reason a backfill
+/// crawls, and worth saying so (#3122).
+const NARROW_WINDOW: u64 = 20;
+/// Where the provider's block-range error is explained.
+const WINDOW_DOCS: &str = "https://nuthatch-indexer.com/docs/errors/exceed-maximum-block-range/";
 
 /// Redraw cadence on a TTY - fast enough to feel live, slow enough not to spend the backfill
 /// drawing.
@@ -49,7 +57,34 @@ impl Backfill {
             events: 0,
             tty: std::io::stderr().is_terminal(),
             drew_line: false,
+            window_warned: false,
         }
+    }
+
+    /// Warn once if the window the provider has taught us is tiny. `window` is the live window as
+    /// reported with each backfill step; it only shrinks this far when the endpoint refuses wider
+    /// ranges (or the contract is extremely dense), and either way the backfill will be slow.
+    /// Observational only: it changes nothing about how the window is learned.
+    pub fn note_window(&mut self, block_reached: u64, window: u64) {
+        if let Some(msg) = self.window_warning(block_reached, window) {
+            tracing::warn!("{msg}");
+        }
+    }
+
+    fn window_warning(&mut self, block_reached: u64, window: u64) -> Option<String> {
+        if self.window_warned || window > NARROW_WINDOW {
+            return None;
+        }
+        let eta = self.eta(block_reached);
+        if eta == "-" {
+            return None; // no rate yet: wait for the next step rather than guess
+        }
+        self.window_warned = true;
+        Some(format!(
+            "the RPC endpoint only allows getLogs windows of about {window} blocks, so this backfill \
+             is slow: roughly {eta} remaining. Use an endpoint with a wider eth_getLogs range \
+             (`nuthatch doctor` measures it). See {WINDOW_DOCS}"
+        ))
     }
 
     /// Record progress: the highest block now processed, and how many events that step added.
@@ -244,6 +279,27 @@ mod tests {
         let b = Backfill::new("backfilling", 0, 1000);
         // No blocks done yet → no rate → no estimate.
         assert_eq!(b.eta(0), "-");
+    }
+
+    #[test]
+    fn a_ten_block_window_warns_once_with_window_eta_and_docs() {
+        let mut b = Backfill::new("sealing history", 0, 1000);
+        b.start = Instant::now() - Duration::from_secs(10);
+        assert_eq!(b.window_warning(100, 21), None, "a wide window is quiet");
+        let msg = b
+            .window_warning(100, 10)
+            .expect("warns on a 10-block window");
+        assert!(msg.contains("10 blocks"), "{msg}");
+        assert!(msg.contains("remaining") && msg.contains("1m"), "{msg}"); // 900 blocks at 10/s = 90s
+        assert!(
+            msg.contains("docs/errors/exceed-maximum-block-range"),
+            "{msg}"
+        );
+        assert_eq!(
+            b.window_warning(200, 10),
+            None,
+            "only one warning per backfill"
+        );
     }
 
     #[test]
