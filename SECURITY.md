@@ -66,8 +66,7 @@ from the day it is designated**, on the same terms as above: a patch release fro
 
 | Line | Designated | Security fixes until | Status |
 |---|---|---|---|
-
-No line has been designated yet. The first is due in the first week of January 2027 (#3098).
+| 5.24 | 2026-11-26 | 2027-08-26 | Supported |
 
 What an operator on an LTS line can rely on:
 
