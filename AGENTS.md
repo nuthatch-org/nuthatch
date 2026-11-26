@@ -35,25 +35,23 @@ nuthatch init 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 --alias weth
 ## Run it headless
 
 `nuthatch dev` indexes and serves until it is stopped, so running it in the foreground blocks the
-shell, and querying straight after backgrounding it finds nothing answering yet. Start it in the
-background with its output in a log, wait until `/ready` puts it fewer than ten blocks behind the
-tip, then query. The log goes outside the nest: its identity counts every file in the directory.
+shell. `--detach` starts it in the background (log outside the nest, whose identity counts every file
+in the directory) and `--wait-rows` returns once `/ready` reports a row, so the query finds data.
+It exits non-zero if this `dev` died or the port was taken by something else (exit 10, `port_in_use`),
+so do not query after a failure.
 
 ```sh
-nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
+nuthatch dev --backfill 300 --detach --wait-rows
 nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 ```
 
 - `dev` serves on `127.0.0.1:8288` (`--listen` to change). `--backfill 300` starts 300 blocks behind
   the tip, which has rows within seconds; without it `dev` reads from the deployment block, which
   for WETH is 21 million blocks of history.
-- The loop gives up after five minutes. If it does, the log and `curl -s 127.0.0.1:8288/ready` say
-  why; `/ready` answers 503 while the nest is stalled.
-- Stop it with `pkill -f 'nuthatch dev'`.
-- `nuthatch dev --backfill 300 --detach` is the one-command form: it returns once `/ready` reports a
-  first poll (not ten blocks behind; the loop above still waits for that), prints where its log is,
-  outside the nest, and `nuthatch stop` stops it. Exit codes and `--json`: `docs/cli-errors.md`.
+- `--wait-timeout SECS` (default 300) bounds the wait; on timeout exit 11 (`rows_timeout`) leaves it
+  running and the printed log tail says why.
+- Stop it with `nuthatch stop`.
+- Exit codes and `--json`: `docs/cli-errors.md`.
 
 ## Query
 

@@ -87,6 +87,9 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         }
     }
     let hosts = crate::host_names::HostNames::declared(&args.local_host, &args.public_host)?;
+    // Before anything creates `nuthatch.redb`: a `dev` that cannot have its port must not leave an
+    // empty store behind for `nuthatch sql` to read as a nest (#3145).
+    ensure_listen_free(&args.listen)?;
     apply_dev_args(&mut config, &args);
     // Today: RPC polling. The indexer only sees `dyn Source`, so an ExEx tip source slots in here
     // with no change to anything downstream. An explicit `--rpc` replaces the runtime pool without
@@ -157,6 +160,19 @@ pub async fn dev(args: DevArgs) -> Result<()> {
         audit.abort();
     }
     result
+}
+
+/// Fail fast, before the store is created, when `listen` is taken. The real bind still happens in
+/// the serve path (and can still lose a race); this only keeps the common failure from leaving an
+/// empty `nuthatch.redb` behind. Other bind errors are left to that real bind to report.
+fn ensure_listen_free(listen: &str) -> Result<()> {
+    match std::net::TcpListener::bind(listen) {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(crate::cli_error::tag(
+            crate::cli_error::Code::PortInUse,
+            anyhow::anyhow!("cannot bind {listen}: Address already in use"),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// `dev`'s run-time settings, carried on `Config` because every layer below already takes `&Config`.

@@ -406,18 +406,19 @@ pub fn agents_md(chain: &str, contracts: &[(&str, &str)], schema: &[TableSchema]
          {tables}\n\
          ## Run it headless\n\
          \n\
-         `nuthatch dev` runs until it is stopped. Start it in the background with its log outside the\n\
-         nest, whose identity counts every file in it, then wait until `/ready` puts it fewer than ten\n\
-         blocks behind the tip:\n\
+         `nuthatch dev` runs until it is stopped. `--detach` starts it in the background, with its log\n\
+         outside the nest (whose identity counts every file in it), and `--wait-rows` returns only once\n\
+         `/ready` reports a row is indexed, so the `sql` below sees data:\n\
          \n\
          ```sh\n\
-         nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &\n\
-         for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '\"lag_blocks\": ?[0-9][,}}]' && break; sleep 2; done\n\
+         nuthatch dev --backfill 300 --detach --wait-rows\n\
          ```\n\
          \n\
-         `--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's\n\
-         start block. A nest that has already indexed ignores it. The log says why if it never gets\n\
-         there.\n\
+         It exits 0 only when this `dev` is serving with rows. Exit 10 (`port_in_use`) means another\n\
+         process holds the port and nothing was started: do not query then, you would read the other\n\
+         nest or an empty one. Exit 11 (`rows_timeout`) leaves it running; the log it prints says why.\n\
+         `nuthatch stop` stops it. `--backfill 300` starts 300 blocks behind the tip; without it `dev`\n\
+         reads from each contract's start block. A nest that has already indexed ignores it.\n\
          \n\
          ## Query\n\
          \n\
@@ -446,6 +447,24 @@ fn contract_list(contracts: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headless recipe must be the form that notices a dead or foreign `dev` (#3145): detached,
+    /// waiting for rows, and not the backgrounded `&` form that polls whatever answers `/ready`.
+    #[test]
+    fn the_headless_recipe_detaches_and_waits_for_rows() {
+        let md = agents_md(
+            "mainnet",
+            &[("weth", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")],
+            &[],
+        );
+        assert!(
+            md.contains("nuthatch dev --backfill 300 --detach --wait-rows\n"),
+            "{md}"
+        );
+        assert!(!md.contains("127.0.0.1:8288/ready"), "{md}");
+        assert!(!md.contains("2>&1 &"), "{md}");
+        assert!(md.contains("port_in_use"), "{md}");
+    }
 
     /// The store and the admin token are written beside the nest, so a `git add` of a fresh nest
     /// must leave both out (#2722).
