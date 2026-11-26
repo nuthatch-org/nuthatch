@@ -654,10 +654,9 @@ pub async fn process_window<E: WindowEntity>(
                 }
             };
             for b in &want {
-                let Some(r) = headers
-                    .get(b)
-                    .and_then(|h| block_row(*b, h, registry.timestamps(), registry.null_timestamps()))
-                else {
+                let Some(r) = headers.get(b).and_then(|h| {
+                    block_row(*b, h, registry.timestamps(), registry.null_timestamps())
+                }) else {
                     tracing::warn!(
                         "block {b} has no usable header - retrying window {next}..={to}"
                     );

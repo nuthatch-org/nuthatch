@@ -525,12 +525,7 @@ pub fn count_header_transactions(header: &mut Json) {
 /// none of the three, so: `log_index` is 0 (one row per block makes it unique by construction),
 /// `tx_hash` is the block's own hash, and `address` is empty. The alternative - reshaping the key for
 /// one table - would touch the storage layer this design exists to leave alone.
-pub fn block_row(
-    number: u64,
-    header: &Json,
-    timestamps: bool,
-    null: bool,
-) -> Option<DecodedRow> {
+pub fn block_row(number: u64, header: &Json, timestamps: bool, null: bool) -> Option<DecodedRow> {
     let hex = |k: &str| -> u64 {
         header
             .get(k)
@@ -2261,8 +2256,8 @@ mod tests {
             "l1BlockNumber": "0x18b23d3",
             "transactions": [],
         });
-        let row =
-            block_row(501_277_084, &arbitrum, true, false).expect("a header with a hash yields a row");
+        let row = block_row(501_277_084, &arbitrum, true, false)
+            .expect("a header with a hash yields a row");
         let l1 = row
             .params
             .iter()
