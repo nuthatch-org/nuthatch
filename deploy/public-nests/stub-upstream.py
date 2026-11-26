@@ -22,6 +22,10 @@ class Stub(BaseHTTPRequestHandler):
         if "COPY" in body or "DELETE" in body:
             status = 400
             out = {"error": "only SELECT/WITH queries are allowed on the read-only SQL surface"}
+        elif self.path.startswith("/mcp") and self.headers.get("origin"):
+            # What the real nest does with a non-local Origin on /mcp.
+            status = 403
+            out = {"error": "forbidden origin"}
         elif self.path.startswith("/mcp"):
             out = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
         else:

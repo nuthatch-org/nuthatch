@@ -64,6 +64,12 @@ expect "GET /sql?q=SELECT 1"         200 -G "$base/sql" --data-urlencode 'q=SELE
 expect "POST /sql"                   200 "${json[@]}" -d '{"q":"SELECT 1 AS one"}' "$base/sql"
 body_has "POST /mcp tools/list"      '"tools"' "${json[@]}" -H 'accept: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"
+# A browser page on another origin (#3155): the nest refuses a non-local Origin, so the proxy must not forward it.
+body_has "cross-origin POST /mcp tools/list" '"tools"' "${json[@]}" -H 'accept: application/json' \
+  -H 'origin: https://showcase.example' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"
+expect "cross-origin POST /mcp status" 200 "${json[@]}" -H 'origin: https://showcase.example' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp"
 
 echo "== refused: admin and operator surface"
 # Against the host itself nginx answers these, so they are held to its exact answers. Behind the path URL on
