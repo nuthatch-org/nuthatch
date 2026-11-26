@@ -9,8 +9,8 @@ SQL" without reading the message.
 | 0 | | Success. |
 | 1 | `error` | Anything not classified below. |
 | 2 | `usage` | The command line was refused: an unknown flag, a missing argument. |
-| 3 | `no_nest` | There is no nest in the directory: no `nuthatch.toml`, and for `sql` no store either. |
-| 4 | `nest_not_running` | The command needs a running nest, and nothing answered at its `--url`. |
+| 3 | `no_nest` | There is no nest in the directory: no `nuthatch.toml` or `mounts.toml`, and for `sql` no store either; `sql` and `diff` then never fall back to a running instance. |
+| 4 | `nest_not_running` | The command needs a running nest, and nothing answered at its `--url`, or what answered serves a different nest than the one in `--dir` (matched by `nid` or contract address). |
 | 5 | `sql_invalid` | The query was refused as written: an unknown table or column, a syntax error. |
 | 6 | `abi_not_found` | No ABI could be resolved for a contract. |
 | 7 | `chain_not_detected` | The contract has no code on any chain probed or on the chain named, or that chain is unknown. |

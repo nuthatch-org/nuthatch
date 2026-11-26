@@ -161,7 +161,15 @@ fn init_through_an_rpc_that_does_not_answer_is_rpc_refused() {
 /// A 400 from a running nest is the query's fault, and its hint is the next step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_query_the_nest_refuses_is_sql_invalid_with_its_hint_as_next() {
-    let app = axum::Router::new().route(
+    let dir = nest_dir();
+    // The instance must identify as this nest (#3144), or `sql` refuses before asking.
+    let nid = nuthatch::blob::nest_nid(dir.path()).unwrap();
+    let app = axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(move || async move { axum::Json(serde_json::json!({ "nid": nid })) }),
+        )
+        .route(
         "/sql",
         axum::routing::get(|| async {
             (
@@ -177,7 +185,6 @@ async fn a_query_the_nest_refuses_is_sql_invalid_with_its_hint_as_next() {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let dir = nest_dir();
     let path = dir.path().to_path_buf();
     let out = tokio::task::spawn_blocking(move || {
         run_in(

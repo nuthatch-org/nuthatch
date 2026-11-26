@@ -1062,6 +1062,53 @@ async fn resolve_mount_prefix(
     }
 }
 
+/// #3144: before the HTTP fallback answers for the nest in `dir`, confirm the instance at
+/// `{url}{prefix}/` serves *that* nest - its `nid`, or failing that its contract address - rather than
+/// another contract's data that happens to be on :8288. Only checked when `dir` holds a
+/// `nuthatch.toml`; a connection that fails is left for the query to report as `nest_not_running`.
+async fn confirm_served_nest(
+    client: &reqwest::Client,
+    url: &str,
+    prefix: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
+    let Ok(cfg) = config::Config::load(dir) else {
+        return Ok(());
+    };
+    let Ok(resp) = client.get(format!("{url}{prefix}/")).send().await else {
+        return Ok(());
+    };
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    let served_nid = body["nid"].as_str().unwrap_or("");
+    let served_addr = body["address"].as_str().unwrap_or("");
+    let mine: Vec<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.address.to_ascii_lowercase())
+        .collect();
+    let local_nid = nuthatch::blob::nest_nid(dir).ok();
+    let nid_match = !served_nid.is_empty() && local_nid.as_deref() == Some(served_nid);
+    let addr_match = !served_addr.is_empty() && mine.contains(&served_addr.to_ascii_lowercase());
+    if nid_match || addr_match {
+        return Ok(());
+    }
+    let describe = |nid: &str, addr: &str| match (nid.is_empty(), addr.is_empty()) {
+        (true, true) => "an unidentified nest".to_string(),
+        (false, true) => format!("nid {nid}"),
+        (true, false) => format!("address {addr}"),
+        (false, false) => format!("nid {nid}, address {addr}"),
+    };
+    Err(nuthatch::cli_error::tag(
+        Code::NestNotRunning,
+        anyhow::anyhow!(
+            "the nest in {} ({}) is not running at {url}{prefix}: what answers there is {}",
+            dir.display(),
+            describe(local_nid.as_deref().unwrap_or(""), &mine.join(",")),
+            describe(served_nid, served_addr),
+        ),
+    ))
+}
+
 impl SqlBackend {
     async fn open(dir: &str, url: &str) -> Result<Self> {
         let dir = std::path::PathBuf::from(dir);
@@ -1078,9 +1125,27 @@ impl SqlBackend {
         match store::Store::open_existing(&db) {
             Ok(store) => Ok(SqlBackend::Local { dir, store }),
             Err(_) => {
+                // #3144: no store, no `nuthatch.toml`, no `mounts.toml` is not a nest, and the HTTP
+                // fallback must not paper over that with whatever answers on :8288.
+                if !db.exists()
+                    && !dir.join(config::CONFIG_FILE).exists()
+                    && !dir.join(nuthatch::runtime::MOUNTS_FILE).exists()
+                {
+                    return Err(nuthatch::cli_error::tag(
+                        Code::NoNest,
+                        anyhow::anyhow!(
+                            "no nest in {}: no {}, no {} and no store, so there is nothing to \
+                             query (not falling back to {url})",
+                            dir.display(),
+                            config::CONFIG_FILE,
+                            nuthatch::runtime::MOUNTS_FILE,
+                        ),
+                    ));
+                }
                 let url = url.trim_end_matches('/').to_string();
                 let client = reqwest::Client::new();
                 let prefix = resolve_mount_prefix(&client, &url, &dir).await;
+                confirm_served_nest(&client, &url, &prefix, &dir).await?;
                 Ok(SqlBackend::Http {
                     url,
                     prefix,

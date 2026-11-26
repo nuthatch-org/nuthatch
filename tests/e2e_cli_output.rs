@@ -122,12 +122,15 @@ fn a_failed_sql_query_prints_the_hint_first_on_both_backends() {
             );
         }
     });
-    let empty = tempfile::tempdir().unwrap();
+    // A store held by another process, as `dev` holds it, sends the CLI to HTTP. An empty directory
+    // no longer does: it is `no_nest` (#3144).
+    let held_dir = tempfile::tempdir().unwrap();
+    let _held = nuthatch::store::Store::open(&held_dir.path().join("nuthatch.redb")).unwrap();
     let (code, _, err) = run(&[
         "sql",
         "SELECT * FROM transfer",
         "--dir",
-        empty.path().to_str().unwrap(),
+        held_dir.path().to_str().unwrap(),
         "--url",
         &url,
     ]);

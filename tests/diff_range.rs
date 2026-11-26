@@ -464,11 +464,14 @@ pub(crate) fn mcp_diff(port: u16, args: serde_json::Value) -> String {
 }
 
 pub(crate) fn cli_over_http(port: u16, args: &[&str]) -> String {
-    let empty = tempfile::tempdir().unwrap();
+    // A store held open, as `dev` holds it, sends the CLI to HTTP; an empty directory is `no_nest`
+    // and no longer falls back (#3144).
+    let held_dir = tempfile::tempdir().unwrap();
+    let _held = nuthatch::store::Store::open(&held_dir.path().join("nuthatch.redb")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_nuthatch"))
         .arg("diff")
         .arg("--dir")
-        .arg(empty.path())
+        .arg(held_dir.path())
         .args(["--url", &format!("http://127.0.0.1:{port}")])
         .args(args)
         .output()
