@@ -1727,6 +1727,9 @@ fn refuse_inapplicable(args: &InitArgs) -> Result<()> {
 /// clones/copies it and validates it: the toml parses at a supported schema version and the decode
 /// registry builds from the vendored ABIs. Publishing a nest is `git push`; consuming it is this.
 fn init_from(source: &str, target: &Path) -> Result<()> {
+    if source.starts_with('-') {
+        bail!("--from '{source}' starts with '-' and cannot be a git URL or a directory");
+    }
     if target.exists() && target.read_dir().map(|mut d| d.next().is_some())? {
         bail!(
             "target '{}' already exists and is not empty",
@@ -4180,6 +4183,19 @@ abi = "abis/tok.json"
                 !is_git_source(hostile),
                 "must not be treated as a git source: {hostile}"
             );
+        }
+    }
+
+    /// An option-shaped `--from` ending in `.git` passed `is_git_source` and was read by `git clone`
+    /// as an option. It is refused before git runs, and nothing is created.
+    #[test]
+    fn an_option_shaped_from_value_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        for hostile in ["--upload-pack=touch pwned;.git", "-c core.x=y.git", "-"] {
+            let target = tmp.path().join("out");
+            let err = init_from(hostile, &target).unwrap_err().to_string();
+            assert!(err.contains("starts with '-'"), "{hostile}: {err}");
+            assert!(!target.exists(), "{hostile} must not create the target");
         }
     }
 
