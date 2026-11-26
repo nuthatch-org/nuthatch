@@ -654,7 +654,7 @@ async fn run_diff(args: cli::DiffArgs) -> Result<()> {
             tables = match &local_config {
                 Some(cfg) => {
                     let reg = nuthatch::registry::from_nest(dir, cfg)?;
-                    indexer::full_schema(&reg, cfg)
+                    indexer::full_schema(&reg, indexer::call_registry(dir, cfg)?.as_ref(), cfg)
                 }
                 None => {
                     let raw =
@@ -1177,9 +1177,9 @@ impl SqlBackend {
                 let declared = config::Config::load(dir)
                     .ok()
                     .and_then(|cfg| {
-                        nuthatch::registry::from_nest(dir, &cfg)
-                            .ok()
-                            .map(|reg| nuthatch::indexer::full_schema(&reg, &cfg))
+                        let reg = nuthatch::registry::from_nest(dir, &cfg).ok()?;
+                        let calls = nuthatch::indexer::call_registry(dir, &cfg).ok()?;
+                        Some(nuthatch::indexer::full_schema(&reg, calls.as_ref(), &cfg))
                     })
                     .unwrap_or_default();
                 let sealed_through = store.sealed_through();

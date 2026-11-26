@@ -8079,7 +8079,7 @@ mod tests {
         let mut state = test_state(&dir, SQL_MAX_CONCURRENCY);
         let config = crate::config::Config::load(&dir).unwrap();
         let registry = crate::registry::from_nest(&dir, &config).unwrap();
-        state.tables = Arc::new(crate::indexer::full_schema(&registry, &config));
+        state.tables = Arc::new(crate::indexer::full_schema(&registry, None, &config));
         let app = router(SharedNest::new(state));
         println!(
             "SWEEP\tviews={}\tpermits={SQL_MAX_CONCURRENCY}\tseconds={secs}",
