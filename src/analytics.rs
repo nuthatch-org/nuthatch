@@ -1588,6 +1588,14 @@ fn timed_out(guard: Option<QueryGuard>, deadline: Option<Instant>) -> Option<u64
     }
 }
 
+const SHOW_TABLES_AS_SELECT: &str = "SELECT table_name FROM information_schema.tables";
+
+/// `show tables` and nothing else, past comments and a trailing `;`. `head` is lowercased.
+fn is_bare_show_tables(head: &str) -> bool {
+    let mut words = head.trim_end().trim_end_matches(';').split_whitespace();
+    words.next() == Some("show") && words.next() == Some("tables") && words.next().is_none()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attempt(
     dir: &Path,
@@ -1607,8 +1615,19 @@ fn attempt(
     // Check the first *statement keyword*, past any leading whitespace and SQL comments - a query
     // that opens with `-- note` or `/* … */` is still a SELECT. The engine gets the original text.
     let head = strip_leading_sql_comments(sql).to_ascii_lowercase();
+    // `SHOW TABLES` is the same question as the catalogue query below, so it is answered as that
+    // query and gets exactly its confinement. Nothing else after `SHOW TABLES` is accepted.
+    let sql = if is_bare_show_tables(&head) {
+        SHOW_TABLES_AS_SELECT
+    } else {
+        sql
+    };
+    let head = strip_leading_sql_comments(sql).to_ascii_lowercase();
     if !(head.starts_with("select") || head.starts_with("with")) {
-        bail!("only SELECT/WITH queries are allowed on the read-only SQL surface");
+        bail!(
+            "only SELECT/WITH queries are allowed on the read-only SQL surface \
+             (to list tables: SELECT table_name FROM information_schema.tables)"
+        );
     }
     // Before any walk. A long chain of operators overflows the planner, and the walk that names
     // tables recurses the same way. The engine repeats the bound when it plans.
@@ -7414,6 +7433,37 @@ template="pool"
         }
     }
 
+    #[test]
+    fn show_tables_is_matched_bare_and_the_other_refusals_name_the_catalogue() {
+        for yes in ["show tables", "show   tables ;", "show tables;\n"] {
+            assert!(is_bare_show_tables(yes), "{yes}");
+        }
+        for no in [
+            "show tables; select 1",
+            "show tables from x",
+            "show columns from t",
+            "show",
+            "showtables",
+            "select 1",
+        ] {
+            assert!(!is_bare_show_tables(no), "{no}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let e = query_hot_cold(
+            dir.path(),
+            "SHOW COLUMNS FROM t",
+            QueryGuard::default(),
+            &HotRows::new(),
+            0,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("information_schema.tables"),
+            "{e:#}"
+        );
+    }
+
     /// SEC-7: a CTE list is only a prefix. The statement after it must still be a query.
     ///
     /// The leading-keyword gate accepts `WITH`, and an earlier comment claimed the engine would not
@@ -10990,7 +11040,9 @@ mod confinement {
             "SELECT * FROM information_schema.df_settings".to_string(),
             "SELECT * FROM information_schema.schemata".to_string(),
             "SELECT * FROM pg_catalog.pg_tables".to_string(),
-            "SHOW TABLES".to_string(),
+            "SHOW TABLES; SELECT * FROM t__e".to_string(),
+            "SHOW TABLES FROM bbbb".to_string(),
+            "SHOW COLUMNS FROM t__e".to_string(),
             "EXPLAIN SELECT * FROM t__e".to_string(),
             // B's view by name: views are per dataset.
             "SELECT * FROM b_only".to_string(),
@@ -11014,6 +11066,8 @@ mod confinement {
             "SELECT * FROM t__e".to_string(),
             "SELECT * FROM v".to_string(),
             "SELECT * FROM information_schema.tables".to_string(),
+            "SHOW TABLES".to_string(),
+            "-- first\n show   tables ;".to_string(),
             "SELECT * FROM information_schema.columns".to_string(),
             "SELECT * FROM datafusion.information_schema.tables".to_string(),
             // A schema qualifier never reaches another dataset: every name resolves in A's session.
