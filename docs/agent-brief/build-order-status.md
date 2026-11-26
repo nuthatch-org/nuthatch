@@ -166,6 +166,18 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 > hardened SQL surface, with read replicas and upgrades without an outage as the last and largest
 > slices. FR8's isolation guarantee ships only after an independent review.
 >
+> **RFC-0073 by request, 2026-11-26 (#3093).** Built: FR1 (followers, beside the writer and on other
+> hosts), FR2, FR3, FR4 (per-nest metrics and the `Nuthatch-Cost` report), FR5, FR6, FR9 (including a
+> runtime booting with no chain and no mount), FR10, FR11, FR12, FR13, FR14, FR16. Gated by CI: FR7 (the
+> `rolling-upgrade` job) and FR15 (the versitygw registry job). **Open: FR8.** `isolation = "strict"`
+> is built and tested, including `/metrics` isolation by route, but the independent review has not run
+> and the guarantee is **not claimed** anywhere. Also open inside built rows: FR7's restart time on
+> real nests (only small nests are measured) and FR1's run on two real hosts. The full table is
+> [RFC-0073 §8](../../docs/rfcs/0073-the-shared-runtime.md#8-status-by-request-2026-11-26-read-at-originmain-39188462);
+> the operator's procedure is [docs/partner-hosting-runbook.md](../../docs/partner-hosting-runbook.md).
+> Nuthatch does no billing, accounts or identity for a partner's customers: per-tenant metrics and the
+> cost header are the operator's input to the partner's own metering.
+>
 > **RFC-0077 is accepted, and this line is the record RFC-0044 §8 asks for.** Chief accepted
 > [RFC-0077](../../docs/rfcs/0077-the-embeddable-engine.md) (the embeddable engine) on 2026-10-30, from
 > Chris's "it's pure rust and can(?) be embedded as a wasm blob". Chief's rule binds every slice:
