@@ -65,7 +65,7 @@ template = "pool"
         );
     }
     std::fs::write(dir.join("nuthatch.toml"), toml).unwrap();
-    nuthatch::project::regen_artifacts(&dir).expect("regen nest artifacts");
+    nuthatch::project::regen_artifacts(dir).expect("regen nest artifacts");
 }
 
 fn select_sql(sql: &str) -> String {
