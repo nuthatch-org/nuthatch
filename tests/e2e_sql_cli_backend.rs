@@ -94,35 +94,124 @@ async fn run_sql(dir: &Path, url: &str, query: &str) -> (std::process::ExitStatu
     .unwrap()
 }
 
-/// **Absent → HTTP, and no store left behind.** The reported defect, both halves.
-///
-/// The directory has no nest in it, which is what `--dir .` means whenever the command is run one
-/// level up from the nest - the ordinary way to meet this.
+/// **No nest here → `no_nest`, not :8288's answer** (#3144, superseding the #413 fallback for a
+/// directory with nothing in it). `--dir .` one level up from a nest used to fall through to whatever
+/// instance answered, with exit 0 and another contract's rows. Exit 3 is `no_nest`
+/// (`docs/cli-errors.md`); the instance must not be asked, and no store may be created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn no_local_store_asks_the_running_instance_and_creates_nothing() {
+async fn an_empty_directory_is_no_nest_and_never_asks_the_running_instance() {
     let instance = serving_instance().await;
     let empty = tempfile::tempdir().unwrap();
 
     let (status, output) = run_sql(empty.path(), &instance.url, "SELECT 1 AS n").await;
 
+    assert_eq!(status.code(), Some(3), "no_nest is exit 3, got:\n{output}");
     assert!(
-        status.success(),
-        "the fallback must answer, not merely be chosen, got:\n{output}"
-    );
-    assert!(
-        output.contains(MARKER),
-        "with no store here the answer must come from the running instance, got:\n{output}"
+        !output.contains(MARKER),
+        "the foreign instance's rows must not be printed, got:\n{output}"
     );
     assert_eq!(
         instance.hits.load(Ordering::SeqCst),
-        1,
-        "and the instance must actually have been asked"
+        0,
+        "the instance must not have been asked"
     );
     assert!(
         !empty.path().join("nuthatch.redb").exists(),
-        "probing for a store must not create one - it left {:?} behind",
-        empty.path().join("nuthatch.redb")
+        "probing for a store must not create one"
     );
+}
+
+/// A stand-in that serves another contract's nest: `GET /` names it, `/sql` would answer with MARKER.
+async fn foreign_instance(nid: &str, address: &str) -> Instance {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let summary = json!({ "name": "nuthatch", "nid": nid, "address": address });
+    let app = Router::new()
+        .route("/", get(move || async move { Json(summary) }))
+        .route(
+            "/sql",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({ "rows": [{ "who": MARKER }], "truncated": false }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Instance { url, hits }
+}
+
+/// **A nest whose store is not there, with another nest on the port → `nest_not_running`** (#3144).
+/// Both nests are named, the foreign rows are not printed, and `/sql` is never asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_foreign_nest_on_the_port_is_nest_not_running_naming_both() {
+    let other = "0x00000000000000000000000000000000000f00d5";
+    let instance = foreign_instance(&"ab".repeat(32), other).await;
+    let nest = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "nest_not_running is exit 4:\n{output}"
+    );
+    assert!(
+        output.contains(other),
+        "must name the foreign nest:\n{output}"
+    );
+    assert!(
+        output.to_lowercase().contains(&USDC.to_lowercase()),
+        "must name this nest:\n{output}"
+    );
+    assert!(!output.contains(MARKER), "foreign rows leaked:\n{output}");
+    assert_eq!(instance.hits.load(Ordering::SeqCst), 0);
+}
+
+/// A present but unloadable `nuthatch.toml` must not fail open onto a foreign instance (#3144).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_config_does_not_answer_from_a_foreign_nest() {
+    let other = "0x00000000000000000000000000000000000f00d5";
+    let instance = foreign_instance(&"ab".repeat(32), other).await;
+    let nest = tempfile::tempdir().unwrap();
+    std::fs::write(
+        nest.path().join("nuthatch.toml"),
+        "this is not a nest config\n",
+    )
+    .unwrap();
+
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+
+    assert!(
+        !status.success(),
+        "a malformed config must not answer, got:\n{output}"
+    );
+    assert!(!output.contains(MARKER), "foreign rows leaked:\n{output}");
+    assert_eq!(
+        instance.hits.load(Ordering::SeqCst),
+        0,
+        "the instance must not have been asked /sql"
+    );
+}
+
+/// The same instance answering as *this* nest (matched by contract address) is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_serving_this_nest_still_answers() {
+    let instance =
+        foreign_instance(&"ab".repeat(32), &USDC.to_uppercase().replace("0X", "0x")).await;
+    let nest = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+
+    assert!(status.success(), "{output}");
+    assert!(output.contains(MARKER), "{output}");
 }
 
 /// **Present and free → local.** Without this the fix is indistinguishable from "always use HTTP",
@@ -193,7 +282,10 @@ async fn a_store_held_by_another_process_falls_back_to_the_instance() {
 /// slow, without needing to race a listener's shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_local_store_and_no_instance_names_both_in_the_error() {
+    // A nest directory (it has a `nuthatch.toml`) whose store is missing; `--dir` with nothing at all
+    // is `no_nest` before any connection is tried (#3144).
     let empty = tempfile::tempdir().unwrap();
+    scaffold_nest(empty.path(), "usdc", USDC);
 
     let (status, output) = run_sql(empty.path(), "http://127.0.0.1:1", "SELECT 1 AS n").await;
 
