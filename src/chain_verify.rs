@@ -15,7 +15,9 @@
 //! transactions, and its receipts.
 
 use crate::address_discovery::Rpc;
-use crate::address_partitions::{op_stack, served_body, served_header, Body, Broken};
+use crate::address_partitions::{
+    nonstandard_tx_chain, op_stack, served_body, served_header, Body, Broken,
+};
 use crate::registry::{DecodedRow, TableSchema};
 use crate::sealed_audit::{canonical, Auditor};
 use alloy_primitives::{keccak256, Bloom, B256};
@@ -328,6 +330,13 @@ fn supported(chain_id: u64) -> Result<()> {
         "audit chain does not support OP-stack chains (chain {chain_id}) yet: their blocks hold \
          deposit transactions (type 0x7e), which the transactions root cannot be rebuilt from here"
     );
+    if let Some((name, ty)) = nonstandard_tx_chain(chain_id) {
+        anyhow::bail!(
+            "audit chain does not support {name} (chain {chain_id}): its blocks hold transactions \
+             of a type Ethereum does not have (such as {ty}), which the transactions root cannot \
+             be rebuilt from here"
+        );
+    }
     Ok(())
 }
 
@@ -681,6 +690,78 @@ mod tests {
             assert!(e.contains("0x7e") && e.contains("OP-stack"), "{e}");
         }
         assert!(supported(1).is_ok());
+    }
+
+    /// Append Bor's state-sync pseudo-transaction and its receipt to block 2, which the header's
+    /// roots (and so its hash) do not commit to.
+    fn with_state_sync(chain: &mut [Made]) {
+        let hash = B256::repeat_byte(0x5c);
+        let zero = Address::ZERO;
+        chain[1].block["transactions"].as_array_mut().unwrap().push(
+            json!({"type": "0x0", "hash": hash, "nonce": "0x0", "from": zero, "to": zero,
+                "gas": "0x0", "gasPrice": "0x0", "value": "0x0", "input": "0x",
+                "v": "0x0", "r": "0x0", "s": "0x0", "blockNumber": "0x2",
+                "transactionIndex": "0x1"}),
+        );
+        chain[1].receipts.as_array_mut().unwrap().push(
+            json!({"type": "0x0", "status": "0x1", "cumulativeGasUsed": "0x7530", "logs": [],
+                "logsBloom": Bloom::default(), "transactionHash": hash, "transactionIndex": "0x1",
+                "blockNumber": "0x2", "gasUsed": "0x0", "effectiveGasPrice": "0x0",
+                "from": zero, "to": zero, "contractAddress": null}),
+        );
+    }
+
+    /// #3141: a Polygon block ending in a state-sync pseudo-transaction is clean, and its real logs
+    /// are still compared; off Polygon the same block is not.
+    #[tokio::test]
+    async fn a_polygon_state_sync_block_is_clean_and_its_logs_are_compared() {
+        for (amount, want) in [(5, vec![]), (6, vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let mut chain = chain(&auditor);
+            with_state_sync(&mut chain);
+            seal(dir.path(), &auditor, &chain, Some(amount));
+            let r = verify_range(dir.path(), &auditor, &rpc(chain.clone()), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+            auditor.chain_id = 5;
+            let r = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3).await;
+            assert!(
+                r.is_err() || fields(r.as_ref().unwrap()).contains(&(2, "transactions_root")),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// #3141: Arbitrum and its like are refused by name, and a block holding a type no Ethereum
+    /// envelope has is an error naming the type rather than an unparsable body.
+    #[tokio::test]
+    async fn arbitrum_is_refused_by_name_and_an_unknown_tx_type_is_named() {
+        for id in [42161, 42170, 421614, 324] {
+            let e = supported(id).unwrap_err().to_string();
+            assert!(
+                e.contains("does not support") && !e.contains("OP-stack"),
+                "{e}"
+            );
+        }
+        assert!(supported(42161)
+            .unwrap_err()
+            .to_string()
+            .contains("Arbitrum"));
+        assert!(supported(137).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+        let mut chain = chain(&auditor);
+        chain[1].block["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "0x6a", "hash": B256::repeat_byte(1)}));
+        let e = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("0x6a"), "{e:#}");
     }
 
     /// A header whose hash and roots hold, and whose logs bloom the receipts' logs do not make.
