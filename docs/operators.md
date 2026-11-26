@@ -1669,8 +1669,8 @@ nothing is added to the request path. With it, every call to `/sql`, `/explain`,
   guess it.
 - **Tamper evidence:** each record's `prev` is the SHA-256 of the line before it, and the chain runs
   across files. `nuthatch audit verify DIR` fails by name on a deleted, edited or reordered record, and
-  on a deleted prefix (a log that starts past seq 1 without a `pruned` record that accounts for
-  exactly the missing records), and prints the head (`<seq>:<hash>`). No chain can show that its own tail was cut or rewritten, so keep
+  on a deleted prefix (a log that starts past seq 1 without a `pruned` record that covers at
+  least the missing records), and prints the head (`<seq>:<hash>`). No chain can show that its own tail was cut or rewritten, so keep
   the head somewhere this host cannot write, then pass it back with `verify --head`.
 - **fsync:** `--audit-log-fsync batch` (the default) has one writer thread that fsyncs after each batch
   it drains, and a response does not wait for it. A crash can lose the records queued or written

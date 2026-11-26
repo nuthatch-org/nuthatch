@@ -1029,8 +1029,11 @@ pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
     }
     let head = head.context("the audit log holds no records")?;
     // Only the writer's own retention may remove the oldest records, and it records that on the
-    // chain. A start past seq 1 that no `pruned` record accounts for is a deleted prefix.
-    if first_seq != 1 && pruned_through + 1 != first_seq {
+    // chain. A start past seq 1 that no `pruned` record covers is a deleted prefix. The marker
+    // may cover more than the visible prefix: prune writes through_seq for every file it
+    // intends to drop, then deletes them one by one, so a crash partway through leaves a valid
+    // chain whose first seq is still below that marker.
+    if first_seq != 1 && pruned_through + 1 < first_seq {
         bail!(
             "the log starts at seq {first_seq} but nothing on the chain accounts for records 1..={}: \
              its oldest records were deleted",
@@ -1563,6 +1566,37 @@ mod tests {
         let all = files(tmp.path()).unwrap();
         std::fs::remove_file(&all[0].1).unwrap();
         assert!(verify(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn a_crash_partway_through_retention_still_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 0);
+        let all = files(tmp.path()).unwrap();
+        assert!(
+            all.len() >= 3,
+            "need several files so a mid-loop crash is visible"
+        );
+        let through = all[all.len() - 1].0 - 1;
+        let mut chain = Chain::open(&Settings {
+            rotate_bytes: 64 << 20,
+            keep_files: 0,
+            ..settings(tmp.path())
+        })
+        .unwrap();
+        let seq = chain.seq + 1;
+        let head = chain.head.clone();
+        let mut r = Record::bare(seq, &head, "pruned");
+        r.through_seq = Some(through);
+        let line = serde_json::to_vec(&r).unwrap();
+        chain.append(&line).unwrap();
+        chain.sync().unwrap();
+        // prune would now delete every file but the last. A crash after the first removal
+        // leaves a start below the marker, which must still verify.
+        std::fs::remove_file(&all[0].1).unwrap();
+        verify(tmp.path(), None).unwrap();
+        std::fs::remove_file(&all[1].1).unwrap();
+        verify(tmp.path(), None).unwrap();
     }
 
     #[test]
