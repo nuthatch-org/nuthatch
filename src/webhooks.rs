@@ -449,6 +449,31 @@ fn deliver_sealed_bounded(
     Ok(enqueued)
 }
 
+/// A `where` must be exactly one SQL expression: text that closes the parenthesis it is placed in
+/// (`1=1) OR (1=1`) or runs on past it is refused, not run as a looser query.
+fn one_expression(p: &str) -> Result<()> {
+    use sqlparser::tokenizer::Token;
+    let dialect = sqlparser::dialect::DuckDbDialect {};
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, p)
+        .tokenize()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut depth = 0u32;
+    for t in &tokens {
+        match t {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("it closes a parenthesis it did not open"))?;
+            }
+            Token::SemiColon => anyhow::bail!("it holds a second statement"),
+            _ => {}
+        }
+    }
+    anyhow::ensure!(depth == 0, "it leaves a parenthesis open");
+    Ok(())
+}
+
 /// One slice's rows, `(lo, hi]` from `offset`, as a request from the seated mount, or with the
 /// default guard outside a seat, and never past `left`.
 fn slice(
@@ -459,14 +484,17 @@ fn slice(
     limit: u64,
     left: std::time::Duration,
 ) -> Result<Vec<serde_json::Value>> {
-    let predicate = w
-        .where_clause
-        .as_deref()
-        .map(|p| format!(" AND ({p}\n)"))
-        .unwrap_or_default();
-    // The newline ends a `--` in `where` before the bounds, so a comment cannot drop them.
+    // The bounds sit in an inner query and `where` only in the outer one, so no `where` text can
+    // lift them: at worst it widens its own filter over rows already inside `(lo, hi]`.
+    let predicate = match w.where_clause.as_deref() {
+        Some(p) => {
+            one_expression(p)?;
+            format!(" WHERE ({p}\n)")
+        }
+        None => String::new(),
+    };
     let sql = format!(
-        "SELECT * FROM {} WHERE block_number > {lo} AND block_number <= {hi}{predicate} \
+        "SELECT * FROM (SELECT * FROM {} WHERE block_number > {lo} AND block_number <= {hi}){predicate} \
          ORDER BY block_number, log_index LIMIT {limit} OFFSET {offset}",
         quoted(&w.table),
     );
@@ -738,8 +766,11 @@ pub fn refuse_unbound(
             );
         }
         if let Some(p) = &w.where_clause {
+            if let Err(e) = one_expression(p) {
+                anyhow::bail!("webhook '{}': `where = \"{p}\"` is refused: {e:#}", w.name);
+            }
             let sql = format!(
-                "SELECT * FROM {} WHERE block_number > 0 AND ({p}\n) ORDER BY block_number, log_index",
+                "SELECT * FROM (SELECT * FROM {} WHERE block_number > 0) WHERE ({p}\n) ORDER BY block_number, log_index",
                 quoted(&w.table)
             );
             if let Err(e) = plan(&sql) {
@@ -1036,6 +1067,33 @@ mod tests {
             refuse_unbound(dir.path(), &declared, &[commented], false).is_err(),
             "a `where` that comments out the statement's bounds is refused"
         );
+    }
+
+    /// #3132: a `where` that closes its own parenthesis cannot lift the delivery query's bounds.
+    #[test]
+    fn a_where_cannot_lift_the_delivery_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let declared = transfer_schema("t__transfer");
+        for bad in ["1=1) OR (1=1", "1=1)", "1=1) OR (1=1) --", "1=1; SELECT 1"] {
+            let mut w = wh("w", "t__transfer", "genesis");
+            w.where_clause = Some(bad.into());
+            assert!(
+                refuse_unbound(dir.path(), &declared, &[w.clone()], false).is_err(),
+                "load refuses {bad:?}"
+            );
+            // Even if load were skipped, the slice itself refuses and returns no rows.
+            let rows: Vec<String> = (10..=14).map(|b| transfer(b, 0)).collect();
+            crate::seal::seal_range(dir.path(), &rows, 10, 14).unwrap();
+            let got = slice(
+                dir.path(),
+                &w,
+                None,
+                (11, 12, 0),
+                100,
+                std::time::Duration::from_secs(30),
+            );
+            assert!(got.is_err(), "slice refuses {bad:?}: {got:?}");
+        }
     }
 
     /// A `where` the SQL screen cannot parse is refused at load with the parser's message; one in
