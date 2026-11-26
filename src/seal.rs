@@ -167,6 +167,23 @@ pub fn seal_range_with_snapshot(
     nuthatch_core::seal::seal_range(&mut sink, entity_json, from, to, registry_snapshot)
 }
 
+/// [`seal_range_with_snapshot`] for the end of a seal-direct backfill: the segment is provisional
+/// whatever its size, so the next cut folds it in (#3139).
+pub fn seal_tail_with_snapshot(
+    dir: &Path,
+    entity_json: &[String],
+    from: u64,
+    to: u64,
+    registry_snapshot: Option<&str>,
+) -> Result<Option<SealSummary>> {
+    let mut sink = FsSink {
+        dir,
+        publishing: Vec::new(),
+        folded_away: Vec::new(),
+    };
+    nuthatch_core::seal::seal_range_tail(&mut sink, entity_json, from, to, registry_snapshot)
+}
+
 /// Opens an [`FsSink`] over the nest at `dir` for each seal.
 pub struct FsSinks<'a>(pub &'a Path);
 
