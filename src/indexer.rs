@@ -4842,6 +4842,7 @@ impl Default for DirectExtras<'_> {
 
 impl DirectExtras<'_> {
     /// Top-level calls and resolved documents for `from..=to`, merged into `rows` in canonical order.
+    #[allow(clippy::too_many_arguments)]
     async fn extend(
         &self,
         source: &dyn Source,
@@ -4850,6 +4851,7 @@ impl DirectExtras<'_> {
         from: u64,
         to: u64,
         timestamps: bool,
+        null_timestamps: bool,
     ) -> Result<()> {
         if let Some(creg) = self.call_registry {
             rows.extend(
@@ -4860,6 +4862,7 @@ impl DirectExtras<'_> {
                     from,
                     to,
                     timestamps,
+                    null_timestamps,
                     call_body_concurrency(),
                 )
                 .await?,
@@ -4902,6 +4905,7 @@ impl DirectExtras<'_> {
 ///
 /// Bounded by the nest's own contracts before decode, so a busy chain costs this nest nothing it did
 /// not ask for.
+#[allow(clippy::too_many_arguments)]
 async fn decode_top_level_calls(
     source: &dyn Source,
     creg: &crate::calldata::CallRegistry,
@@ -4909,11 +4913,22 @@ async fn decode_top_level_calls(
     from: u64,
     to: u64,
     timestamps: bool,
+    null_timestamps: bool,
     fanout: usize,
 ) -> Result<Vec<crate::registry::DecodedRow>> {
-    decode_top_level_calls_upto(source, creg, addresses, from, to, timestamps, fanout, None)
-        .await
-        .map(|(rows, _)| rows)
+    decode_top_level_calls_upto(
+        source,
+        creg,
+        addresses,
+        from,
+        to,
+        timestamps,
+        null_timestamps,
+        fanout,
+        None,
+    )
+    .await
+    .map(|(rows, _)| rows)
 }
 
 /// [`decode_top_level_calls`], each body batch retried at most `attempts` times when that is set,
@@ -4926,6 +4941,7 @@ async fn decode_top_level_calls_upto(
     from: u64,
     to: u64,
     timestamps: bool,
+    null_timestamps: bool,
     fanout: usize,
     attempts: Option<usize>,
 ) -> Result<(
@@ -4954,7 +4970,15 @@ async fn decode_top_level_calls_upto(
         for batch in batches {
             bodies.extend(batch?);
         }
-        decode_bodies(creg, addresses, chunk, &bodies, timestamps, &mut call_rows)?;
+        decode_bodies(
+            creg,
+            addresses,
+            chunk,
+            &bodies,
+            timestamps,
+            null_timestamps,
+            &mut call_rows,
+        )?;
         hashes.extend(bodies.iter().map(|(b, body)| {
             let h = body
                 .get("hash")
@@ -5055,6 +5079,7 @@ fn decode_bodies(
     want: &[u64],
     bodies: &std::collections::HashMap<u64, serde_json::Value>,
     timestamps: bool,
+    null_timestamps: bool,
     call_rows: &mut Vec<crate::registry::DecodedRow>,
 ) -> Result<()> {
     for b in want {
@@ -5071,11 +5096,15 @@ fn decode_bodies(
             .to_string();
         // The body already carries the header, so the timestamp comes from it rather than from a
         // second fetch - and it covers blocks that emitted no matching log at all, which is most.
-        let ts = body
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0);
+        // A null-mode nest stores no stamp, whatever the body carries (#3153).
+        let ts = if null_timestamps {
+            crate::registry::UNKNOWN_TIMESTAMP
+        } else {
+            body.get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(0)
+        };
         let txs = body.get("transactions").and_then(|t| t.as_array());
         for tx in txs.into_iter().flatten() {
             // `to` is absent for a contract creation, which is not a call to anything we index.
@@ -6464,6 +6493,7 @@ pub async fn backfill_direct_pipelined_with(
                 fetch_from,
                 w_to,
                 registry.timestamps(),
+                registry.null_timestamps(),
             )
             .await?;
         if !l1_rows.is_empty() {
@@ -7017,6 +7047,7 @@ pub async fn backfill_direct_factory_with(
                 fetch_from,
                 chunk_to,
                 registry.timestamps(),
+                registry.null_timestamps(),
             )
             .await?;
         if !l1_rows.is_empty() {
@@ -8007,6 +8038,7 @@ impl nuthatch_core::extra::ExtraRows for NodeRows<'_> {
             next,
             to,
             self.registry.timestamps(),
+            self.registry.null_timestamps(),
             call_body_concurrency(),
             Some(TIP_RETRY_ATTEMPTS),
         )
@@ -9699,6 +9731,7 @@ mod tests {
             &[10],
             &std::collections::HashMap::new(),
             false,
+            false,
             &mut Vec::new(),
         )
         .unwrap_err()
@@ -9710,7 +9743,7 @@ mod tests {
             10,
             serde_json::json!({"hash": "0xabc", "timestamp": "0x1", "transactions": []}),
         );
-        decode_bodies(&creg, &[], &[10], &bodies, false, &mut Vec::new()).unwrap();
+        decode_bodies(&creg, &[], &[10], &bodies, false, false, &mut Vec::new()).unwrap();
     }
 
     // ---------------------------------------------------------------------------------------
@@ -19343,7 +19376,7 @@ template = "pool"
             posts: PostSource(vec![(3, qos_post(&cid)), (19_876, qos_post(&cid))]),
             widest: std::sync::atomic::AtomicUsize::new(0),
         };
-        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true, 4)
+        let rows = decode_top_level_calls(&source, &creg, &[], 0, 19_999, true, false, 4)
             .await
             .unwrap();
         assert_eq!(
@@ -19447,7 +19480,7 @@ template = "pool"
                 now: std::sync::atomic::AtomicUsize::new(0),
                 peak: std::sync::atomic::AtomicUsize::new(0),
             };
-            let rows = decode_top_level_calls(&source, &creg, &[], 0, 399, true, fanout)
+            let rows = decode_top_level_calls(&source, &creg, &[], 0, 399, true, false, fanout)
                 .await
                 .unwrap();
             assert_eq!(
@@ -19495,7 +19528,7 @@ template = "pool"
         let config = Config::load(dir.path()).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
         let task = tokio::spawn(async move {
-            decode_top_level_calls(&Never, &creg, &[], 0, 399, true, 4).await
+            decode_top_level_calls(&Never, &creg, &[], 0, 399, true, false, 4).await
         });
         tokio::task::yield_now().await;
         task.abort();
@@ -19722,7 +19755,7 @@ template = "pool"
             let tables = full_schema(&registry, Some(&creg), &config);
             let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
             let source = PostSource(vec![(4, qos_post(&cid))]);
-            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
+            let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, false, 4)
                 .await
                 .unwrap();
 
@@ -19911,7 +19944,7 @@ template = "pool"
         let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
-        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
+        let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, false, 4)
             .await
             .unwrap();
 
@@ -20181,7 +20214,7 @@ template = "pool"
             };
             let mut rows = Vec::new();
             extras
-                .extend(&source, &[], &mut rows, 4, 4, true)
+                .extend(&source, &[], &mut rows, 4, 4, true, false)
                 .await
                 .unwrap();
         }
@@ -23813,6 +23846,138 @@ template="pool"
             .iter()
             .all(|r| r.timestamp() == Some(r.block_number * 1000)));
         assert_ne!(null_a, eager);
+    }
+
+    /// #3153: `block_timestamps = "null"` promises every row's stamp is null, and top-level call rows
+    /// took the block body's real one. A recognised call and an unrecognised selector (which lands in
+    /// `calls_raw`) are both posted, so both call tables are checked.
+    fn null_timestamp_call_nest() -> tempfile::TempDir {
+        let dir = qos_topic_nest("t");
+        let path = dir.path().join(crate::config::CONFIG_FILE);
+        let cfg = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            cfg.replacen(
+                "[nest]\n",
+                "[nest]\nschema_version = 2\nblock_timestamps = \"null\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn null_timestamp_call_posts() -> Vec<(u64, String)> {
+        vec![
+            (4, qos_post(&crate::cid::cid_v0_for(b"one post"))),
+            (4, "0xdeadbeef".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn seal_direct_call_rows_are_null_stamped_in_a_null_nest() {
+        let dir = null_timestamp_call_nest();
+        let config = Config::load(dir.path()).unwrap();
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        assert!(registry.null_timestamps(), "premise: the nest is null");
+        let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
+        let _tables = full_schema(&registry, Some(&creg), &config);
+        let source = PostSource(null_timestamp_call_posts());
+        backfill_direct_pipelined_with(
+            &source,
+            &registry,
+            dir.path(),
+            &[],
+            &[],
+            &[],
+            None,
+            100,
+            0,
+            10,
+            1_000,
+            SPAN_REAL,
+            1,
+            DirectExtras {
+                call_registry: Some(&creg),
+                ipfs: None,
+                gateways: &[],
+                metrics: None,
+                ipfs_policy: crate::ipfs_resolve::Policy::seal_direct(),
+                store: None,
+                window_ceiling: None,
+                threshold: None,
+            },
+            |_| Ok(()),
+            |_, _, _| {},
+        )
+        .await
+        .unwrap();
+        // `calls_raw`'s `selector` is a kind `read_table_rows` cannot read back, so the stamp column is
+        // read straight from the segment.
+        for table in ["data_edge__call_submit_qo_s_payload", "calls_raw"] {
+            let prefix = format!("{table}-");
+            let segments: Vec<_> = std::fs::read_dir(crate::seal::segments_dir(dir.path()))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    let name = p.file_name().unwrap().to_string_lossy();
+                    name.starts_with(&prefix) && name.ends_with(".parquet")
+                })
+                .collect();
+            assert_eq!(segments.len(), 1, "{table} must be sealed");
+            let bytes = std::fs::read(&segments[0]).unwrap();
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes::Bytes::from(bytes),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            let mut seen = 0;
+            for batch in reader {
+                let batch = batch.unwrap();
+                let col = batch
+                    .column_by_name("block_timestamp")
+                    .unwrap_or_else(|| panic!("{table} has no block_timestamp column"));
+                assert_eq!(col.null_count(), col.len(), "{table} stored a stamp");
+                seen += col.len();
+            }
+            assert_eq!(seen, 1, "{table} must hold its call");
+        }
+    }
+
+    #[tokio::test]
+    async fn tip_call_rows_are_null_stamped_in_a_null_nest() {
+        let dir = null_timestamp_call_nest();
+        let (mut nest, state, source) = qos_nest_with(
+            dir.path(),
+            "http://127.0.0.1:1/ipfs/".into(),
+            null_timestamp_call_posts(),
+        )
+        .await;
+        nest.process_window(source.as_ref(), &[], 4, 4, 10_000)
+            .await
+            .unwrap()
+            .expect("the window must commit");
+        drop(nest);
+        drop(state);
+        let store: Arc<dyn crate::store::HotStore> =
+            Arc::new(Store::open(&dir.path().join(DB_FILE)).unwrap());
+        let rows: Vec<serde_json::Value> = store
+            .entities_in_range(4, 4)
+            .unwrap()
+            .iter()
+            .map(|e| serde_json::from_str::<serde_json::Value>(e).unwrap())
+            .filter(|v| {
+                v["table"] == "calls_raw" || v["table"] == "data_edge__call_submit_qo_s_payload"
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "both calls are stored: {rows:?}");
+        for r in &rows {
+            assert!(
+                r["block_timestamp"].is_null(),
+                "a null nest stored a call stamp: {r}"
+            );
+        }
     }
 
     /// #3065: the null nest's rows must not depend on a stamp the endpoint volunteers. Here the logs
