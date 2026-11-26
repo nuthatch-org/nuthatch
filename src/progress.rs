@@ -61,9 +61,9 @@ impl Backfill {
         }
     }
 
-    /// Warn once if the window the provider has taught us is tiny. `window` is the live window as
-    /// reported with each backfill step; it only shrinks this far when the endpoint refuses wider
-    /// ranges (or the contract is extremely dense), and either way the backfill will be slow.
+    /// Warn once if the window the provider has taught us is tiny. `window` must be the chunker's
+    /// `ceiling()`, not its live `window()`: only a refusal lowers the ceiling, whereas a dense
+    /// contract shrinks the live window and the endpoint is not at fault (#3165).
     /// Observational only: it changes nothing about how the window is learned.
     pub fn note_window(&mut self, block_reached: u64, window: u64) {
         if let Some(msg) = self.window_warning(block_reached, window) {
@@ -300,6 +300,37 @@ mod tests {
             None,
             "only one warning per backfill"
         );
+    }
+
+    #[test]
+    fn a_busy_contract_shrink_does_not_blame_the_endpoint() {
+        use crate::chunker::AdaptiveWindow;
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        for _ in 0..6 {
+            w.observed(1_000_000);
+        }
+        assert!(
+            w.window() <= NARROW_WINDOW,
+            "setup: window is {}",
+            w.window()
+        );
+        let mut b = Backfill::new("backfilling", 0, 1000);
+        b.start = Instant::now() - Duration::from_secs(10);
+        assert_eq!(b.window_warning(100, w.ceiling()), None);
+        assert!(!b.window_warned);
+    }
+
+    #[test]
+    fn a_refusal_driven_ceiling_drop_still_blames_the_endpoint() {
+        use crate::chunker::AdaptiveWindow;
+        let mut w = AdaptiveWindow::new(1_000, 2_000, 1, 100_000);
+        w.served_by_splitting(10);
+        let mut b = Backfill::new("backfilling", 0, 1000);
+        b.start = Instant::now() - Duration::from_secs(10);
+        let msg = b
+            .window_warning(100, w.ceiling())
+            .expect("a refused ceiling of 10 warns");
+        assert!(msg.contains("10 blocks"), "{msg}");
     }
 
     #[test]
