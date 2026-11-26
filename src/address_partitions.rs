@@ -140,6 +140,41 @@ pub fn op_stack(chain_id: u64) -> bool {
     matches!(chain_id, 10 | 8453)
 }
 
+/// Polygon PoS (Bor) chains by id: mainnet and Amoy. Their blocks may end in a state-sync
+/// pseudo-transaction that the header's transactions and receipts roots do not commit to.
+pub fn polygon(chain_id: u64) -> bool {
+    matches!(chain_id, 137 | 80002)
+}
+
+/// A chain known by id whose blocks hold transaction types no Ethereum envelope decodes, with the
+/// name to refuse it by and the type that gives it away: Arbitrum's internal transactions (0x6a),
+/// zkSync Era's (0x71).
+pub fn nonstandard_tx_chain(chain_id: u64) -> Option<(&'static str, &'static str)> {
+    match chain_id {
+        42161 | 42170 | 421614 => Some(("Arbitrum", "0x6a")),
+        324 | 300 => Some(("zkSync Era", "0x71")),
+        _ => None,
+    }
+}
+
+/// Whether `tx`, a served transaction, is Bor's state-sync pseudo-transaction: sent from and to the
+/// zero address, with no gas and a zero signature.
+fn state_sync_tx(tx: &Value) -> bool {
+    let zero_addr = |k: &str| {
+        tx[k]
+            .as_str()
+            .and_then(|s| s.parse::<alloy_primitives::Address>().ok())
+            .is_some_and(|a| a.is_zero())
+    };
+    let zero_num = |k: &str| {
+        tx[k]
+            .as_str()
+            .and_then(|s| s.parse::<U256>().ok())
+            .is_some_and(|n| n.is_zero())
+    };
+    zero_addr("from") && zero_addr("to") && zero_num("gas") && zero_num("r") && zero_num("s")
+}
+
 /// The first Ethereum mainnet block whose receipts carry a `status` (EIP-658). Before it a receipt
 /// commits to a post-state `root`, which an endpoint may not serve.
 pub const BYZANTIUM_MAINNET: u64 = 4_370_000;
@@ -341,6 +376,9 @@ pub struct Body {
     /// The receipts could not be hashed to the header's receipts root: a pre-Byzantium block whose
     /// endpoint serves `status` where the chain committed to a post-state `root`. Not a forgery.
     pub receipts_unverified: bool,
+    /// Bor's state-sync pseudo-transaction receipts, by the hash the RPC served for the
+    /// transaction. In neither root, but their logs are real and sealed like any other.
+    pub state_sync: Vec<(B256, alloy_consensus::ReceiptEnvelope)>,
 }
 
 /// The transactions in `block`, the RPC's answer for the block `header` hashes to `hash` with full
@@ -373,9 +411,35 @@ pub async fn served_body(
     block: &Value,
 ) -> Result<Body> {
     let n = header.number;
-    let txs: Vec<alloy_rpc_types_eth::Transaction> =
-        serde_json::from_value(block["transactions"].clone())
-            .with_context(|| format!("block {n}'s transactions"))?;
+    let mut raw: Vec<Value> = serde_json::from_value(block["transactions"].clone())
+        .with_context(|| format!("block {n}'s transactions"))?;
+    for tx in &raw {
+        let ty = match tx["type"].as_str() {
+            Some(t) => u64::from_str_radix(t.trim_start_matches("0x"), 16).ok(),
+            None => Some(0),
+        };
+        if ty.is_none_or(|t| t > 4) {
+            let ty = tx["type"].as_str().unwrap_or("?");
+            bail!(
+                "block {n} holds a transaction of type {ty}, which is not an Ethereum transaction \
+                 type: audit chain cannot rebuild the transactions root of this chain"
+            );
+        }
+    }
+    // Bor's state-sync pseudo-transaction (and its receipt) is in what the RPC serves, and in
+    // neither root the header commits to: leave both out of the hashing, but keep the receipt.
+    let mut pseudo = Vec::new();
+    if polygon(chain_id) {
+        raw.retain(|tx| {
+            if !state_sync_tx(tx) {
+                return true;
+            }
+            pseudo.push(tx["hash"].clone());
+            false
+        });
+    }
+    let txs: Vec<alloy_rpc_types_eth::Transaction> = serde_json::from_value(Value::Array(raw))
+        .with_context(|| format!("block {n}'s transactions"))?;
     let txs: Vec<TxEnvelope> = txs.into_iter().map(|t| t.into_inner()).collect();
     let broken = |commitment| Broken {
         block: n,
@@ -390,6 +454,13 @@ pub async fn served_body(
             .with_context(|| format!("block {n}'s receipts"))?,
     )
     .with_context(|| format!("block {n}'s receipts"))?;
+    let (synced, receipts): (Vec<_>, Vec<_>) = receipts
+        .into_iter()
+        .partition(|r| pseudo.contains(&json!(r.transaction_hash)));
+    let state_sync = synced
+        .into_iter()
+        .map(|r| (r.transaction_hash, r.into_primitives_receipt().inner))
+        .collect();
     let receipts: Vec<_> = receipts
         .into_iter()
         .map(|r| r.into_primitives_receipt().inner)
@@ -416,6 +487,7 @@ pub async fn served_body(
         txs,
         receipts,
         receipts_unverified,
+        state_sync,
     })
 }
 

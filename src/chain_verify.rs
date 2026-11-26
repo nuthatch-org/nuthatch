@@ -15,7 +15,9 @@
 //! transactions, and its receipts.
 
 use crate::address_discovery::Rpc;
-use crate::address_partitions::{op_stack, served_body, served_header, Body, Broken};
+use crate::address_partitions::{
+    nonstandard_tx_chain, op_stack, served_body, served_header, Body, Broken,
+};
 use crate::registry::{DecodedRow, TableSchema};
 use crate::sealed_audit::{canonical, Auditor};
 use alloy_primitives::{keccak256, Bloom, B256};
@@ -118,7 +120,13 @@ fn tx_hash(tx: &alloy_consensus::TxEnvelope) -> B256 {
 fn decoded_logs(auditor: &Auditor, b: u64, hash: B256, body: &Body) -> BTreeMap<u64, String> {
     let mut out = BTreeMap::new();
     let mut index = 0u64;
-    for (tx, receipt) in body.txs.iter().zip(&body.receipts) {
+    let hashed = body.txs.iter().map(tx_hash);
+    let synced = body.state_sync.iter().map(|(h, _)| *h);
+    let receipts = body
+        .receipts
+        .iter()
+        .chain(body.state_sync.iter().map(|(_, r)| r));
+    for (tx_hash, receipt) in hashed.chain(synced).zip(receipts) {
         for log in receipt.logs() {
             let log = crate::rpc::Log {
                 address: format!("{:#x}", log.address),
@@ -126,7 +134,7 @@ fn decoded_logs(auditor: &Auditor, b: u64, hash: B256, body: &Body) -> BTreeMap<
                 data: format!("0x{}", hex::encode(&log.data.data)),
                 block_number: b,
                 block_hash: format!("{hash:#x}"),
-                tx_hash: format!("{:#x}", tx_hash(tx)),
+                tx_hash: format!("{tx_hash:#x}"),
                 log_index: index,
             };
             index += 1;
@@ -240,7 +248,8 @@ fn compare(
     // Rows from a body that does not hash to its header cannot be told apart from the truth.
     let Some(body) = body else { return };
     let mut bloom = Bloom::default();
-    for log in body.receipts.iter().flat_map(|r| r.logs()) {
+    let synced = body.state_sync.iter().map(|(_, r)| r);
+    for log in body.receipts.iter().chain(synced).flat_map(|r| r.logs()) {
         bloom.accrue_log(log);
     }
     if bloom != header.logs_bloom {
@@ -328,6 +337,13 @@ fn supported(chain_id: u64) -> Result<()> {
         "audit chain does not support OP-stack chains (chain {chain_id}) yet: their blocks hold \
          deposit transactions (type 0x7e), which the transactions root cannot be rebuilt from here"
     );
+    if let Some((name, ty)) = nonstandard_tx_chain(chain_id) {
+        anyhow::bail!(
+            "audit chain does not support {name} (chain {chain_id}): its blocks hold transactions \
+             of a type Ethereum does not have (such as {ty}), which the transactions root cannot \
+             be rebuilt from here"
+        );
+    }
     Ok(())
 }
 
@@ -681,6 +697,143 @@ mod tests {
             assert!(e.contains("0x7e") && e.contains("OP-stack"), "{e}");
         }
         assert!(supported(1).is_ok());
+    }
+
+    /// Append Bor's state-sync pseudo-transaction and its receipt to block 2, which the header's
+    /// roots (and so its hash) do not commit to.
+    fn with_state_sync(chain: &mut [Made]) {
+        let hash = B256::repeat_byte(0x5c);
+        let zero = Address::ZERO;
+        chain[1].block["transactions"].as_array_mut().unwrap().push(
+            json!({"type": "0x0", "hash": hash, "nonce": "0x0", "from": zero, "to": zero,
+                "gas": "0x0", "gasPrice": "0x0", "value": "0x0", "input": "0x",
+                "v": "0x0", "r": "0x0", "s": "0x0", "blockNumber": "0x2",
+                "transactionIndex": "0x1"}),
+        );
+        chain[1].receipts.as_array_mut().unwrap().push(
+            json!({"type": "0x0", "status": "0x1", "cumulativeGasUsed": "0x7530", "logs": [],
+                "logsBloom": Bloom::default(), "transactionHash": hash, "transactionIndex": "0x1",
+                "blockNumber": "0x2", "gasUsed": "0x0", "effectiveGasPrice": "0x0",
+                "from": zero, "to": zero, "contractAddress": null}),
+        );
+    }
+
+    /// Blocks 1..=3 as [`chain`], block 2's state-sync pseudo-receipt holding a transfer of 7 that
+    /// the header's logs bloom covers and its receipts root does not.
+    fn chain_with_state_sync_log(auditor: &Auditor) -> Vec<Made> {
+        let one = make(1, B256::repeat_byte(9), &[], 100, true);
+        let mut two = make(2, one.hash, &[transfer(auditor, 5)], 112, true);
+        let log = transfer(auditor, 7);
+        let mut header: Header = serde_json::from_value(two.block.clone()).unwrap();
+        header.logs_bloom.accrue_log(&log);
+        two.hash = header.hash_slow();
+        let txs = two.block["transactions"].clone();
+        two.block = serde_json::to_value(&header).unwrap();
+        two.block["hash"] = json!(two.hash);
+        two.block["transactions"] = txs;
+        two.block["uncles"] = json!([]);
+        let three = make(3, two.hash, &[], 124, true);
+        let mut chain = vec![one, two, three];
+        with_state_sync(&mut chain);
+        let hash = B256::repeat_byte(0x5c);
+        let mut bloom = Bloom::default();
+        bloom.accrue_log(&log);
+        let receipt = chain[1].receipts[1].as_object_mut().unwrap();
+        receipt["logs"] = json!([{"address": format!("{:#x}", log.address), "topics": log.topics(),
+            "data": format!("0x{}", hex::encode(&log.data.data)), "blockNumber": "0x2",
+            "transactionHash": hash, "transactionIndex": "0x1", "logIndex": "0x1",
+            "removed": false}]);
+        receipt["logsBloom"] = json!(bloom);
+        chain
+    }
+
+    /// A state-sync receipt's logs are in the logs bloom and are sealed by the nest, though the
+    /// receipts root leaves the receipt out: neither may be reported as a difference.
+    #[tokio::test]
+    async fn state_sync_receipt_logs_are_compared_not_dropped() {
+        let sync_hash = format!("{:#x}", B256::repeat_byte(0x5c));
+        for (sealed_sync, want) in [(true, vec![]), (false, vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let chain = chain_with_state_sync_log(&auditor);
+            let row = |amount, tx_hash: String, log_index| {
+                let log = crate::rpc::Log {
+                    address: USDC.into(),
+                    topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
+                    data: word(amount),
+                    block_number: 2,
+                    block_hash: format!("{:#x}", chain[1].hash),
+                    tx_hash,
+                    log_index,
+                };
+                let row = auditor.registry.decode(&log).unwrap().unwrap();
+                row.to_json().to_string()
+            };
+            let mut rows = vec![row(5, format!("{:#x}", chain[1].tx_hashes[0]), 0)];
+            if sealed_sync {
+                rows.push(row(7, sync_hash.clone(), 1));
+            }
+            crate::seal::test_set_table_floor(dir.path(), 0);
+            crate::seal::seal_range(dir.path(), &rows, 1, 3).unwrap();
+            let r = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+        }
+    }
+
+    /// #3141: a Polygon block ending in a state-sync pseudo-transaction is clean, and its real logs
+    /// are still compared; off Polygon the same block is not.
+    #[tokio::test]
+    async fn a_polygon_state_sync_block_is_clean_and_its_logs_are_compared() {
+        for (amount, want) in [(5, vec![]), (6, vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let mut chain = chain(&auditor);
+            with_state_sync(&mut chain);
+            seal(dir.path(), &auditor, &chain, Some(amount));
+            let r = verify_range(dir.path(), &auditor, &rpc(chain.clone()), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+            auditor.chain_id = 5;
+            let r = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3).await;
+            assert!(
+                r.is_err() || fields(r.as_ref().unwrap()).contains(&(2, "transactions_root")),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// #3141: Arbitrum and its like are refused by name, and a block holding a type no Ethereum
+    /// envelope has is an error naming the type rather than an unparsable body.
+    #[tokio::test]
+    async fn arbitrum_is_refused_by_name_and_an_unknown_tx_type_is_named() {
+        for id in [42161, 42170, 421614, 324] {
+            let e = supported(id).unwrap_err().to_string();
+            assert!(
+                e.contains("does not support") && !e.contains("OP-stack"),
+                "{e}"
+            );
+        }
+        assert!(supported(42161)
+            .unwrap_err()
+            .to_string()
+            .contains("Arbitrum"));
+        assert!(supported(137).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+        let mut chain = chain(&auditor);
+        chain[1].block["transactions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "0x6a", "hash": B256::repeat_byte(1)}));
+        let e = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("0x6a"), "{e:#}");
     }
 
     /// A header whose hash and roots hold, and whose logs bloom the receipts' logs do not make.
