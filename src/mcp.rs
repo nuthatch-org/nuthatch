@@ -1020,6 +1020,24 @@ fn query_tools(shape: &Shape) -> Vec<Value> {
     tools
 }
 
+/// A non-negative integer argument, sent either as a JSON integer or as a string of digits (LLM
+/// clients often quote numbers). Absent or null is `None`; anything else is refused, as `/sql` does,
+/// rather than dropped so the query silently answers from the tip.
+fn uint_arg(args: &Value, key: &str) -> Result<Option<u64>> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("`{key}` must be a non-negative integer, got {n}")),
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow!("`{key}` is too large: {s}")),
+        other => bail!("`{key}` must be a non-negative integer, got {other}"),
+    }
+}
+
 async fn call_tool(params: &Value, client: Link<'_>, base: &str) -> Result<String> {
     let name = params
         .get("name")
@@ -1052,10 +1070,10 @@ async fn call_tool(params: &Value, client: Link<'_>, base: &str) -> Result<Strin
                 .ok_or_else(|| anyhow!("`query` is required"))?;
             // Shape the result for a context window (RFC-0016 §4): a small default row cap and a
             // compact table + provenance stamp, instead of 50K rows of verbose JSON.
-            let limit = args["limit"].as_u64().unwrap_or(200).to_string();
+            let limit = uint_arg(&args, "limit")?.unwrap_or(200).to_string();
             let mut params = vec![("q", q.to_string()), ("max_rows", limit.clone())];
             for at in ["at_block", "at_time"] {
-                if let Some(v) = args[at].as_u64() {
+                if let Some(v) = uint_arg(&args, at)? {
                     params.push((at, v.to_string()));
                 }
             }
@@ -1749,6 +1767,58 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("larger than 1024 bytes"), "{err}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sql_refuses_a_malformed_at_block_at_time_or_limit() {
+        use axum::{extract::RawQuery, routing::get, Router};
+        let app = Router::new().route(
+            "/sql",
+            get(|RawQuery(q): RawQuery| async move {
+                format!(
+                    r#"{{"count":0,"truncated":false,"rows":[],"provenance":{{"as_of":42,"sealed_through":40,"source":"hot","registry_hash":"0x0"}},"echo":"{}"}}"#,
+                    q.unwrap_or_default()
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let run = |args: Value| {
+            let params = json!({ "name": "sql", "arguments": args });
+            let (client, base) = (client.clone(), base.clone());
+            async move { call_tool(&params, (&client).into(), &base).await }
+        };
+
+        for ok in [json!(1000), json!("1000")] {
+            let r = run(json!({ "query": "SELECT 1", "at_block": ok })).await;
+            assert!(r.is_ok(), "{ok}: {r:?}");
+        }
+        let r = run(
+            json!({ "query": "SELECT 1", "at_time": "1700000000", "limit": "5", "at_block": null }),
+        )
+        .await;
+        assert!(r.is_ok(), "{r:?}");
+
+        for key in ["at_block", "at_time", "limit"] {
+            for bad in [
+                json!(1000.0),
+                json!("1e3"),
+                json!(-5),
+                json!("-5"),
+                json!("abc"),
+                json!(""),
+                json!(true),
+            ] {
+                let r = run(json!({ "query": "SELECT 1", key: bad })).await;
+                let err = r.expect_err(&format!("{key}={bad} must be refused"));
+                assert!(err.to_string().contains(key), "{err}");
+            }
+        }
+        assert_eq!(uint_arg(&json!({"a": "1000"}), "a").unwrap(), Some(1000));
+        assert_eq!(uint_arg(&json!({}), "a").unwrap(), None);
         server.abort();
     }
 
