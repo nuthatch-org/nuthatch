@@ -5643,7 +5643,14 @@ pub async fn backfill_direct(
                 .map(|b| {
                     headers
                         .get(b)
-                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                        .and_then(|h| {
+                            crate::registry::block_row(
+                                *b,
+                                h,
+                                registry.timestamps(),
+                                registry.null_timestamps(),
+                            )
+                        })
                         .with_context(|| format!("block {b} has no usable header"))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -6520,7 +6527,14 @@ pub async fn backfill_direct_pipelined_with(
                 .map(|b| {
                     headers
                         .get(b)
-                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                        .and_then(|h| {
+                            crate::registry::block_row(
+                                *b,
+                                h,
+                                registry.timestamps(),
+                                registry.null_timestamps(),
+                            )
+                        })
                         .with_context(|| format!("block {b} has no usable header"))
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -23978,6 +23992,96 @@ template="pool"
                 "a null nest stored a call stamp: {r}"
             );
         }
+    /// `ResultCapSource` plus the headers a `[extract] blocks` nest asks for, each stamped `b * 1000`.
+    struct WithHeaders(ResultCapSource);
+
+    #[async_trait::async_trait]
+    impl Source for WithHeaders {
+        async fn tip(&self) -> Result<u64> {
+            self.0.tip().await
+        }
+        async fn block_hash(&self, n: u64) -> Result<Option<String>> {
+            self.0.block_hash(n).await
+        }
+        async fn logs(
+            &self,
+            filter: &crate::source::LogFilter,
+            from: u64,
+            to: u64,
+        ) -> Result<Vec<crate::rpc::Log>> {
+            self.0.logs(filter, from, to).await
+        }
+        async fn block_timestamps(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, u64>> {
+            self.0.block_timestamps(blocks).await
+        }
+        async fn block_headers(
+            &self,
+            blocks: &[u64],
+        ) -> Result<std::collections::HashMap<u64, serde_json::Value>> {
+            Ok(blocks
+                .iter()
+                .map(|&b| {
+                    let header = serde_json::json!({
+                        "hash": format!("0x{b:064x}"),
+                        "timestamp": format!("0x{:x}", b * 1000),
+                    });
+                    (b, header)
+                })
+                .collect())
+        }
+    }
+
+    /// #3173: a null nest promises null on every row, and the blocks table is a row like the rest.
+    #[tokio::test]
+    async fn a_null_nests_sealed_blocks_table_stores_null_and_an_eager_nests_does_not() {
+        let run = |null: bool| async move {
+            let (reg, addresses, topic0s) = usdc_transfers();
+            let reg = reg.with_blocks(true).with_null_timestamps(null);
+            let logs = (1u64..=20).map(|b| transfer_log(b, 0)).collect();
+            let source = WithHeaders(ResultCapSource::new(logs, usize::MAX));
+            let d = tempfile::tempdir().unwrap();
+            backfill_direct_pipelined(
+                &source,
+                &reg,
+                d.path(),
+                &addresses,
+                &topic0s,
+                &[],
+                None,
+                0,
+                0,
+                20,
+                50,
+                SPAN_OFF,
+                2,
+                |_| Ok(()),
+                |_, _, _| {},
+            )
+            .await
+            .unwrap();
+            let schema = reg
+                .schema()
+                .iter()
+                .find(|t| t.table == crate::registry::BLOCKS_TABLE)
+                .expect("blocks table")
+                .clone();
+            (seal::read_table_rows(d.path(), &schema).unwrap(), d)
+        };
+
+        let (rows, _d) = run(true).await;
+        assert_eq!(rows.len(), 21);
+        assert!(
+            rows.iter().all(|r| r.timestamp().is_none()),
+            "a null nest's block rows must not carry a wall-clock value"
+        );
+        let (rows, _d2) = run(false).await;
+        assert_eq!(rows.len(), 21);
+        assert!(rows
+            .iter()
+            .all(|r| r.timestamp() == Some(r.block_number * 1000)));
     }
 
     /// #3065: the null nest's rows must not depend on a stamp the endpoint volunteers. Here the logs

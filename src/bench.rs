@@ -1312,9 +1312,14 @@ async fn hot_store_backfill(
             let mut block_rows: Vec<_> = want
                 .iter()
                 .filter_map(|b| {
-                    headers
-                        .get(b)
-                        .and_then(|h| crate::registry::block_row(*b, h, registry.timestamps()))
+                    headers.get(b).and_then(|h| {
+                        crate::registry::block_row(
+                            *b,
+                            h,
+                            registry.timestamps(),
+                            registry.null_timestamps(),
+                        )
+                    })
                 })
                 .collect();
             block_rows.sort_by_key(|r| r.block_number);
