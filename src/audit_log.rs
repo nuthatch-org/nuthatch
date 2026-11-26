@@ -238,6 +238,9 @@ fn surface_of(path: &str) -> Option<&'static str> {
         s if s.contains(&"_admin") => Some("admin"),
         [.., "q", _] => Some("query"),
         [.., "sql"] => Some("sql"),
+        // `/explain` plans caller SQL over hot and sealed data; `/diff` reads every table.
+        [.., "explain"] => Some("explain"),
+        [.., "diff"] => Some("diff"),
         [.., "mcp"] => Some("mcp"),
         _ => None,
     }
@@ -406,7 +409,7 @@ async fn record(
         .map(|v| clip(&String::from_utf8_lossy(v.as_bytes())));
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
-    // `/sql` and `/mcp` say what they run through [`statement`] and [`mcp`]; the others are hashed
+    // `/sql`, `/explain` and `/mcp` say what they run through [`statement`] and [`mcp`]; the others are hashed
     // here: `/q`'s query string and body, an admin call's body only (its query string may carry the
     // admin token, and its body is hashed because a mount's RPC URL may carry a key).
     let (req, body) = match surface {
@@ -1514,6 +1517,9 @@ mod tests {
         assert_eq!(surface_of("/lodestar/sql"), Some("sql"));
         assert_eq!(surface_of("/lodestar/q/sql"), Some("query"));
         assert_eq!(surface_of("/mcp"), Some("mcp"));
+        assert_eq!(surface_of("/explain"), Some("explain"));
+        assert_eq!(surface_of("/lodestar/diff"), Some("diff"));
+        assert_eq!(surface_of("/_admin/nests/diff"), Some("admin"));
         assert_eq!(surface_of("/_admin/mounts/a"), Some("admin"));
         assert_eq!(surface_of("/a/_admin/requests"), Some("admin"));
         assert_eq!(surface_of("/table/sql_x"), None);

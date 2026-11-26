@@ -6327,6 +6327,7 @@ async fn explain_post(
 
 async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     use crate::metrics::METRICS;
+    crate::audit_log::statement(&q.q);
     // `/explain` gets the same treatment as `/sql`. It plans caller-supplied SQL, so leaving it open
     // on a bounded mount would leak the schema and the cost model of every table. Bounding the
     // surface closes that; the hot-row ceiling below closes the scan cost (#293).
@@ -10872,6 +10873,15 @@ mod tests {
             app.clone().oneshot(req).await.unwrap().status(),
             StatusCode::OK
         );
+        // `/explain` and `/diff` are recorded whatever they answer, a refusal included.
+        let req = axum::http::Request::get(format!("/{name}/explain?q={}", url_encode(sql)))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+        let req = axum::http::Request::get(format!("/{name}/diff?block=1"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
         let req = axum::http::Request::get(format!("/{name}/tables"))
             .body(axum::body::Body::empty())
             .unwrap();
@@ -10888,7 +10898,7 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records.len(), 4, "{records:?}");
         let hash = {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(sql.as_bytes()))
@@ -10902,6 +10912,11 @@ mod tests {
         }
         assert_eq!(records[0]["identity"], "team-a");
         assert_eq!(records[1]["tool"], "tools/call:sql");
+        assert_eq!(records[2]["surface"], "explain", "{}", records[2]);
+        assert_eq!(records[2]["nest"], name);
+        assert_eq!(records[2]["statement_sha256"], hash);
+        assert_eq!(records[3]["surface"], "diff", "{}", records[3]);
+        assert_eq!(records[3]["nest"], name);
         crate::audit_log::verify(logs.path(), None).unwrap();
     }
 

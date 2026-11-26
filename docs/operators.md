@@ -1639,7 +1639,7 @@ Three things worth knowing first:
 ### Call audit log (#3095)
 
 Off unless you start `dev` or `serve` with `--audit-log <DIR>`. Without it nothing is written and
-nothing is added to the request path. With it, every call to `/sql`, `/q/{name}`, the admin API
+nothing is added to the request path. With it, every call to `/sql`, `/explain`, `/diff`, `/q/{name}`, the admin API
 (`/_admin…`, a runtime's lifecycle routes included) and `/mcp` gets one JSON line in
 `DIR/audit-<first seq>.jsonl`. That includes calls that were refused: a `401`, a `403`, a `413`, a
 `503` busy. Monitoring routes and point reads are not recorded. Nothing leaves the host.
