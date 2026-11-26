@@ -4,6 +4,7 @@
 #
 #   test-proxy.sh                        against a stub that answers 200 to everything
 #   UPSTREAM=127.0.0.1:8120 test-proxy.sh   against a real nest already running there
+#   CONF=nginx-base-usdc.conf test-proxy.sh  the same checks against the hosted-nest template
 #
 # With the stub, every 403, 404 and 413 can only have come from the proxy. With a real nest it also
 # shows the nest's own answers pass through.
@@ -22,6 +23,8 @@ trap cleanup EXIT
 proxy_port=${PROXY_PORT:-18480}
 stub_port=${STUB_PORT:-18120}
 upstream=${UPSTREAM:-127.0.0.1:$stub_port}
+conf=${CONF:-nginx.conf}
+[ -f "$here/$conf" ] || { echo "no such config: $here/$conf" >&2; exit 2; }
 
 if [ -z "${UPSTREAM:-}" ]; then
   python3 -I "$here/stub-upstream.py" "$stub_port" &
@@ -30,12 +33,12 @@ fi
 
 # The lines marked TEST-* (and the /run/nuthatch-public paths) are the only ones this rewrites.
 mkdir -p "$work/run/tmp"
-sed -e "s#/run/nuthatch-public#$work/run#g" \
+sed -e "s#/run/nuthatch-public[-a-z0-9]*#$work/run#g" \
     -e "/TEST-LOG/s#.*#    access_log off;#" \
     -e "/TEST-ERRLOG/s#.*#error_log $work/error.log warn;#" \
     -e "/TEST-UPSTREAM/s#server [0-9.:]*;#server $upstream;#" \
     -e "/TEST-LISTEN/s#listen [0-9.:]*;#listen 127.0.0.1:$proxy_port;#" \
-    "$here/nginx.conf" > "$work/nginx.conf"
+    "$here/$conf" > "$work/nginx.conf"
 
 "$nginx_bin" -t -c "$work/nginx.conf" -e "$work/error.log" >"$work/t.out" 2>&1 \
   || { cat "$work/t.out"; exit 1; }
