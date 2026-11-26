@@ -1678,20 +1678,29 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         );
     }
 
-    if is_git_source(source) {
+    let fetched = if is_git_source(source) {
         say!("→ cloning nest from {source} …");
-        clone_repo(source, target)?;
+        let r = clone_repo(source, target);
+        // A clone keeps a committed link: refuse it while `.git/` is still the only thing skipped.
+        let r = r.and_then(|()| crate::blob::refuse_symlinks(target));
         // Drop the clone's history: a consumed nest is a plain working copy, not a live checkout.
         let _ = std::fs::remove_dir_all(target.join(".git"));
+        r
     } else {
         let src = PathBuf::from(source);
         if !src.is_dir() {
             bail!("--from '{source}' is neither a git URL nor an existing local directory");
         }
         say!("→ copying nest from {} …", src.display());
-        copy_dir_except(&src, target, &crate::blob::is_excluded)?;
+        crate::blob::refuse_symlinks(&src)
+            .and_then(|()| copy_dir_except(&src, target, &crate::blob::is_excluded))
+    };
+    if let Err(e) = fetched {
+        // Remove the half-made target (it was absent or empty on entry).
+        let _ = std::fs::remove_dir_all(target);
+        return Err(e);
     }
-    // A clone keeps a committed symlink, which `dev` would refuse (#2355): say so now.
+    // Belt and braces: the copy is itself link-free (#2355).
     crate::blob::collect_files(target, None)
         .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
 
@@ -1768,7 +1777,7 @@ fn source_basename(source: &str) -> String {
 /// Shallow-clone a nest repo into `target` using the system `git` (no in-process git dependency).
 fn clone_repo(url: &str, target: &Path) -> Result<()> {
     let status = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", url])
+        .args(["clone", "--depth", "1", "--", url])
         .arg(target)
         .status()
         .context("failed to run `git` - is it installed and on PATH?")?;
@@ -1789,12 +1798,10 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
-        if skip(&name) {
-            continue;
-        }
         let from = entry.path();
         let to = dst.join(&name);
         let file_type = entry.file_type()?;
+        // Before `skip`: a link named like derived state is refused, not silently left out.
         if file_type.is_symlink() {
             // Following a link would copy whatever it points at into the nest, possibly from outside
             // it (#2692). A nest is plain files, so a link is refused rather than dereferenced.
@@ -1802,6 +1809,9 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
                 "{} is a symbolic link; a nest cannot contain one",
                 from.display()
             );
+        }
+        if skip(&name) {
+            continue;
         }
         if file_type.is_dir() {
             copy_dir_except(&from, &to, skip)?;
@@ -3463,6 +3473,40 @@ mod tests {
             init_from(repo.to_str().unwrap(), &dir.path().join("out")).unwrap_err()
         );
         assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// A link named like derived state is refused by `init --from <dir>`; the half-made target is
+    /// removed and nothing is written through the link.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_refuses_a_link_named_like_derived_state() {
+        for name in ["segments", crate::config::DB_FILE] {
+            let src = tempfile::tempdir().unwrap();
+            copy_dir(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+                src.path(),
+            )
+            .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target_of_link = if name == "segments" {
+                outside.path().to_path_buf()
+            } else {
+                let f = outside.path().join("f");
+                std::fs::write(&f, b"outside").unwrap();
+                f
+            };
+            std::os::unix::fs::symlink(&target_of_link, src.path().join(name)).unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let target = out.path().join("copy");
+            let err = format!(
+                "{:#}",
+                init_from(src.path().to_str().unwrap(), &target).unwrap_err()
+            );
+            assert!(err.contains("symbolic link"), "{name}: {err}");
+            assert!(!target.exists(), "half-made target removed");
+            let n = std::fs::read_dir(outside.path()).unwrap().count();
+            assert!(n <= 1, "nothing written to the link target");
+        }
     }
 
     #[test]
