@@ -7796,13 +7796,12 @@ impl NestIngest {
                 Ok(logs) => {
                     chunker.served(to - next + 1);
                     chunker.observed(logs.len() as u64);
-                    let n = logs.len() as u64;
                     match self.process_window(source, &logs, next, to, tip).await {
-                        Ok(Some(_)) => {
+                        Ok(Some(stored)) => {
                             next = to + 1;
                             no_progress = 0;
                             if let Some(p) = progress.as_mut() {
-                                p.tick(to, n);
+                                p.tick(to, stored as u64);
                                 p.note_window(to, chunker.ceiling());
                             }
                         }
@@ -8520,18 +8519,17 @@ async fn index_loop(
             Ok(logs) => {
                 chunker.served(to - next + 1);
                 chunker.observed(logs.len() as u64);
-                let n = logs.len() as u64;
                 match nest
                     .process_window(source.as_ref(), &logs, next, to, tip)
                     .await
                 {
                     // Window processed and committed - advance the cursor past it.
-                    Ok(Some(_stored)) => {
+                    Ok(Some(stored)) => {
                         next = to + 1;
                         no_progress = 0;
                         reorg_gate.checked(tip, next);
                         if let Some(p) = progress.as_mut() {
-                            p.tick(to, n);
+                            p.tick(to, stored as u64);
                             p.note_window(to, chunker.ceiling());
                         }
                         // Caught up **as of the tip this iteration polled** (#1190). Judged here and
@@ -21824,6 +21822,41 @@ template="pool"
             .unwrap();
         assert_eq!(next, 30);
         assert_eq!(nest.store.entities_in_range(12, 29).unwrap().len(), 36);
+    }
+
+    /// #3143: the "caught up" line counts rows the windows committed, not logs fetched. Each window
+    /// refetches its two-block tail, so counting the fetch reported the same log again every window.
+    #[tokio::test]
+    async fn the_caught_up_line_counts_stored_rows_not_fetched_logs() {
+        let (lines, _guard) = Lines::capture();
+        let d = tempfile::tempdir().unwrap();
+        let mut nest =
+            build_test_nest(d.path(), "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").await;
+        // The range starts at 12, so the first window has no tail behind it to refetch.
+        nest.start_block = Some(12);
+        let cursor_at = || Some(30u64);
+        let wanted = || true;
+        let join = CatchUp {
+            cursor_at: &cursor_at,
+            wanted: &wanted,
+        };
+        nest.catch_up(&one_block_at_a_time(10..=40), 12, 1, &join)
+            .await
+            .unwrap();
+        let stored = nest.store.entities_in_range(12, 29).unwrap().len();
+        assert_eq!(stored, 36);
+        let line = lines
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.contains("caught up to tip"))
+            .cloned()
+            .expect("a caught-up line");
+        assert!(
+            line.contains(&format!(" - {stored} events in ")),
+            "over-reported against {stored} stored rows: {line}"
+        );
     }
 
     /// Refuses any range wider than `cap` blocks as over the result cap, counting each answer.
