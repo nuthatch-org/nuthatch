@@ -507,12 +507,18 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
             let id = id?;
             let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
             let name = params["name"].as_str().unwrap_or_default().to_string();
+            let mut is_error = false;
             let answer = match session.authoring {
                 Some(a) if authoring::is_tool(&name) => a.call(&name, &params["arguments"]).await,
                 // Offered only on an address-history nest, so accepted only there.
                 _ if wallet::is_tool(&name) => {
                     if fetch_shape(session).await.address_history {
-                        wallet::call(&name, &params["arguments"], client, base).await
+                        wallet::call(&name, &params["arguments"], client, base)
+                            .await
+                            .map(|(text, refused)| {
+                                is_error = refused;
+                                text
+                            })
                     } else {
                         Err(anyhow!("unknown tool `{name}`"))
                     }
@@ -520,6 +526,7 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
                 _ => call_tool(&params, client, base).await,
             };
             match answer {
+                Ok(text) if is_error => Some(ok(id, content(&text, true))),
                 Ok(text) => Some(ok(id, tool_result(&text, &name))),
                 Err(e) => {
                     let text = explain_bare_404(format!("{e:#}"), session).await;
@@ -3506,12 +3513,17 @@ mod tests {
                         }
                         "getblocknobytime" => json!({"status": "1", "message": "OK", "result": "200"}),
                         "tokennfttx" => json!({"status": "0", "message": "No transactions found", "result": []}),
+                        "txlist" | "tokentx" if !g("generation").is_empty() && g("generation") != "7" => {
+                            json!({"status": "0", "message": "NOTOK",
+                                "result": "NUTHATCH_INCOMPLETE: generation moved since page 1"})
+                        }
                         "txlist" => json!({"status": "1", "message": "OK", "generation": "7",
                             "result": [{"blockNumber": g("startblock"), "endBlock": g("endblock"),
+                                "seen_generation": g("generation"),
                                 "value": "1500000000000000000"}]}),
                         "tokentx" => json!({"status": "1", "message": "OK", "generation": "7",
                             "result": [
-                                {"value": "2500000", "tokenName": "USD Coin", "tokenSymbol": "USDC", "tokenDecimal": "6"},
+                                {"value": "2500000", "seen_generation": g("generation"), "tokenName": "USD Coin", "tokenSymbol": "USDC", "tokenDecimal": "6"},
                                 {"value": "42", "tokenName": "", "tokenSymbol": "", "tokenDecimal": "0"}]}),
                         _ => json!({"status": "0", "message": "NOTOK",
                             "result": "NUTHATCH_INCOMPLETE: txlistinternal for 0xabc is not indexed at block 100; pending"}),
@@ -3571,7 +3583,10 @@ mod tests {
             json!({"address": "0xabc", "from_time": 1_700_000_000u64, "to_time": 1_700_100_000u64}),
         )
         .await;
-        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(
+            r["result"]["isError"], true,
+            "a refused kind is an error result: {r}"
+        );
         let v: Value = serde_json::from_str(tool_text(&r)).unwrap();
         assert_eq!(
             (v["from_block"].clone(), v["to_block"].clone()),
@@ -3603,6 +3618,41 @@ mod tests {
         )
         .await;
         assert_eq!(r["result"]["isError"], true, "a window is required: {r}");
+
+        // Pages after the first carry page 1's generation on every kind's query; page 1 sends none.
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc", "from_block": 1, "to_block": 2, "kinds": ["normal", "token"], "page": 2, "generation": "7"}),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let v: Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(v["normal"]["rows"][0]["seen_generation"], "7", "{v}");
+        assert_eq!(v["token"]["rows"][0]["seen_generation"], "7", "{v}");
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc", "from_block": 1, "to_block": 2, "kinds": ["normal"], "generation": 7}),
+        )
+        .await;
+        let v: Value = serde_json::from_str(tool_text(&r)).unwrap();
+        assert_eq!(
+            v["normal"]["rows"][0]["seen_generation"], "",
+            "page 1 sends none: {v}"
+        );
+        // A moved generation is the nest's refusal, and so an error result.
+        let r = call_named(
+            &client,
+            &base,
+            "wallet_history",
+            json!({"address": "0xabc", "from_block": 1, "to_block": 2, "kinds": ["normal"], "page": 2, "generation": 6}),
+        )
+        .await;
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(tool_text(&r).contains("generation moved"), "{r}");
 
         // Etherscan's shape for a window with no rows is an empty answer, not a refusal.
         let r = call_named(
