@@ -1065,16 +1065,21 @@ async fn resolve_mount_prefix(
 /// #3144: before the HTTP fallback answers for the nest in `dir`, confirm the instance at
 /// `{url}{prefix}/` serves *that* nest - its `nid`, or failing that its contract address - rather than
 /// another contract's data that happens to be on :8288. Only checked when `dir` holds a
-/// `nuthatch.toml`; a connection that fails is left for the query to report as `nest_not_running`.
+/// `nuthatch.toml`. A present but unloadable config must not fail open. A connection that fails
+/// is left for the query to report as `nest_not_running`.
 async fn confirm_served_nest(
     client: &reqwest::Client,
     url: &str,
     prefix: &str,
     dir: &std::path::Path,
 ) -> Result<()> {
-    let Ok(cfg) = config::Config::load(dir) else {
+    // Skip the identity check only when there is no nuthatch.toml (a bare `data/<nid>`
+    // directory, or a mounts.toml root). A present but unloadable config used to return
+    // Ok and fall through to `/sql` on a foreign instance.
+    if !dir.join(config::CONFIG_FILE).exists() {
         return Ok(());
-    };
+    }
+    let cfg = config::Config::load(dir)?;
     let Ok(resp) = client.get(format!("{url}{prefix}/")).send().await else {
         return Ok(());
     };

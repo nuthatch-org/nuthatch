@@ -174,6 +174,32 @@ async fn a_foreign_nest_on_the_port_is_nest_not_running_naming_both() {
     assert_eq!(instance.hits.load(Ordering::SeqCst), 0);
 }
 
+/// A present but unloadable `nuthatch.toml` must not fail open onto a foreign instance (#3144).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_config_does_not_answer_from_a_foreign_nest() {
+    let other = "0x00000000000000000000000000000000000f00d5";
+    let instance = foreign_instance(&"ab".repeat(32), other).await;
+    let nest = tempfile::tempdir().unwrap();
+    std::fs::write(
+        nest.path().join("nuthatch.toml"),
+        "this is not a nest config\n",
+    )
+    .unwrap();
+
+    let (status, output) = run_sql(nest.path(), &instance.url, "SELECT 1 AS n").await;
+
+    assert!(
+        !status.success(),
+        "a malformed config must not answer, got:\n{output}"
+    );
+    assert!(!output.contains(MARKER), "foreign rows leaked:\n{output}");
+    assert_eq!(
+        instance.hits.load(Ordering::SeqCst),
+        0,
+        "the instance must not have been asked /sql"
+    );
+}
+
 /// The same instance answering as *this* nest (matched by contract address) is used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instance_serving_this_nest_still_answers() {
