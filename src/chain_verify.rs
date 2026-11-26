@@ -120,7 +120,13 @@ fn tx_hash(tx: &alloy_consensus::TxEnvelope) -> B256 {
 fn decoded_logs(auditor: &Auditor, b: u64, hash: B256, body: &Body) -> BTreeMap<u64, String> {
     let mut out = BTreeMap::new();
     let mut index = 0u64;
-    for (tx, receipt) in body.txs.iter().zip(&body.receipts) {
+    let hashed = body.txs.iter().map(tx_hash);
+    let synced = body.state_sync.iter().map(|(h, _)| *h);
+    let receipts = body
+        .receipts
+        .iter()
+        .chain(body.state_sync.iter().map(|(_, r)| r));
+    for (tx_hash, receipt) in hashed.chain(synced).zip(receipts) {
         for log in receipt.logs() {
             let log = crate::rpc::Log {
                 address: format!("{:#x}", log.address),
@@ -128,7 +134,7 @@ fn decoded_logs(auditor: &Auditor, b: u64, hash: B256, body: &Body) -> BTreeMap<
                 data: format!("0x{}", hex::encode(&log.data.data)),
                 block_number: b,
                 block_hash: format!("{hash:#x}"),
-                tx_hash: format!("{:#x}", tx_hash(tx)),
+                tx_hash: format!("{tx_hash:#x}"),
                 log_index: index,
             };
             index += 1;
@@ -242,7 +248,8 @@ fn compare(
     // Rows from a body that does not hash to its header cannot be told apart from the truth.
     let Some(body) = body else { return };
     let mut bloom = Bloom::default();
-    for log in body.receipts.iter().flat_map(|r| r.logs()) {
+    let synced = body.state_sync.iter().map(|(_, r)| r);
+    for log in body.receipts.iter().chain(synced).flat_map(|r| r.logs()) {
         bloom.accrue_log(log);
     }
     if bloom != header.logs_bloom {
@@ -709,6 +716,71 @@ mod tests {
                 "blockNumber": "0x2", "gasUsed": "0x0", "effectiveGasPrice": "0x0",
                 "from": zero, "to": zero, "contractAddress": null}),
         );
+    }
+
+    /// Blocks 1..=3 as [`chain`], block 2's state-sync pseudo-receipt holding a transfer of 7 that
+    /// the header's logs bloom covers and its receipts root does not.
+    fn chain_with_state_sync_log(auditor: &Auditor) -> Vec<Made> {
+        let one = make(1, B256::repeat_byte(9), &[], 100, true);
+        let mut two = make(2, one.hash, &[transfer(auditor, 5)], 112, true);
+        let log = transfer(auditor, 7);
+        let mut header: Header = serde_json::from_value(two.block.clone()).unwrap();
+        header.logs_bloom.accrue_log(&log);
+        two.hash = header.hash_slow();
+        let txs = two.block["transactions"].clone();
+        two.block = serde_json::to_value(&header).unwrap();
+        two.block["hash"] = json!(two.hash);
+        two.block["transactions"] = txs;
+        two.block["uncles"] = json!([]);
+        let three = make(3, two.hash, &[], 124, true);
+        let mut chain = vec![one, two, three];
+        with_state_sync(&mut chain);
+        let hash = B256::repeat_byte(0x5c);
+        let mut bloom = Bloom::default();
+        bloom.accrue_log(&log);
+        let receipt = chain[1].receipts[1].as_object_mut().unwrap();
+        receipt["logs"] = json!([{"address": format!("{:#x}", log.address), "topics": log.topics(),
+            "data": format!("0x{}", hex::encode(&log.data.data)), "blockNumber": "0x2",
+            "transactionHash": hash, "transactionIndex": "0x1", "logIndex": "0x1",
+            "removed": false}]);
+        receipt["logsBloom"] = json!(bloom);
+        chain
+    }
+
+    /// A state-sync receipt's logs are in the logs bloom and are sealed by the nest, though the
+    /// receipts root leaves the receipt out: neither may be reported as a difference.
+    #[tokio::test]
+    async fn state_sync_receipt_logs_are_compared_not_dropped() {
+        let sync_hash = format!("{:#x}", B256::repeat_byte(0x5c));
+        for (sealed_sync, want) in [(true, vec![]), (false, vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let chain = chain_with_state_sync_log(&auditor);
+            let row = |amount, tx_hash: String, log_index| {
+                let log = crate::rpc::Log {
+                    address: USDC.into(),
+                    topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
+                    data: word(amount),
+                    block_number: 2,
+                    block_hash: format!("{:#x}", chain[1].hash),
+                    tx_hash,
+                    log_index,
+                };
+                let row = auditor.registry.decode(&log).unwrap().unwrap();
+                row.to_json().to_string()
+            };
+            let mut rows = vec![row(5, format!("{:#x}", chain[1].tx_hashes[0]), 0)];
+            if sealed_sync {
+                rows.push(row(7, sync_hash.clone(), 1));
+            }
+            crate::seal::test_set_table_floor(dir.path(), 0);
+            crate::seal::seal_range(dir.path(), &rows, 1, 3).unwrap();
+            let r = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+        }
     }
 
     /// #3141: a Polygon block ending in a state-sync pseudo-transaction is clean, and its real logs

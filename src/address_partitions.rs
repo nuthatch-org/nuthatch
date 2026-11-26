@@ -376,6 +376,9 @@ pub struct Body {
     /// The receipts could not be hashed to the header's receipts root: a pre-Byzantium block whose
     /// endpoint serves `status` where the chain committed to a post-state `root`. Not a forgery.
     pub receipts_unverified: bool,
+    /// Bor's state-sync pseudo-transaction receipts, by the hash the RPC served for the
+    /// transaction. In neither root, but their logs are real and sealed like any other.
+    pub state_sync: Vec<(B256, alloy_consensus::ReceiptEnvelope)>,
 }
 
 /// The transactions in `block`, the RPC's answer for the block `header` hashes to `hash` with full
@@ -424,7 +427,7 @@ pub async fn served_body(
         }
     }
     // Bor's state-sync pseudo-transaction (and its receipt) is in what the RPC serves, and in
-    // neither root the header commits to: drop both before hashing.
+    // neither root the header commits to: leave both out of the hashing, but keep the receipt.
     let mut pseudo = Vec::new();
     if polygon(chain_id) {
         raw.retain(|tx| {
@@ -451,9 +454,15 @@ pub async fn served_body(
             .with_context(|| format!("block {n}'s receipts"))?,
     )
     .with_context(|| format!("block {n}'s receipts"))?;
+    let (synced, receipts): (Vec<_>, Vec<_>) = receipts
+        .into_iter()
+        .partition(|r| pseudo.contains(&json!(r.transaction_hash)));
+    let state_sync = synced
+        .into_iter()
+        .map(|r| (r.transaction_hash, r.into_primitives_receipt().inner))
+        .collect();
     let receipts: Vec<_> = receipts
         .into_iter()
-        .filter(|r| !pseudo.contains(&json!(r.transaction_hash)))
         .map(|r| r.into_primitives_receipt().inner)
         .collect();
     if receipts.len() != txs.len() {
@@ -478,6 +487,7 @@ pub async fn served_body(
         txs,
         receipts,
         receipts_unverified,
+        state_sync,
     })
 }
 
