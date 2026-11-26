@@ -102,6 +102,33 @@ pub fn seal_range(
     to: u64,
     registry_snapshot: Option<&str>,
 ) -> Result<Option<SealSummary>> {
+    seal_range_inner(sink, entity_json, from, to, registry_snapshot, false)
+}
+
+/// Like [`seal_range`], but every table's segment is written provisional whatever its size (#3139).
+///
+/// For the leftover at the end of a `--seal-direct` backfill: it ends at wherever finality stood
+/// when the run happened to finish, not at a data-determined boundary (RFC-0028 §4), so sealing it
+/// final would give two operators with identical rows different segments. Provisional, it is folded
+/// into the table's next cut, which is data-determined.
+pub fn seal_range_tail(
+    sink: &mut dyn SegmentSink,
+    entity_json: &[String],
+    from: u64,
+    to: u64,
+    registry_snapshot: Option<&str>,
+) -> Result<Option<SealSummary>> {
+    seal_range_inner(sink, entity_json, from, to, registry_snapshot, true)
+}
+
+fn seal_range_inner(
+    sink: &mut dyn SegmentSink,
+    entity_json: &[String],
+    from: u64,
+    to: u64,
+    registry_snapshot: Option<&str>,
+    hold_tail: bool,
+) -> Result<Option<SealSummary>> {
     let mut by_table: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     let mut cut_time: Option<u64> = None;
     for j in entity_json {
@@ -175,7 +202,8 @@ pub fn seal_range(
                 (all, prev.from_block, bytes, hash, Some(prev))
             }
         };
-        let provisional = nuthatch_seal::cut::provisional(&rows, sink.table_floor(), cut_time);
+        let provisional =
+            hold_tail || nuthatch_seal::cut::provisional(&rows, sink.table_floor(), cut_time);
         let file = format!("{table}-{hash}.parquet");
         sink.publish(&file, &hash, &bytes, replaced.as_ref())?;
         summary.tables += 1;
@@ -194,6 +222,7 @@ pub fn seal_range(
             provisional,
             writer_profile: WRITER_PROFILE.to_string(),
             input_hash: Some(input_hash),
+            hold_tail,
         });
     }
 
@@ -204,10 +233,16 @@ pub fn seal_range(
         if cut_time.is_none() || touched.contains(table) {
             continue;
         }
-        for s in segments.iter_mut().filter(|s| s.provisional) {
+        for s in segments
+            .iter_mut()
+            .filter(|s| s.provisional && !s.hold_tail)
+        {
             let rows = sink
                 .rows(s)
                 .with_context(|| format!("reading provisional segment {} to age it", s.file))?;
+            // A `hold_tail` leftover ends wherever finality stood, not at a data-determined
+            // boundary, so aging it here would stick that tail as a final segment (#3139), whatever
+            // its size. It stays provisional and folds into the table's next cut.
             if aged(&rows, cut_time) {
                 s.provisional = false;
             }

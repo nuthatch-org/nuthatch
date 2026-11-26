@@ -167,6 +167,23 @@ pub fn seal_range_with_snapshot(
     nuthatch_core::seal::seal_range(&mut sink, entity_json, from, to, registry_snapshot)
 }
 
+/// [`seal_range_with_snapshot`] for the end of a seal-direct backfill: the segment is provisional
+/// whatever its size, so the next cut folds it in (#3139).
+pub fn seal_tail_with_snapshot(
+    dir: &Path,
+    entity_json: &[String],
+    from: u64,
+    to: u64,
+    registry_snapshot: Option<&str>,
+) -> Result<Option<SealSummary>> {
+    let mut sink = FsSink {
+        dir,
+        publishing: Vec::new(),
+        folded_away: Vec::new(),
+    };
+    nuthatch_core::seal::seal_range_tail(&mut sink, entity_json, from, to, registry_snapshot)
+}
+
 /// Opens an [`FsSink`] over the nest at `dir` for each seal.
 pub struct FsSinks<'a>(pub &'a Path);
 
@@ -5939,6 +5956,78 @@ mod tests {
             only(&m, "t__quiet").provisional,
             "an untouched tail one second short"
         );
+    }
+
+    /// #3139 follow-up: a `hold_tail` leftover over the floor is provisional only because its end
+    /// is not data-determined. A later cut of another table must not age it to final.
+    #[test]
+    fn quiet_table_aging_leaves_an_over_floor_tail_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a: Vec<String> = (0..SEAL_TABLE_FLOOR as u64 + 5)
+            .map(|i| stamped("t__a", 10 + i, T0))
+            .collect();
+        a.sort();
+        let last = 10 + SEAL_TABLE_FLOOR as u64 + 4;
+        seal_tail_with_snapshot(dir.path(), &a, 10, last, None).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(only(&m, "t__a").provisional, "the leftover is held");
+
+        // A B-only cut three hours of chain time later would age A's tail.
+        let later = T0 + SEAL_TABLE_AGE_SECS;
+        seal_range(
+            dir.path(),
+            &[stamped("t__b", last + 1, later)],
+            last + 1,
+            last + 1,
+        )
+        .unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(
+            only(&m, "t__a").provisional,
+            "an over-floor leftover must not be finalised by quiet-table aging"
+        );
+
+        // The next A cut still folds it into one segment.
+        seal_range(
+            dir.path(),
+            &[stamped("t__a", last + 2, later)],
+            last + 2,
+            last + 2,
+        )
+        .unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = only(&m, "t__a");
+        assert_eq!(seg.rows, SEAL_TABLE_FLOOR + 6);
+        assert_eq!(seg.from_block, 10);
+    }
+
+    /// #3139 follow-up: the same holds for a leftover under both floors. Size cannot tell it from
+    /// an ordinary provisional, so the segment records its origin.
+    #[test]
+    fn quiet_table_aging_leaves_an_under_floor_tail_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        let a: Vec<String> = (0..3u64).map(|i| stamped("t__a", 10 + i, T0)).collect();
+        seal_tail_with_snapshot(dir.path(), &a, 10, 12, None).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(only(&m, "t__a").provisional && only(&m, "t__a").hold_tail);
+
+        let later = T0 + SEAL_TABLE_AGE_SECS;
+        seal_range(dir.path(), &[stamped("t__b", 13, later)], 13, 13).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(
+            only(&m, "t__a").provisional,
+            "an under-floor leftover must not be finalised by quiet-table aging"
+        );
+
+        seal_range(dir.path(), &[stamped("t__a", 14, later)], 14, 14).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = only(&m, "t__a");
+        assert_eq!(
+            (seg.rows, seg.from_block),
+            (4, 10),
+            "the next A cut folds the tail"
+        );
+        assert!(!seg.hold_tail, "the fold is an ordinary cut");
     }
 
     #[test]

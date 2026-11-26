@@ -5723,7 +5723,7 @@ pub async fn backfill_direct(
             },
         )?;
         if next > to && !buf.is_empty() {
-            seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?;
+            seal::seal_tail_with_snapshot(dir, &drain_sealable(&mut buf), batch_from, to, None)?;
             batch_from = next;
         }
     }
@@ -6701,7 +6701,7 @@ pub async fn backfill_direct_pipelined_with(
     if !buf.is_empty() {
         count_sealed(
             extras.metrics,
-            seal::seal_range(dir, &drain_sealable(&mut buf), batch_from, to)?,
+            seal::seal_tail_with_snapshot(dir, &drain_sealable(&mut buf), batch_from, to, None)?,
         );
         on_seal(to)?;
     }
@@ -7139,7 +7139,7 @@ pub async fn backfill_direct_factory_with(
             },
         )?;
         if next > to && !buf.is_empty() {
-            let sealed = seal::seal_range_with_snapshot(
+            let sealed = seal::seal_tail_with_snapshot(
                 dir,
                 &drain_sealable(&mut buf),
                 batch_from,
@@ -10106,6 +10106,74 @@ mod tests {
                  nest - the fold, not only the cut, has to be a function of the data (#1150)"
             );
         }
+    }
+
+    /// #3139 - two operators who index the same chain with `--seal-direct` while finality stands at
+    /// different heights must agree on every segment that sits inside a completed cut. The leftover
+    /// past the last cut ends at wherever finality was, so it is provisional, not a final segment
+    /// that the other operator's longer cut could never reproduce.
+    #[test]
+    fn seal_direct_tail_does_not_depend_on_where_finality_stood() {
+        const PER_BLOCK: u64 = 3;
+        // The leftover must clear SEAL_TABLE_FLOOR, or it was provisional anyway and this proves nothing.
+        let run = |finalized: u64| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut buf: Vec<SealRow> = Vec::new();
+            for b in 0..finalized {
+                for i in 0..PER_BLOCK {
+                    buf.push((
+                        b,
+                        i,
+                        format!(r#"{{"table":"t","block_number":{b},"log_index":{i}}}"#),
+                    ));
+                }
+            }
+            let mut batch_from = 0u64;
+            drain_all_sealable(
+                &mut buf,
+                tail_hold(finalized - 1, true),
+                finalized - 1,
+                SPAN_OFF,
+                |rows, seal_to| {
+                    seal::seal_range(dir.path(), &rows, batch_from, seal_to)?;
+                    batch_from = seal_to + 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(
+                buf.len() >= seal::SEAL_TABLE_FLOOR,
+                "premise: a leftover of {} rows is over the floor",
+                buf.len()
+            );
+            seal::seal_tail_with_snapshot(
+                dir.path(),
+                &drain_sealable(&mut buf),
+                batch_from,
+                finalized - 1,
+                None,
+            )
+            .unwrap();
+            seal::load_manifest(dir.path())
+                .unwrap()
+                .tables
+                .remove("t")
+                .unwrap()
+        };
+        let short = run(30_000);
+        let long = run(33_000);
+        let (tail, cuts) = short.split_last().unwrap();
+        assert!(tail.provisional, "the leftover is provisional");
+        assert!(cuts.len() >= 2 && cuts.iter().all(|s| !s.provisional));
+        for s in cuts {
+            assert!(
+                long.iter().any(|l| l.hash == s.hash && !l.provisional),
+                "a completed cut ({}..={}) of the short run is missing from the long run",
+                s.from_block,
+                s.to_block
+            );
+        }
+        assert!(long.last().unwrap().provisional);
     }
 
     fn entity_json(block: u64, i: u64) -> String {
