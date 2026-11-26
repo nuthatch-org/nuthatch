@@ -84,11 +84,7 @@ async fn a_checked_entity_file_starts_and_indexes() {
     let dir = tempfile::tempdir().unwrap();
     scaffold_nest(dir.path(), "usdc", USDC);
     declare_entity(dir.path());
-    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
-        dir: dir.path().to_str().unwrap().into(),
-        json: false,
-    })
-    .unwrap();
+    nuthatch::project::regen_artifacts(dir.path()).unwrap();
     nuthatch::check::check(nuthatch::cli::CheckArgs {
         name: None,
         dir: dir.path().to_str().unwrap().into(),

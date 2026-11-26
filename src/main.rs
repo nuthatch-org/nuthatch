@@ -352,7 +352,7 @@ async fn run(command: cli::Command) -> Result<()> {
             }
         }
         cli::Command::Check(args) => check::check(args),
-        cli::Command::Schema(args) => project::regen(args),
+        cli::Command::Schema(args) => project::regen(args).await,
         cli::Command::Bench(args) => match args.what {
             cli::BenchWhat::Backfill(a) => bench::backfill(a).await,
             cli::BenchWhat::Query(a) => bench::query(a),
