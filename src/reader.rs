@@ -2053,6 +2053,7 @@ impl Follower {
             .with_context(|| format!("no nest at '{}'", dir.display()))?;
         config.read_only_role = true;
         let registry = crate::registry::from_nest(&dir, &config)?;
+        let calls = crate::indexer::call_registry(&dir, &config)?;
         let identity = hex::encode(crate::project::decode_identity(&dir, &config, &registry)?);
         let seal_span = crate::chains::lookup(&config.nest.chain)
             .map(|c| c.seal_span)
@@ -2100,7 +2101,11 @@ impl Follower {
             entities: Arc::new(Vec::new()),
             threshold: config.flags.threshold_amount(),
             velocity_threshold: config.flags.velocity().map(|(amt, _)| amt),
-            tables: Arc::new(crate::indexer::full_schema(&registry, &config)),
+            tables: Arc::new(crate::indexer::full_schema(
+                &registry,
+                calls.as_ref(),
+                &config,
+            )),
             sql_gate,
             tenant,
             sql_queued: Default::default(),

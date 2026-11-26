@@ -581,7 +581,7 @@ async fn story_json(dir: &Path, store: &nuthatch::store::Store, from: u64, to: u
     use nuthatch::diff;
     let cfg = nuthatch::config::Config::load(dir).unwrap();
     let reg = nuthatch::registry::from_nest(dir, &cfg).unwrap();
-    let tables = nuthatch::indexer::full_schema(&reg, &cfg);
+    let tables = nuthatch::indexer::full_schema(&reg, None, &cfg);
     let id = nuthatch::blob::build_manifest(dir, None)
         .unwrap()
         .data_identity();

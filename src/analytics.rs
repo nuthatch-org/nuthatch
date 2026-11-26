@@ -9405,7 +9405,7 @@ events = ["Minted", "Withdrawn"]
         // Step 3: the two calls `dev` makes at startup to get `declared` - real registry, real
         // full_schema, no hand-built `TableSchema`.
         let registry = crate::registry::from_nest(dir.path(), &cfg).unwrap();
-        let declared = crate::indexer::full_schema(&registry, &cfg);
+        let declared = crate::indexer::full_schema(&registry, None, &cfg);
         assert!(
             declared.iter().any(|t| t.table == "tok__withdrawn"),
             "the live registry must know about Withdrawn even though schema.json does not"
@@ -9532,7 +9532,7 @@ events = ["Transfer"]
         // Step 3: the two calls `dev` makes at startup to get `declared` - real registry, real
         // full_schema, no hand-built `TableSchema`.
         let registry = crate::registry::from_nest(dir.path(), &cfg).unwrap();
-        let declared = crate::indexer::full_schema(&registry, &cfg);
+        let declared = crate::indexer::full_schema(&registry, None, &cfg);
         assert!(
             declared
                 .iter()

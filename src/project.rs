@@ -1309,17 +1309,8 @@ fn nest_tables(
     Vec<crate::registry::TableSchema>,
 )> {
     let registry = crate::registry::from_nest(dir, config)?;
-    let mut schema = registry.schema();
-    if config.extract.decodes_calls() {
-        let calls = crate::calldata::CallRegistry::from_nest(dir, config)?;
-        schema.extend(calls.schema(&config.extract));
-    }
-    if !config.ipfs.is_empty() {
-        schema.extend(crate::ipfs::schema(&config.ipfs, registry.timestamps()));
-    }
-    if !config.calls.is_empty() {
-        schema.extend(crate::calls::schema(&config.calls, registry.timestamps()));
-    }
+    let calls = crate::indexer::call_registry(dir, config)?;
+    let schema = crate::indexer::full_schema(&registry, calls.as_ref(), config);
     crate::indexer::refuse_duplicate_tables(&schema)?;
     Ok((registry, schema))
 }

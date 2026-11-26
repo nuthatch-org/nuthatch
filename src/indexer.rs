@@ -3245,15 +3245,33 @@ pub async fn build_and_prepare_nest(
 /// told an agent it did not exist at all, and the `semantic.toml` drift check warned that a
 /// correctly-described table "has no decoder" - a warning that fires on a correct config, which
 /// teaches operators to ignore warnings.
+///
+/// The top-level call and extraction tables (`[extract]`, RFC-0014) are the same kind of omission, so
+/// `calls` is part of the composition rather than something callers append: pass the nest's
+/// [`call_registry`], `None` only when it decodes no calldata. The generated `schema.json` is composed
+/// by this function too (`project::nest_tables`), so the artifacts and the running nest cannot drift.
 pub fn full_schema(
     registry: &DecodeRegistry,
+    calls: Option<&crate::calldata::CallRegistry>,
     config: &Config,
 ) -> Vec<crate::registry::TableSchema> {
     let ts = registry.timestamps();
     let mut tables = registry.schema();
-    tables.extend(crate::calls::schema(&config.calls, ts));
+    if let Some(calls) = calls {
+        tables.extend(calls.schema(&config.extract));
+    }
     tables.extend(crate::ipfs::schema(&config.ipfs, ts));
+    tables.extend(crate::calls::schema(&config.calls, ts));
     tables
+}
+
+/// The nest's [`crate::calldata::CallRegistry`], built whenever `[extract]` decodes calldata at all.
+pub fn call_registry(dir: &Path, config: &Config) -> Result<Option<crate::calldata::CallRegistry>> {
+    config
+        .extract
+        .decodes_calls()
+        .then(|| crate::calldata::CallRegistry::from_nest(dir, config))
+        .transpose()
 }
 
 /// Refuse a composed schema in which two sources declare one table. Config validation sees only its own
@@ -3594,9 +3612,14 @@ async fn build_nest(
         &identity[..12],
     );
 
+    // RFC-0038 §5: built whenever the nest decodes calldata at all, and before the served catalogue,
+    // which includes its tables. Distinct from `enabled()`, which is the node-gated set - a
+    // top-level-calls nest needs this surface and needs no node.
+    let call_registry = call_registry(&dir, config)?.map(Arc::new);
+
     // Governed semantic layer (RFC-0016): if `semantic.toml` describes a table/column the registry
     // doesn't have, the semantics are stale - worse than none. Warn loudly at startup.
-    let served = full_schema(&registry, config);
+    let served = full_schema(&registry, call_registry.as_deref(), config);
     if let Ok(Some(sem)) = crate::semantic::load(&dir) {
         for w in crate::semantic::drift(&served, &sem) {
             tracing::warn!("semantic.toml drift: {w}");
@@ -3681,22 +3704,10 @@ async fn build_nest(
     // RFC-0023 tier 3: the archive endpoint a declared call is resolved against. Built here so a
     // nest declaring `[[calls]]` without one is refused at startup rather than discovered thousands
     // of blocks into a backfill as a wall of identical failures.
-    // RFC-0038 §5: built whenever the nest decodes calldata at all. Distinct from `enabled()`, which
-    // is the node-gated set - a top-level-calls nest needs this surface and needs no node.
-    let call_registry = if config.extract.decodes_calls() {
-        Some(Arc::new(crate::calldata::CallRegistry::from_nest(
-            &dir, config,
-        )?))
-    } else {
-        None
-    };
 
     // A declaration may read a call table, so the gate sees those columns as well as the event ones.
     let ipfs_gate = {
-        let mut tables = full_schema(&registry, config);
-        if let Some(calls) = &call_registry {
-            tables.extend(calls.schema(&config.extract));
-        }
+        let tables = full_schema(&registry, call_registry.as_deref(), config);
         refuse_duplicate_tables(&tables)?;
         crate::webhooks::refuse_unbound(&dir, &tables, &config.webhooks, config.strict_isolation)?;
         crate::ipfs_resolve::Gate::new(&config.ipfs, &tables)
@@ -3897,7 +3908,7 @@ async fn build_nest(
         entities,
         threshold,
         velocity_threshold: velocity_cfg.map(|(amt, _)| amt),
-        tables: Arc::new(full_schema(&registry, config)),
+        tables: Arc::new(full_schema(&registry, call_registry.as_deref(), config)),
         sql_gate,
         tenant: None,
         sql_queued: Default::default(),
@@ -19507,8 +19518,7 @@ template = "pool"
         let config = Config::load(dir.path()).unwrap();
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let gateways = vec![gateway];
         let source = PostSource(vec![(4, qos_post(&cid)), (4_900, qos_post(&cid))]);
@@ -19568,8 +19578,7 @@ template = "pool"
         let config = Config::load(dir.path()).unwrap();
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let gateways = vec![gateway];
         let source = PostSource(vec![(4, qos_post(&cid))]);
@@ -19645,8 +19654,7 @@ template = "pool"
         let config = Config::load(dir.path()).unwrap();
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let gateways = vec![gateway];
         let source = PostSource(vec![(4, qos_post(&cid)), (700, qos_post(&cid))]);
@@ -19709,8 +19717,7 @@ template = "pool"
             let config = Config::load(dir.path()).unwrap();
             let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
             let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-            let mut tables = full_schema(&registry, &config);
-            tables.extend(creg.schema(&config.extract));
+            let tables = full_schema(&registry, Some(&creg), &config);
             let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
             let source = PostSource(vec![(4, qos_post(&cid))]);
             let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
@@ -19899,8 +19906,7 @@ template = "pool"
         let config = Config::load(dir.path()).unwrap();
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         let source = PostSource(vec![(4, qos_post(&bad_cid)), (4, qos_post(&late_cid))]);
         let rows = decode_top_level_calls(&source, &creg, &[], 4, 4, true, 4)
@@ -20134,8 +20140,7 @@ template = "pool"
         let config = Config::load(dir).unwrap();
         let registry = crate::registry::from_nest(dir, &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir, &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let gate = crate::ipfs_resolve::Gate::new(&config.ipfs, &tables).unwrap();
         (registry, creg, gate)
     }
@@ -20328,8 +20333,7 @@ template = "pool"
 
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let tables = full_schema(&registry, Some(&creg), &config);
         let schema = tables.iter().find(|t| t.table == "qos_payload").unwrap();
         let stored = crate::seal::read_table_rows(dir.path(), schema)
             .unwrap()
@@ -21053,6 +21057,85 @@ template = "pool"
         .unwrap();
         std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
         dir
+    }
+
+    /// #3154: `[extract] top_level_calls` tables were readable through `/sql` and absent from every
+    /// catalogue. Through the real `build_nest`, served over HTTP: the catalogue, `/table/{name}` (the
+    /// route behind the MCP `table` tool) and the generated `schema.json` must all name `calls_raw`.
+    #[tokio::test]
+    async fn top_level_call_tables_are_in_the_served_catalogue_and_the_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("abis")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::CONFIG_FILE),
+            format!(
+                "[nest]\nname = \"calls\"\nchain = \"gnosis\"\nchain_id = 100\nrpc_urls = []\n\n\
+                 [[contracts]]\nalias = \"data_edge\"\naddress = \"{QOS_EDGE}\"\nabi = \"abis/data-edge.json\"\n\n\
+                 [extract]\ntop_level_calls = true\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
+        let config = Config::load(dir.path()).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (_nest, state, worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        assert!(worker.is_none());
+
+        let served: Vec<String> = state.tables.iter().map(|t| t.table.clone()).collect();
+        assert!(
+            served.contains(&crate::calldata::RAW_CALLS_TABLE.to_string()),
+            "{served:?}"
+        );
+        assert!(served.contains(&"data_edge__call_submit_qo_s_payload".to_string()));
+
+        crate::project::refresh_stale_artifacts(dir.path(), &config).unwrap();
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("schema.json")).unwrap())
+                .unwrap();
+        let mut artefact: Vec<String> = on_disk["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["table"].as_str().unwrap().to_string())
+            .collect();
+        let mut runtime = served.clone();
+        artefact.sort();
+        runtime.sort();
+        assert_eq!(
+            artefact, runtime,
+            "schema.json and the running nest disagree"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = serve::router(serve::SharedNest::new(state));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let get = |path: &str| reqwest::get(format!("{base}{path}"));
+
+        let tables: serde_json::Value = get("/tables").await.unwrap().json().await.unwrap();
+        let listed: Vec<&str> = tables["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["table"].as_str().unwrap())
+            .collect();
+        assert!(listed.contains(&"calls_raw"), "{listed:?}");
+        let schema = get("/schema").await.unwrap().text().await.unwrap();
+        assert!(schema.contains("calls_raw"), "/schema omits calls_raw");
+        let table = get("/table/calls_raw").await.unwrap();
+        assert_eq!(table.status(), 200, "/table/calls_raw must not 404");
+        server.abort();
     }
 
     /// `E(uint256 a, uint256 b)` with parameter `indexed` indexed: the same topic0 and registry hash
@@ -27202,7 +27285,7 @@ template="pool"
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
 
         let decoder_only: Vec<String> = registry.schema().iter().map(|t| t.table.clone()).collect();
-        let served: Vec<String> = full_schema(&registry, &config)
+        let served: Vec<String> = full_schema(&registry, None, &config)
             .iter()
             .map(|t| t.table.clone())
             .collect();
