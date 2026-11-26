@@ -19,6 +19,15 @@ use tokio::time::Instant;
 /// bounds the source at a few hundred MB beside the 2 GB cursor budget.
 pub(super) const KEEP_CHUNKS: usize = 4;
 
+/// The largest block file accepted (a mainnet chunk's is a few MB), and logs file (35 to 50 MB).
+/// A longer body is `Fault::Bad`: the chunk comes from the RPC instead.
+pub(super) const MAX_BLOCKS_BYTES: usize = 16 << 20;
+pub(super) const MAX_LOGS_BYTES: usize = 256 << 20;
+
+/// The most compressed logs held across chunks, in bytes. Past it the least recently used chunks go,
+/// whatever [`KEEP_CHUNKS`] says, so the bound is on bytes and not only on a count.
+pub(super) const LOGS_BUDGET: usize = 384 << 20;
+
 /// Chunks whose hashes and timestamps are held at once (about 100 KB each on mainnet). Wider than
 /// [`KEEP_CHUNKS`] so a window spanning more chunks than that still finds every block's header here
 /// when the indexer asks for it after the window's logs.
@@ -103,6 +112,15 @@ fn touch(order: &mut VecDeque<u64>, start: u64) {
     order.push_back(start);
 }
 
+/// A body over its cap is the host's fault, not a passing one; any other failure may pass.
+fn fetch_fault(e: anyhow::Error) -> Fault {
+    if e.is::<super::fetch::TooLarge>() {
+        Fault::Bad(e)
+    } else {
+        Fault::Transient(e)
+    }
+}
+
 impl XatuSource {
     /// The headers of a chunk already loaded, without loading anything. Header lookups use this:
     /// they follow the logs read of the same window, which loaded the chunk, and a miss just goes to
@@ -161,7 +179,11 @@ impl XatuSource {
                 }
                 st.ready.insert(start, c.clone());
                 touch(&mut st.order, start);
-                while st.order.len() > self.keep_chunks {
+                let held = |st: &State| st.ready.values().map(|c| c.logs.len()).sum::<usize>();
+                // The newest chunk always stays, even alone over the budget.
+                while st.order.len() > self.keep_chunks
+                    || (st.order.len() > 1 && held(&st) > LOGS_BUDGET)
+                {
                     if let Some(old) = st.order.pop_front() {
                         st.ready.remove(&old);
                     }
@@ -282,9 +304,12 @@ impl XatuSource {
         let last = start + self.chunk_len - 1;
         let Some(blocks) = self
             .fetch
-            .get(&self.url("canonical_execution_block", start))
+            .get(
+                &self.url("canonical_execution_block", start),
+                MAX_BLOCKS_BYTES,
+            )
             .await
-            .map_err(Fault::Transient)?
+            .map_err(fetch_fault)?
         else {
             return Ok(None);
         };
@@ -339,9 +364,9 @@ impl XatuSource {
 
         let Some(logs) = self
             .fetch
-            .get(&self.url("canonical_execution_logs", start))
+            .get(&self.url("canonical_execution_logs", start), MAX_LOGS_BYTES)
             .await
-            .map_err(Fault::Transient)?
+            .map_err(fetch_fault)?
         else {
             // Not bad: the two files may be published apart, so the newest chunk can have its
             // block file first. Try again in a while.

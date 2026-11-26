@@ -191,7 +191,7 @@ impl Files {
 
 #[async_trait::async_trait]
 impl Fetch for Files {
-    async fn get(&self, url: &str) -> Result<Option<Bytes>> {
+    async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>> {
         self.gets.fetch_add(1, Ordering::SeqCst);
         let rel = url
             .strip_prefix("https://mirror.test/")
@@ -223,6 +223,11 @@ impl Fetch for Files {
             dir().join(rel)
         };
         match std::fs::read(path) {
+            Ok(b) if b.len() > max => Err(crate::xatu::fetch::TooLarge {
+                url: url.to_string(),
+                max,
+            }
+            .into()),
             Ok(b) => Ok(Some(b.into())),
             Err(_) => Ok(None),
         }
@@ -408,6 +413,38 @@ async fn a_chunk_that_will_not_parse_falls_back_to_rpc_for_that_chunk_only() {
     let before = files.gets.load(Ordering::SeqCst);
     x.logs(&f, FIRST + 4, FIRST + 5).await.unwrap();
     assert_eq!(files.gets.load(Ordering::SeqCst), before);
+}
+
+/// A host that sends more than the cap (here: the cap the source asks with is exceeded) must fail
+/// that chunk over to the RPC, once, not be retried or trusted.
+#[tokio::test]
+async fn an_oversized_logs_body_falls_back_to_rpc_for_that_chunk() {
+    struct Huge(Arc<Files>, u64);
+    #[async_trait::async_trait]
+    impl Fetch for Huge {
+        async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>> {
+            if url.contains("canonical_execution_logs")
+                && url.ends_with(&format!("/{}.parquet", self.1))
+            {
+                return Err(crate::xatu::fetch::TooLarge {
+                    url: url.to_string(),
+                    max,
+                }
+                .into());
+            }
+            self.0.get(url, max).await
+        }
+    }
+    let (rpc, files) = (Recorded::load(), Files::all());
+    let mut x = checked(&rpc, Arc::new(Huge(files.clone(), FIRST + 4)));
+    x.spot_checks = 0;
+    let f = filter(&[USDC, USDT]);
+    same(
+        &x.logs(&f, FIRST, LAST).await.unwrap(),
+        &rpc.answer(&f, FIRST, LAST),
+    );
+    assert_eq!(*rpc.log_calls.lock().unwrap(), vec![(FIRST + 4, FIRST + 7)]);
+    assert_eq!(x.stats.fallbacks.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -644,8 +681,8 @@ async fn a_damaged_logs_footer_falls_back_rather_than_panicking() {
     struct Flipped(Arc<Files>, usize);
     #[async_trait::async_trait]
     impl Fetch for Flipped {
-        async fn get(&self, url: &str) -> Result<Option<Bytes>> {
-            let b = self.0.get(url).await?;
+        async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>> {
+            let b = self.0.get(url, max).await?;
             if !url.contains("canonical_execution_logs") {
                 return Ok(b);
             }
@@ -737,8 +774,8 @@ struct Tampered(Arc<Files>, u64, EditFn);
 
 #[async_trait::async_trait]
 impl Fetch for Tampered {
-    async fn get(&self, url: &str) -> Result<Option<Bytes>> {
-        let b = self.0.get(url).await?;
+    async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>> {
+        let b = self.0.get(url, max).await?;
         if url.contains("canonical_execution_logs")
             && url.ends_with(&format!("/{}.parquet", self.1))
         {

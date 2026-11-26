@@ -10,14 +10,14 @@ struct Mangled<F: Fn(&str, Bytes) -> Option<Bytes> + Send + Sync> {
 
 #[async_trait::async_trait]
 impl<F: Fn(&str, Bytes) -> Option<Bytes> + Send + Sync> Fetch for Mangled<F> {
-    async fn get(&self, url: &str) -> Result<Option<Bytes>> {
+    async fn get(&self, url: &str, max: usize) -> Result<Option<Bytes>> {
         let rel = url
             .strip_prefix("https://mirror.test/")
             .unwrap()
             .to_string();
         Ok(self
             .inner
-            .get(url)
+            .get(url, max)
             .await?
             .and_then(|b| (self.mangle)(&rel, b)))
     }
