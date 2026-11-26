@@ -965,7 +965,8 @@ pub struct Verified {
 /// Walk the chain in `path`, a log directory or one of its files. An error names the first record
 /// that breaks it.
 pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
-    let list = if path.is_dir() {
+    let as_dir = path.is_dir();
+    let list = if as_dir {
         files(path)?
     } else {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1033,7 +1034,9 @@ pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
     // may cover more than the visible prefix: prune writes through_seq for every file it
     // intends to drop, then deletes them one by one, so a crash partway through leaves a valid
     // chain whose first seq is still below that marker.
-    if first_seq != 1 && pruned_through + 1 < first_seq {
+    // A single shipped file is allowed to start past seq 1: rotation closes it and operators
+    // copy it off the host. The missing-prefix rule is for a directory that has lost its start.
+    if as_dir && first_seq != 1 && pruned_through + 1 < first_seq {
         bail!(
             "the log starts at seq {first_seq} but nothing on the chain accounts for records 1..={}: \
              its oldest records were deleted",
@@ -1566,6 +1569,20 @@ mod tests {
         let all = files(tmp.path()).unwrap();
         std::fs::remove_file(&all[0].1).unwrap();
         assert!(verify(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn a_single_rotated_file_still_verifies_on_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 0);
+        let all = files(tmp.path()).unwrap();
+        assert!(all.len() >= 2, "need a rotated file");
+        // The file itself is an intact chain, even though it starts past seq 1 and has no
+        // pruned record (keep is off). A directory missing that earlier file is the deleted prefix.
+        verify(&all[1].1, None).unwrap();
+        std::fs::remove_file(&all[0].1).unwrap();
+        assert!(verify(tmp.path(), None).is_err());
+        verify(&all[1].1, None).unwrap();
     }
 
     #[test]
