@@ -23992,6 +23992,8 @@ template="pool"
                 "a null nest stored a call stamp: {r}"
             );
         }
+    }
+
     /// `ResultCapSource` plus the headers a `[extract] blocks` nest asks for, each stamped `b * 1000`.
     struct WithHeaders(ResultCapSource);
 
