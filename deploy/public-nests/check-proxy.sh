@@ -55,8 +55,11 @@ expect "GET /health"                 200 "$base/health"
 expect "GET /ready"                  200 "$base/ready"
 expect "GET /schema"                 200 "$base/schema"
 expect "GET /tables"                 200 "$base/tables"
-expect "GET /table/usdc__transfer"   200 "$base/table/usdc__transfer"
-expect "GET /table/usdc__transfer?limit=5" 200 "$base/table/usdc__transfer?limit=5"
+# A table this nest has (the first /tables lists); a stub upstream lists none, so fall back to a fixed name.
+table=$(curl -s -m 20 "$base/tables" 2>/dev/null | grep -oE '"[A-Za-z0-9_-]+__[A-Za-z0-9_]+"' | head -n 1 | tr -d '"')
+table=${table:-usdc__transfer}
+expect "GET /table/$table"           200 "$base/table/$table"
+expect "GET /table/$table?limit=5"   200 "$base/table/$table?limit=5"
 expect "GET /sql?q=SELECT 1"         200 -G "$base/sql" --data-urlencode 'q=SELECT 1 AS one'
 expect "POST /sql"                   200 "${json[@]}" -d '{"q":"SELECT 1 AS one"}' "$base/sql"
 body_has "POST /mcp tools/list"      '"tools"' "${json[@]}" -H 'accept: application/json' \
@@ -93,6 +96,7 @@ expect "GET /table/a/b"              404 "$base/table/a/b"
 expect "GET /table/a.b"              404 "$base/table/a.b"
 expect "GET /table/a%2Fb"            404 --path-as-is "$base/table/a%2Fb"
 expect "GET /table/<encoded ctl>"    404 --path-as-is "$base/table/x%0d%0ay"
+expect "GET /table/<trailing ctl>"   404 --path-as-is "$base/table/x%0a"
 
 echo "== refused: methods"
 for m in PUT DELETE PATCH; do
