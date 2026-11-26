@@ -3275,6 +3275,18 @@ pub fn call_registry(dir: &Path, config: &Config) -> Result<Option<crate::callda
         .transpose()
 }
 
+/// [`full_schema`] for a nest on disk: builds the [`call_registry`] itself. The one entry point for
+/// callers that hold a directory and a registry but no running nest (`check`, the follower's feed), so
+/// none of them can fall back to `registry.schema()` and miss the call tables (#3174).
+pub fn nest_full_schema(
+    dir: &Path,
+    config: &Config,
+    registry: &DecodeRegistry,
+) -> Result<Vec<crate::registry::TableSchema>> {
+    let calls = call_registry(dir, config)?;
+    Ok(full_schema(registry, calls.as_ref(), config))
+}
+
 /// Refuse a composed schema in which two sources declare one table. Config validation sees only its own
 /// declarations, not the event and call tables the ABIs produce, so a `[[ipfs]]` or `[ipfs.rows]` name
 /// can land on one of those; its rows would then be read with the other table's columns.
@@ -21106,6 +21118,41 @@ template = "pool"
         .unwrap();
         std::fs::write(dir.path().join("abis/data-edge.json"), QOS_EDGE_ABI).unwrap();
         dir
+    }
+
+    /// #3174: `check` and the follower's feed built their schema from `registry.schema()` and so missed
+    /// the call tables the live serve path names. Both now come through `nest_full_schema`; this holds
+    /// them to the running nest's own catalogue, so a fourth path cannot quietly go back to events only.
+    #[tokio::test]
+    async fn check_and_follower_schema_match_the_live_catalogue() {
+        let dir = qos_topic_nest("t");
+        let config = Config::load(dir.path()).unwrap();
+        let source: Arc<dyn Source> = Arc::new(MockSource { logs: Vec::new() });
+        let (_nest, state, _worker, _w) = build_nest(
+            &source,
+            dir.path().to_path_buf(),
+            &config,
+            None,
+            false,
+            None,
+            None,
+            serve::new_sql_gate(),
+        )
+        .await
+        .unwrap();
+        let names = |t: &[crate::registry::TableSchema]| {
+            let mut v: Vec<String> = t.iter().map(|t| t.table.clone()).collect();
+            v.sort();
+            v
+        };
+        let live = names(&state.tables);
+        assert!(live.contains(&crate::calldata::RAW_CALLS_TABLE.to_string()));
+
+        let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
+        let follower = crate::indexer::nest_full_schema(dir.path(), &config, &registry).unwrap();
+        assert_eq!(names(&follower), live, "follower feed schema drifted");
+        let check = crate::check::nest_schema(dir.path()).unwrap().unwrap();
+        assert_eq!(names(&check), live, "check schema drifted");
     }
 
     /// #3154: `[extract] top_level_calls` tables were readable through `/sql` and absent from every
