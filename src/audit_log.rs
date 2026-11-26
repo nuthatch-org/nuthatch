@@ -1115,6 +1115,48 @@ mod tests {
         assert_eq!(send(app, other).await, 200);
     }
 
+    /// #3116: auditing a call must not make the engine measure it. Only `Nuthatch-Cost: 1` does, so a
+    /// log-on `/sql` costs what a log-off one does (no QueryMetrics, no segment footer pass).
+    #[tokio::test]
+    async fn the_audit_meter_does_not_ask_for_engine_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(settings(tmp.path())).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let routes = axum::Router::new()
+            .route(
+                "/sql",
+                get(move || {
+                    let s = s.clone();
+                    async move {
+                        let on_blocking = crate::cost::spawn_blocking(crate::cost::asked)
+                            .await
+                            .unwrap();
+                        s.lock().unwrap().push((crate::cost::asked(), on_blocking));
+                        crate::cost::result_rows(1);
+                        "rows"
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn(crate::cost::layer));
+        let app = wrap(routes, log.clone());
+        let plain = axum::http::Request::get("/sql")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, plain).await, 200);
+        let asked = axum::http::Request::get("/sql")
+            .header(crate::cost::HEADER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, asked).await, 200);
+        log.flush().await;
+        assert_eq!(*seen.lock().unwrap(), vec![(false, false), (true, true)]);
+        // Both calls are still audited, with their row counts.
+        let r = records(tmp.path());
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r.iter().all(|x| x["rows"] == 1), "{r:?}");
+    }
+
     #[tokio::test]
     async fn one_record_per_audited_call_with_identity_and_no_secret() {
         let tmp = tempfile::tempdir().unwrap();
