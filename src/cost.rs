@@ -46,6 +46,10 @@ struct Tally {
     /// Rows the request's answers carried, for the audit log (#3095); not part of the header.
     result_rows: AtomicU64,
     answered: std::sync::atomic::AtomicBool,
+    /// The caller sent `Nuthatch-Cost: 1`, so the engine must measure (QueryMetrics, a footer pass
+    /// over the segments). A meter the audit log installs (#3095) only counts and leaves this unset,
+    /// so turning the log on does not change what a statement costs (#3116).
+    asked: std::sync::atomic::AtomicBool,
 }
 
 /// One request's tally, shared by every task and thread that works on it.
@@ -91,7 +95,8 @@ pub fn spawn_blocking<R: Send + 'static>(
     })
 }
 
-/// Run `f` metered by `meter`: what the audit log (#3095) records of a call it audits.
+/// Run `f` metered by `meter`: what the audit log (#3095) records of a call it audits. A fresh
+/// `Meter::default()` is counting-only until the `Nuthatch-Cost` layer asks.
 pub async fn within<F: std::future::Future>(meter: Meter, f: F) -> F::Output {
     METER.scope(meter, f).await
 }
@@ -106,7 +111,7 @@ pub fn result_rows(n: u64) {
 
 /// Whether the work on this task or thread is for a request that asked for its cost.
 pub fn asked() -> bool {
-    current().is_some()
+    current().is_some_and(|m| m.0.asked.load(Relaxed))
 }
 
 /// What one Burrmill statement did.
@@ -147,6 +152,11 @@ pub struct Figures {
 }
 
 impl Meter {
+    /// A request that asked for its cost: engine metrics are collected for it.
+    fn ask(&self) {
+        self.0.asked.store(true, Relaxed);
+    }
+
     /// What the request did so far.
     pub fn figures(&self) -> Figures {
         let t = &self.0;
@@ -210,9 +220,13 @@ pub async fn layer(
     }
     // Under the audit log's meter already (#3095): report into that one, so both see every figure.
     let (meter, mut resp) = match METER.try_with(Clone::clone) {
-        Ok(outer) => (outer, next.run(req).await),
+        Ok(outer) => {
+            outer.ask();
+            (outer, next.run(req).await)
+        }
         Err(_) => {
             let meter = Meter::default();
+            meter.ask();
             (meter.clone(), METER.scope(meter, next.run(req)).await)
         }
     };
@@ -256,6 +270,23 @@ mod tests {
             m.header(12),
             "sealed_bytes=4097; hot_rows=7; engine_us=2500; peak_mem_bytes=1048576; queue_us=250; result_bytes=12; sealed_bytes_read=3000; scan_cpu_us=1500"
         );
+    }
+
+    /// #3116: the audit log's meter counts but does not make the engine collect QueryMetrics.
+    #[tokio::test]
+    async fn an_audit_meter_does_not_ask_for_engine_metrics() {
+        assert!(!asked());
+        let m = Meter::default();
+        within(m.clone(), async {
+            assert!(!asked());
+            assert!(!spawn_blocking(asked).await.unwrap());
+            hot_rows(2);
+            m.ask();
+            assert!(asked());
+            assert!(spawn_blocking(asked).await.unwrap());
+        })
+        .await;
+        assert_eq!(m.figures().hot_rows, 2);
     }
 
     #[tokio::test]
