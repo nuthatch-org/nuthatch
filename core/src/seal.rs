@@ -233,7 +233,10 @@ fn seal_range_inner(
         if cut_time.is_none() || touched.contains(table) {
             continue;
         }
-        for s in segments.iter_mut().filter(|s| s.provisional && !s.hold_tail) {
+        for s in segments
+            .iter_mut()
+            .filter(|s| s.provisional && !s.hold_tail)
+        {
             let rows = sink
                 .rows(s)
                 .with_context(|| format!("reading provisional segment {} to age it", s.file))?;
