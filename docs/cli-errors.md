@@ -51,7 +51,7 @@ stderr:
 
 - `nuthatch init 0xADDR --json` and `nuthatch add 0xADDR --json`: `nest_dir`, `name`, `chain`,
   `chain_id`, `contracts` (each with `address`, `alias`, `deployment_block`, `proxy_checked` and
-  `proxy_warning`), `tables`, `files_written`, `files_skipped`, `files_appended`, `dir_defaulted` and `next`, the commands to run next.
+  `proxy_warning`), `tables`, `files_written`, `files_skipped`, `files_appended`, `files_updated`, `dir_defaulted` and `next`, the commands to run next.
   `proxy_checked` is true only for a contract this run resolved and compared against its proxy
   history: a contract given `--abi`, one added earlier, or one whose proxy slots or blocks could
   not be read is false, and its `proxy_warning` null says nothing. The nest keeps no record of the

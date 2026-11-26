@@ -1550,7 +1550,7 @@ pub struct InitArgs {
 
     /// Print one JSON object on stdout: `nest_dir`, `chain`, `contracts` (address, alias,
     /// deployment block, proxy warning), `tables`, `files_written`, `files_skipped` (scaffold files that were
-    /// already there and kept), `files_appended` (existing files given a nuthatch section),
+    /// already there and kept), `files_appended` (existing files given a nuthatch section), `files_updated` (existing files whose section was refreshed),
     /// `dir_defaulted` and `next`, the commands to run next. The progress lines go to stderr, and an error is one JSON object there.
     #[arg(long)]
     pub json: bool,
