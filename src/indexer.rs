@@ -7503,6 +7503,7 @@ impl NestIngest {
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
+                            prog.note_window(blk, window);
                             prog.tick(blk, n);
                         },
                     )
@@ -7538,6 +7539,7 @@ impl NestIngest {
                         on_seal,
                         |blk, n, window| {
                             note_seal_direct_progress(&metrics, blk, window);
+                            prog.note_window(blk, window);
                             prog.tick(blk, n);
                         },
                     )
@@ -7731,6 +7733,7 @@ impl NestIngest {
                             no_progress = 0;
                             if let Some(p) = progress.as_mut() {
                                 p.tick(to, n);
+                                p.note_window(to, chunker.window());
                             }
                         }
                         Ok(None) => {
@@ -7762,6 +7765,9 @@ impl NestIngest {
                         return Err(e).with_context(|| single_block_over_cap(next));
                     }
                     chunker.too_large();
+                    if let Some(p) = progress.as_mut() {
+                        p.note_window(next.saturating_sub(1), chunker.window());
+                    }
                     no_progress_tick(&mut no_progress, next, to, false, "narrowing")?;
                 }
                 Err(e) => {
@@ -8455,6 +8461,7 @@ async fn index_loop(
                         reorg_gate.checked(tip, next);
                         if let Some(p) = progress.as_mut() {
                             p.tick(to, n);
+                            p.note_window(to, chunker.window());
                         }
                         // Caught up **as of the tip this iteration polled** (#1190). Judged here and
                         // not only at the top of the loop, because on a chain producing blocks
@@ -8504,6 +8511,9 @@ async fn index_loop(
                 }
                 // Provider capped the response - shrink and retry the same range immediately.
                 chunker.too_large();
+                if let Some(p) = progress.as_mut() {
+                    p.note_window(next.saturating_sub(1), chunker.window());
+                }
                 no_progress_tick(&mut no_progress, next, to, caught_up, "narrowing")?;
                 tracing::debug!("range {next}..={to} refused; shrinking and retrying");
             }
