@@ -196,17 +196,16 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
     if let Some(source) = args.from.clone() {
         let target = target_dir(&args);
         init_from(&source, &target)?;
-        return Ok(Scaffolded::next(format!(
-            "nuthatch dev --detach --wait-rows --dir {}",
-            target.display()
-        )));
+        let step = next_step_for(&target.display().to_string(), &target, &args.rpc).await?;
+        print_next(&step);
+        return Ok(Scaffolded::next(step.command));
     }
     if let Some(source) = args.from_subgraph.clone() {
         init_from_subgraph(&source, &args).await?;
-        return Ok(Scaffolded::next(format!(
-            "nuthatch dev --detach --wait-rows{}",
-            dir_hint(&args.dir)
-        )));
+        let step = next_step_for(&args.dir, Path::new(&args.dir), &args.rpc).await?;
+        say!();
+        print_next(&step);
+        return Ok(Scaffolded::next(step.command));
     }
     if args.addresses.is_empty() {
         bail!("provide one or more contract addresses, --from <git-url|dir>, or --from-subgraph <cid>");
@@ -370,10 +369,7 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         tip,
         chain.log_window,
     );
-    say!("next:  {}", step.command);
-    if let Some(note) = step.note {
-        say!("       {note}");
-    }
+    print_next(&step);
     say!("       (--wait-rows waits up to 300s for the first row, then exits 11 with the nest still running)");
     say!("       nuthatch mcp   (expose this index to a coding agent over MCP)");
     print_undetected_start_blocks(&undetected);
@@ -531,16 +527,16 @@ pub async fn add(args: AddArgs) -> Result<()> {
         config.contracts.len(),
         table_count,
     );
-    say!(
-        "next:  nuthatch dev --detach --wait-rows{}   (backfills every contract from deployment)",
-        dir_hint(&args.dir)
+    let step = next_step(
+        &args.dir,
+        config.contracts.iter().filter_map(|c| c.start_block).min(),
+        tip,
+        chain.log_window,
     );
+    print_next(&step);
     print_undetected_start_blocks(&undetected);
     if let Some(before) = &before {
-        done.next = vec![format!(
-            "nuthatch dev --detach --wait-rows{}",
-            dir_hint(&args.dir)
-        )];
+        done.next = vec![step.command];
         println!("{}", done.report(&dir, before)?);
     }
     Ok(())
@@ -573,21 +569,25 @@ fn refuse_an_indexed_nest(dir: &Path, config: &Config, addresses: &[String]) -> 
 /// automatically: run it after hand-editing the config - notably adding a factory `[[templates]]` /
 /// `[[factories]]`, which introduces the `{template}__{event}` tables and their `*_dec` columns that
 /// the auto path never saw. Idempotent: authored views and semantic descriptions are preserved.
-pub fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
+pub async fn regen(args: crate::cli::SchemaArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
     prose_on_stderr(args.json);
     let before = Files::when(args.json, &dir);
-    let config = Config::load(&dir)
-        .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
-    let n = write_nest_artifacts(&dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
-    say!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
+    regen_artifacts(&dir)?;
     if let Some(before) = &before {
-        let done = Scaffolded::next(format!(
-            "nuthatch dev --detach --wait-rows{}",
-            dir_hint(&args.dir)
-        ));
+        let step = next_step_for(&args.dir, &dir, &[]).await?;
+        let done = Scaffolded::next(step.command);
         println!("{}", done.report(&dir, before)?);
     }
+    Ok(())
+}
+
+/// The files half of `schema`, without a next step: `port` runs it on a nest it has just written.
+pub fn regen_artifacts(dir: &Path) -> Result<()> {
+    let config = Config::load(dir)
+        .with_context(|| format!("no nest at '{}' (need a nuthatch.toml)", dir.display()))?;
+    let n = write_nest_artifacts(dir, &config.nest.chain, &config, AgentDocs::Rewrite)?;
+    say!("✓ regenerated schema.json + AI surface from nuthatch.toml - {n} table(s)");
     Ok(())
 }
 
@@ -1106,10 +1106,6 @@ async fn init_from_subgraph(source: &str, args: &InitArgs) -> Result<()> {
             ipfs_templates.join(", ")
         );
     }
-    say!(
-        "\n  Next: nuthatch dev --detach --wait-rows{}",
-        dir_hint(&args.dir)
-    );
     Ok(())
 }
 
@@ -1733,10 +1729,6 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
             config.factories.len(),
         );
     }
-    say!(
-        "next:  nuthatch dev --detach --wait-rows --dir {}",
-        target.display()
-    );
     Ok(())
 }
 
@@ -2644,6 +2636,37 @@ fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> Ne
     }
 }
 
+fn print_next(step: &NextStep) {
+    say!("next:  {}", step.command);
+    if let Some(note) = &step.note {
+        say!("       {note}");
+    }
+}
+
+/// The next step for a nest already on disk (`schema`, `init --from`, `--from-subgraph`), which has
+/// no RPC client in hand: read its earliest start block and the chain tip. A tip that cannot be read
+/// within ten seconds leaves the plain command, as in `init`.
+async fn next_step_for(dir_arg: &str, dir: &Path, rpc: &[String]) -> Result<NextStep> {
+    let config = Config::load(dir)?;
+    let urls = crate::rpc::select_rpcs(rpc, config.nest.rpc_urls.iter().cloned());
+    let tip = match RpcClient::new(urls) {
+        Ok(client) => {
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.block_number())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        }
+        Err(_) => None,
+    };
+    Ok(next_step_for_config(dir_arg, &config, tip))
+}
+
+fn next_step_for_config(dir_arg: &str, config: &Config, tip: Option<u64>) -> NextStep {
+    let chain = chains::from_config(&config.nest.chain, config.nest.chain_id);
+    let start = config.contracts.iter().filter_map(|c| c.start_block).min();
+    next_step(dir_arg, start, tip, chain.log_window)
+}
+
 fn dir_hint(dir: &str) -> String {
     if dir == "." {
         String::new()
@@ -3226,6 +3249,57 @@ mod tests {
         let no_start = next_step(".", None, Some(26_096_175), 20);
         assert_eq!(no_start.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(no_start.note, None);
+    }
+
+    /// #3166: `add`, `schema`, `init --from` and `--from-subgraph` once printed the unbounded
+    /// command. Every such line comes from `next_step`; nothing else may spell it.
+    #[test]
+    fn only_next_step_spells_the_dev_command() {
+        let src = include_str!("project.rs");
+        let code = src.split("\nmod tests {").next().unwrap();
+        let spelled: Vec<&str> = code
+            .lines()
+            .filter(|l| {
+                l.contains("nuthatch dev --detach --wait-rows") && !l.trim_start().starts_with("//")
+            })
+            .collect();
+        assert_eq!(spelled.len(), 1, "{spelled:#?}");
+        assert!(spelled[0].contains("let dev = format!"), "{spelled:#?}");
+    }
+
+    /// A nest read back from disk, as `add`, `schema` and `init --from` do, gets the bounded
+    /// command when its history is long, and the plain one when it is short or the tip is unknown.
+    #[test]
+    fn a_nest_on_disk_is_offered_a_bounded_backfill() {
+        let mut config: Config = toml::from_str(
+            r#"
+[nest]
+name = "n"
+chain = "mainnet"
+chain_id = 1
+
+[[contracts]]
+alias = "usdc"
+address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+abi = "abis/usdc.json"
+start_block = 6082465
+"#,
+        )
+        .unwrap();
+        let long = next_step_for_config("n", &config, Some(26_096_175));
+        assert!(
+            long.command.ends_with("--dir n --backfill 300"),
+            "{}",
+            long.command
+        );
+        assert!(long.note.is_some());
+        assert_eq!(
+            next_step_for_config("n", &config, None).command,
+            "nuthatch dev --detach --wait-rows --dir n"
+        );
+        config.contracts[0].start_block = Some(26_090_000);
+        let short = next_step_for_config("n", &config, Some(26_096_175));
+        assert!(!short.command.contains("--backfill"), "{}", short.command);
     }
 
     #[test]

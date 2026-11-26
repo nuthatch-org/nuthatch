@@ -302,10 +302,7 @@ pub fn emit(subgraph: &Path, nest: &Path) -> Result<EmitResult> {
     config.calls = emitted_calls.iter().map(|c| c.decl.clone()).collect();
     let (factories, unwired_templates) = wire_templates(&mappings, &mut config);
     config.save(nest)?;
-    crate::project::regen(crate::cli::SchemaArgs {
-        dir: nest.display().to_string(),
-        json: false,
-    })?;
+    crate::project::regen_artifacts(nest)?;
 
     // The real decoded columns, so a mapped column name is *resolved* rather than guessed (#1250).
     // Built after `regen` so it reflects the `[[calls]]` just written.

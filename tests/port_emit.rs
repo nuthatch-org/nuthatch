@@ -65,11 +65,7 @@ template = "pool"
         );
     }
     std::fs::write(dir.join("nuthatch.toml"), toml).unwrap();
-    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
-        dir: dir.display().to_string(),
-        json: false,
-    })
-    .expect("regen nest artifacts");
+    nuthatch::project::regen_artifacts(dir).expect("regen nest artifacts");
 }
 
 fn select_sql(sql: &str) -> String {
@@ -961,11 +957,7 @@ events = ["PoolCreated", "TokenUpdated"]
 "#,
     )
     .unwrap();
-    nuthatch::project::regen(nuthatch::cli::SchemaArgs {
-        dir: nest.path().display().to_string(),
-        json: false,
-    })
-    .expect("regen nest artifacts");
+    nuthatch::project::regen_artifacts(nest.path()).expect("regen nest artifacts");
 
     let result = nuthatch::port_emit::emit(subgraph.path(), nest.path()).unwrap();
     let token = result
