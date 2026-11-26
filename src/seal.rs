@@ -1979,7 +1979,7 @@ fn quarantine_segment(dir: &Path, table: &str, s: &Segment, path: &Path, reason:
     };
     std::fs::create_dir_all(&quarantine).ok();
     let dest = keep_earlier(quarantine.join(dest_name));
-    // A rename cannot cross filesystems, as it must where `segments/` is a link onto another disk.
+    // A rename cannot cross filesystems, as it must where `segments/` is a bind mount of another disk.
     let rename = || {
         #[cfg(test)]
         if test_rename_fails().lock().unwrap().contains(path) {

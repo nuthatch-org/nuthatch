@@ -1669,20 +1669,42 @@ fn init_from(source: &str, target: &Path) -> Result<()> {
         );
     }
 
-    if is_git_source(source) {
+    let created = !target.exists();
+    let fetched = if is_git_source(source) {
         say!("→ cloning nest from {source} …");
-        clone_repo(source, target)?;
+        let r = clone_repo(source, target);
+        // A clone keeps a committed link: refuse it while `.git/` is still the only thing skipped.
+        let r = r.and_then(|()| crate::blob::refuse_symlinks(target));
         // Drop the clone's history: a consumed nest is a plain working copy, not a live checkout.
         let _ = std::fs::remove_dir_all(target.join(".git"));
+        r
     } else {
         let src = PathBuf::from(source);
         if !src.is_dir() {
             bail!("--from '{source}' is neither a git URL nor an existing local directory");
         }
         say!("→ copying nest from {} …", src.display());
-        copy_dir_except(&src, target, &crate::blob::is_excluded)?;
+        crate::blob::refuse_symlinks(&src)
+            .and_then(|()| copy_dir_except(&src, target, &crate::blob::is_excluded))
+    };
+    if let Err(e) = fetched {
+        // Remove the half-made target only if this call made it; an empty directory that was
+        // already there is left as it was.
+        if created {
+            let _ = std::fs::remove_dir_all(target);
+        } else if let Ok(rd) = std::fs::read_dir(target) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let _ = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+            }
+        }
+        return Err(e);
     }
-    // A clone keeps a committed symlink, which `dev` would refuse (#2355): say so now.
+    // Belt and braces: the copy is itself link-free (#2355).
     crate::blob::collect_files(target, None)
         .with_context(|| format!("'{}' is not a valid nuthatch nest", target.display()))?;
 
@@ -1759,7 +1781,7 @@ fn source_basename(source: &str) -> String {
 /// Shallow-clone a nest repo into `target` using the system `git` (no in-process git dependency).
 fn clone_repo(url: &str, target: &Path) -> Result<()> {
     let status = std::process::Command::new("git")
-        .args(["clone", "--depth", "1", url])
+        .args(["clone", "--depth", "1", "--", url])
         .arg(target)
         .status()
         .context("failed to run `git` - is it installed and on PATH?")?;
@@ -1780,12 +1802,10 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
     for entry in std::fs::read_dir(src).with_context(|| format!("cannot read {}", src.display()))? {
         let entry = entry?;
         let name = entry.file_name();
-        if skip(&name) {
-            continue;
-        }
         let from = entry.path();
         let to = dst.join(&name);
         let file_type = entry.file_type()?;
+        // Before `skip`: a link named like derived state is refused, not silently left out.
         if file_type.is_symlink() {
             // Following a link would copy whatever it points at into the nest, possibly from outside
             // it (#2692). A nest is plain files, so a link is refused rather than dereferenced.
@@ -1793,6 +1813,9 @@ fn copy_dir_except(src: &Path, dst: &Path, skip: &dyn Fn(&std::ffi::OsStr) -> bo
                 "{} is a symbolic link; a nest cannot contain one",
                 from.display()
             );
+        }
+        if skip(&name) {
+            continue;
         }
         if file_type.is_dir() {
             copy_dir_except(&from, &to, skip)?;
@@ -3454,6 +3477,89 @@ mod tests {
             init_from(repo.to_str().unwrap(), &dir.path().join("out")).unwrap_err()
         );
         assert!(err.contains("symbolic link"), "{err}");
+    }
+
+    /// A link named like derived state is refused by `init --from <dir>`; the half-made target is
+    /// removed and nothing is written through the link.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_refuses_a_link_named_like_derived_state() {
+        for name in ["segments", crate::config::DB_FILE] {
+            let src = tempfile::tempdir().unwrap();
+            copy_dir(
+                &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+                src.path(),
+            )
+            .unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target_of_link = if name == "segments" {
+                outside.path().to_path_buf()
+            } else {
+                let f = outside.path().join("f");
+                std::fs::write(&f, b"outside").unwrap();
+                f
+            };
+            std::os::unix::fs::symlink(&target_of_link, src.path().join(name)).unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let target = out.path().join("copy");
+            let err = format!(
+                "{:#}",
+                init_from(src.path().to_str().unwrap(), &target).unwrap_err()
+            );
+            assert!(err.contains("symbolic link"), "{name}: {err}");
+            assert!(!target.exists(), "half-made target removed");
+            let n = std::fs::read_dir(outside.path()).unwrap().count();
+            assert!(n <= 1, "nothing written to the link target");
+        }
+    }
+
+    /// A committed link survives `git clone`; it is refused and the target is not left behind.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_a_git_repo_refuses_a_committed_link() {
+        let git = |dir: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("nest.git");
+        std::fs::create_dir(&repo).unwrap();
+        copy_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scaffold/two"),
+            &repo,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(tmp.path(), repo.join("segments")).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "nest"]);
+
+        let target = tmp.path().join("out");
+        let source = repo.to_str().unwrap();
+        assert!(is_git_source(source));
+        let err = format!("{:#}", init_from(source, &target).unwrap_err());
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(!target.exists(), "half-made target removed");
+    }
+
+    /// A failed `--from` into a directory that was already there (empty) leaves that directory.
+    #[cfg(unix)]
+    #[test]
+    fn init_from_keeps_a_target_directory_it_did_not_create() {
+        let src = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(src.path(), src.path().join("segments")).unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let target = out.path().join("existing");
+        std::fs::create_dir(&target).unwrap();
+        init_from(src.path().to_str().unwrap(), &target).unwrap_err();
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
     }
 
     #[test]
