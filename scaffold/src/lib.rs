@@ -452,7 +452,11 @@ mod tests {
     /// waiting for rows, and not the backgrounded `&` form that polls whatever answers `/ready`.
     #[test]
     fn the_headless_recipe_detaches_and_waits_for_rows() {
-        let md = agents_md("mainnet", &[("weth", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")], &[]);
+        let md = agents_md(
+            "mainnet",
+            &[("weth", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2")],
+            &[],
+        );
         assert!(
             md.contains("nuthatch dev --backfill 300 --detach --wait-rows\n"),
             "{md}"
