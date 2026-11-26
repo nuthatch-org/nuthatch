@@ -1,6 +1,6 @@
 {
   "name": "nuthatch-indexer",
-  "version": "5.24.0",
+  "version": "5.24.1",
   "description": "Runs the nuthatch release binary: a self-hosted EVM indexer with SQL and an MCP server.",
   "mcpName": "io.github.nuthatch-org/nuthatch",
   "license": "MIT OR Apache-2.0",
