@@ -43,6 +43,13 @@ pub struct Segment {
     /// stay hot until the watermark, and the file hash no longer names them. Absent reads as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hash: Option<String>,
+    /// Set when this segment is the leftover of a `--seal-direct` backfill, held provisional
+    /// whatever its size because its end is wherever finality stood, not a data-determined boundary
+    /// (#3139). Quiet-table aging must not finalise it, or two runs with identical rows would end
+    /// with different final segments; only the table's next cut (which folds it) clears it. Absent
+    /// reads as `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_tail: bool,
 }
 
 /// Rows a table needs before its segment at a cut is final rather than provisional (#1150).

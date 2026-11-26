@@ -6001,6 +6001,35 @@ mod tests {
         assert_eq!(seg.from_block, 10);
     }
 
+    /// #3139 follow-up: the same holds for a leftover under both floors. Size cannot tell it from
+    /// an ordinary provisional, so the segment records its origin.
+    #[test]
+    fn quiet_table_aging_leaves_an_under_floor_tail_provisional() {
+        let dir = tempfile::tempdir().unwrap();
+        let a: Vec<String> = (0..3u64).map(|i| stamped("t__a", 10 + i, T0)).collect();
+        seal_tail_with_snapshot(dir.path(), &a, 10, 12, None).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(only(&m, "t__a").provisional && only(&m, "t__a").hold_tail);
+
+        let later = T0 + SEAL_TABLE_AGE_SECS;
+        seal_range(dir.path(), &[stamped("t__b", 13, later)], 13, 13).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        assert!(
+            only(&m, "t__a").provisional,
+            "an under-floor leftover must not be finalised by quiet-table aging"
+        );
+
+        seal_range(dir.path(), &[stamped("t__a", 14, later)], 14, 14).unwrap();
+        let m = load_manifest(dir.path()).unwrap();
+        let seg = only(&m, "t__a");
+        assert_eq!(
+            (seg.rows, seg.from_block),
+            (4, 10),
+            "the next A cut folds the tail"
+        );
+        assert!(!seg.hold_tail, "the fold is an ordinary cut");
+    }
+
     #[test]
     fn a_table_under_the_floor_is_sealed_provisionally_and_still_reads_back() {
         let dir = tempfile::tempdir().unwrap();
