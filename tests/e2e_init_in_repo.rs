@@ -161,3 +161,51 @@ fn a_repo_without_those_files_is_scaffolded_in_place() {
     assert!(dir.path().join("nuthatch.toml").exists());
     assert!(strings(&v["files_skipped"]).is_empty(), "{v}");
 }
+
+#[test]
+fn a_second_run_refreshes_the_section_when_the_generated_text_changed() {
+    let dir = repo();
+    assert_eq!(init(dir.path(), &["--dir", "."]).0, 0);
+    let agents_path = dir.path().join("AGENTS.md");
+    let first = read(&agents_path);
+    assert!(first.contains("weth__transfer"), "{first}");
+
+    // Stale text inside the block, as if the tables or the generator had changed since.
+    let stale = first.replace("weth__transfer", "weth__stale_table");
+    assert_ne!(stale, first);
+    std::fs::write(&agents_path, format!("{stale}\nTheir footer.\n")).unwrap();
+    std::fs::remove_file(dir.path().join("nuthatch.toml")).unwrap();
+
+    let (code, v, stderr) = init(dir.path(), &["--dir", "."]);
+    assert_eq!(code, 0, "{stderr}");
+    let agents = read(&agents_path);
+    assert!(agents.contains("weth__transfer"), "{agents}");
+    assert!(!agents.contains("stale_table"), "{agents}");
+    assert!(agents.starts_with(THEIR_AGENTS), "{agents}");
+    assert!(agents.ends_with("\nTheir footer.\n"), "{agents}");
+    assert_eq!(agents.matches("nuthatch:begin").count(), 1, "{agents}");
+    assert_eq!(agents.matches("nuthatch:end").count(), 1, "{agents}");
+    let updated = strings(&v["files_updated"]);
+    assert_eq!(updated.len(), 1, "{v}");
+    assert!(updated[0].ends_with("AGENTS.md"), "{v}");
+    assert!(strings(&v["files_appended"]).is_empty(), "{v}");
+}
+
+#[test]
+fn rerunning_after_the_nest_is_deleted_refreshes_the_host_section() {
+    let dir = repo();
+    assert_eq!(init(dir.path(), &[]).0, 0);
+    let agents_path = dir.path().join("AGENTS.md");
+    let first = read(&agents_path);
+    std::fs::write(&agents_path, first.replace("`nest/`", "`gone/`")).unwrap();
+    std::fs::remove_dir_all(dir.path().join("nest")).unwrap();
+
+    let (code, v, stderr) = init(dir.path(), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        read(&agents_path),
+        first,
+        "block regenerated, not duplicated"
+    );
+    assert_eq!(strings(&v["files_updated"]).len(), 1, "{v}");
+}

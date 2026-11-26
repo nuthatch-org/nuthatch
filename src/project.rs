@@ -56,6 +56,8 @@ struct Scaffolded {
     skipped: Vec<String>,
     /// Existing files a delimited nuthatch section was appended to this run, as absolute paths.
     appended: Vec<PathBuf>,
+    /// Existing files whose nuthatch section was already there and was rewritten this run (#3157).
+    updated: Vec<PathBuf>,
     /// `--dir` was not given and the current directory is a repository with its own agent or ignore
     /// file, so the nest went to `./nest`.
     dir_defaulted: bool,
@@ -100,6 +102,7 @@ impl Scaffolded {
             "files_written": before.written_since(dir),
             "files_skipped": self.skipped,
             "files_appended": self.appended,
+            "files_updated": self.updated,
             "dir_defaulted": self.dir_defaulted,
             "next": self.next,
         }))
@@ -176,10 +179,17 @@ pub async fn init(mut args: InitArgs) -> Result<()> {
     if defaulted {
         done.dir_defaulted = true;
         let more = adopt_host_files(Path::new("."), "nest")?;
-        for path in &more {
-            say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running does not repeat it)", path.display());
+        for path in &more.appended {
+            say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running refreshes it)", path.display());
         }
-        done.appended.extend(more);
+        for path in &more.updated {
+            say!(
+                "note:  refreshed the nuthatch section in {}",
+                path.display()
+            );
+        }
+        done.appended.extend(more.appended);
+        done.updated.extend(more.updated);
     }
     say!("help:  {DISCORD}   (stuck, or something missing? say so here)");
     count.ask(before.is_some()).await; // RFC-0054 hook
@@ -339,7 +349,9 @@ async fn scaffold(args: InitArgs) -> Result<Scaffolded> {
         .map(|r| r.skipped_anonymous())
         .unwrap_or(0);
     done.skipped = existing.clone();
-    done.appended = adopt_existing_files(&dir, &chain.name, &config, &existing)?;
+    let adopted = adopt_existing_files(&dir, &chain.name, &config, &existing)?;
+    done.appended = adopted.appended;
+    done.updated = adopted.updated;
 
     say!(
         "{}",
@@ -1351,7 +1363,7 @@ fn write_nest_artifacts(
 }
 
 /// Opens and closes the section nuthatch appends to a file that is not its own, so a second run
-/// finds it and leaves the file alone.
+/// finds it and rewrites just that block.
 const SECTION_BEGIN: &str = "nuthatch:begin";
 const SECTION_END: &str = "nuthatch:end";
 
@@ -1406,33 +1418,61 @@ fn existing_scaffold_files(dir: &Path) -> Vec<String> {
     .collect()
 }
 
-/// Append a `begin`/`end`-delimited section to `path` unless one is there already. `html` picks
-/// Markdown's comment syntax over a `#` line. Returns whether the file changed.
-fn append_section(path: &Path, html: bool, body: &str) -> Result<bool> {
-    let mut text =
+/// What [`append_section`] did to the file.
+#[derive(Debug, PartialEq, Eq)]
+enum Section {
+    /// Already there with this very text (or its end marker is missing, so it cannot be delimited).
+    Unchanged,
+    /// No section yet: one was added.
+    Appended,
+    /// A section was there with other text: its block was replaced, the rest of the file untouched.
+    Updated,
+}
+
+/// Write a `begin`/`end`-delimited section into `path`: appended if none is there, replaced in place
+/// if one is (so a re-created nest or changed generated text refreshes it, #3157), left alone if it
+/// already reads the same. `html` picks Markdown's comment syntax over a `#` line.
+fn append_section(path: &Path, html: bool, body: &str) -> Result<Section> {
+    let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    if text.contains(SECTION_BEGIN) {
-        return Ok(false);
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    if !text.is_empty() {
-        text.push('\n');
-    }
     let what = "written by `nuthatch init`; safe to delete";
-    if html {
-        text.push_str(&format!(
-            "<!-- {SECTION_BEGIN}: {what} -->\n{body}<!-- {SECTION_END} -->\n"
-        ));
+    let block = if html {
+        format!("<!-- {SECTION_BEGIN}: {what} -->\n{body}<!-- {SECTION_END} -->\n")
     } else {
-        text.push_str(&format!(
-            "# {SECTION_BEGIN}: {what}\n{body}# {SECTION_END}\n"
-        ));
-    }
-    std::fs::write(path, text)
-        .with_context(|| format!("failed to append to {}", path.display()))?;
-    Ok(true)
+        format!("# {SECTION_BEGIN}: {what}\n{body}# {SECTION_END}\n")
+    };
+    let had = text.contains(SECTION_BEGIN);
+    let out = if let Some(at) = text.find(SECTION_BEGIN) {
+        // The block runs from the start of the line holding the begin marker to the end of the line
+        // holding the end marker.
+        let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        let Some(end_at) = text[at..].find(SECTION_END).map(|i| at + i) else {
+            return Ok(Section::Unchanged);
+        };
+        let end = text[end_at..]
+            .find('\n')
+            .map_or(text.len(), |i| end_at + i + 1);
+        if text[start..end] == block {
+            return Ok(Section::Unchanged);
+        }
+        format!("{}{}{}", &text[..start], block, &text[end..])
+    } else {
+        let mut out = text;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&block);
+        out
+    };
+    std::fs::write(path, out).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(if had {
+        Section::Updated
+    } else {
+        Section::Appended
+    })
 }
 
 /// Ignore rules for a nest at `prefix` (`""` inside the nest, `nest/` from the repository root).
@@ -1451,14 +1491,15 @@ fn ignore_body(prefix: &str) -> String {
 
 /// An `AGENTS.md` or `.gitignore` that was already in the nest directory is the author's, so `init`
 /// appends a delimited nuthatch section to it instead of skipping it in silence (#3025). Idempotent:
-/// a section already there is left alone. Returns the files it appended to.
+/// a section already there is rewritten in place (#3157), and left alone when it already reads the
+/// same. Returns the files it appended to and the ones whose section it updated.
 fn adopt_existing_files(
     dir: &Path,
     chain: &str,
     config: &Config,
     existing: &[String],
-) -> Result<Vec<PathBuf>> {
-    let mut appended = Vec::new();
+) -> Result<Adopted> {
+    let mut appended = Adopted::default();
     let had = |f: &str| existing.iter().any(|e| e == f);
     let agents = dir.join(nuthatch_scaffold::AGENTS_MD);
     // A file `init` wrote itself carries nuthatch's mark and is not the author's.
@@ -1485,49 +1526,76 @@ fn adopt_existing_files(
             })
             .collect();
         let body = format!("## Nuthatch nest\n{body}");
-        if append_section(&agents, true, &body)? {
-            appended.push(agents);
-        }
+        appended.note(agents.clone(), append_section(&agents, true, &body)?);
     }
     if had(".gitignore") {
         let ignore = dir.join(".gitignore");
-        if append_section(&ignore, false, &ignore_body(""))? {
-            appended.push(ignore);
-        }
+        appended.note(
+            ignore.clone(),
+            append_section(&ignore, false, &ignore_body(""))?,
+        );
     }
-    Ok(appended
-        .into_iter()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-        .collect())
+    Ok(appended.canonical())
 }
 
 /// The repository around a nest `init` put in `./<sub>`: a pointer in its `AGENTS.md`, and the nest's
 /// store and sealed data in its `.gitignore`. Returns the files it appended to.
-fn adopt_host_files(host: &Path, sub: &str) -> Result<Vec<PathBuf>> {
-    let mut appended = Vec::new();
+fn adopt_host_files(host: &Path, sub: &str) -> Result<Adopted> {
+    let mut appended = Adopted::default();
     let agents = host.join("AGENTS.md");
     if agents.is_file() {
         let body = format!(
             "## Nuthatch nest\n\nThe `{sub}/` directory is a nuthatch nest: a local SQL index of its contracts. Read\n`{sub}/AGENTS.md` before running or querying it, and query it with\n`nuthatch sql --dir {sub} \"...\" --json` rather than a third-party API.\n"
         );
-        if append_section(&agents, true, &body)? {
-            appended.push(agents);
-        }
+        appended.note(agents.clone(), append_section(&agents, true, &body)?);
     }
     let ignore = host.join(".gitignore");
-    if ignore.is_file() && append_section(&ignore, false, &ignore_body(&format!("{sub}/")))? {
-        appended.push(ignore);
+    if ignore.is_file() {
+        let change = append_section(&ignore, false, &ignore_body(&format!("{sub}/")))?;
+        appended.note(ignore, change);
     }
-    Ok(appended
-        .into_iter()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-        .collect())
+    Ok(appended.canonical())
+}
+
+/// The existing files `init` gave a section to, or whose section it refreshed.
+#[derive(Debug, Default)]
+struct Adopted {
+    appended: Vec<PathBuf>,
+    updated: Vec<PathBuf>,
+}
+
+impl Adopted {
+    fn note(&mut self, path: PathBuf, change: Section) {
+        match change {
+            Section::Appended => self.appended.push(path),
+            Section::Updated => self.updated.push(path),
+            Section::Unchanged => {}
+        }
+    }
+
+    fn canonical(self) -> Self {
+        let abs = |v: Vec<PathBuf>| -> Vec<PathBuf> {
+            v.into_iter()
+                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+                .collect()
+        };
+        Adopted {
+            appended: abs(self.appended),
+            updated: abs(self.updated),
+        }
+    }
 }
 
 /// What `init` did with files that were there already, in the prose a person reads.
 fn report_adoption(done: &Scaffolded) {
     for path in &done.appended {
-        say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running does not repeat it)", path.display());
+        say!("note:  appended a nuthatch section to {} (between `{SECTION_BEGIN}` and `{SECTION_END}`; re-running refreshes it)", path.display());
+    }
+    for path in &done.updated {
+        say!(
+            "note:  refreshed the nuthatch section in {}",
+            path.display()
+        );
     }
     let kept: Vec<&str> = done
         .skipped
@@ -1537,6 +1605,7 @@ fn report_adoption(done: &Scaffolded) {
             !done
                 .appended
                 .iter()
+                .chain(&done.updated)
                 .any(|p| p.file_name().is_some_and(|n| n == *f))
         })
         .collect();
