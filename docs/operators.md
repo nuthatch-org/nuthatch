@@ -2176,7 +2176,7 @@ bytes are wrong for every dataset that names that hash, so every mount of every 
 reduced from then on, and sealing the same rows again in any of them puts it back. A provisional
 tail found corrupt in the background stops later seals until the next start records it as lost, and
 `/ready` answers `503` with `integrity.seals_stopped` from that moment. Where the quarantine cannot be renamed
-into place, as across filesystems when `segments/` is a link onto another disk, the segment is copied
+into place, as across filesystems when `segments/` is a bind mount of another disk, the segment is copied
 there and removed; where it cannot be moved at all, it stays on disk refused, so no read uses it,
 until a pass finds it intact or a seal rewrites it. `nuthatch publish` hashes every segment as it
 reads it for upload, once, and refuses one that does not match by name, exiting non-zero, so a
@@ -2443,8 +2443,8 @@ nuthatch migrate --dir <runtime>              # applies it; add --allow-breaking
   a symbolic link anywhere in the nest, `nuthatch.redb` and `segments/` included, is refused by
   `init --from` and every command that computes the NID, because the NID cannot see what it points to.
   `dev`, `serve` and a runtime's mounts also refuse a link among the nest's top-level state names (`nuthatch.redb`,
-  `segments`, the admin token and the spill directories) and anywhere inside `segments/`, `quarantine/`, `maintained/`
-  and the spill directories, checked before anything is opened; the nest directory itself may be reached through a
+  `segments`, `quarantine`, `maintained`, `checkpoints`, the admin token and the spill directories) and anywhere
+  inside `segments/`, `quarantine/`, `maintained/`, `checkpoints/` and the spill directories, checked before anything is opened; the nest directory itself may be reached through a
   link. A runtime's shared `<root>/segments` is the operator's own and is not checked: keep it a real directory too. To keep the store or `segments/` on
   another disk, mount that disk at the path (a bind mount) rather than linking to it. Whether it is indexed again
   depends on what the edit touched. Views, `entities.toml`, `semantic.toml`, `llms.txt`, `AGENTS.md` and the

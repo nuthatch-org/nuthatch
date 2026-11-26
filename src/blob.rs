@@ -139,6 +139,9 @@ pub fn refuse_symlinked_state(dir: &Path) -> Result<()> {
         dir.join(DB_FILE),
         dir.join("segments"),
         dir.join(crate::admin_token::FILE),
+        dir.join(crate::seal::QUARANTINE_DIR),
+        dir.join(crate::maintained::COPIES_DIR),
+        dir.join("checkpoints"),
     ];
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -172,6 +175,7 @@ pub fn refuse_symlinks_in_state(dir: &Path) -> Result<()> {
         "segments",
         crate::seal::QUARANTINE_DIR,
         crate::maintained::COPIES_DIR,
+        "checkpoints",
     ] {
         stack.push(dir.join(name));
     }
@@ -1024,6 +1028,7 @@ mod tests {
             "segments/blocks/x.parquet",
             "quarantine/x",
             "maintained/v/x",
+            "checkpoints/x",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let link = dir.path().join(rel);
@@ -1032,6 +1037,17 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), &link).unwrap();
             let err = format!("{:#}", refuse_symlinks_in_state(dir.path()).unwrap_err());
             assert!(err.contains("symbolic link"), "{rel}: {err}");
+        }
+        // A top-level state directory that is itself a link is refused, not walked through.
+        for name in [
+            crate::seal::QUARANTINE_DIR,
+            crate::maintained::COPIES_DIR,
+            "checkpoints",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), dir.path().join(name)).unwrap();
+            let err = format!("{:#}", refuse_symlinks_in_state(dir.path()).unwrap_err());
+            assert!(err.contains("symbolic link"), "{name}: {err}");
         }
         // A nest directory reached through a link is not refused: only what is under it is checked.
         let real = tempfile::tempdir().unwrap();
