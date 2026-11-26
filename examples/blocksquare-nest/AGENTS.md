@@ -147,18 +147,19 @@ Query it here; never call a third-party API for this data.
 
 ## Run it headless
 
-`nuthatch dev` runs until it is stopped. Start it in the background with its log outside the
-nest, whose identity counts every file in it, then wait until `/ready` puts it fewer than ten
-blocks behind the tip:
+`nuthatch dev` runs until it is stopped. `--detach` starts it in the background, with its log
+outside the nest (whose identity counts every file in it), and `--wait-rows` returns only once
+`/ready` reports a row is indexed, so the `sql` below sees data:
 
 ```sh
-nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
+nuthatch dev --backfill 300 --detach --wait-rows
 ```
 
-`--backfill 300` starts 300 blocks behind the tip; without it `dev` reads from each contract's
-start block. A nest that has already indexed ignores it. The log says why if it never gets
-there.
+It exits 0 only when this `dev` is serving with rows. Exit 10 (`port_in_use`) means another
+process holds the port and nothing was started: do not query then, you would read the other
+nest or an empty one. Exit 11 (`rows_timeout`) leaves it running; the log it prints says why.
+`nuthatch stop` stops it. `--backfill 300` starts 300 blocks behind the tip; without it `dev`
+reads from each contract's start block. A nest that has already indexed ignores it.
 
 ## Query
 

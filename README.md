@@ -474,12 +474,12 @@ RPC ingestion  →  deterministic decode  →  redb hot store (the unsealed tip)
 nuthatch has a Model Context Protocol server compiled in, so a coding agent can query your contract's
 data in plain English - offline, no phone-home.
 
-An agent with one shell cannot run `nuthatch dev` in the foreground, which never returns. Run it in
-the background, wait until `/ready` puts it fewer than ten blocks behind the tip, then query:
+An agent with one shell cannot run `nuthatch dev` in the foreground, which never returns. Detach it
+and wait for a first row (it exits non-zero if `dev` died or the port is taken by another process),
+then query:
 
 ```sh
-nuthatch dev --backfill 300 > /tmp/nuthatch-dev.log 2>&1 &
-for i in $(seq 150); do curl -sf 127.0.0.1:8288/ready | grep -Eq '"lag_blocks": ?[0-9][,}]' && break; sleep 2; done
+nuthatch dev --backfill 300 --detach --wait-rows
 nuthatch sql "SELECT count(*) FROM weth__transfer" --json
 ```
 

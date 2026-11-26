@@ -329,6 +329,38 @@ fn a_taken_port_is_port_in_use_not_a_false_success() {
     assert_eq!(code, 4, "{stderr}");
 }
 
+/// The foreground form (what a backgrounded `&` runs) must refuse a taken port before it creates the
+/// store: an empty `nuthatch.redb` left behind is read by `nuthatch sql` as a real nest (#3145).
+#[test]
+fn a_taken_port_leaves_no_store_behind() {
+    let rpc = serve_rpc(42_161);
+    let nest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    scaffold_nest(nest.path(), "usdc", USDC);
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = holder.local_addr().unwrap().to_string();
+    let (code, stdout, stderr) = nuthatch(
+        state.path(),
+        &[
+            "dev",
+            "--dir",
+            nest.path().to_str().unwrap(),
+            "--rpc",
+            &rpc,
+            "--listen",
+            &listen,
+            "--no-admin",
+        ],
+    );
+    assert_eq!(code, 10, "{stdout}{stderr}");
+    assert!(stderr.contains("Address already in use"), "{stderr}");
+    assert!(
+        !nest.path().join("nuthatch.redb").exists(),
+        "a failed dev left a store: {:?}",
+        files_in(nest.path())
+    );
+}
+
 #[test]
 fn detach_without_a_nest_is_no_nest() {
     let empty = tempfile::tempdir().unwrap();
