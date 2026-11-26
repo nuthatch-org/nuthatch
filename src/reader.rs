@@ -302,7 +302,8 @@ fn sealed_touches(
     }
     let mut config = crate::config::Config::load(dir)?;
     config.read_only_role = true;
-    let schema = crate::registry::from_nest(dir, &config)?.schema();
+    let registry = crate::registry::from_nest(dir, &config)?;
+    let schema = crate::indexer::nest_full_schema(dir, &config, &registry)?;
     crate::seal::within(dir, store.clone(), || {
         let mut touches = Vec::new();
         for (table, segment) in fresh {
@@ -2053,7 +2054,6 @@ impl Follower {
             .with_context(|| format!("no nest at '{}'", dir.display()))?;
         config.read_only_role = true;
         let registry = crate::registry::from_nest(&dir, &config)?;
-        let calls = crate::indexer::call_registry(&dir, &config)?;
         let identity = hex::encode(crate::project::decode_identity(&dir, &config, &registry)?);
         let seal_span = crate::chains::lookup(&config.nest.chain)
             .map(|c| c.seal_span)
@@ -2087,6 +2087,7 @@ impl Follower {
             ))
         });
         let process = crate::limits::Limits::process();
+        let tables = crate::indexer::nest_full_schema(&dir, &config, &registry)?;
         let mut state = AppState {
             freshness: config.freshness,
             store,
@@ -2101,11 +2102,7 @@ impl Follower {
             entities: Arc::new(Vec::new()),
             threshold: config.flags.threshold_amount(),
             velocity_threshold: config.flags.velocity().map(|(amt, _)| amt),
-            tables: Arc::new(crate::indexer::full_schema(
-                &registry,
-                calls.as_ref(),
-                &config,
-            )),
+            tables: Arc::new(tables),
             sql_gate,
             tenant,
             sql_queued: Default::default(),

@@ -206,16 +206,16 @@ fn check_folds(dir: &Path, from_genesis: bool) -> Result<()> {
     Ok(())
 }
 
-/// The nest's decode-registry table schemas, for view drift-validation. `None` if the dir isn't a
+/// The nest's full served schema (events, calls, documents), for view drift-validation. `None` if the dir isn't a
 /// nest (no config), and view validation is then skipped. A config `dev` would refuse is an error
 /// (#2687): skipping on it let `check` pass a nest that does not start.
-fn nest_schema(dir: &Path) -> Result<Option<Vec<crate::registry::TableSchema>>> {
+pub(crate) fn nest_schema(dir: &Path) -> Result<Option<Vec<crate::registry::TableSchema>>> {
     if !dir.join(crate::config::CONFIG_FILE).exists() {
         return Ok(None);
     }
     let cfg = crate::config::Config::load(dir)?;
     let reg = crate::registry::from_nest(dir, &cfg).context("building the decode registry")?;
-    Ok(Some(reg.schema()))
+    Ok(Some(crate::indexer::nest_full_schema(dir, &cfg, &reg)?))
 }
 
 /// Every `checks/<name>.sql` (sorted), optionally filtered to names containing `filter`.
