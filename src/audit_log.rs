@@ -555,6 +555,8 @@ struct Record<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     dropped_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    through_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     identity: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_from: Option<&'a str>,
@@ -603,6 +605,7 @@ impl<'a> Record<'a> {
                 .map_or(0, |d| d.as_millis() as u64),
             event,
             dropped_bytes: None,
+            through_seq: None,
             identity: None,
             identity_from: None,
             surface: None,
@@ -682,6 +685,10 @@ fn last_line(f: &mut File) -> std::io::Result<(u64, Option<Vec<u8>>)> {
 struct Link {
     seq: u64,
     prev: String,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    through_seq: Option<u64>,
 }
 
 /// The writer's state: the chain's head and the file it appends to.
@@ -782,7 +789,8 @@ impl Chain {
             .file
             .as_ref()
             .is_some_and(|(_, len)| *len > 0 && *len + line.len() as u64 + 1 > self.rotate_bytes);
-        if full || self.file.is_none() {
+        let rotated = full || self.file.is_none();
+        if rotated {
             if let Some((f, _)) = self.file.take() {
                 f.sync_all()?;
             }
@@ -793,10 +801,17 @@ impl Chain {
             File::open(&self.dir)?.sync_all()?;
             let len = f.metadata()?.len();
             self.file = Some((f, len));
-            self.retain()?;
         }
+        self.write_line(line, seq)?;
+        if rotated {
+            self.retain();
+        }
+        Ok(())
+    }
+
+    fn write_line(&mut self, line: &[u8], seq: u64) -> Result<()> {
         let Some((f, len)) = self.file.as_mut() else {
-            unreachable!("opened above");
+            unreachable!("opened by the caller");
         };
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line);
@@ -813,13 +828,36 @@ impl Chain {
         Ok(())
     }
 
-    /// Delete the oldest files past `keep_files`.
-    fn retain(&self) -> Result<()> {
+    /// Delete the oldest files past `keep_files`. The deletion is put on the chain first, as a
+    /// `pruned` record in the newest file, and the newest file is made durable before anything is
+    /// removed: a crash can leave too many files, never a log that has lost its past without saying
+    /// so, and never one a restart would take for empty.
+    fn retain(&mut self) {
         if self.keep_files == 0 {
+            return;
+        }
+        if let Err(e) = self.prune() {
+            tracing::warn!("audit log: retention skipped: {e:#}");
+        }
+    }
+
+    fn prune(&mut self) -> Result<()> {
+        let all = files(&self.dir)?;
+        let drop = all.len().saturating_sub(self.keep_files);
+        if drop == 0 {
             return Ok(());
         }
-        let all = files(&self.dir)?;
-        for (_, path) in all.iter().take(all.len().saturating_sub(self.keep_files)) {
+        let through = all[drop].0 - 1;
+        let seq = self.seq + 1;
+        let head = self.head.clone();
+        let mut r = Record::bare(seq, &head, "pruned");
+        r.through_seq = Some(through);
+        let line = serde_json::to_vec(&r)?;
+        self.write_line(&line, seq)?;
+        if let Some((f, _)) = &self.file {
+            f.sync_all()?;
+        }
+        for (_, path) in &all[..drop] {
             std::fs::remove_file(path)?;
         }
         Ok(())
@@ -927,7 +965,8 @@ pub struct Verified {
 /// Walk the chain in `path`, a log directory or one of its files. An error names the first record
 /// that breaks it.
 pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
-    let list = if path.is_dir() {
+    let as_dir = path.is_dir();
+    let list = if as_dir {
         files(path)?
     } else {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -942,6 +981,7 @@ pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
         bail!("no audit-<seq>.jsonl files in {}", path.display());
     }
     let mut head: Option<String> = None;
+    let mut pruned_through = 0;
     let (mut first_seq, mut last_seq, mut records) = (0, 0, 0u64);
     for (named, file) in &list {
         let reader = std::io::BufReader::new(
@@ -979,6 +1019,9 @@ pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
                     }
                 }
             }
+            if link.event.as_deref() == Some("pruned") {
+                pruned_through = pruned_through.max(link.through_seq.unwrap_or(0));
+            }
             first_in_file = false;
             last_seq = link.seq;
             head = Some(sha256_hex(&line));
@@ -986,6 +1029,20 @@ pub fn verify(path: &Path, expect_head: Option<&str>) -> Result<Verified> {
         }
     }
     let head = head.context("the audit log holds no records")?;
+    // Only the writer's own retention may remove the oldest records, and it records that on the
+    // chain. A start past seq 1 that no `pruned` record covers is a deleted prefix. The marker
+    // may cover more than the visible prefix: prune writes through_seq for every file it
+    // intends to drop, then deletes them one by one, so a crash partway through leaves a valid
+    // chain whose first seq is still below that marker.
+    // A single shipped file is allowed to start past seq 1: rotation closes it and operators
+    // copy it off the host. The missing-prefix rule is for a directory that has lost its start.
+    if as_dir && first_seq != 1 && pruned_through + 1 < first_seq {
+        bail!(
+            "the log starts at seq {first_seq} but nothing on the chain accounts for records 1..={}: \
+             its oldest records were deleted",
+            first_seq - 1
+        );
+    }
     if let Some(want) = expect_head {
         let (seq, hash) = want.split_once(':').unwrap_or(("", want));
         if hash != head || (!seq.is_empty() && seq.parse::<u64>().ok() != Some(last_seq)) {
@@ -1015,7 +1072,7 @@ pub fn verify_cli(a: &crate::cli::AuditVerifyArgs) -> Result<()> {
         );
         if v.first_seq != 1 {
             println!(
-                "note: the log starts at seq {}: earlier files were removed (--audit-log-keep) or are missing",
+                "note: the log starts at seq {}: earlier files were removed by --audit-log-keep",
                 v.first_seq
             );
         }
@@ -1479,7 +1536,121 @@ mod tests {
         assert_eq!(files(tmp.path()).unwrap().len(), 2);
         let v = verify(tmp.path(), None).unwrap();
         assert!(v.first_seq > 1);
-        assert_eq!(v.last_seq, 30);
+        // Each prune takes a seq of its own.
+        assert!(v.last_seq > 30, "{v:?}");
+    }
+
+    #[test]
+    fn a_deleted_prefix_fails_verify_even_with_the_head_and_as_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 20, 400, 0);
+        let v = verify(tmp.path(), None).unwrap();
+        let head = format!("{}:{}", v.last_seq, v.head);
+        let all = files(tmp.path()).unwrap();
+        assert!(all.len() > 2);
+        std::fs::remove_file(&all[0].1).unwrap();
+        for h in [None, Some(head.as_str())] {
+            let e = verify(tmp.path(), h).unwrap_err().to_string();
+            assert!(e.contains("oldest records were deleted"), "{e}");
+        }
+        let args = crate::cli::AuditVerifyArgs {
+            path: tmp.path().to_path_buf(),
+            head: Some(head),
+            json: true,
+        };
+        assert!(verify_cli(&args).is_err());
+    }
+
+    #[test]
+    fn retention_is_recorded_and_a_further_deletion_still_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 2);
+        verify(tmp.path(), None).unwrap();
+        let all = files(tmp.path()).unwrap();
+        std::fs::remove_file(&all[0].1).unwrap();
+        assert!(verify(tmp.path(), None).is_err());
+    }
+
+    #[test]
+    fn a_single_rotated_file_still_verifies_on_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 0);
+        let all = files(tmp.path()).unwrap();
+        assert!(all.len() >= 2, "need a rotated file");
+        // The file itself is an intact chain, even though it starts past seq 1 and has no
+        // pruned record (keep is off). A directory missing that earlier file is the deleted prefix.
+        verify(&all[1].1, None).unwrap();
+        std::fs::remove_file(&all[0].1).unwrap();
+        assert!(verify(tmp.path(), None).is_err());
+        verify(&all[1].1, None).unwrap();
+    }
+
+    #[test]
+    fn a_crash_partway_through_retention_still_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 0);
+        let all = files(tmp.path()).unwrap();
+        assert!(
+            all.len() >= 3,
+            "need several files so a mid-loop crash is visible"
+        );
+        let through = all[all.len() - 1].0 - 1;
+        let mut chain = Chain::open(&Settings {
+            rotate_bytes: 64 << 20,
+            keep_files: 0,
+            ..settings(tmp.path())
+        })
+        .unwrap();
+        let seq = chain.seq + 1;
+        let head = chain.head.clone();
+        let mut r = Record::bare(seq, &head, "pruned");
+        r.through_seq = Some(through);
+        let line = serde_json::to_vec(&r).unwrap();
+        chain.append(&line).unwrap();
+        chain.sync().unwrap();
+        // prune would now delete every file but the last. A crash after the first removal
+        // leaves a start below the marker, which must still verify.
+        std::fs::remove_file(&all[0].1).unwrap();
+        verify(tmp.path(), None).unwrap();
+        std::fs::remove_file(&all[1].1).unwrap();
+        verify(tmp.path(), None).unwrap();
+    }
+
+    #[test]
+    fn a_crash_after_a_keep_one_rotation_cannot_restart_the_chain_at_seq_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 1);
+        let before = verify(tmp.path(), None).unwrap();
+        assert!(before.first_seq > 1);
+        // The crash: a rotation had created the next file, and nothing in it survived.
+        let next = tmp.path().join(file_name(before.last_seq + 1));
+        File::create(&next).unwrap();
+        write(tmp.path(), 1, 400, 1);
+        let after = verify(tmp.path(), None).unwrap();
+        assert!(after.first_seq > 1, "{after:?}");
+        assert!(after.last_seq > before.last_seq, "{after:?}");
+    }
+
+    #[test]
+    fn the_old_file_outlives_a_rotation_until_the_new_one_is_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), 30, 400, 1);
+        let mut chain = Chain::open(&Settings {
+            rotate_bytes: 400,
+            keep_files: 1,
+            ..settings(tmp.path())
+        })
+        .unwrap();
+        // Every rotation point leaves a log that verifies and carries on from the same seq.
+        for _ in 0..40 {
+            let seq = chain.seq + 1;
+            let head = chain.head.clone();
+            let line = serde_json::to_vec(&Record::bare(seq, &head, "call")).unwrap();
+            chain.append(&line).unwrap();
+            let v = verify(tmp.path(), None).unwrap();
+            assert_eq!(v.last_seq, chain.seq);
+            assert!(v.first_seq > 1);
+        }
     }
 
     #[test]

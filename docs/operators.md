@@ -1669,7 +1669,8 @@ nothing is added to the request path. With it, every call to `/sql`, `/explain`,
   guess it.
 - **Tamper evidence:** each record's `prev` is the SHA-256 of the line before it, and the chain runs
   across files. `nuthatch audit verify DIR` fails by name on a deleted, edited or reordered record, and
-  prints the head (`<seq>:<hash>`). No chain can show that its own tail was cut or rewritten, so keep
+  on a deleted prefix (a log that starts past seq 1 without a `pruned` record that covers at
+  least the missing records), and prints the head (`<seq>:<hash>`). No chain can show that its own tail was cut or rewritten, so keep
   the head somewhere this host cannot write, then pass it back with `verify --head`.
 - **fsync:** `--audit-log-fsync batch` (the default) has one writer thread that fsyncs after each batch
   it drains, and a response does not wait for it. A crash can lose the records queued or written
@@ -1690,7 +1691,10 @@ nothing is added to the request path. With it, every call to `/sql`, `/explain`,
   time; a second is refused.
 - **Rotation and retention:** a new file starts once the current one would pass
   `--audit-log-rotate-mb` (64). Files are never deleted unless you set `--audit-log-keep <N>`, which
-  keeps the newest N at each rotation. `verify` then reports the seq the log starts at. A rotated file
+  keeps the newest N at each rotation. Before deleting, nuthatch writes a `pruned` record
+  (`through_seq`) to the newest file and fsyncs it, so the removal is on the chain and a crash cannot
+  restart the log at seq 1. `verify` then reports the seq the log starts at. Removing the oldest files by
+  hand fails `verify`; rewriting the chain to cover it changes the head, which `--head` sees. A rotated file
   is closed and never written again, so you can ship it off the host with your own tooling (`rclone`,
   `aws s3 sync`). nuthatch makes no network call for it.
 - **Not covered yet:** the Arrow Flight SQL listener (`--flight`), the scaled-mode control plane
