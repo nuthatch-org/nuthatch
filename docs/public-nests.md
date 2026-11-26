@@ -139,7 +139,7 @@ and the two-permit gate are nuthatch's documented guards and were not provoked.
 
 | Limit | Value | Where |
 |---|---|---|
-| Routes served | `/`, `/health`, `/ready`, `/nest`, `/shape`, `/schema`, `/tables`, `/table/*`, `/sql`, `/explain`, `/mcp`; anything else `404` | `nginx.conf` |
+| Routes served | `/`, `/health`, `/ready`, `/nest`, `/shape`, `/schema`, `/tables`, `/table/<name>`, `/sql`, `/explain`, `/mcp`; anything else `404` | `nginx.conf` |
 | `/_admin*`, `/metrics` | `403` | `nginx.conf` (the nest has no `/_admin` either) |
 | Methods | `/sql`, `/explain`: GET, POST. `/mcp`: POST. The rest: GET. Others `403` | `nginx.conf` |
 | Query rate, per IP | 30 a minute, burst 15, then `429` (`/sql`, `/explain`, `/mcp` share it) | `nginx.conf` `per_ip_query` |
