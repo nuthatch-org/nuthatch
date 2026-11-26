@@ -6,7 +6,7 @@ use crate::metrics::CursorMetrics;
 use crate::source::Source;
 use crate::store::{HotStore, LAST_BLOCK_KEY, SEALED_THROUGH_KEY, START_BLOCK_KEY};
 use anyhow::{Context, Result};
-use nuthatch_seal::cut::{aged, block_timestamp, CutScan, Segment, SEAL_DIRECT_BATCH};
+use nuthatch_seal::cut::{aged, block_timestamp, CutScan, Segment, SEAL_DIRECT_BATCH, SEAL_TABLE_BYTES_FLOOR};
 use nuthatch_seal::{rows_to_batch, sort_rows_for_seal, write_parquet, WRITER_PROFILE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,6 +236,14 @@ fn seal_range_inner(
             let rows = sink
                 .rows(s)
                 .with_context(|| format!("reading provisional segment {} to age it", s.file))?;
+            // At or over a floor, a provisional segment can only be a `hold_tail` leftover: a
+            // normal cut would have sealed it final. Its end is wherever finality stood, not a
+            // data-determined boundary, so aging it here would stick that tail as a final segment
+            // (#3139). It stays provisional and folds into the table's next cut.
+            let bytes: usize = rows.iter().map(|v| v.to_string().len()).sum();
+            if rows.len() >= sink.table_floor() || bytes >= SEAL_TABLE_BYTES_FLOOR {
+                continue;
+            }
             if aged(&rows, cut_time) {
                 s.provisional = false;
             }
