@@ -67,6 +67,10 @@ pub struct Config {
     pub jwks_min_refetch_secs: u64,
     /// The name of the environment variable holding an HS256 secret (never the secret itself).
     pub hs256_secret_env: Option<String>,
+    /// The header the gateway sets to the verified token's `sub`, for nuthatch's
+    /// `--audit-log-identity-header`. Any value a client sends under this name is dropped. When set,
+    /// a token with no usable `sub` is refused rather than forwarded unattributed.
+    pub identity_header: Option<String>,
     #[serde(rename = "nest", default)]
     pub nests: Vec<NestConf>,
 }
@@ -93,6 +97,15 @@ impl Config {
         ];
         if sources.iter().filter(|s| **s).count() != 1 {
             return Err("config: set exactly one of jwks_url, jwks_file, hs256_secret_env".into());
+        }
+        if let Some(h) = &cfg.identity_header {
+            let name = HeaderName::try_from(h.as_str())
+                .map_err(|_| format!("config: identity_header {h:?} is not a header name"))?;
+            if name == header::AUTHORIZATION || name == header::VIA || name == header::HOST {
+                return Err(format!(
+                    "config: identity_header {h:?} is not usable for an identity"
+                ));
+            }
         }
         if cfg.nests.is_empty() {
             return Err("config: no [[nest]]: the gateway would refuse everything".into());
@@ -189,6 +202,7 @@ pub struct Gateway {
     client: reqwest::Client,
     /// Longest prefix first, so `/acme/usdc` wins over `/acme`.
     nests: Vec<NestConf>,
+    identity_header: Option<HeaderName>,
 }
 
 impl Gateway {
@@ -229,6 +243,9 @@ impl Gateway {
             keys,
             client: client(None),
             nests: cfg.nests,
+            identity_header: cfg
+                .identity_header
+                .map(|h| HeaderName::try_from(h.as_str()).expect("checked by Config::parse")),
         })
     }
 
@@ -365,9 +382,31 @@ async fn handle(State(g): State<Arc<Gateway>>, req: Request) -> Response {
         Ok(token) => g.verify(token).await,
         Err(e) => Err(e),
     };
-    let held = match claims {
-        Ok(c) => c.scopes(),
+    let claims = match claims {
+        Ok(c) => c,
         Err(e) => return refuse(StatusCode::UNAUTHORIZED, e.code(), method, path, json!({})),
+    };
+    let held = claims.scopes();
+    let identity = match &g.identity_header {
+        None => None,
+        Some(name) => match claims
+            .0
+            .get("sub")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| HeaderValue::from_str(s).ok())
+        {
+            Some(v) => Some((name.clone(), v)),
+            None => {
+                return refuse(
+                    StatusCode::UNAUTHORIZED,
+                    "subject_missing",
+                    method,
+                    path,
+                    json!({}),
+                )
+            }
+        },
     };
     let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
         return refuse(
@@ -419,7 +458,7 @@ async fn handle(State(g): State<Arc<Gateway>>, req: Request) -> Response {
             json!({ "needs": needed }),
         );
     }
-    forward(&g, parts, forwarded).await
+    forward(&g, parts, forwarded, identity).await
 }
 
 /// What the gateway adds to `Via` on every upstream request.
@@ -441,7 +480,12 @@ fn hop_by_hop(name: &HeaderName) -> bool {
     )
 }
 
-async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) -> Response {
+async fn forward(
+    g: &Gateway,
+    parts: axum::http::request::Parts,
+    body: Bytes,
+    identity: Option<(HeaderName, HeaderValue)>,
+) -> Response {
     let target = parts
         .uri
         .path_and_query()
@@ -474,7 +518,8 @@ async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) ->
             || *name == header::VIA
             || *name == header::AUTHORIZATION
             || *name == header::HOST
-            || *name == header::CONTENT_LENGTH;
+            || *name == header::CONTENT_LENGTH
+            || identity.as_ref().is_some_and(|(n, _)| n == name);
         if !dropped {
             out = out.header(name, value);
         }
@@ -483,6 +528,10 @@ async fn forward(g: &Gateway, parts: axum::http::request::Parts, body: Bytes) ->
     // rewrites Host to the upstream, so without a proxy marker every remote caller would look local.
     // `Via` is on nuthatch's proxy-header list (src/address_mode.rs, PROXY_HEADERS).
     out = out.header(header::VIA, via.join(", "));
+    // Set after the client's copies are dropped above, so this is the only one nuthatch sees.
+    if let Some((name, value)) = identity {
+        out = out.header(name, value);
+    }
     let resp = match out.body(body).send().await {
         Ok(r) => r,
         Err(e) => {

@@ -11,7 +11,8 @@
 //! hash unless the operator asks for its text with `--audit-log-statements text`.
 //!
 //! **Identity.** nuthatch authenticates nobody here; it records the string it is given. Either a
-//! header the operator's gateway sets (`--audit-log-identity-header`). [`caller`] is the hook a token
+//! header the operator's gateway sets (`--audit-log-identity-header`), which the gateway must also
+//! strip from what clients send; a call carrying that header twice is refused `400`. [`caller`] is the hook a token
 //! check will hand its verified subject to (#3094); nothing calls it yet. The audit layer sits outside
 //! every route and every layer a router adds, so a check that refuses a call still leaves a record
 //! of the refusal; [`refused`] names why.
@@ -401,12 +402,20 @@ async fn record(
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
-    let header = log
-        .settings
-        .identity_header
-        .as_ref()
-        .and_then(|h| req.headers().get(h))
-        .map(|v| clip(&String::from_utf8_lossy(v.as_bytes())));
+    // A duplicated identity header is refused below: `get` would pick the first value, and the
+    // first is the one a caller can put there.
+    let (header, duplicated) = {
+        let mut values = log
+            .settings
+            .identity_header
+            .as_ref()
+            .into_iter()
+            .flat_map(|h| req.headers().get_all(h).iter());
+        let first = values
+            .next()
+            .map(|v| clip(&String::from_utf8_lossy(v.as_bytes())));
+        (first, values.next().is_some())
+    };
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     // `/sql`, `/explain` and `/mcp` say what they run through [`statement`] and [`mcp`]; the others are hashed
@@ -442,7 +451,7 @@ async fn record(
     let pending = Pending {
         entry: Some(Entry {
             ts_ms,
-            identity: header.map(|h| (h, "header")),
+            identity: header.filter(|_| !duplicated).map(|h| (h, "header")),
             surface,
             method,
             path,
@@ -461,9 +470,24 @@ async fn record(
         slot,
         mutating,
     };
-    let resp = NOTE
-        .scope(note, crate::cost::within(meter, next.run(req)))
-        .await;
+    let resp = if duplicated {
+        NOTE.scope(note, async {
+            refused("identity_header_duplicated");
+            let mut r = axum::response::Response::new(axum::body::Body::from(
+                r#"{"error":"identity_header_duplicated"}"#,
+            ));
+            *r.status_mut() = axum::http::StatusCode::BAD_REQUEST;
+            r.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            r
+        })
+        .await
+    } else {
+        NOTE.scope(note, crate::cost::within(meter, next.run(req)))
+            .await
+    };
     log.finish(pending, resp).await
 }
 
@@ -1215,6 +1239,27 @@ mod tests {
         let r = records(tmp.path());
         assert_eq!(r.len(), 2, "{r:?}");
         assert!(r.iter().all(|x| x["rows"] == 1), "{r:?}");
+    }
+
+    /// #3134: `get` returns the first of a repeated header, which a caller can choose. Refused, and
+    /// recorded as refused with no identity.
+    #[tokio::test]
+    async fn a_duplicated_identity_header_is_refused_and_not_recorded_as_an_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = AuditLog::open(settings(tmp.path())).unwrap();
+        let app = app(log.clone());
+        let req = axum::http::Request::get("/sql?q=SELECT%201")
+            .header("x-forwarded-user", "victim")
+            .header("x-forwarded-user", "gateway-set")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, req).await, 400);
+        log.flush().await;
+        let r = records(tmp.path());
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert!(r[0].get("identity").is_none(), "{r:?}");
+        assert_eq!(r[0]["status"], 400);
+        assert!(r[0].to_string().contains("identity_header_duplicated"));
     }
 
     #[tokio::test]

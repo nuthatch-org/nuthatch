@@ -1652,8 +1652,10 @@ nothing is added to the request path. With it, every call to `/sql`, `/explain`,
 ```
 
 - **Identity** is recorded as an opaque string. nuthatch authenticates nobody here. It comes from
-  `--audit-log-identity-header <name>`, a header your gateway sets (and must strip from what clients
-  send); it is marked `"identity_from":"header"`. Without that flag a record has no identity. A
+  `--audit-log-identity-header <name>`, a header your gateway sets from the verified token and must
+  strip from what clients send (the reference gateway does both when `identity_header` is set; a
+  gateway that does not lets any caller choose the name its records carry). A call that sends the
+  header more than once is refused `400 identity_header_duplicated`. It is marked `"identity_from":"header"`. Without that flag a record has no identity. A
   verified token subject (`"identity_from":"token"`) is not recorded yet: that waits on the token
   check of [#3094](https://github.com/nuthatch-org/nuthatch/issues/3094) calling the audit log's
   `caller()` hook, which nothing does today. A credential header is refused as the identity header:

@@ -143,6 +143,10 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Harness {
+        Harness::with("").await
+    }
+
+    async fn with(extra: &str) -> Harness {
         let (upstream, seen) = stub_nuthatch().await;
         let signer = Signer::new();
         let jwks = signer.jwks();
@@ -165,6 +169,7 @@ impl Harness {
             audience = "nuthatch"
             leeway_secs = 0
             jwks_url = "{idp}/jwks.json"
+            {extra}
             [[nest]]
             name = "usdc"
             prefix = "/usdc"
@@ -851,4 +856,43 @@ async fn an_oversized_jwks_is_refused_at_start() {
         .err()
         .expect("an oversized JWKS is refused");
     assert!(err.contains("larger than"), "{err}");
+}
+
+/// #3134: the audit identity is the gateway's word, never the client's.
+#[tokio::test]
+async fn the_identity_header_is_the_token_subject_and_a_client_copy_is_dropped() {
+    let h = Harness::with(r#"identity_header = "x-forwarded-user""#).await;
+    let token = h.signer.sign("es", claims("read:usdc"));
+    let r = h
+        .http
+        .get(format!("{}/usdc/tables", h.base))
+        .bearer_auth(&token)
+        .header("x-forwarded-user", "victim")
+        .header("X-Forwarded-User", "victim-2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let seen = h.seen.lock().unwrap().clone();
+    let ids: Vec<&str> = seen[0]
+        .headers
+        .iter()
+        .filter(|(k, _)| k == "x-forwarded-user")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(ids, ["team-a"], "{:?}", seen[0].headers);
+}
+
+#[tokio::test]
+async fn a_token_without_a_subject_is_refused_when_an_identity_header_is_set() {
+    let h = Harness::with(r#"identity_header = "x-forwarded-user""#).await;
+    let mut c = claims("read:usdc");
+    c.as_object_mut().unwrap().remove("sub");
+    let token = h.signer.sign("es", c);
+    let (status, body, _) = h.get("/usdc/tables", Some(&token)).await;
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (401, Some("subject_missing"))
+    );
+    assert_eq!(h.forwarded(), 0);
 }
