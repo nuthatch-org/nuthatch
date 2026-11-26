@@ -23879,8 +23879,7 @@ template="pool"
         let registry = crate::registry::from_nest(dir.path(), &config).unwrap();
         assert!(registry.null_timestamps(), "premise: the nest is null");
         let creg = crate::calldata::CallRegistry::from_nest(dir.path(), &config).unwrap();
-        let mut tables = full_schema(&registry, &config);
-        tables.extend(creg.schema(&config.extract));
+        let _tables = full_schema(&registry, Some(&creg), &config);
         let source = PostSource(null_timestamp_call_posts());
         backfill_direct_pipelined_with(
             &source,
