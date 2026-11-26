@@ -330,3 +330,32 @@ service itself: the 2026-09-29 retirement stands.
 2. FR1: whether readers may also run on another host from a segment mirror plus the feed, or only
    beside the writer.
 3. FR2: whether shares apply per chain gate (today's structure) or across the process.
+
+## 8. Status by request (2026-11-26, read at `origin/main` `39188462`)
+
+**built** is in the default binary and tested in this tree. **gated** is built and held by a CI or release
+gate that fails the build. **open** is not done, or not confirmed against a real deployment. A row can say
+more than one: the word is the state of the request, the note is what is still open inside it.
+[docs/partner-hosting-runbook.md](../partner-hosting-runbook.md) is the operator's procedure over these.
+
+| FR | State | Evidence, and what is open |
+|---|---|---|
+| FR1 followers | built | `nuthatch serve --follow` beside the writer, `tests/e2e_follower.rs`; on another host from the mirror and registry (RFC-0076 FR17), `tests/e2e_remote_follower.rs`. **Open:** the §7 question is answered in code, but no run on two real hosts with a real mirror |
+| FR2 tenant shares | built | `PUT /_admin/tenants/<tenant>`, `src/fair_share.rs`, `docs/bench/rfc-0076-tenants.md` |
+| FR3 per-mount limits | built | `PATCH /_admin/mounts/<name>`, `per_mount_limits_bound_one_mount_and_not_its_co_tenant` |
+| FR4 metrics and cost | built | per-nest series and `Nuthatch-Cost` (`docs/operators.md`); a report, not a price |
+| FR5 live memory budget | built | `PUT /_admin/runtime`; the 2 GB default is per cursor, as amended 2026-10-28 |
+| FR6 fault containment | built | ingest panic, build failure, query panic and the rest, each with a co-tenant test in `src/runtime.rs` and `tests/e2e_runtime_chains.rs` |
+| FR7 restarts and upgrades | gated | `scripts/rolling-upgrade.sh` is the `rolling-upgrade` CI job and the release gate's step; restart to ready is measured for 1, 10, 100 and 500 small mounts (`docs/bench/rfc-0073-fr7-restart-to-ready.md`). **Open:** restart time on real nests, by mount count |
+| FR8 strict isolation | **open: not claimed** | `isolation = "strict"` is built (allow-list, per-tenant sessions, confinement tests, `fuzz/sql` in the `fuzz-sql` job, strict `/metrics` isolation by route from #3110 and #3120). The independent review has not run, so the guarantee is not claimed in any doc or to anyone |
+| FR9 add a chain live | built | `POST /_admin/chains`; a runtime with no chain and no mount boots HTTP-only and takes one live (#3110) |
+| FR10 bundle lifecycle | built | `nest inspect --json` and the `/_admin/bundles` endpoints |
+| FR11 `POST /sql` | built | `/sql` accepts `POST`, same guards |
+| FR12 supported release line | built | policy in `SECURITY.md`: previous minor for 30 days |
+| FR13 MCP bearer token | built | `nuthatch mcp --token-env`, `NUTHATCH_MCP_TOKEN` |
+| FR14 decode gaps | built | `nuthatch_nest_logs_undecoded_total`, the `undecoded` block of `/ready` |
+| FR15 S3 registry | gated | `tests/e2e_s3_registry.rs` in the versitygw CI job, which fails when the server is absent (`NUTHATCH_REQUIRE_MINIO`) |
+| FR16 seed through the admin API | built | `"seed": true`; `tests/e2e_seed_mount.rs`, and over S3 `tests/e2e_s3_seed_mount.rs` in CI |
+
+GraphOps's issue #3093 tracks the remaining items: FR8's review, FR7's measured restart on real nests,
+and FR1's two-host run.

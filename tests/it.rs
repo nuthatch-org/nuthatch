@@ -190,6 +190,8 @@ mod over_i128_is_reported;
 mod parity_epoch_shift;
 #[path = "parity_timer_script.rs"]
 mod parity_timer_script;
+#[path = "partner_runbook_refs.rs"]
+mod partner_runbook_refs;
 #[path = "payment_absent.rs"]
 mod payment_absent;
 #[path = "pg_parity.rs"]
