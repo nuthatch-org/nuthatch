@@ -45,7 +45,7 @@ pub(super) fn tool_specs() -> Vec<Value> {
           "inputSchema": { "type": "object", "properties": {} } }),
         json!({ "name": "coverage", "title": "Watched accounts and coverage", "description": "The EVM accounts this nest watches and, per account and per action (txlist, txlistinternal, tokentx, tokennfttx, token1155tx), the block ranges it holds (`covered`) and the ranges between `start_block` and the finalized head it does not (`missing`), each with a status: `pending` (watched, owed, backfill running), `stalled` (owed, but the account's backfill windows are failing or the cursor is stalled, with the error), `not_watched` (watching it would backfill it) or `never` (this nest will not cover it, with why). Before the first finalized head `missing` is absent and `missing_unknown` says why. Read from one store transaction with its `generation`, finalized head and tip. Give `address` for one account, watched or not.",
           "inputSchema": { "type": "object", "properties": { "address": { "type": "string", "description": "One 0x address; omitted, every watched account." }, "chainid": { "type": "integer", "description": "The chain, where one URL serves a directory of chains." } } } }),
-        json!({ "name": "wallet_history", "title": "One account's history", "description": "One EVM account's normal transactions, internal transactions and token transfers over a block or time window, as this address-history nest serves them to rotki at `/api`, with decimals applied: `value_native` on normal and internal rows (wei at 18 decimals), `value_formatted` on token rows (by the row's `tokenDecimal`). Each kind is answered whole for the window or refused with the nest's reason (not indexed, pending, not watched), never shortened. A window above the finalized head, up to the chain head, is covered on demand through the nest's RPC within its request deadline. The answer carries a provenance stamp (generation, finalized head, tip) and `not_seen`. Give `from_block` or `from_time`, and `to_block` or `to_time`.",
+        json!({ "name": "wallet_history", "title": "One account's history", "description": "One EVM account's normal transactions, internal transactions and token transfers over a block or time window, as this address-history nest serves them to rotki at `/api`, with decimals applied: `value_native` on normal and internal rows (wei at 18 decimals), `value_formatted` on token rows (by the row's `tokenDecimal`). Each kind is answered whole for the window or refused with the nest's reason (not indexed, pending, not watched), never shortened. A window above the finalized head, up to the chain head, is covered on demand through the nest's RPC within its request deadline. The answer carries a provenance stamp (generation, finalized head, tip) and `not_seen`. A kind the nest refuses makes the whole result an error (`isError`), with the other kinds' rows still in it. Give `from_block` or `from_time`, and `to_block` or `to_time`. For `page` above 1, pass the `generation` that page 1 returned (each kind's `generation`): the nest then refuses the page if a reorg or an unwatch has moved it, instead of shifting rows silently.",
           "inputSchema": { "type": "object", "properties": {
             "address": { "type": "string", "description": "The 0x address." },
             "chainid": { "type": "integer", "description": "The chain, where one URL serves a directory of chains." },
@@ -55,7 +55,8 @@ pub(super) fn tool_specs() -> Vec<Value> {
             "to_time": { "type": "integer", "description": "End, unix seconds UTC: the last block at or before it." },
             "kinds": { "type": "array", "items": { "type": "string", "enum": ["normal", "internal", "token", "nft", "erc1155"] }, "description": "Which kinds to read (default normal, internal, token)." },
             "limit": { "type": "integer", "description": "Rows per kind per page (default 200, at most 10000).", "default": DEFAULT_LIMIT },
-            "page": { "type": "integer", "description": "Page of each kind, from 1.", "default": 1 } },
+            "page": { "type": "integer", "description": "Page of each kind, from 1.", "default": 1 },
+            "generation": { "type": ["integer", "string"], "description": "The `generation` page 1 returned. Sent on every kind's query for page 2 and later; the nest refuses the page if the generation has moved." } },
             "required": ["address"] } }),
     ]
 }
@@ -105,9 +106,17 @@ pub(super) fn is_tool(name: &str) -> bool {
 }
 
 /// A wallet tool's answer.
-pub(super) async fn call(name: &str, args: &Value, link: Link<'_>, base: &str) -> Result<String> {
+///
+/// The flag is true when the answer is an error result: a `wallet_history` kind the nest refused.
+pub(super) async fn call(
+    name: &str,
+    args: &Value,
+    link: Link<'_>,
+    base: &str,
+) -> Result<(String, bool)> {
+    let plain = |r: Result<String>| r.map(|t| (t, false));
     match name {
-        "wallet_status" => get(link, &format!("{base}/ready")).await,
+        "wallet_status" => plain(get(link, &format!("{base}/ready")).await),
         "coverage" => {
             let chain = args["chainid"].as_u64().map(|c| c.to_string());
             let q: Vec<(&str, &str)> = [
@@ -117,9 +126,12 @@ pub(super) async fn call(name: &str, args: &Value, link: Link<'_>, base: &str) -
             .into_iter()
             .filter_map(|(k, v)| Some((k, v?)))
             .collect();
-            get_query(link, &format!("{base}/api/coverage"), &q).await
+            plain(get_query(link, &format!("{base}/api/coverage"), &q).await)
         }
-        "wallet_history" => history(args, link, base).await.map(|v| v.to_string()),
+        "wallet_history" => history(args, link, base).await.map(|v| {
+            let refused = KINDS.iter().any(|(k, _, _)| v[k].get("refused").is_some());
+            (v.to_string(), refused)
+        }),
         other => bail!("unknown tool `{other}`"),
     }
 }
@@ -148,6 +160,12 @@ async fn history(args: &Value, link: Link<'_>, base: &str) -> Result<Value> {
         bail!("`limit` must be 1 to {MAX_LIMIT}");
     }
     let page = args["page"].as_u64().unwrap_or(1).max(1);
+    // Page 1 is cut at some generation; later pages must be cut at the same one, or the nest refuses.
+    let generation = match &args["generation"] {
+        Value::Number(n) => Some(n.to_string()),
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
     let kinds: Vec<&str> = match args["kinds"].as_array() {
         Some(k) => k.iter().filter_map(Value::as_str).collect(),
         None => DEFAULT_KINDS.to_vec(),
@@ -177,6 +195,9 @@ async fn history(args: &Value, link: Link<'_>, base: &str) -> Result<Value> {
             ("sort", "asc"),
         ];
         q.extend(chain.map(|c| ("chainid", c)));
+        if page > 1 {
+            q.extend(generation.as_deref().map(|g| ("generation", g)));
+        }
         let body: Value =
             serde_json::from_str(&get_query(link, &format!("{base}/api"), &q).await?)?;
         out.insert(kind.to_string(), section(body, scale, limit, page));
@@ -224,8 +245,9 @@ fn section(body: Value, scale: Scale, limit: u64, page: u64) -> Value {
     });
     if truncated {
         s["next"] = json!(format!(
-            "more rows may follow: ask again with page {}",
-            page + 1
+            "more rows may follow: ask again with page {} and generation {}",
+            page + 1,
+            body["generation"].as_str().unwrap_or("from this answer")
         ));
     }
     s
