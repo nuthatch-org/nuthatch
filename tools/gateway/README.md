@@ -28,6 +28,8 @@ upstream = "http://127.0.0.1:8080"   # nuthatch, bound where only the gateway ca
 issuer   = "https://idp.example.org/realms/data"
 audience = "nuthatch"
 leeway_secs = 60                     # clock skew allowed on exp/nbf (default 60)
+identity_header = "x-forwarded-user" # optional: set to the token's `sub`; a client's own copy is dropped.
+                                     # Give nuthatch the same name as --audit-log-identity-header
 
 # Exactly one key source:
 jwks_url = "https://idp.example.org/realms/data/protocol/openid-connect/certs"
