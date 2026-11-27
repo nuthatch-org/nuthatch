@@ -11,22 +11,22 @@ indexed events are queryable with SQL a couple of minutes later.
 
 ```sh
 # nothing installed but Node: run it through npx (or install it, then `export PATH="$HOME/.local/bin:$PATH"`)
-npx -y nuthatch-indexer@5.24.3 init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc --dir nest
-npx -y nuthatch-indexer@5.24.3 dev --dir nest --detach --backfill 300
-npx -y nuthatch-indexer@5.24.3 sql "SELECT count(*) FROM usdc__transfer" --dir nest
+npx -y nuthatch-indexer@5.25.0-dev init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc --dir nest
+npx -y nuthatch-indexer@5.25.0-dev dev --dir nest --detach --backfill 300
+npx -y nuthatch-indexer@5.25.0-dev sql "SELECT count(*) FROM usdc__transfer" --dir nest
 ```
 
 Run these in order. `dev --detach` returns once the API answers, so the shell is never blocked;
 never run `dev` in the foreground from an agent shell. The `sql` count is 0 until the first blocks
 land: repeat the `sql` line every few seconds until it is above zero. Stop it with
-`npx -y nuthatch-indexer@5.24.3 stop --dir nest`.
+`npx -y nuthatch-indexer@5.25.0-dev stop --dir nest`.
 
 To install instead of using `npx`: download the release archive for your platform from
 https://github.com/nuthatch-org/nuthatch/releases, check it against the `.sha256` file beside it
 (and with `gh attestation verify nuthatch-<target>.tar.gz --repo nuthatch-org/nuthatch`, as https://github.com/nuthatch-org/nuthatch/blob/main/docs/install.md describes), unpack it and put
 `nuthatch` on your `PATH`. Or build it with `rustup toolchain install 1.95.0` and
 `cargo +1.95.0 install --git https://github.com/nuthatch-org/nuthatch nuthatch`. Then drop the
-`npx -y nuthatch-indexer@5.24.3` prefix.
+`npx -y nuthatch-indexer@5.25.0-dev` prefix.
 
 - `init` resolves the ABI, detects the chain and writes the nest (the project) into `--dir nest`, so
   nothing lands in your project root. Pass several addresses to index them together. Leave out `--chain`.
@@ -35,8 +35,8 @@ https://github.com/nuthatch-org/nuthatch/releases, check it against the `.sha256
 - Tables are `{alias}__{event}`, with decoded parameters as columns.
 - The bundled public RPCs are for trying it out. Pass your own with `--rpc <url>` on `init` or `dev`.
 - For an agent to query it, with no binary installed and no nest yet (it can create and index one):
-  `claude mcp add nuthatch -- npx -y nuthatch-indexer@5.24.3 mcp --authoring --dir nest`.
-- Porting an existing subgraph: `npx -y nuthatch-indexer@5.24.3 init --from-subgraph <CID> --dir nest`.
+  `claude mcp add nuthatch -- npx -y nuthatch-indexer@5.25.0-dev mcp --authoring --dir nest`.
+- Porting an existing subgraph: `npx -y nuthatch-indexer@5.25.0-dev init --from-subgraph <CID> --dir nest`.
 
 For anything beyond this (factories, views, entities, several nests, troubleshooting), use the
 `nuthatch-builder` skill, or read `llms.txt` in the nest `init` wrote.
