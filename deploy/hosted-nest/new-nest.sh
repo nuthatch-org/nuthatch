@@ -3,7 +3,7 @@
 # Generates what deploy/public-nests/ does by hand for each nest, from that directory's own files (the
 # Base USDC set is the template, so a fix there carries into every new nest). Docs: docs/hosted-nests.md.
 #
-#   new-nest.sh [--apply] <name> <chain> <spec> <start-block> [rpc-env-file]
+#   new-nest.sh [--apply] [--root DIR] [--host-ip IP] [--local-host HOST] [--env-file FILE] <name> <chain> <spec> <start-block> [rpc-env-file]
 #
 #   name          lowercase letters, digits and dashes: becomes /nests/<name>, the unit names, the nest dir
 #   chain         a nuthatch chain name (base, arbitrum-one, arc-testnet, ...)
@@ -18,16 +18,30 @@
 # --apply writes the host files (run on the host, with sudo) and does not start or reload anything.
 # Idempotent: a second run changes nothing; a file that differs is reported and not overwritten.
 #
-# Environment: NEST_ROOT (prefix for every host path, for tests), HOST_IP (the sslip.io address, default
-# the Helsinki host), NUTHATCH_BIN (default /usr/local/bin/nuthatch-5.23.0), SERVICE_USER (nests-public),
+# Settings (flags, never rely on the environment surviving `sudo`, which resets it; `sudo -E` often drops these too):
+#   --root DIR         prefix for every host path (tests); same as NEST_ROOT
+#   --host-ip IP       the sslip.io address, default the Helsinki host; same as HOST_IP
+#   --local-host HOST  the tailnet address Prometheus scrapes /metrics through; adds --local-host to the unit,
+#                      default none; same as NEST_LOCAL_HOST
+#   --env-file FILE    KEY=VALUE lines (NEST_ROOT, HOST_IP, NEST_LOCAL_HOST only; # comments ok), read by the
+#                      script itself so sudo cannot drop them. Flags win over the file, the file over the environment.
+# Other environment: NUTHATCH_BIN (default /usr/local/bin/nuthatch-5.23.0), SERVICE_USER (nests-public),
 # NEST_DEV_ARGS (extra `nuthatch dev` flags, default "--poll-interval 3s --seal-direct --concurrency 4"; add
 # "--window N" for a provider that caps eth_getLogs results, as the Base USDC unit does with --window 1500),
-# NEST_LOCAL_HOST (the tailnet address Prometheus scrapes /metrics through; adds --local-host, default none).
 set -euo pipefail
 
-apply=0
-if [ "${1:-}" = "--apply" ]; then apply=1; shift; fi
-[ $# -ge 4 ] && [ $# -le 5 ] || { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+apply=0 f_root= f_hostip= f_local= f_envfile=
+while [ $# -gt 0 ]; do
+  case $1 in
+    --apply) apply=1; shift;;
+    --root|--host-ip|--local-host|--env-file)
+      [ $# -ge 2 ] || { echo "error: $1 needs a value" >&2; exit 2; }
+      case $1 in --root) f_root=$2;; --host-ip) f_hostip=$2;; --local-host) f_local=$2;; --env-file) f_envfile=$2;; esac
+      shift 2;;
+    *) break;;
+  esac
+done
+[ $# -ge 4 ] && [ $# -le 5 ] || { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 name=$1 chain=$2 spec=$3 start=$4 rpc_file=${5:-}
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -41,14 +55,23 @@ for f in nuthatch-public-base-usdc.service nuthatch-public-base-usdc-proxy.servi
   [ -f "$tpl/$f" ] || die "template missing: $tpl/$f (needs the public-nests kit, PR #3057)"
 done
 
-ROOT=${NEST_ROOT:-}
+# Settings file: parsed, never sourced; only the three known keys.
+ROOT=${NEST_ROOT:-} HOST_IP=${HOST_IP:-} LOCAL_HOST=${NEST_LOCAL_HOST:-}
+if [ -n "$f_envfile" ]; then
+  [ -r "$f_envfile" ] || die "cannot read $f_envfile"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue;; NEST_ROOT=*) ROOT=${line#*=};; HOST_IP=*) HOST_IP=${line#*=};; NEST_LOCAL_HOST=*) LOCAL_HOST=${line#*=};; *) die "unknown line in $f_envfile (only NEST_ROOT, HOST_IP, NEST_LOCAL_HOST): ${line%%=*}";; esac
+  done < "$f_envfile"
+fi
+[ -z "$f_root" ] || ROOT=$f_root
+[ -z "$f_hostip" ] || HOST_IP=$f_hostip
+[ -z "$f_local" ] || LOCAL_HOST=$f_local
 HOST_IP=${HOST_IP:-89.167.109.4}
 NUTHATCH_BIN=${NUTHATCH_BIN:-/usr/local/bin/nuthatch-5.23.0}
 SVC_USER=${SERVICE_USER:-nests-public}
 DEV_ARGS=${NEST_DEV_ARGS:---poll-interval 3s --seal-direct --concurrency 4}
-LOCAL_HOST=${NEST_LOCAL_HOST:-}
 local_host_line=
-[ -z "$LOCAL_HOST" ] || { [[ $LOCAL_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || die "bad NEST_LOCAL_HOST: $LOCAL_HOST"; local_host_line="    --local-host $LOCAL_HOST \\"$'\n'; }
+[ -z "$LOCAL_HOST" ] || { [[ $LOCAL_HOST =~ ^[A-Za-z0-9.:-]+$ ]] || die "bad local host: $LOCAL_HOST"; local_host_line="    --local-host $LOCAL_HOST \\"$'\n'; }
 under=${name//-/_}
 public_host=$name.nuthatch-indexer.com          # only ever sent as a Host header; never needs DNS
 site=$name.$HOST_IP.sslip.io
@@ -121,7 +144,7 @@ render_nest_unit() {
 # $name on $chain, public and read-only: --no-admin removes the admin routes, --public-host names the Host the
 # nest answers to (#3002). The backfill flags are NEST_DEV_ARGS, not the Base USDC unit's: that unit also sets --window 1500
 # (a GraphOps log cap) and --local-host (the tailnet scrape); see deploy/public-nests/nuthatch-public-base-usdc.service.
-# Without --local-host a loopback nest refuses the Host Prometheus sends, so set NEST_LOCAL_HOST to be scraped.
+# Without --local-host a loopback nest refuses the Host Prometheus sends, so pass --local-host to be scraped.
 [Unit]
 Description=nuthatch public read-only nest: $name ($chain)
 Documentation=https://github.com/nuthatch-org/nuthatch/blob/main/docs/hosted-nests.md

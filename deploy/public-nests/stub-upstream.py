@@ -27,7 +27,7 @@ class Stub(BaseHTTPRequestHandler):
             status = 403
             out = {"error": "forbidden origin"}
         elif self.path.startswith("/mcp"):
-            out = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+            out = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}, "host": self.headers.get("host")}
         else:
             out = {"stub": True, "path": self.path, "host": self.headers.get("host")}
         data = json.dumps(out).encode()

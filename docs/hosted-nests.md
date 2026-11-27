@@ -39,8 +39,16 @@ already authored, pass its directory or git URL instead of addresses, and `-` fo
 user, binary, nginx installed); it already has it if a nest is running. Then:
 
 ```sh
-sudo deploy/hosted-nest/new-nest.sh --apply acme-vault base 0xAddr1,0xAddr2 21000000 ~/secrets/acme.rpc.env
+sudo deploy/hosted-nest/new-nest.sh --apply --local-host 100.x.y.z acme-vault base 0xAddr1,0xAddr2 21000000 ~/secrets/acme.rpc.env
 ```
+
+Settings are flags, not environment variables: `sudo` resets the environment and `sudo -E` often drops
+`NEST_ROOT`, `HOST_IP` and `NEST_LOCAL_HOST` anyway. Use `--local-host` (the tailnet address Prometheus scrapes
+through; without it the unit has no `--local-host` and the nest refuses Prometheus's Host), `--host-ip` and
+`--root DIR` (a prefix for every host path, for tests), or put them in a file as `NEST_ROOT=`, `HOST_IP=`,
+`NEST_LOCAL_HOST=` lines and pass `--env-file FILE`. Flags win over the file, the file over the environment.
+`remove-nest.sh` takes `--root DIR` the same way. `deploy/hosted-nest/test-nest-kit.sh` checks all of this under
+`env -i`.
 
 It writes the files and appends the Caddy block, and starts nothing. Running it again changes nothing; a file
 that differs is reported and left alone. Ports are the next free pair (nest 81xx, proxy 84xx).
@@ -116,7 +124,7 @@ service with an uptime promise.
 ## Tested
 
 `new-nest.sh` and `remove-nest.sh` were run against a scratch `NEST_ROOT` (dry run, apply, apply again,
-remove). The generated units and nginx config come from the Base USDC files by substitution, and were not
+remove; `test-nest-kit.sh` repeats it with the environment cleared). The generated units and nginx config come from the Base USDC files by substitution, and were not
 started on a real host or run through `test-proxy.sh` in this change.
 
 ## Notes from hosting the lead nests (gooddollar-xdc, sablier-xdc, pharos-eth)

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Take down a nest made by new-nest.sh. Dry run by default; --apply does it; --purge-data also deletes the
 # nest's data directory (otherwise it is kept, so a removal can be undone by re-running new-nest.sh).
-#   remove-nest.sh [--apply] [--purge-data] <name>
-# NEST_ROOT prefixes every host path (tests); with it set, systemctl is not called.
+#   remove-nest.sh [--apply] [--purge-data] [--root DIR] <name>
+# --root DIR (or NEST_ROOT) prefixes every host path (tests); with it set, systemctl is not called. Use the flag
+# under sudo: sudo resets the environment, and `sudo -E` often drops NEST_ROOT too.
 set -euo pipefail
-apply=0 purge=0
-while [ $# -gt 1 ]; do case $1 in --apply) apply=1;; --purge-data) purge=1;; *) echo "unknown flag $1" >&2; exit 2;; esac; shift; done
-name=${1:?usage: remove-nest.sh [--apply] [--purge-data] <name>}
+apply=0 purge=0 f_root=
+while [ $# -gt 1 ]; do case $1 in --apply) apply=1;; --purge-data) purge=1;; --root) [ $# -gt 2 ] || { echo "--root needs a value" >&2; exit 2; }; f_root=$2; shift;; *) echo "unknown flag $1" >&2; exit 2;; esac; shift; done
+name=${1:?usage: remove-nest.sh [--apply] [--purge-data] [--root DIR] <name>}
 [[ $name =~ ^[a-z][a-z0-9-]{1,30}[a-z0-9]$ ]] || { echo "bad name" >&2; exit 2; }
 case $name in
   arc-usdc|base-usdc|arc-testnet) echo "refusing: $name is one of the permanent demo nests (deploy/public-nests)" >&2; exit 2;;
   proxy|*-proxy|*-nest|xdc-rpc-ua) echo "refusing: $name would name a shared unit (nuthatch-public-$name*), not a nest made by new-nest.sh" >&2; exit 2;;
 esac
-ROOT=${NEST_ROOT:-}
+ROOT=${f_root:-${NEST_ROOT:-}}
 unit=nuthatch-public-$name
 # Act only on what new-nest.sh made: its unit header and its marked Caddy block. Checked before anything is touched.
 mine=/etc/systemd/system/$unit.service cf=$ROOT/etc/caddy/Caddyfile
