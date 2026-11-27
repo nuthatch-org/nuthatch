@@ -2679,8 +2679,9 @@ fn scaffold_ai_surface_with(
 
 /// What `init` prints as the next command. A backfill longer than a thousand windows (#1607) is
 /// offered as the last fifteen of them, which a bundled public endpoint can serve, and told that
-/// the whole span is a job for the operator's own RPC. A short history, or one whose start or tip
-/// was not read, is offered plain `nuthatch dev`.
+/// the whole span is a job for the operator's own RPC. A short history is offered plain
+/// `nuthatch dev`. A start or tip that was not read is offered the same bounded command, since the
+/// span is unknown and plain `dev` could be a full-history backfill on a public endpoint (#3128).
 struct NextStep {
     command: String,
     note: Option<String>,
@@ -2688,18 +2689,27 @@ struct NextStep {
 
 fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> NextStep {
     let dev = format!("nuthatch dev --detach --wait-rows{}", dir_hint(dir));
-    let Some(span) = start
-        .zip(tip)
-        .and_then(|(start, tip)| crate::indexer::long_backfill(start, tip, window))
-    else {
+    let recent = window.saturating_mul(15);
+    let bounded = format!("{dev} --backfill {recent}");
+    let Some((start, tip)) = start.zip(tip) else {
+        // Start or tip unread: the span is unknown, and plain `dev` could be a full-history backfill.
+        return NextStep {
+            command: bounded,
+            note: Some(format!(
+                "(the last {recent} blocks, on the bundled public RPCs. The history length could not \
+                 be read; a full backfill needs your own RPC: {dev} --rpc=<url>, or rpc_urls in \
+                 nuthatch.toml)"
+            )),
+        };
+    };
+    let Some(span) = crate::indexer::long_backfill(start, tip, window) else {
         return NextStep {
             command: dev,
             note: None,
         };
     };
-    let recent = window.saturating_mul(15);
     NextStep {
-        command: format!("{dev} --backfill {recent}"),
+        command: bounded,
         note: Some(format!(
             "(the last {recent} blocks, on the bundled public RPCs. A full backfill of {span} \
              blocks from deployment needs your own RPC: {dev} --rpc=<url>, or rpc_urls in \
@@ -2717,7 +2727,7 @@ fn print_next(step: &NextStep) {
 
 /// The next step for a nest already on disk (`schema`, `init --from`, `--from-subgraph`), which has
 /// no RPC client in hand: read its earliest start block and the chain tip. A tip that cannot be read
-/// within ten seconds leaves the plain command, as in `init`.
+/// within ten seconds gets the bounded command, as in `init`.
 async fn next_step_for(dir_arg: &str, dir: &Path, rpc: &[String]) -> Result<NextStep> {
     let config = Config::load(dir)?;
     let urls = crate::rpc::select_rpcs(rpc, config.nest.rpc_urls.iter().cloned());
@@ -3292,8 +3302,8 @@ mod tests {
     }
 
     /// #1607: the README demo, USDC from deployment, is offered `dev --backfill 300` as the command
-    /// to run, and told the full span needs the operator's own RPC. A nest with a short history or
-    /// no detected start is offered plain `dev`.
+    /// to run, and told the full span needs the operator's own RPC. A short history is offered
+    /// plain `dev`; an unread start or tip is offered the same bounded command (#3128).
     #[test]
     fn init_offers_recent_history_only_beside_a_long_backfill() {
         let step = next_step("usdc", Some(6_082_465), Some(26_096_175), 20);
@@ -3316,11 +3326,17 @@ mod tests {
         assert_eq!(short.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(short.note, None);
         let no_tip = next_step(".", Some(6_082_465), None, 20);
-        assert_eq!(no_tip.command, "nuthatch dev --detach --wait-rows");
-        assert_eq!(no_tip.note, None);
+        assert_eq!(
+            no_tip.command,
+            "nuthatch dev --detach --wait-rows --backfill 300"
+        );
+        assert!(no_tip.note.is_some_and(|n| !n.contains("rpc ")));
         let no_start = next_step(".", None, Some(26_096_175), 20);
-        assert_eq!(no_start.command, "nuthatch dev --detach --wait-rows");
-        assert_eq!(no_start.note, None);
+        assert_eq!(
+            no_start.command,
+            "nuthatch dev --detach --wait-rows --backfill 300"
+        );
+        assert!(no_start.note.is_some());
     }
 
     /// #3166: `add`, `schema`, `init --from` and `--from-subgraph` once printed the unbounded
