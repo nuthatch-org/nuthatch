@@ -63,8 +63,8 @@ if [[ $spec =~ ^0x[0-9a-fA-F]{40}(,0x[0-9a-fA-F]{40})*$ ]]; then
   mode=init
   [ "$start" != "-" ] || die "start-block is needed with addresses"
   nest_cmd="$NUTHATCH_BIN init ${spec//,/ } --chain $chain --dir $nestdir --start-block $start"
-elif [[ $spec =~ ^(https?://|git@) ]]; then
-  mode=git; nest_cmd="git clone -- $spec $nestdir"
+elif [[ $spec =~ ^(https://|git@)[A-Za-z0-9._~:/@+-]+$ ]]; then
+  mode=git; nest_cmd="git clone -- $(printf %q "$spec") $nestdir"
 elif [ -d "$spec" ]; then
   mode=dir; nest_cmd="cp -a $(cd "$spec" && pwd)/. $nestdir/"
 else
