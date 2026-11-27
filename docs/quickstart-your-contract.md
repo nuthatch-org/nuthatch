@@ -2,8 +2,8 @@
 
 Point nuthatch at one contract and get its event history as SQL tables on your own machine, with an
 MCP server your coding agent can query. No Postgres, no subgraph, no handlers to write, and no
-`eth_getLogs` windows to hand-roll. Every block below was run from an empty home directory on
-nuthatch 5.24.0 (25 November 2026) against Base USDC and the Uniswap V3 USDC/WETH pool.
+`eth_getLogs` windows to hand-roll. Checked against nuthatch 5.24.2. The blocks below were run
+from an empty home directory against Base USDC and the Uniswap V3 USDC/WETH pool, and the timings were measured on 5.24.0.
 
 ## 1. Install
 
@@ -29,6 +29,26 @@ which for a proxy like USDC is `fiat_token_v2_2`.
 ```sh
 mkdir usdc-nest && cd usdc-nest
 nuthatch init 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 --chain base --alias usdc
+```
+
+`init` checks proxies. For USDC it prints a warning like this (block numbers are the real ones for your
+run):
+
+```text
+⚠ usdc: the proxy starts at block <proxy_start>, but its current implementation was deployed at block <impl_start>.
+  Events before block <impl_start> may use earlier implementation ABIs and will not be decoded by this scaffold.
+```
+
+The fix is a second `[[contracts]]` entry in `nuthatch.toml` at the same address, with the earlier ABI
+saved under `abis/` and an `events` allowlist of the events the current ABI lacks:
+
+```toml
+[[contracts]]
+alias = "usdc_v1"
+address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+start_block = <proxy_start>
+abi = "abis/usdc_v1.json"
+events = ["<EventName>"]   # only events the current ABI lacks
 ```
 
 Leave `--chain` out and `init` probes the known chains for the address. The ABI comes from Sourcify,
@@ -72,9 +92,15 @@ provider.
 Use your endpoint for the recent window or for the whole history:
 
 ```sh
-nuthatch dev --backfill 300 --rpc https://your-endpoint.example
-nuthatch dev --rpc https://your-endpoint.example
+export NUTHATCH_RPC=https://your-endpoint.example
+nuthatch dev --backfill 300
+nuthatch dev
 ```
+
+From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv and ordinary
+process-list output (`ps`). Typing `export NUTHATCH_RPC=...` at the prompt still goes into shell
+history, like any other command. `--rpc https://your-endpoint.example` does the same job as an
+explicit flag, but it also puts the URL on the command line.
 
 The URL can live in `nuthatch.toml` as `rpc_urls` instead. With a 10-block limit, nuthatch learns the
 limit from the error and keeps going. Against a proxy that rejected every range over 10 blocks (a simulation of that error, not the plan itself), a day of Ethereum took well over ten minutes, so start with `--backfill`.
@@ -146,7 +172,7 @@ skill into the directory. Other clients: [AGENTS.md](../AGENTS.md#mcp).
   [`Log response size exceeded`](https://nuthatch-indexer.com/docs/errors/log-response-size-exceeded/),
   [`exceed maximum block range`](https://nuthatch-indexer.com/docs/errors/exceed-maximum-block-range/),
   [`query timeout exceeded`](https://nuthatch-indexer.com/docs/errors/query-timeout-exceeded/).
-- **`every RPC endpoint is rate-limiting us`**: the free bundled endpoints are shared. Pass `--rpc`.
+- **`every RPC endpoint is rate-limiting us`**: the free bundled endpoints are shared. Set `NUTHATCH_RPC` (or pass `--rpc`).
 - **`nuthatch sql` says it cannot find a store or anything answering**: `dev` is not running, or
   `--dir` is not the nest directory.
 - **`no table`**: your `--alias` is the prefix; `.tables` lists the names.

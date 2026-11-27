@@ -86,11 +86,17 @@ Use your own node or a paid endpoint. `--rpc` replaces the bundled pool. The fir
 the recent window. The second backfills from the deployment block:
 
 ```sh
-nuthatch dev --backfill 300 --rpc https://your-endpoint.example
-nuthatch dev --rpc https://your-endpoint.example
+export NUTHATCH_RPC=https://your-endpoint.example
+nuthatch dev --backfill 300
+nuthatch dev
 ```
 
-The same URL can live in `nuthatch.toml` as `rpc_urls` instead of `--rpc`. More, including how to
+From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv and ordinary
+process-list output (`ps`). Typing `export NUTHATCH_RPC=...` at the prompt still goes into shell
+history, like any other command. `--rpc https://your-endpoint.example` does the same job as an
+explicit flag, but it also puts the URL on the command line.
+
+The same URL can live in `nuthatch.toml` as `rpc_urls` instead. More, including how to
 probe an endpoint first, is under [Bring your own RPC endpoint](#bring-your-own-rpc-endpoint).
 
 | | Needs a subgraph | Needs handler code | Data comes from | What you run | Query with |
@@ -254,8 +260,18 @@ nuthatch doctor --rpc https://your-endpoint.example --address 0xADDR
 **Use your own endpoint for anything you care about** - your own node, or a paid provider:
 
 ```sh
+export NUTHATCH_RPC=https://your-endpoint.example/arbitrum
+nuthatch init 0xADDR --chain arbitrum-one
+nuthatch dev
+```
+
+`init` and `dev` read `NUTHATCH_RPC` from 5.24.2. The same URL can live in `nuthatch.toml` as `rpc_urls` instead.
+
+The explicit flag still works, and puts the URL in `ps` and shell history:
+
+```sh
 nuthatch init 0xADDR --chain arbitrum-one --rpc https://your-endpoint.example/arbitrum
-nuthatch dev --rpc https://your-endpoint.example/arbitrum   # or set rpc_urls in nuthatch.toml
+nuthatch dev --rpc https://your-endpoint.example/arbitrum
 ```
 
 `--rpc` is repeatable, and nuthatch round-robins across the pool with per-endpoint health tracking, so
