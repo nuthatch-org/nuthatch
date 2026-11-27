@@ -3383,7 +3383,7 @@ start_block = 6082465
         assert!(long.note.is_some());
         assert_eq!(
             next_step_for_config("n", &config, None).command,
-            "nuthatch dev --detach --wait-rows --dir n"
+            "nuthatch dev --detach --wait-rows --dir n --backfill 300"
         );
         config.contracts[0].start_block = Some(26_090_000);
         let short = next_step_for_config("n", &config, Some(26_096_175));
