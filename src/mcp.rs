@@ -852,6 +852,8 @@ fn prompt_permitted(name: &str, session: &Session<'_>) -> bool {
     let tools: &[&str] = match name {
         "investigate-address" => &["balance", "exposure", "flags"],
         "profile-contract" | "verify-a-number" => &["schema", "sql"],
+        "wallet-history" => &["coverage", "wallet_history"],
+        "coverage-gaps" => &["coverage"],
         _ => &[],
     };
     tools.iter().all(|t| session.permits(t))
@@ -2853,6 +2855,55 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(get["error"]["code"], -32602, "{get}");
+        h.abort();
+    }
+
+    /// Address-history prompts name wallet tools, so they must be hidden when those tools are not
+    /// on the allowlist.
+    #[tokio::test]
+    async fn an_allowlist_hides_address_history_prompts_that_name_withheld_tools() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_wallet_nest().await;
+        let allowed: Vec<String> = ["wallet_status", "diff"].map(String::from).into();
+        let session = Session::new(&client, &base).with_allowed(Some(&allowed));
+
+        let prompts = handle(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = prompts["result"]["prompts"].to_string();
+        assert!(!text.contains("wallet-history"), "{text}");
+        assert!(!text.contains("coverage-gaps"), "{text}");
+
+        for name in ["wallet-history", "coverage-gaps"] {
+            let get = handle(
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+                         "params": { "name": name, "arguments": { "address": "0xabc" } } }),
+                &session,
+            )
+            .await
+            .unwrap();
+            assert_eq!(get["error"]["code"], -32602, "{name}: {get}");
+        }
+
+        // coverage alone is enough for coverage-gaps, but not for wallet-history
+        let coverage_only: Vec<String> = ["coverage"].map(String::from).into();
+        let session = Session::new(&client, &base).with_allowed(Some(&coverage_only));
+        let prompts = handle(
+            &json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = prompts["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(names, ["coverage-gaps"], "{prompts}");
         h.abort();
     }
 
