@@ -141,9 +141,9 @@ bytes = "1"
 # integer wider than any fixed-width type: `sqrtPriceX96^2` reaches 2^384.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 # The analytical engine (RFC-0044 Amendment 2), pinned by tag; Cargo.lock records the commit the tag
-# resolved to (36fcfb3), so a moved tag cannot change a locked build. Its arrow is not ours, so no batch
+# resolved to (2cbc368), so a moved tag cannot change a locked build. Its arrow is not ours, so no batch
 # crosses; rows cross as JSON, and Arrow results as IPC.
-burrmill = { git = "https://github.com/nuthatch-org/burrmill", tag = "v0.3.0", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", tag = "v0.5.0", default-features = false, features = ["datafusion"] }
 dbsp = "0.320"
 # RFC-0041 §4 step 4 (#870): the dynamic row representation entity circuits are built over has to
 # satisfy `dbsp::DBData`, which wants `SizeOf` and rkyv archival. Both are already in the tree via
