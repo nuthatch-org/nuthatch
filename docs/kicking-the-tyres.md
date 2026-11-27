@@ -63,6 +63,7 @@ a fresh directory, only the published docs, no reading the source when something
 stopwatch.
 
 ```sh
+mkdir my-nest && cd my-nest
 nuthatch init 0xYourContract --chain mainnet
 nuthatch dev --backfill 300        # without it, dev backfills from the deployment block
 nuthatch sql "SELECT count(*) FROM <alias>__<event>"

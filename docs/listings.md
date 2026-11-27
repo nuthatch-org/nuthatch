@@ -27,6 +27,7 @@ Most forms ask for the same few things. Use these.
 
   ```sh
   curl -fsSL https://nuthatch-indexer.com/install.sh | sh
+  mkdir usdc-nest && cd usdc-nest
   nuthatch init 0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48 --alias usdc
   nuthatch dev --backfill 300
   ```
