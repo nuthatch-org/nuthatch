@@ -159,7 +159,9 @@ impl Authoring {
             cmd.arg(format!("--alias={alias}"));
         }
         if let Some(rpc) = args["rpc"].as_str() {
-            cmd.arg(format!("--rpc={}", rpc_url(rpc)?));
+            // The URL may carry a key; argv is world-readable in /proc, the environment is not.
+            // `init --rpc` reads NUTHATCH_RPC.
+            cmd.env("NUTHATCH_RPC", rpc_url(rpc)?);
         }
         if let Some(abi) = args["abi"].as_str() {
             // Checked here, so a path to some other file is refused without `init` quoting it back.
@@ -807,5 +809,43 @@ mod tests {
             "{argv}"
         );
         assert!(argv.contains("dev"), "{argv}");
+    }
+
+    /// `init_nest` hands the keyed RPC URL to `init` by environment too.
+    #[tokio::test]
+    async fn init_gets_the_rpc_url_by_environment_not_argv() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("seen");
+        let fake = dir.path().join("fake-nuthatch");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$NUTHATCH_RPC\" > {out}.env\nprintf '%s\\n' \"$@\" > {out}.argv\nexit 1\n",
+                out = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let a = Authoring::with_exe(
+            dir.path().join("nest"),
+            fake,
+            "http://127.0.0.1:1",
+            "127.0.0.1:1".into(),
+            dir.path().join("state"),
+        );
+        let url = "https://rpc.example/v2/KEYVALUE";
+        let address = format!("0x{}", "ab".repeat(20));
+        let _ = a
+            .call("init_nest", &json!({ "address": address, "rpc": url }))
+            .await;
+        let env = std::fs::read_to_string(format!("{}.env", out.display())).unwrap();
+        let argv = std::fs::read_to_string(format!("{}.argv", out.display())).unwrap();
+        assert_eq!(env.trim(), url);
+        assert!(
+            !argv.contains("KEYVALUE") && !argv.contains("--rpc"),
+            "{argv}"
+        );
+        assert!(argv.contains("init"), "{argv}");
     }
 }

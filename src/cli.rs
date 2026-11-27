@@ -239,6 +239,27 @@ mod tests {
         }
     }
 
+    /// #3136: a keyed RPC URL can come by `NUTHATCH_RPC` (kept out of argv and `--help`) to `init`
+    /// as it does to `dev`.
+    #[test]
+    fn init_and_dev_read_the_rpc_url_from_the_environment() {
+        let cmd = Cli::command();
+        for sub in ["init", "dev"] {
+            let rpc = cmd
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .find(|a| a.get_id() == "rpc")
+                .unwrap();
+            assert_eq!(
+                rpc.get_env().and_then(|e| e.to_str()),
+                Some("NUTHATCH_RPC"),
+                "{sub}"
+            );
+            assert!(rpc.is_hide_env_values_set(), "{sub}");
+        }
+    }
+
     /// #1399: the seal-direct document deadline takes `--poll-interval`'s durations, and `0` for none.
     #[test]
     fn dev_parses_an_ipfs_window_deadline() {
@@ -1500,7 +1521,7 @@ pub struct InitArgs {
 
     /// Use only these RPC URL(s) (repeatable). They are written to the nest's `rpc_urls` and used
     /// for ABI/deploy-block resolution during init. Point at your own node to avoid public-RPC limits.
-    #[arg(long)]
+    #[arg(long, env = "NUTHATCH_RPC", hide_env_values = true)]
     pub rpc: Vec<String>,
 
     /// Directory to scaffold into. Defaults to the current directory; for `--from`, to the nest's own
