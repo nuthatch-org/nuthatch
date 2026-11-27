@@ -14,29 +14,41 @@
 //!   failure at the bottom and the parse does not return. The same blow-up needs only about twenty
 //!   levels when the text is simply malformed (`CAST(` twenty times and no closing).
 //!
-//! [`check`] answers both before any other parse sees the text, and costs one tokenizer pass plus
-//! at most one bounded parse:
+//! A third shape is a run of `INTERVAL`: each one parses its value as a prefix, outside the
+//! recursion limit, so a thousand of them in a row overflowed the stack inside the bound itself.
 //!
-//! 1. A token scan refuses brackets nested deeper than [`MAX_NESTING`] and a run of more than
-//!    [`MAX_SUBSCRIPTS`] `[]` suffixes. The tokenizer is iterative, so this cannot recurse.
+//! [`check`] answers all three before any other parse sees the text, and costs one tokenizer pass
+//! plus at most three bounded parses:
+//!
+//! 1. A token scan refuses brackets nested deeper than [`MAX_NESTING`], a run of more than
+//!    [`MAX_SUBSCRIPTS`] `[]` suffixes and a run of more than [`MAX_INTERVAL_RUN`] `INTERVAL`s. The
+//!    tokenizer is iterative, so this cannot recurse.
 //! 2. A parse through [`Bounded`], sqlparser's DuckDB dialect with a counter on every expression
 //!    prefix. Ordinary SQL makes well under one prefix call per token (0.3 at most across the views
 //!    in this tree); the multiplied retries make millions. Past [`budget`] calls, or past the
 //!    query's deadline, every further prefix fails at once, so each pending retry fails in constant
 //!    time and the parse returns. A statement that parses within the budget will parse within it
-//!    again wherever else it is parsed, because every later parse takes the same path.
-//! 3. A statement that fails this parse for an ordinary reason (a syntax error, or syntax that only
-//!    Burrmill's own rewrites accept) has not shown what the later parsers will spend on it, so it
-//!    is held to [`MAX_KEYWORD_CALLS`] nested keyword calls, which keeps the worst retry cost to a
-//!    few milliseconds.
+//!    again wherever else it is parsed in the same language, because every later parse takes the
+//!    same path, and so does one that fails within it.
+//!
+//!    The text is read in each language a parser in this process reads it in: sqlparser's DuckDB
+//!    dialect as written (nuthatch's own walks), Burrmill's dialect as written (its `inspect`), and
+//!    Burrmill's dialect after the text rewrites its engine makes first ([`as_burrmill_reads`]).
+//!    They differ: `last_value(x IGNORE NULLS)` fails early in the first and parses in the other
+//!    two, so what follows it is measured only by those.
+//! 3. A statement that fails the engine's parse for an ordinary reason (a syntax error, or a
+//!    rewrite of Burrmill's that the tokens here do not mirror exactly) has not shown what every
+//!    later parser will spend on it, so it is held to [`MAX_KEYWORD_CALLS`] retrying forms, nested
+//!    keyword calls and `(a) ->` lambdas together, which keeps the worst retry cost to a few
+//!    milliseconds.
 //!
 //! None of this sits in the data path: it decides only whether a statement is parsed at all.
 
 use std::cell::Cell;
 use std::time::Instant;
 
-use sqlparser::ast::Expr;
-use sqlparser::dialect::{Dialect, DuckDbDialect};
+use sqlparser::ast::{Expr, Statement};
+use sqlparser::dialect::{Dialect, DuckDbDialect, Precedence};
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
@@ -49,9 +61,16 @@ pub const MAX_NESTING: usize = 47;
 /// Longest run of `[]`, `[n]` or `[i]` suffixes accepted on one type or value.
 pub const MAX_SUBSCRIPTS: usize = 32;
 
-/// Nested keyword calls (`CAST(`, `EXTRACT(`, ...) accepted in a statement that did not parse here.
-/// A failure at the bottom of twelve costs about 2^12 small parses: a few milliseconds.
+/// Retrying forms accepted in a statement that did not parse here: the most keyword calls
+/// (`CAST(`, `EXTRACT(`, ...) open at once, plus every `(a) ->` lambda, each of which the parser
+/// tries once as a lambda and once as a parenthesised expression. A failure at the bottom of twelve
+/// costs about 2^12 small parses: a few milliseconds.
 pub const MAX_KEYWORD_CALLS: usize = 12;
+
+/// Most `INTERVAL`s accepted in a row, with nothing between them but unary operators. Each parses
+/// the next as its value, outside the parser's recursion limit, so a thousand overflowed a 2 MiB
+/// stack. An interval written to be read never holds a second one.
+pub const MAX_INTERVAL_RUN: usize = 2;
 
 /// Why a statement is not parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +79,10 @@ pub enum Refusal {
     TooNested,
     /// More than [`MAX_SUBSCRIPTS`] `[]` suffixes in a row.
     TooManySubscripts,
-    /// More than [`MAX_KEYWORD_CALLS`] nested keyword calls in a statement that did not parse.
+    /// More than [`MAX_KEYWORD_CALLS`] retrying forms in a statement that did not parse.
     TooManyKeywordCalls,
+    /// More than [`MAX_INTERVAL_RUN`] `INTERVAL`s in a row.
+    TooManyIntervals,
     /// The parse made more than [`budget`] prefix calls.
     TooComplex,
     /// The query's deadline passed while it was being parsed.
@@ -83,8 +104,14 @@ impl std::fmt::Display for Refusal {
             ),
             Refusal::TooManyKeywordCalls => write!(
                 f,
-                "query does not parse, and nests more than {MAX_KEYWORD_CALLS} calls such as \
-                 CAST( inside one another, which cannot be parsed within its budget"
+                "query does not parse, and holds more than {MAX_KEYWORD_CALLS} calls such as \
+                 CAST( nested inside one another or lambdas such as (a) ->, which cannot be \
+                 parsed within its budget"
+            ),
+            Refusal::TooManyIntervals => write!(
+                f,
+                "query chains more than {MAX_INTERVAL_RUN} INTERVAL keywords into one another \
+                 and cannot be parsed"
             ),
             Refusal::TooComplex => {
                 write!(
@@ -107,18 +134,30 @@ pub fn check(sql: &str, deadline: Option<Instant>) -> Result<(), Refusal> {
         return Ok(());
     };
     let scan = scan(&tokens)?;
-    let bounded = Bounded {
-        budget: budget(tokens.len()),
-        deadline,
-        ..Bounded::default()
+    let rewritten = as_burrmill_reads(&tokens);
+    // Whether the text parsed, or the refusal if the parse ran out of budget or time.
+    let parse = |burrmill: bool, tokens: Vec<TokenWithSpan>| {
+        let bounded = Bounded {
+            budget: budget(tokens.len()),
+            deadline,
+            burrmill,
+            ..Bounded::default()
+        };
+        let parsed = Parser::new(&bounded)
+            .with_tokens_with_locations(tokens)
+            .parse_statements();
+        match bounded.tripped.get() {
+            Some(trip) => Err(trip),
+            None => Ok(parsed.is_ok()),
+        }
     };
-    let parsed = Parser::new(&bounded)
-        .with_tokens_with_locations(tokens)
-        .parse_statements();
-    if let Some(trip) = bounded.tripped.get() {
-        return Err(trip);
+    // As written, in each dialect, then as Burrmill's engine reads it.
+    parse(false, tokens.clone())?;
+    let mut engine_parsed = parse(true, tokens)?;
+    if let Some(rewritten) = rewritten {
+        engine_parsed = parse(true, rewritten)?;
     }
-    if parsed.is_err() && scan.keyword_calls > MAX_KEYWORD_CALLS {
+    if !engine_parsed && scan.keyword_calls + scan.lambdas > MAX_KEYWORD_CALLS {
         return Err(Refusal::TooManyKeywordCalls);
     }
     Ok(())
@@ -134,6 +173,8 @@ pub fn budget(tokens: usize) -> u64 {
 struct Scan {
     /// The most keyword calls open at once.
     keyword_calls: usize,
+    /// `->` after a `)`: a lambda with its parameters in parentheses.
+    lambdas: usize,
 }
 
 fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
@@ -152,9 +193,23 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
     let mut subscripts = 0usize;
     let mut simple_group = false;
     let mut previous: Option<&Token> = None;
+    let (mut intervals, mut lambdas) = (0usize, 0usize);
     for token in tokens.iter().map(|t| &t.token) {
         if matches!(token, Token::Whitespace(_)) {
             continue;
+        }
+        // A run of `INTERVAL` goes on through unary operators, which recurse within the limit, and
+        // ends at anything else.
+        if is_keyword(Some(token), Some(&[Keyword::INTERVAL])) {
+            intervals += 1;
+            if intervals > MAX_INTERVAL_RUN {
+                return Err(Refusal::TooManyIntervals);
+            }
+        } else if !is_unary(token) {
+            intervals = 0;
+        }
+        if *token == Token::Arrow && previous == Some(&Token::RParen) {
+            lambdas += 1;
         }
         match token {
             Token::LParen | Token::LBracket => {
@@ -211,19 +266,41 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
     }
     Ok(Scan {
         keyword_calls: max_keyword_calls,
+        lambdas,
     })
 }
 
+/// A token that can only begin a prefix operator's operand here: `-`, `+`, `~`, `@`, `!`, `|/`,
+/// `||/` and `NOT`.
+fn is_unary(token: &Token) -> bool {
+    match token {
+        Token::Minus
+        | Token::Plus
+        | Token::Tilde
+        | Token::AtSign
+        | Token::ExclamationMark
+        | Token::DoubleExclamationMark
+        | Token::PGSquareRoot
+        | Token::PGCubeRoot => true,
+        Token::Word(w) => w.quote_style.is_none() && w.keyword == Keyword::NOT,
+        _ => false,
+    }
+}
+
 /// sqlparser's DuckDB dialect, unchanged except that every expression prefix is counted against a
-/// budget and the query's deadline. Once either is spent, every further prefix fails at once.
+/// budget and the query's deadline. Once either is spent, every further prefix fails at once. With
+/// `burrmill`, it is Burrmill's dialect instead (`burrmill::df::dialect::Duck`, private to that
+/// crate): DuckDB's with `IGNORE NULLS` inside a call, `^@`, `GLOB`, `IS [NOT] DISTINCT FROM` bound
+/// as DuckDB binds it, and `PIVOT` refused by name.
 ///
 /// It reports itself as [`DuckDbDialect`] (`dialect()`), so the parser's dialect checks answer as
 /// they do for DuckDB, and it forwards every method `DuckDbDialect` overrides. A method added to
-/// `DuckDbDialect` by a later sqlparser must be forwarded here too; `the_bounded_dialect_parses_as_duckdb`
-/// compares the two over the views in this tree.
+/// `DuckDbDialect` by a later sqlparser, or to Burrmill's dialect by a later pin, must be followed
+/// here too; `the_bounded_dialect_parses_as_duckdb` compares them over the views in this tree.
 #[derive(Debug, Default)]
 pub(crate) struct Bounded {
     inner: DuckDbDialect,
+    burrmill: bool,
     budget: u64,
     deadline: Option<Instant>,
     calls: Cell<u64>,
@@ -327,6 +404,288 @@ impl Dialect for Bounded {
     }
     fn supports_comma_separated_trim(&self) -> bool {
         self.inner.supports_comma_separated_trim()
+    }
+
+    // Burrmill's own, as its dialect has them.
+    fn supports_window_function_null_treatment_arg(&self) -> bool {
+        self.burrmill || self.inner.supports_window_function_null_treatment_arg()
+    }
+
+    fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
+        if self.burrmill {
+            if let Token::Word(w) = &parser.peek_token_ref().token {
+                if matches!(w.keyword, Keyword::PIVOT | Keyword::UNPIVOT) {
+                    return Some(Err(ParserError::ParserError(format!(
+                        "{} is not supported here",
+                        w.value.to_uppercase()
+                    ))));
+                }
+            }
+        }
+        self.inner.parse_statement(parser)
+    }
+
+    fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
+        if self.burrmill && burrmill_like(&parser.peek_token_ref().token) {
+            return Some(Ok(self.prec_value(Precedence::Like)));
+        }
+        self.inner.get_next_precedence(parser)
+    }
+
+    fn parse_infix(
+        &self,
+        parser: &mut Parser,
+        expr: &Expr,
+        precedence: u8,
+    ) -> Option<Result<Expr, ParserError>> {
+        if !self.burrmill {
+            return self.inner.parse_infix(parser, expr, precedence);
+        }
+        match &parser.peek_token_ref().token {
+            Token::CaretAt => {
+                parser.next_token();
+                let right = parser.parse_subexpr(self.prec_value(Precedence::Like));
+                return Some(right.map(|right| starts_with(expr.clone(), right)));
+            }
+            token if burrmill_like(token) => {
+                return Some(Err(ParserError::ParserError(
+                    "GLOB is not supported here".into(),
+                )));
+            }
+            _ => {}
+        }
+        let not = if parser.parse_keywords(&[Keyword::IS, Keyword::DISTINCT, Keyword::FROM]) {
+            false
+        } else if parser.parse_keywords(&[
+            Keyword::IS,
+            Keyword::NOT,
+            Keyword::DISTINCT,
+            Keyword::FROM,
+        ]) {
+            true
+        } else {
+            return None;
+        };
+        let right = match parser.parse_subexpr(self.prec_value(Precedence::Is)) {
+            Ok(right) => Box::new(right),
+            Err(e) => return Some(Err(e)),
+        };
+        let left = Box::new(expr.clone());
+        Some(Ok(if not {
+            Expr::IsNotDistinctFrom(left, right)
+        } else {
+            Expr::IsDistinctFrom(left, right)
+        }))
+    }
+}
+
+/// `^@` and `GLOB`, which Burrmill's dialect binds as tightly as `LIKE`.
+fn burrmill_like(token: &Token) -> bool {
+    match token {
+        Token::CaretAt => true,
+        Token::Word(w) => w.quote_style.is_none() && w.value.eq_ignore_ascii_case("glob"),
+        _ => false,
+    }
+}
+
+/// `a ^@ b` as Burrmill's dialect reads it.
+fn starts_with(left: Expr, right: Expr) -> Expr {
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName,
+    };
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new("starts_with")]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: [left, right]
+                .into_iter()
+                .map(|a| FunctionArg::Unnamed(FunctionArgExpr::Expr(a)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
+}
+
+/// The text rewrites Burrmill makes before its parser sees a statement, made here on tokens, so the
+/// bounded parse reads what its engine reads: `[e FOR x IN l]` as `list_transform(l, lambda x: e)`
+/// (with `IF p` as a `list_filter(l, lambda x: p)` in front), `AS [NOT] MATERIALIZED (` as `AS (`,
+/// and an `ASOF` before a join left out. `None` when none of them applies.
+fn as_burrmill_reads(tokens: &[TokenWithSpan]) -> Option<Vec<TokenWithSpan>> {
+    let word = |t: &TokenWithSpan, k: Keyword| matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k);
+    let significant: Vec<usize> = (0..tokens.len())
+        .filter(|&i| !matches!(tokens[i].token, Token::Whitespace(_)))
+        .collect();
+    let at = |i: usize, k: Keyword| significant.get(i).is_some_and(|&j| word(&tokens[j], k));
+    let snowflake_asof = tokens.iter().any(|t| word(t, Keyword::MATCH_CONDITION));
+    let mut dropped = vec![false; tokens.len()];
+    for i in 0..significant.len() {
+        if !snowflake_asof
+            && at(i, Keyword::ASOF)
+            && (at(i + 1, Keyword::JOIN) || at(i + 1, Keyword::LEFT))
+        {
+            dropped[significant[i]] = true;
+        }
+        if at(i, Keyword::AS) {
+            let m = if at(i + 1, Keyword::NOT) {
+                i + 2
+            } else {
+                i + 1
+            };
+            let paren = significant
+                .get(m + 1)
+                .is_some_and(|&j| tokens[j].token == Token::LParen);
+            if at(m, Keyword::MATERIALIZED) && paren {
+                (i + 1..=m).for_each(|k| dropped[significant[k]] = true);
+            }
+        }
+    }
+    let tokens: Vec<TokenWithSpan> = tokens
+        .iter()
+        .zip(&dropped)
+        .filter(|(_, d)| !**d)
+        .map(|(t, _)| t.clone())
+        .collect();
+    // Each `[` with the index of its `]`, and each `(` with its `)`.
+    let mut close = vec![usize::MAX; tokens.len()];
+    let (mut brackets, mut parens) = (Vec::new(), Vec::new());
+    for (i, t) in tokens.iter().enumerate() {
+        let (stack, closes) = match t.token {
+            Token::LBracket => (&mut brackets, false),
+            Token::LParen => (&mut parens, false),
+            Token::RBracket => (&mut brackets, true),
+            Token::RParen => (&mut parens, true),
+            _ => continue,
+        };
+        if !closes {
+            stack.push(i);
+        } else if let Some(open) = stack.pop() {
+            close[open] = i;
+        }
+    }
+    let mut out = Vec::with_capacity(tokens.len() + 16);
+    let comprehensions = Comprehensions {
+        tokens: &tokens,
+        close: &close,
+    }
+    .emit(0, tokens.len(), &mut out);
+    (comprehensions || dropped.contains(&true)).then_some(out)
+}
+
+struct Comprehensions<'a> {
+    tokens: &'a [TokenWithSpan],
+    close: &'a [usize],
+}
+
+impl Comprehensions<'_> {
+    /// `tokens[from..to]` into `out`, each comprehension rewritten; whether there was one. Recurses
+    /// once per nested `[`, which the scan has held to [`MAX_NESTING`].
+    fn emit(&self, from: usize, to: usize, out: &mut Vec<TokenWithSpan>) -> bool {
+        let mut found = false;
+        let mut i = from;
+        while i < to {
+            let end = self.close[i];
+            if self.tokens[i].token != Token::LBracket || end >= to {
+                out.push(self.tokens[i].clone());
+                i += 1;
+                continue;
+            }
+            let push = |out: &mut Vec<TokenWithSpan>, words: &[Token]| {
+                for t in words {
+                    out.push(TokenWithSpan::wrap(t.clone()));
+                }
+            };
+            let lambda = |var: &Token| {
+                [
+                    Token::Comma,
+                    Token::make_keyword("lambda"),
+                    Token::Whitespace(sqlparser::tokenizer::Whitespace::Space),
+                    var.clone(),
+                    Token::Colon,
+                ]
+            };
+            if let Some((for_at, var, list, pred)) = self.comprehension(i, end) {
+                found = true;
+                push(
+                    out,
+                    &[Token::make_word("list_transform", None), Token::LParen],
+                );
+                if let Some(pred) = pred {
+                    push(out, &[Token::make_word("list_filter", None), Token::LParen]);
+                    self.emit(list, pred, out);
+                    push(out, &lambda(&var));
+                    self.emit(pred + 1, end, out);
+                    push(out, &[Token::RParen]);
+                } else {
+                    self.emit(list, end, out);
+                }
+                push(out, &lambda(&var));
+                self.emit(i + 1, for_at, out);
+                push(out, &[Token::RParen]);
+            } else {
+                out.push(self.tokens[i].clone());
+                found |= self.emit(i + 1, end, out);
+                out.push(self.tokens[end].clone());
+            }
+            i = end + 1;
+        }
+        found
+    }
+
+    /// For the `[` at `open` closed at `end`, when it holds `e FOR x IN l [IF p]`: where `FOR` is,
+    /// `x`, where `l` starts and where `IF` is.
+    fn comprehension(
+        &self,
+        open: usize,
+        end: usize,
+    ) -> Option<(usize, Token, usize, Option<usize>)> {
+        let next = |mut i: usize| {
+            while i < end && matches!(self.tokens[i].token, Token::Whitespace(_)) {
+                i += 1;
+            }
+            i
+        };
+        let is = |i: usize, k: Keyword| {
+            i < end
+                && matches!(&self.tokens[i].token, Token::Word(w) if w.quote_style.is_none() && w.keyword == k)
+        };
+        // The first `FOR` outside any parentheses or nested brackets, then at the same level `IF`.
+        let top = |from: usize, k: Keyword| {
+            let mut i = from;
+            while i < end {
+                if is(i, k) {
+                    return Some(i);
+                }
+                i = match self.tokens[i].token {
+                    Token::LBracket | Token::LParen if self.close[i] < end => self.close[i] + 1,
+                    _ => i + 1,
+                };
+            }
+            None
+        };
+        let for_at = top(open + 1, Keyword::FOR)?;
+        let var_at = next(for_at + 1);
+        let var = match self.tokens.get(var_at).map(|t| &t.token) {
+            Some(Token::Word(w)) if var_at < end => Token::Word(w.clone()),
+            _ => return None,
+        };
+        let in_at = next(var_at + 1);
+        if !is(in_at, Keyword::IN) || next(open + 1) == for_at {
+            return None;
+        }
+        let list = in_at + 1;
+        let pred = top(list, Keyword::IF);
+        let list_end = pred.unwrap_or(end);
+        if next(list) >= list_end || pred.is_some_and(|p| next(p + 1) >= end) {
+            return None;
+        }
+        Some((for_at, var, list, pred))
     }
 }
 
@@ -461,6 +820,147 @@ mod tests {
         assert_eq!(check("SELECT '((((' AS s -- [[[[", None), Ok(()));
     }
 
+    fn lambdas(n: usize) -> String {
+        format!("{}1 +", "(a) -> ".repeat(n))
+    }
+
+    #[test]
+    fn a_lambda_chain_after_burrmill_only_syntax_is_refused_quickly() {
+        // Each prefix parses in Burrmill's dialect and not in sqlparser's DuckDB dialect, so a parse
+        // in that dialect alone stopped at it and never reached the lambdas, which double per
+        // level: 26 of them kept the engine's parse going for well over 15 s.
+        for prefix in [
+            "SELECT last_value(x IGNORE NULLS) OVER () AS v, ",
+            "SELECT 'ab' ^@ 'a' AS v, ",
+            "SELECT [y * 2 FOR y IN [1, 2]] AS v, ",
+            "SELECT [y FOR y IN [1, 2] IF y > 1] AS v, ",
+            "WITH t AS MATERIALIZED (SELECT 1 AS y) SELECT ",
+            "SELECT ",
+        ] {
+            let sql = format!("{prefix}{}", lambdas(26));
+            let (out, took) = on_small_stack(Duration::from_secs(5), move || check(&sql, None));
+            assert_eq!(out, Err(Refusal::TooComplex), "{prefix}");
+            assert!(took < Duration::from_secs(1), "{prefix}: {took:?}");
+        }
+        for sql in [
+            "SELECT last_value(x IGNORE NULLS) OVER (ORDER BY t) AS v FROM t",
+            "SELECT 'ab' ^@ 'a' AS v",
+            "SELECT list_transform([1, 2], (a) -> a + 1) AS v",
+        ] {
+            assert_eq!(check(sql, None), Ok(()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn lambdas_in_a_statement_no_dialect_parses_count_against_the_fallback() {
+        let sql = format!("SELECT FROM WHERE 1, {}", lambdas(MAX_KEYWORD_CALLS + 1));
+        let (out, took) = on_small_stack(Duration::from_secs(5), move || check(&sql, None));
+        assert_eq!(out, Err(Refusal::TooManyKeywordCalls));
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        let sql = format!("SELECT FROM WHERE 1, {}", lambdas(MAX_KEYWORD_CALLS));
+        assert_eq!(check(&sql, None), Ok(()));
+    }
+
+    #[test]
+    fn a_run_of_intervals_is_refused_without_overflowing_the_stack() {
+        // A thousand `INTERVAL`s overflowed a 2 MiB stack inside the bounded parse, which aborts
+        // the process. Now each is an error, and this thread goes on to answer the next statement.
+        for sql in [
+            format!("SELECT {}1", "INTERVAL ".repeat(1000)),
+            format!("SELECT {}1", "INTERVAL - ".repeat(1000)),
+            format!("SELECT {}'1' DAY", "INTERVAL NOT ".repeat(1000)),
+        ] {
+            let (out, took) = on_small_stack(Duration::from_secs(5), move || {
+                (check(&sql, None), check("SELECT 1", None))
+            });
+            assert_eq!(out, (Err(Refusal::TooManyIntervals), Ok(())));
+            assert!(took < Duration::from_secs(1), "{took:?}");
+        }
+        // The deepest the runs can still stack, under the recursion limit, returns.
+        for sql in [
+            format!(
+                "SELECT {}1{}",
+                "INTERVAL INTERVAL (".repeat(46),
+                ")".repeat(46)
+            ),
+            format!(
+                "SELECT {}1{}",
+                "INTERVAL - INTERVAL CASE WHEN 1 THEN ".repeat(100),
+                " END".repeat(100)
+            ),
+        ] {
+            let (out, _) = on_small_stack(Duration::from_secs(5), move || check(&sql, None));
+            assert_eq!(out, Ok(()));
+        }
+        assert_eq!(
+            check(
+                "SELECT INTERVAL '1' DAY + INTERVAL 2 HOUR - INTERVAL (3) MINUTE, -INTERVAL 1 DAY",
+                None
+            ),
+            Ok(())
+        );
+    }
+
+    /// The tokens as Burrmill's dialect parses them.
+    fn parse_burrmill(tokens: Vec<TokenWithSpan>) -> Result<Vec<Statement>, ParserError> {
+        let bounded = Bounded {
+            budget: u64::MAX,
+            burrmill: true,
+            ..Bounded::default()
+        };
+        Parser::new(&bounded)
+            .with_tokens_with_locations(tokens)
+            .parse_statements()
+    }
+
+    #[test]
+    fn the_token_rewrites_read_as_burrmills_text_rewrites() {
+        let tokens = |sql: &str| {
+            Tokenizer::new(&DuckDbDialect {}, sql)
+                .tokenize_with_location()
+                .unwrap()
+        };
+        // As written, and as Burrmill's `listcomp` and `asof` modules write it before parsing.
+        for (sql, burrmill) in [
+            (
+                "SELECT [x * 2 FOR x IN [1, 2, 3]]",
+                "SELECT list_transform([1, 2, 3], lambda x: x * 2)",
+            ),
+            (
+                "SELECT [x * 2 FOR x IN [1, 2, 3] IF x > 1]",
+                "SELECT list_transform(list_filter([1, 2, 3], lambda x: x > 1), lambda x: x * 2)",
+            ),
+            (
+                "SELECT [[y + 1 FOR y IN x] FOR x IN [[1], [2]]]",
+                "SELECT list_transform([[1], [2]], lambda x: list_transform(x, lambda y: y + 1))",
+            ),
+            (
+                "WITH a AS NOT MATERIALIZED (SELECT 1) SELECT * FROM a",
+                "WITH a AS (SELECT 1) SELECT * FROM a",
+            ),
+            (
+                "SELECT * FROM t ASOF LEFT JOIN u USING (k)",
+                "SELECT * FROM t LEFT JOIN u USING (k)",
+            ),
+        ] {
+            let ours = as_burrmill_reads(&tokens(sql)).expect(sql);
+            let theirs = Parser::parse_sql(&DuckDbDialect {}, burrmill).unwrap();
+            if !sql.contains("ASOF") {
+                // What Burrmill's own rewrite parses to, printed back.
+                let canonical = burrmill::inspect::canonical(sql);
+                assert_eq!(canonical, Some(theirs[0].to_string()), "{sql}");
+            }
+            assert_eq!(parse_burrmill(ours).unwrap(), theirs, "{sql}");
+        }
+        for sql in [
+            "SELECT [1, 2, 3]",
+            "SELECT list_transform([1], lambda x: 'for x in [2]') FROM t",
+            "SELECT [x FOR x IN] FROM t",
+        ] {
+            assert!(as_burrmill_reads(&tokens(sql)).is_none(), "{sql}");
+        }
+    }
+
     /// The bounded dialect must parse exactly as DuckDB's does, or the bound would refuse (or admit)
     /// a different language from the one the engine runs.
     #[test]
@@ -495,6 +995,25 @@ mod tests {
             };
             let ours = Parser::parse_sql(&bounded, &sql).map_err(|e| e.to_string());
             assert_eq!(ours, duck, "{}", file.display());
+            // And in Burrmill's mode as Burrmill's dialect does, where `ASOF` does not change the
+            // statement on the way.
+            let tokens = Tokenizer::new(&DuckDbDialect {}, &sql)
+                .tokenize_with_location()
+                .unwrap();
+            if !sql.to_ascii_lowercase().contains("asof") {
+                let ours = parse_burrmill(tokens.clone());
+                let theirs = burrmill::inspect::parse(&sql);
+                assert_eq!(ours.is_ok(), theirs.is_ok(), "{}", file.display());
+                if let (Ok(ours), Ok(theirs)) = (ours, theirs) {
+                    assert_eq!(ours, theirs, "{}", file.display());
+                }
+            }
+            // As the engine reads it: where Burrmill parses its rewrite, so do the tokens here.
+            if let Some(rewritten) = as_burrmill_reads(&tokens) {
+                if burrmill::inspect::canonical(&sql).is_some() {
+                    assert!(parse_burrmill(rewritten).is_ok(), "{}", file.display());
+                }
+            }
             assert_eq!(check(&sql, None), Ok(()), "{}", file.display());
             let tokens = Tokenizer::new(&DuckDbDialect {}, &sql)
                 .tokenize()

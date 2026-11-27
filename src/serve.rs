@@ -12092,11 +12092,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["rows"][0]["n"], 1);
 
+        // Lambdas that double per level, behind syntax only Burrmill's dialect reads; and a run of
+        // `INTERVAL` that overflowed the stack of the thread checking it. Each twice.
+        let lambdas = format!(
+            "SELECT last_value(x IGNORE NULLS) OVER () AS v, {}1 +",
+            "(a) -> ".repeat(26)
+        );
+        let intervals = format!("SELECT {}1", "INTERVAL ".repeat(1000));
         let refused = [
             casts(48),
             casts(48),
             format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
             format!("SELECT {}1", "CAST(".repeat(40)),
+            lambdas.clone(),
+            lambdas,
+            intervals.clone(),
+            intervals,
         ];
         for (i, q) in refused.iter().enumerate() {
             for route in ["/sql", "/explain"] {

@@ -4498,6 +4498,12 @@ mod tests {
             casts(48),
             format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
             format!("SELECT {}1", "CAST(".repeat(40)),
+            // Lambdas that double per level, behind syntax only Burrmill's dialect reads.
+            format!(
+                "SELECT last_value(x IGNORE NULLS) OVER () AS v, {}1 +",
+                "(a) -> ".repeat(26)
+            ),
+            format!("SELECT {}1", "INTERVAL ".repeat(1000)),
         ] {
             let (out, took) = run(sql);
             let e = out.unwrap_err();
