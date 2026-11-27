@@ -44,7 +44,7 @@ verified release download, or `cargo install`) and run it locally; then point Cl
 **When a skill runs nuthatch on your machine**, at your request, these are what it fetches, and
 from where. None of it is sent to us:
 
-- `npx -y nuthatch-indexer@5.24.0` downloads that npm package from the npm registry, and on first
+- `npx -y nuthatch-indexer@5.24.2` downloads that npm package from the npm registry, and on first
   run the matching nuthatch release binary from https://github.com/nuthatch-org/nuthatch/releases,
   checked against the checksums in the package.
 - `nuthatch init` fetches the contract's ABI from Sourcify (https://sourcify.dev), or from Etherscan
