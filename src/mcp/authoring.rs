@@ -53,7 +53,7 @@ pub fn tool_specs() -> Vec<Value> {
         json!({ "name": "index_status", "title": "Indexing progress",
           "description": "Whether the local nuthatch indexer of EVM contract events is serving and caught up: its `/ready` answer (tip, last indexed and sealed block, lag), and the indexer's state and recent log when `start_indexing` started it.",
           "inputSchema": { "type": "object", "properties": {} },
-          "annotations": { "title": "Indexing progress", "readOnlyHint": true, "openWorldHint": false } }),
+          "annotations": { "title": "Indexing progress", "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false } }),
         json!({ "name": "stop_indexing", "title": "Stop indexing",
           "description": "Stop indexing EVM contract events into this directory's nest: stops the nuthatch indexer `start_indexing` started, including one left running by an earlier server. The nest and its indexed data stay; `start_indexing` resumes where it stopped.",
           "inputSchema": { "type": "object", "properties": {} },

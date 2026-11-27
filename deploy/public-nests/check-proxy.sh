@@ -47,6 +47,19 @@ body_has() {
   fi
 }
 
+# header_has <label> <needle, case-insensitive> <curl args...>
+header_has() {
+  local label=$1 needle=$2; shift 2
+  local out
+  out=$(curl -s -o /dev/null -D - -m 20 "$@" 2>/dev/null | tr -d '\r') || out=
+  if grep -qiF -- "$needle" <<<"$out"; then
+    printf 'ok    %-46s has %s\n' "$label" "$needle"
+  else
+    printf 'FAIL  %-46s lacks %s\n' "$label" "$needle"
+    fails=$((fails + 1))
+  fi
+}
+
 json=(-H 'content-type: application/json')
 
 echo "== served"
@@ -110,7 +123,10 @@ for m in PUT DELETE PATCH; do
 done
 expect "POST /"                      '403|405' -X POST "${json[@]}" -d '{}' "$base/"
 expect "POST /tables"                '403|405' -X POST "${json[@]}" -d '{}' "$base/tables"
-expect "GET /mcp"                    '403|405' "$base/mcp"
+# MCP is POST only and this server offers no GET SSE stream: 405 with Allow, never a 403 that reads as blocked.
+expect "GET /mcp"                    405 "$base/mcp"
+expect "DELETE /mcp"                 405 -X DELETE "$base/mcp"
+header_has "GET /mcp names Allow"    'allow: POST, OPTIONS' "$base/mcp"
 body_has "SQL write is refused"      'read-only' "${json[@]}" -d '{"q":"COPY (SELECT 1) TO '"'"'/tmp/x.csv'"'"'"}' "$base/sql"
 expect "SQL write is a 4xx"          '4[0-9][0-9]' "${json[@]}" -d '{"q":"DELETE FROM usdc__transfer"}' "$base/sql"
 

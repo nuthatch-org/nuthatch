@@ -512,7 +512,7 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
     }
     let id = req.get("id").cloned();
     match req.get("method").and_then(Value::as_str).unwrap_or("") {
-        "initialize" => Some(ok(id?, initialize_result())),
+        "initialize" => Some(ok(id?, initialize_result(session.authoring.is_some()))),
         "notifications/initialized" => None,
         "ping" => Some(ok(id?, json!({}))),
         "tools/list" => {
@@ -723,7 +723,14 @@ fn root_explanation(mounts: &[String]) -> String {
     )
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(authoring: bool) -> Value {
+    // The authoring tools are named only when this server offers them: a read-only nest (the public
+    // demo among them) must not tell a client about tools it does not have.
+    let instructions = if authoring {
+        format!("{INSTRUCTIONS} {AUTHORING_INSTRUCTIONS}")
+    } else {
+        INSTRUCTIONS.to_string()
+    };
     json!({
         // This server implements one protocol version, so unsupported requests fall back to it.
         "protocolVersion": PROTOCOL_VERSION,
@@ -731,7 +738,7 @@ fn initialize_result() -> Value {
         // standing-queries RFC lands, `notifications` slots in here without breaking a client (§6).
         "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
         "serverInfo": { "name": "nuthatch", "title": "nuthatch EVM indexer", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
     })
 }
 
@@ -741,8 +748,11 @@ const INSTRUCTIONS: &str = "nuthatch indexes an EVM smart contract's onchain eve
     contract's onchain history: transfers, swaps, holders, balances, who called what and when. Call \
     `schema` first, then answer with `sql`; a `sql` answer carries the block it is as of. On an \
     address-history nest, which watches accounts instead of contracts, call `coverage` first, then \
-    `wallet_history`. When the server was started with --authoring and no nest exists yet, `init_nest` and then \
-    `start_indexing` create and index one.";
+    `wallet_history`.";
+
+/// Appended to [`INSTRUCTIONS`] only when the authoring tools are offered (`nuthatch mcp --authoring`).
+const AUTHORING_INSTRUCTIONS: &str =
+    "When no nest exists yet, `init_nest` and then `start_indexing` create and index one.";
 
 /// The resources a client may preload (RFC-0016 §6). Stable `nuthatch://…` URIs backed by the running
 /// nest's HTTP surface - reading one is a GET, so a client gets the context without a tool round-trip.
@@ -953,6 +963,7 @@ fn annotated(mut tool: Value) -> Value {
     tool["annotations"] = json!({
         "title": tool["title"],
         "readOnlyHint": true,
+        "destructiveHint": false,
         "openWorldHint": false,
     });
     tool
@@ -2175,6 +2186,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["result"]["serverInfo"]["name"], "nuthatch");
+        // A server without --authoring (the public read-only demo among them) names no authoring tool.
+        let instructions = resp["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("EVM"), "{instructions}");
+        for tool in ["init_nest", "start_indexing", "--authoring"] {
+            assert!(!instructions.contains(tool), "{instructions}");
+        }
         assert_eq!(
             resp["result"]["protocolVersion"], PROTOCOL_VERSION,
             "unsupported client versions fall back to the version implemented by this server"
@@ -3132,6 +3149,9 @@ mod tests {
             assert_eq!(a["title"], tool["title"], "{name}");
             assert_eq!(a["readOnlyHint"], !writes.contains(&name), "{name}");
             assert!(a["openWorldHint"].is_boolean(), "{name}");
+            // Directory policy asks for readOnlyHint, destructiveHint and title on every tool. None of
+            // ours deletes or overwrites anything; a read-only tool states that too, not by omission.
+            assert_eq!(a["destructiveHint"], false, "{name}");
         }
         let with_schema: Vec<String> = every_tool(false)
             .iter()

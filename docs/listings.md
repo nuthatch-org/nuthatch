@@ -97,8 +97,15 @@ Most forms ask for the same few things. Use these.
    Verified, a local stdio MCP server and any file that is not Markdown, text, JSON, YAML or an image
    (#3013). `plugin-directory/` is generated from `plugin/` by `scripts/build-directory-plugin.sh`
    (CI runs it with `--check`); it has no local MCP server, only the public read-only demo nest
-   `https://arc.nuthatch-indexer.com/mcp`, and its version is the release's, so rerun the script when
-   the version changes. The validator asks for a square
+   `https://arc.nuthatch-indexer.com/mcp`, and its version is the release's but never below the
+   script's `listing_floor` (5.24.1: the directory refused the 5.24.0 edition on 2026-11-27 and refuses
+   a version string it has refused before), so rerun the script when the version changes. The script
+   also pins the skills' `npx -y nuthatch-indexer` to the release, writes `LICENSE` (MIT OR Apache-2.0)
+   and a README that names every service the plugin or a skill reaches, and sets the listing fields
+   `icon`, `documentationUrl`, `supportUrl` and `privacyPolicyUrl`. Check it with
+   `claude plugin validate --profile directory ./plugin-directory`. The demo nest is a remote MCP server
+   we run, so the directory also wants it submitted as its own **MCP connector** from the same
+   organisation (portal: Submit new, MCP connector), then paired with the plugin. The validator asks for a square
    PNG icon, 512 to 2048 px, at `plugin-directory/.claude-plugin/icon.png` (a copy of `plugin/`'s); the first one submitted becomes the
    listing's icon for good, so add the real one before submitting.
 
