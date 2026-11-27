@@ -305,7 +305,7 @@ jobs:
 
   # RFC-0077: the embeddable engine, an opt-in artefact beside the binaries, which this job neither
   # builds nor changes. Built as CI's `wasm-plain` leg builds it, then gated again on the exact file
-  # that ships: its imports, the 5.5 MB brotli ceiling, `abi`'s pinned shapes, and RFC-0075 S3's and
+  # that ships: its imports, the 5,540,000-byte brotli ceiling (RFC-0077 S5, raised from 5.5 MB for burrmill 0.5.0), `abi`'s pinned shapes, and RFC-0075 S3's and
   # S5's answers in Node and wasmtime, fresh and killed mid-follow. `nh_abi`'s `engine` must name the
   # version released. RFC-0081 S2: the host package, `nuthatch-engine.js`, is built beside it and gated
   # on the same module: S5's answers through the package, fresh and from its kept store, and a mirrored
@@ -358,7 +358,7 @@ jobs:
           host=tests/wasmtime-host/target/release/wasmtime-host rpc=../tools/fixture-rpc/target/release/fixture-rpc
           cache=(--cache "$RUNNER_TEMP/cwasm")
           node plain/imports.mjs "$m"
-          node size.mjs "$m" --max-brotli 5500000
+          node size.mjs "$m" --max-brotli 5540000
           $host abi "$m" "${cache[@]}" | tee "$RUNNER_TEMP/abi.log"
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' ../Cargo.toml | head -1)
           engine=$(head -1 "$RUNNER_TEMP/abi.log" | jq -r '.nh_abi.engine')

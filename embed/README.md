@@ -553,7 +553,7 @@ it, and an absent verified block, one the chain does not reach, a forged or miss
 off the verified chain each stop sealing by name. `hosts/node/shapes.mjs` follows every nest shape the
 binary's tests run, which `tests/e2e_embed_shapes.rs` writes out of their code under
 `tests/fixtures/embed-shapes/` (the scaffold fixtures, a factory nest, labels and flags, the reorg
-suites), era by era, and must answer as that test pins the node. CI holds the event build to 5.5 MB
+suites), era by era, and must answer as that test pins the node. CI holds the event build to 5,540,000 bytes (5.5 MB before burrmill 0.5.0)
 brotli:
 
 ```sh
@@ -561,7 +561,7 @@ d=../tests/fixtures/tab-parity rpc=../tools/fixture-rpc/target/release/fixture-r
 $rpc recorded --port 8955 --file $d/chain.json.gz --headers $d/headers.json.gz &
 node hosts/node/verified.mjs /tmp/plain.wasm http://127.0.0.1:8955/ $d
 node hosts/node/shapes.mjs /tmp/plain.wasm $rpc ../tests/fixtures/embed-shapes
-node size.mjs /tmp/plain.wasm --max-brotli 5500000
+node size.mjs /tmp/plain.wasm --max-brotli 5540000
 ```
 
 RFC-0081 S4's gate. `hosts/node/complete.mjs` opens S4's nest narrowed to every Transfer with
