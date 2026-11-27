@@ -184,6 +184,8 @@ mod mcp_token;
 mod mutants_check;
 #[path = "nextest_archives_carry_parity.rs"]
 mod nextest_archives_carry_parity;
+#[path = "npm_dist_tag_script.rs"]
+mod npm_dist_tag_script;
 #[path = "over_i128_is_reported.rs"]
 mod over_i128_is_reported;
 #[path = "parity_epoch_shift.rs"]
