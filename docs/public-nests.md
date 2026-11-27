@@ -96,17 +96,20 @@ admin surface.
 - **The admin surface is the only other thing, and a flag removes it.** `--no-admin` means the
   `/_admin*` routes are never registered, so they answer `404`, not a login. (`dev` on a loopback bind
   would otherwise serve them, token-gated.) This unit passes it.
-- **`/mcp` offers only query tools.** `tools/list` returns `status`, `schema`, `tables`, `table`, `sql`,
-  `at`, `explain`, `entity`, `diff`, `balance` and `top_balances`, all read-only. The authoring tools
-  (`init_nest`, `start_indexing`, ...) stay on stdio. A request carrying a non-loopback `Origin` is refused,
+- **`/mcp` offers only the tools whose routes the proxy serves.** The env file sets
+  `NUTHATCH_MCP_TOOLS=status,schema,tables,table,sql,explain`, so `tools/list` returns those and a
+  `tools/call` for any other (`entity`, `diff`, `at`, `balance`, `top_balances`) is refused as unknown.
+  The prompts that name a withheld tool are withheld too. Unset, a nest offers every query tool; set but
+  empty, none. The authoring tools (`init_nest`, `start_indexing`, ...) stay on stdio. A request carrying a non-loopback `Origin` is refused,
   so a web page cannot use it; `curl` and MCP clients send none.
 - **A loopback bind checks `Host`** (#3002), so the unit names the public name with `--public-host`.
 - **`/metrics` is a read route** and shows operator-side counters. It is not public here: the proxy refuses it.
 
 The proxy blocks the same things anyway. `nuthatch dev` on a non-loopback bind, a later flag change or a
 future route would otherwise decide what the internet sees; the allowlist in `nginx.conf` makes that
-decision in one place. The tool calls `/mcp` makes (`entity`, `diff`, ...) run in process and are not
-affected by it, so the nest's own guards are what bound them.
+decision in one place. The tool calls `/mcp` makes run in process and are not
+affected by it, which is why the tool list is cut at the nest (`NUTHATCH_MCP_TOOLS`) and not only here;
+`test-proxy.sh` fails if the list names a tool whose route the proxy 404s.
 
 ## Arc testnet: what was verified
 
