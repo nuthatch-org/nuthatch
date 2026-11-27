@@ -7713,8 +7713,7 @@ impl NestIngest {
                 };
                 tracing::info!("cold start: backfilling from block {start}{src} (tip {tip})");
                 if let Some(span) = long_backfill(start, tip, window).filter(|_| from_deployment) {
-                    let recent = window.saturating_mul(15);
-                    tracing::info!("{}", long_history_advice(span, recent, &self.dir));
+                    tracing::info!("{}", long_history_advice(span, TRY_OUT_BACKFILL, &self.dir));
                 }
                 start
             }
@@ -8896,6 +8895,11 @@ fn cold_start_block(start_block: Option<u64>, backfill: Option<u64>, tip: u64) -
         (None, None) => tip.saturating_sub(DEFAULT_BACKFILL),
     }
 }
+
+/// The first-run try-out length offered by `init`'s next step and the long-history advice: the
+/// `--backfill 300` of the README and quickstart. A block count, not a multiple of `log_window`,
+/// which sizes getLogs and is 1000 on Base.
+pub(crate) const TRY_OUT_BACKFILL: u64 = 300;
 
 /// The span of a backfill long enough that `init` and `dev` point at `--backfill` (#1607): over a
 /// thousand windows. A public endpoint will not serve that in the time a first run is given.

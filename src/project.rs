@@ -2678,7 +2678,7 @@ fn scaffold_ai_surface_with(
 }
 
 /// What `init` prints as the next command. A backfill longer than a thousand windows (#1607) is
-/// offered as the last fifteen of them, which a bundled public endpoint can serve, and told that
+/// offered as the last 300 blocks (`TRY_OUT_BACKFILL`, whatever the chain's window), which a bundled public endpoint can serve, and told that
 /// the whole span is a job for the operator's own RPC. A short history is offered plain
 /// `nuthatch dev`. A start or tip that was not read is offered the same bounded command, since the
 /// span is unknown and plain `dev` could be a full-history backfill on a public endpoint (#3128).
@@ -2689,7 +2689,7 @@ struct NextStep {
 
 fn next_step(dir: &str, start: Option<u64>, tip: Option<u64>, window: u64) -> NextStep {
     let dev = format!("nuthatch dev --detach --wait-rows{}", dir_hint(dir));
-    let recent = window.saturating_mul(15);
+    let recent = crate::indexer::TRY_OUT_BACKFILL;
     let bounded = format!("{dev} --backfill {recent}");
     let Some((start, tip)) = start.zip(tip) else {
         // Start or tip unread: the span is unknown, and plain `dev` could be a full-history backfill.
@@ -3322,6 +3322,13 @@ mod tests {
         // the `·` idiom. The flag is written `--rpc=<url>` so this note is not one of those lines.
         assert!(!note.contains("rpc "), "{note}");
 
+        // Base's window is 1000; the try-out stays 300, not fifteen windows (15000).
+        let base = next_step("usdc", Some(2_797_221), Some(40_000_000), 1000);
+        assert_eq!(
+            base.command,
+            "nuthatch dev --detach --wait-rows --dir usdc --backfill 300"
+        );
+        assert!(!base.note.unwrap().contains("15000"));
         let short = next_step(".", Some(26_090_000), Some(26_096_175), 20);
         assert_eq!(short.command, "nuthatch dev --detach --wait-rows");
         assert_eq!(short.note, None);
