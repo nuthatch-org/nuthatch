@@ -57,6 +57,17 @@ status=0
 "$here/check-proxy.sh" "$base" || status=1
 
 if [ -z "${UPSTREAM:-}" ]; then
+  # /mcp overrides Origin, and a location that sets any proxy_set_header drops the inherited ones (#3205):
+  # the nest must still see the public Host, not the upstream address.
+  echo "== /mcp keeps Host"
+  got=$(curl -s -m 5 -X POST -H 'Host: probe.example.test' -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$base/mcp" || true)
+  if printf '%s' "$got" | grep -q '"host": *"probe.example.test"'; then
+    printf 'ok    %-46s\n' "/mcp forwards the client Host"
+  else
+    printf 'FAIL  %-46s got: %s\n' "/mcp forwards the client Host" "$got"
+    status=1
+  fi
   echo "== timeout backstop"
   start=$(date +%s)
   code=$(curl -s -o /dev/null -m 30 -w '%{http_code}' -G "$base/sql" --data-urlencode 'q=slow') || code=000
