@@ -138,7 +138,7 @@ fn an_mcp_client_goes_from_no_nest_to_rows_with_no_shell() {
     assert!(
         init["result"]["instructions"]
             .as_str()
-            .is_some_and(|s| s.contains("EVM")),
+            .is_some_and(|s| s.contains("EVM") && s.contains("init_nest")),
         "{init}"
     );
     let tools = client.request("tools/list", json!({}));
