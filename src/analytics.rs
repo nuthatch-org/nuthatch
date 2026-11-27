@@ -1424,6 +1424,18 @@ fn run(
     // budget in query execution alone, plus whatever the sweep cost. Sharing one deadline across both
     // attempts and the sweep makes `guard.timeout` the actual wall-clock ceiling on the whole call.
     let deadline = guard.map(|g| Instant::now() + g.timeout);
+    // Before anything parses the text, and under the same deadline: nesting the parser does not
+    // count, or retries that multiply, would otherwise keep this thread and its permit. See
+    // `sql_bounds`.
+    match crate::sql_bounds::check(sql, deadline) {
+        Ok(()) => {}
+        Err(crate::sql_bounds::Refusal::Deadline) => {
+            return Err(anyhow::Error::new(QueryBudgetExceeded {
+                secs: guard.map_or(0, |g| g.timeout.as_secs()),
+            }))
+        }
+        Err(refused) => bail!("{refused}"),
+    }
     // Held across both attempts and the collect, so no file a plan named is deleted by a fold
     // before the rows are read (`seal::ReadLease`).
     let _lease = crate::seal::read_lease(dir);
@@ -4444,6 +4456,58 @@ fn schema_columns(dir: &Path) -> Vec<(String, Vec<(String, String)>)> {
 
 #[cfg(test)]
 mod tests {
+    /// The engine path bounds the parse itself, for the callers that reach it without `/sql`'s
+    /// admission check (named queries, `/diff`, the GraphQL roots): a deep `CAST` and a type with
+    /// thousands of `[]` come back as errors well inside a second, on a statement thread's stack,
+    /// and the 47-deep `CAST` is still answered.
+    #[test]
+    fn the_engine_refuses_deep_statements_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = super::QueryGuard {
+            timeout: std::time::Duration::from_secs(10),
+            max_rows: 10,
+            ..Default::default()
+        };
+        let casts = |n: usize| {
+            format!(
+                "SELECT {}1{} AS n",
+                "CAST(".repeat(n),
+                " AS BIGINT)".repeat(n)
+            )
+        };
+        let run = move |sql: String| {
+            let dir = dir.path().to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let out =
+                        super::query_hot_cold(&dir, &sql, guard, &super::HotRows::new(), 0, &[])
+                            .map(|o| o.rows)
+                            .map_err(|e| format!("{e:#}"));
+                    let _ = tx.send((out, started.elapsed()));
+                })
+                .unwrap();
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the query returned")
+        };
+        let (out, _) = run(casts(47));
+        assert_eq!(out.unwrap()[0]["n"], 1);
+        for sql in [
+            casts(48),
+            format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
+            format!("SELECT {}1", "CAST(".repeat(40)),
+        ] {
+            let (out, took) = run(sql);
+            let e = out.unwrap_err();
+            assert!(e.contains("cannot be parsed"), "{e}");
+            assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        }
+        let (out, _) = run("SELECT 1 AS one".into());
+        assert_eq!(out.unwrap()[0]["one"], 1);
+    }
+
     /// The walk reads every view and entity the fixtures author, IGNORE NULLS included, so failing
     /// closed on a parse refuses none of them.
     #[test]

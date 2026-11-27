@@ -5719,6 +5719,36 @@ fn remembered(
     Err(memo)
 }
 
+/// [`crate::sql_bounds::check`] for a request's text, with `timeout` as the parse's deadline: a
+/// `400` for a statement that cannot be parsed in bounded time and stack, a `504` if the parse
+/// outlives the request's time. Runs before admission, so a refused statement never holds a permit.
+/// `/explain` answers in its own envelope, with `"valid": false`.
+fn parse_bounds(
+    sql: &str,
+    timeout: Duration,
+    explain: bool,
+) -> std::result::Result<(), Box<axum::response::Response>> {
+    use crate::metrics::{SqlRejection, METRICS};
+    use crate::sql_bounds::Refusal;
+    let refused = match crate::sql_bounds::check(sql, Some(std::time::Instant::now() + timeout)) {
+        Ok(()) => return Ok(()),
+        Err(refused) => refused,
+    };
+    let mut body = json!({ "error": refused.to_string() });
+    if explain {
+        body["valid"] = json!(false);
+    }
+    let status = if refused == Refusal::Deadline {
+        METRICS.inc_sql_rejected(SqlRejection::Timeout);
+        body["timeout_secs"] = json!(timeout.as_secs());
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        METRICS.inc_sql_rejected(SqlRejection::Invalid);
+        StatusCode::BAD_REQUEST
+    };
+    Err(Box::new((status, Json(body)).into_response()))
+}
+
 /// Execute SQL and shape the response - shared by `/sql` (caller-supplied text, only when the
 /// surface is open), `/q/{name}` (a declared query, rendered from typed arguments) and the GraphQL
 /// roots, as JSON or, when `arrow`, as an Arrow IPC stream (RFC-0079).
@@ -5734,6 +5764,15 @@ async fn run_sql_query_at(
     arrow: bool,
 ) -> axum::response::Response {
     use crate::metrics::METRICS;
+    // Before the memo, the permit and every parse of the text: a statement no parser here can
+    // finish in bounded time and stack is refused without holding anything. A GraphQL root with no
+    // time left is answered by its own 504 below.
+    let parse_time = operation_timeout
+        .filter(|t| !t.is_zero())
+        .unwrap_or(s.limits.timeout);
+    if let Err(refused) = parse_bounds(&sql_text, parse_time, false) {
+        return *refused;
+    }
     let q = SqlQuery {
         q: sql_text,
         max_rows: requested_max_rows,
@@ -6337,6 +6376,9 @@ async fn explain_answer(s: AppState, q: SqlQuery) -> axum::response::Response {
     }
     if q.q.len() > SQL_MAX_QUERY_LEN {
         return respond(answer::explain_too_long());
+    }
+    if let Err(refused) = parse_bounds(&q.q, s.limits.timeout, true) {
+        return *refused;
     }
     let permit = match s.sql_gate.try_admit(s.tenant_label()) {
         Ok(p) => p,
@@ -11990,6 +12032,95 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Statements no parser here finishes in bounded time or stack are refused quickly with a `400`,
+    /// on `/sql` and `/explain`, and hold no permit: every permit is free afterwards and the next
+    /// `SELECT 1` is answered. Before the bound, each deep `CAST` kept its statement thread and its
+    /// permit, so two of them left every later query at `503 server busy`.
+    ///
+    /// On its own runtime, shut down without waiting: a statement thread that never returns would
+    /// otherwise hold the test at the runtime's drop instead of letting it fail.
+    #[test]
+    fn refused_deep_statements_leave_every_permit_free() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(refused_deep_statements_leave_every_permit_free_body())
+        }));
+        rt.shutdown_background();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    async fn refused_deep_statements_leave_every_permit_free_body() {
+        use tower::ServiceExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state(tmp.path(), SQL_MAX_CONCURRENCY);
+        let app = router(SharedNest::new(state.clone()));
+        let post = |route: &'static str, q: String| {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(route)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json!({ "q": q }).to_string()))
+                .unwrap();
+            let app = app.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let resp = tokio::time::timeout(Duration::from_secs(10), app.oneshot(req))
+                    .await
+                    .unwrap_or_else(|_| panic!("{route} did not answer within 10s"))
+                    .unwrap();
+                (resp, started.elapsed())
+            }
+        };
+        let casts = |n: usize| {
+            format!(
+                "SELECT {}1{} AS n",
+                "CAST(".repeat(n),
+                " AS BIGINT)".repeat(n)
+            )
+        };
+
+        // 47 deep still parses and is answered.
+        let (resp, _) = post("/sql", casts(47)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["n"], 1);
+
+        let refused = [
+            casts(48),
+            casts(48),
+            format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
+            format!("SELECT {}1", "CAST(".repeat(40)),
+        ];
+        for (i, q) in refused.iter().enumerate() {
+            for route in ["/sql", "/explain"] {
+                let (resp, took) = post(route, q.clone()).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route} #{i}");
+                assert!(took < Duration::from_secs(1), "{route} #{i} took {took:?}");
+                let body = body_json(resp).await;
+                assert!(
+                    body["error"].as_str().unwrap().contains("cannot be parsed"),
+                    "{route} #{i}: {body}"
+                );
+            }
+        }
+
+        let free: Vec<_> = std::iter::from_fn(|| state.sql_gate.try_admit(None).ok()).collect();
+        assert_eq!(
+            free.len(),
+            SQL_MAX_CONCURRENCY,
+            "a refused statement kept a permit"
+        );
+        drop(free);
+        let (resp, _) = post("/sql", "SELECT 1 AS one".into()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["rows"][0]["one"], 1);
     }
 
     /// RFC-0073 FR2's acceptance bound: tenant A holds every permit it can and keeps a queue of

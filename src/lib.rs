@@ -158,6 +158,7 @@ pub mod shape_feed;
 pub mod skill;
 pub mod source;
 pub(crate) mod spill;
+pub mod sql_bounds;
 pub mod sqlmemo;
 pub mod store;
 pub mod story;
