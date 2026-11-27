@@ -141,7 +141,9 @@ pub fn op_stack(chain_id: u64) -> bool {
 }
 
 /// Polygon PoS (Bor) chains by id: mainnet and Amoy. Their blocks may end in a state-sync
-/// pseudo-transaction that the header's transactions and receipts roots do not commit to.
+/// transaction. Before Madhugiri (PIP-74, Polygon mainnet block 80,084,800) it is a pseudo-transaction
+/// the header's roots do not commit to; from Madhugiri it is a canonical type-`0x7f` transaction
+/// that the transactions root, the receipts root and the logs bloom all cover.
 pub fn polygon(chain_id: u64) -> bool {
     matches!(chain_id, 137 | 80002)
 }
@@ -157,8 +159,23 @@ pub fn nonstandard_tx_chain(chain_id: u64) -> Option<(&'static str, &'static str
     }
 }
 
-/// Whether `tx`, a served transaction, is Bor's state-sync pseudo-transaction: sent from and to the
-/// zero address, with no gas and a zero signature.
+/// The EIP-2718 type of Bor's canonical state-sync transaction (PIP-74, Madhugiri).
+const STATE_SYNC_TX_TYPE: u64 = 0x7f;
+
+/// The bytes the roots commit to for `item`, from its network encoding: a typed item is wrapped in
+/// an RLP string, a legacy one is its own list.
+pub(crate) fn eip2718_bytes(item: &impl Encodable) -> Vec<u8> {
+    let mut raw = Vec::new();
+    item.encode(&mut raw);
+    let mut payload = raw.as_slice();
+    match alloy_rlp::Header::decode(&mut payload) {
+        Ok(h) if !h.list => payload.to_vec(),
+        _ => raw,
+    }
+}
+
+/// Whether `tx`, a served transaction, is Bor's pre-Madhugiri state-sync pseudo-transaction: sent
+/// from and to the zero address, with no gas and a zero signature.
 fn state_sync_tx(tx: &Value) -> bool {
     let zero_addr = |k: &str| {
         tx[k]
@@ -376,8 +393,9 @@ pub struct Body {
     /// The receipts could not be hashed to the header's receipts root: a pre-Byzantium block whose
     /// endpoint serves `status` where the chain committed to a post-state `root`. Not a forgery.
     pub receipts_unverified: bool,
-    /// Bor's state-sync pseudo-transaction receipts, by the hash the RPC served for the
-    /// transaction. In neither root, but their logs are real and sealed like any other.
+    /// Bor's state-sync receipts, by the hash the RPC served for the transaction: the
+    /// pre-Madhugiri pseudo-transaction, in neither root, or from Madhugiri the canonical
+    /// type-`0x7f` transaction, in both. Their logs are real and sealed like any other.
     pub state_sync: Vec<(B256, alloy_consensus::ReceiptEnvelope)>,
 }
 
@@ -411,13 +429,18 @@ pub async fn served_body(
     block: &Value,
 ) -> Result<Body> {
     let n = header.number;
-    let mut raw: Vec<Value> = serde_json::from_value(block["transactions"].clone())
+    let raw: Vec<Value> = serde_json::from_value(block["transactions"].clone())
         .with_context(|| format!("block {n}'s transactions"))?;
+    let bor = polygon(chain_id);
+    let tx_type = |tx: &Value| match tx["type"].as_str() {
+        Some(t) => u64::from_str_radix(t.trim_start_matches("0x"), 16).ok(),
+        None => Some(0),
+    };
     for tx in &raw {
-        let ty = match tx["type"].as_str() {
-            Some(t) => u64::from_str_radix(t.trim_start_matches("0x"), 16).ok(),
-            None => Some(0),
-        };
+        let ty = tx_type(tx);
+        if bor && ty == Some(STATE_SYNC_TX_TYPE) {
+            continue;
+        }
         if ty.is_none_or(|t| t > 4) {
             let ty = tx["type"].as_str().unwrap_or("?");
             bail!(
@@ -426,39 +449,99 @@ pub async fn served_body(
             );
         }
     }
-    // Bor's state-sync pseudo-transaction (and its receipt) is in what the RPC serves, and in
-    // neither root the header commits to: leave both out of the hashing, but keep the receipt.
+    // Before Madhugiri, Bor's state-sync pseudo-transaction (and its receipt) is in what the RPC
+    // serves, and in neither root the header commits to: leave both out of the hashing, but keep
+    // the receipt. From Madhugiri it is a canonical type-0x7f transaction that is in both roots,
+    // and the RPC serves its payload only as the raw transaction.
     let mut pseudo = Vec::new();
-    if polygon(chain_id) {
-        raw.retain(|tx| {
-            if !state_sync_tx(tx) {
-                return true;
+    let mut canonical: Vec<(B256, Vec<u8>)> = Vec::new();
+    let mut plain = Vec::with_capacity(raw.len());
+    for tx in raw {
+        let hash = || {
+            tx["hash"]
+                .as_str()
+                .and_then(|h| h.parse::<B256>().ok())
+                .with_context(|| format!("block {n}'s state-sync transaction has no hash"))
+        };
+        if bor && tx_type(&tx) == Some(STATE_SYNC_TX_TYPE) {
+            let hash = hash()?;
+            let bytes: alloy_primitives::Bytes = serde_json::from_value(
+                rpc.call("eth_getRawTransactionByHash", json!([format!("{hash:#x}")]))
+                    .await
+                    .with_context(|| format!("block {n}'s state-sync transaction"))?,
+            )
+            .with_context(|| format!("block {n}'s state-sync transaction"))?;
+            canonical.push((hash, bytes.to_vec()));
+        } else if bor && state_sync_tx(&tx) {
+            pseudo.push(hash()?);
+        } else {
+            if !canonical.is_empty() {
+                bail!(
+                    "block {n} holds a transaction after its state-sync transaction: audit chain \
+                     takes the state-sync transaction to end the block"
+                );
             }
-            pseudo.push(tx["hash"].clone());
-            false
-        });
+            plain.push(tx);
+        }
     }
-    let txs: Vec<alloy_rpc_types_eth::Transaction> = serde_json::from_value(Value::Array(raw))
+    let txs: Vec<alloy_rpc_types_eth::Transaction> = serde_json::from_value(Value::Array(plain))
         .with_context(|| format!("block {n}'s transactions"))?;
     let txs: Vec<TxEnvelope> = txs.into_iter().map(|t| t.into_inner()).collect();
     let broken = |commitment| Broken {
         block: n,
         commitment,
     };
-    if proofs::calculate_transaction_root(&txs) != header.transactions_root {
+    // The RPC's hash for the state-sync transaction must be that of the bytes the root is built of.
+    if canonical
+        .iter()
+        .any(|(h, raw)| keccak256(raw) != *h || raw.first() != Some(&0x7f))
+    {
         return Err(broken(Commitment::TransactionsRoot).into());
     }
-    let receipts: Vec<alloy_rpc_types_eth::TransactionReceipt> = serde_json::from_value(
+    let tx_root = if canonical.is_empty() {
+        proofs::calculate_transaction_root(&txs)
+    } else {
+        let items: Vec<Vec<u8>> = (txs.iter().map(eip2718_bytes))
+            .chain(canonical.iter().map(|(_, raw)| raw.clone()))
+            .collect();
+        proofs::ordered_trie_root_encoded(&items)
+    };
+    if tx_root != header.transactions_root {
+        return Err(broken(Commitment::TransactionsRoot).into());
+    }
+    let mut receipts: Vec<Value> = serde_json::from_value(
         rpc.call("eth_getBlockReceipts", json!([format!("{hash:#x}")]))
             .await
             .with_context(|| format!("block {n}'s receipts"))?,
     )
     .with_context(|| format!("block {n}'s receipts"))?;
-    let (synced, receipts): (Vec<_>, Vec<_>) = receipts
+    // A type-0x7f receipt is the RLP of an EIP-1559 one under its own type byte: read it as that,
+    // and put its type byte back where the receipts root is rebuilt.
+    for r in &mut receipts {
+        let synced = r["transactionHash"]
+            .as_str()
+            .and_then(|h| h.parse::<B256>().ok())
+            .is_some_and(|h| canonical.iter().any(|(c, _)| *c == h));
+        if synced {
+            r["type"] = json!("0x2");
+        }
+    }
+    let receipts: Vec<alloy_rpc_types_eth::TransactionReceipt> =
+        serde_json::from_value(Value::Array(receipts))
+            .with_context(|| format!("block {n}'s receipts"))?;
+    let (synced, receipts): (Vec<_>, Vec<_>) = receipts.into_iter().partition(|r| {
+        pseudo.contains(&r.transaction_hash)
+            || canonical.iter().any(|(c, _)| *c == r.transaction_hash)
+    });
+    let (committed, leftover): (Vec<_>, Vec<_>) = synced
         .into_iter()
-        .partition(|r| pseudo.contains(&json!(r.transaction_hash)));
-    let state_sync = synced
+        .partition(|r| canonical.iter().any(|(c, _)| *c == r.transaction_hash));
+    if committed.len() != canonical.len() {
+        return Err(broken(Commitment::ReceiptsRoot).into());
+    }
+    let state_sync: Vec<_> = leftover
         .into_iter()
+        .chain(committed)
         .map(|r| (r.transaction_hash, r.into_primitives_receipt().inner))
         .collect();
     let receipts: Vec<_> = receipts
@@ -469,7 +552,21 @@ pub async fn served_body(
         return Err(broken(Commitment::ReceiptsRoot).into());
     }
     let mut receipts_unverified = false;
-    if proofs::calculate_receipt_root(&receipts) != header.receipts_root {
+    let receipts_root = if canonical.is_empty() {
+        proofs::calculate_receipt_root(&receipts)
+    } else {
+        let synced = state_sync
+            .iter()
+            .filter(|(h, _)| canonical.iter().any(|(c, _)| c == h))
+            .map(|(_, r)| {
+                let mut bytes = eip2718_bytes(r);
+                bytes[0] = STATE_SYNC_TX_TYPE as u8;
+                bytes
+            });
+        let items: Vec<Vec<u8>> = receipts.iter().map(eip2718_bytes).chain(synced).collect();
+        proofs::ordered_trie_root_encoded(&items)
+    };
+    if receipts_root != header.receipts_root {
         use alloy_consensus::TxReceipt;
         let no_root = receipts.iter().all(|r| {
             matches!(

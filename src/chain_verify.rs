@@ -418,7 +418,7 @@ pub async fn run_cli(args: crate::cli::AuditChainArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address_partitions::tests::Fake;
+    use crate::address_partitions::{eip2718_bytes, tests::Fake};
     use alloy_consensus::{proofs, Header, Signed, TxEip1559, TxEnvelope};
     use alloy_primitives::{Address, Log, Signature, TxKind};
     use serde_json::Value;
@@ -436,6 +436,8 @@ mod tests {
         block: Value,
         receipts: Value,
         tx_hashes: Vec<B256>,
+        /// Raw transactions by hash, for `eth_getRawTransactionByHash`.
+        raw: Vec<(B256, Vec<u8>)>,
     }
 
     /// Block `n` after `parent`, one EIP-1559 transaction per log in `logs`, its header committing
@@ -517,6 +519,7 @@ mod tests {
             block,
             receipts: json!(receipts),
             tx_hashes,
+            raw: vec![],
         }
     }
 
@@ -556,6 +559,11 @@ mod tests {
                     let want: B256 = serde_json::from_value(p[0].clone())?;
                     let b = blocks.iter().find(|b| b.hash == want);
                     b.map_or(Value::Null, |b| b.receipts.clone())
+                }
+                "eth_getRawTransactionByHash" => {
+                    let want: B256 = serde_json::from_value(p[0].clone())?;
+                    let raw = blocks.iter().flat_map(|b| &b.raw).find(|(h, _)| *h == want);
+                    raw.map_or(Value::Null, |(_, r)| json!(format!("0x{}", hex::encode(r))))
                 }
                 other => anyhow::bail!("unexpected {other}"),
             })
@@ -804,6 +812,130 @@ mod tests {
                 r.is_err() || fields(r.as_ref().unwrap()).contains(&(2, "transactions_root")),
                 "{r:?}"
             );
+        }
+    }
+
+    /// Blocks 1..=3 as [`chain`], block 2 ending in the type-0x7f state-sync transaction Bor serves
+    /// from Madhugiri (PIP-74), carrying a transfer of 7. The header's transactions root, receipts
+    /// root and logs bloom all cover it. Its payload is opaque here; the real one is a list of
+    /// state-sync records, which only `eth_getRawTransactionByHash` serves.
+    fn chain_with_canonical_state_sync(auditor: &Auditor) -> Vec<Made> {
+        let one = make(1, B256::repeat_byte(9), &[], 100, true);
+        let mut two = make(2, one.hash, &[transfer(auditor, 5)], 112, true);
+        let log = transfer(auditor, 7);
+        let mut raw = vec![0x7f];
+        raw.extend(alloy_rlp::encode(vec![B256::repeat_byte(0x42)]));
+        let hash = keccak256(&raw);
+        let zero = Address::ZERO;
+        let mut bloom = Bloom::default();
+        bloom.accrue_log(&log);
+        let receipt = json!({"type": "0x7f", "status": "0x1", "cumulativeGasUsed": "0x7530",
+            "logs": [{"address": format!("{:#x}", log.address), "topics": log.topics(),
+                "data": format!("0x{}", hex::encode(&log.data.data)), "blockNumber": "0x2",
+                "transactionHash": hash, "transactionIndex": "0x1", "logIndex": "0x1",
+                "removed": false}],
+            "logsBloom": bloom, "transactionHash": hash, "transactionIndex": "0x1",
+            "blockNumber": "0x2", "gasUsed": "0x0", "effectiveGasPrice": "0x0",
+            "from": zero, "to": zero, "contractAddress": null});
+        let tx = json!({"type": "0x7f", "hash": hash, "nonce": "0x0", "from": zero, "to": zero,
+            "gas": "0x0", "gasPrice": "0x0", "maxFeePerGas": "0x0", "maxPriorityFeePerGas": "0x0",
+            "value": "0x0", "input": "0x", "v": "0x0", "yParity": "0x0", "r": "0x0", "s": "0x0",
+            "blockNumber": "0x2", "transactionIndex": "0x1"});
+        // The receipts root commits to the 0x7f receipt as an EIP-1559 one under its own type byte.
+        let as_1559 = |r: &Value| {
+            let mut r = r.clone();
+            r["type"] = json!("0x2");
+            let r = serde_json::from_value::<alloy_rpc_types_eth::TransactionReceipt>(r).unwrap();
+            eip2718_bytes(&r.into_primitives_receipt().inner)
+        };
+        let first_tx: alloy_rpc_types_eth::Transaction =
+            serde_json::from_value(two.block["transactions"][0].clone()).unwrap();
+        let mut sync_receipt = as_1559(&receipt);
+        sync_receipt[0] = 0x7f;
+        let mut header: Header = serde_json::from_value(two.block.clone()).unwrap();
+        header.transactions_root = proofs::ordered_trie_root_encoded(&[
+            eip2718_bytes(&first_tx.into_inner()),
+            raw.clone(),
+        ]);
+        header.receipts_root =
+            proofs::ordered_trie_root_encoded(&[as_1559(&two.receipts[0]), sync_receipt]);
+        header.logs_bloom.accrue_log(&log);
+        two.hash = header.hash_slow();
+        let mut txs = two.block["transactions"].clone();
+        txs.as_array_mut().unwrap().push(tx);
+        two.block = serde_json::to_value(&header).unwrap();
+        two.block["hash"] = json!(two.hash);
+        two.block["transactions"] = txs;
+        two.block["uncles"] = json!([]);
+        two.receipts.as_array_mut().unwrap().push(receipt);
+        two.raw.push((hash, raw));
+        let three = make(3, two.hash, &[], 124, true);
+        vec![one, two, three]
+    }
+
+    /// Madhugiri (PIP-74): a Polygon block's type-0x7f state-sync transaction is in the
+    /// transactions root, the receipts root and the logs bloom. The block is clean, its logs are
+    /// still compared, and the same block off Polygon is refused as an unknown transaction type.
+    #[tokio::test]
+    async fn a_post_madhugiri_state_sync_transaction_is_in_the_roots_and_its_logs_are_compared() {
+        for (sealed_sync, want) in [(true, vec![]), (false, vec![(2, "logs")])] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let chain = chain_with_canonical_state_sync(&auditor);
+            let sync_hash = chain[1].raw[0].0;
+            let row = |amount, tx_hash: String, log_index| {
+                let log = crate::rpc::Log {
+                    address: USDC.into(),
+                    topics: vec![auditor.schema[0].topic0.clone(), word(1), word(2)],
+                    data: word(amount),
+                    block_number: 2,
+                    block_hash: format!("{:#x}", chain[1].hash),
+                    tx_hash,
+                    log_index,
+                };
+                let row = auditor.registry.decode(&log).unwrap().unwrap();
+                row.to_json().to_string()
+            };
+            let mut rows = vec![row(5, format!("{:#x}", chain[1].tx_hashes[0]), 0)];
+            if sealed_sync {
+                rows.push(row(7, format!("{sync_hash:#x}"), 1));
+            }
+            crate::seal::test_set_table_floor(dir.path(), 0);
+            crate::seal::seal_range(dir.path(), &rows, 1, 3).unwrap();
+            let r = verify_range(dir.path(), &auditor, &rpc(chain.clone()), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), want, "{r:?}");
+            auditor.chain_id = 5;
+            let e = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+                .await
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("0x7f"), "{e:#}");
+        }
+    }
+
+    /// The RPC's raw state-sync transaction must be the bytes the roots are built of: bytes that do
+    /// not hash to the served hash, or are not type 0x7f, break the transactions root.
+    #[tokio::test]
+    async fn a_state_sync_transaction_whose_raw_bytes_are_not_its_hash_breaks_the_transactions_root(
+    ) {
+        for tamper in [0x43u8, 0x7e] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut auditor = crate::sealed_audit::tests::nest(dir.path(), "");
+            auditor.chain_id = 137;
+            let mut chain = chain_with_canonical_state_sync(&auditor);
+            let raw = &mut chain[1].raw[0].1;
+            if tamper == 0x7e {
+                raw[0] = 0x7e;
+            } else {
+                *raw.last_mut().unwrap() = tamper;
+            }
+            seal(dir.path(), &auditor, &chain, Some(5));
+            let r = verify_range(dir.path(), &auditor, &rpc(chain), 1, 3)
+                .await
+                .unwrap();
+            assert_eq!(fields(&r), [(2, "transactions_root")], "{r:?}");
         }
     }
 
