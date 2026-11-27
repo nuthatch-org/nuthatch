@@ -69,6 +69,37 @@ if [ -z "${UPSTREAM:-}" ]; then
   fi
 fi
 
+# #3138: a tool calls its route in process, past nginx, so the env file's NUTHATCH_MCP_TOOLS may name
+# only tools whose route this proxy serves. A tool with no route listed here is a failure by design:
+# add its route to nginx.conf on purpose first.
+echo "== mcp tools match the allowed routes"
+case "$conf" in
+  nginx-base-usdc.conf) envfile=base-usdc.env.example ;;
+  *) envfile=arc-testnet.env.example ;;
+esac
+tools=$(sed -n 's/^NUTHATCH_MCP_TOOLS=//p' "$here/$envfile")
+if [ -z "$tools" ]; then
+  printf 'FAIL  %-46s %s sets no NUTHATCH_MCP_TOOLS\n' "public /mcp offers a bounded tool list" "$envfile"
+  status=1
+fi
+for tool in ${tools//,/ }; do
+  case "$tool" in
+    status) path=/ ;;   schema) path=/schema ;;   tables) path=/tables ;;
+    table) path=/table/t ;;   sql) path='/sql?q=select' ;;   explain) path='/explain?q=select' ;;
+    *) printf 'FAIL  %-46s %s\n' "tool $tool" "no route the proxy serves"; status=1; continue ;;
+  esac
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$base$path") || code=000
+  if [ "$code" = 404 ] || [ "$code" = 000 ]; then
+    printf 'FAIL  %-46s %s answers %s\n' "tool $tool" "$path" "$code"; status=1
+  else
+    printf 'ok    %-46s %s answers %s\n' "tool $tool" "$path" "$code"
+  fi
+done
+for route in /entity/x /diff /at /balance/x /balances; do
+  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$base$route") || code=000
+  [ "$code" = 404 ] || { printf 'FAIL  %-46s %s answers %s\n' "withheld route" "$route" "$code"; status=1; }
+done
+
 # Last, because it spends the limiter: a fresh 80-way flood from 127.0.0.1.
 echo "== abuse limits"
 sleep 62   # let the per-IP buckets above refill

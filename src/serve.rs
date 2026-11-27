@@ -645,10 +645,11 @@ pub fn mount_router(backing: SharedNest, label: &str) -> Router {
     // Outside the layers above: `/mcp` is a client of these routes, and each tool call it makes is
     // counted, priced and pinned as the request it becomes.
     let target = routes.clone();
+    let allowed = crate::mcp::allowed_tools_from_env();
     routes.route(
         "/mcp",
         axum::routing::any(move |method, headers, body| {
-            crate::mcp::http(target.clone(), method, headers, body)
+            crate::mcp::http(target.clone(), allowed.clone(), method, headers, body)
         }),
     )
 }

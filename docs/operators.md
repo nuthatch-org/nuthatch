@@ -1465,6 +1465,11 @@ job:
 | feed queues | 8 MiB per follower, 64 MiB per process | encoded feed bytes a writer holds queued for its followers (RFC-0073 FR1), paid from `ingestion_reservation` beside the hot-tip copies; the two together fit its 256MB floor. A snapshot is encoded in 64 KiB chunks as its read transaction iterates and waits for room, so no whole encoded copy of it exists. A follower whose queue is full when a delta, heartbeat or mount line arrives is dropped, not waited for, and reconnects for fresh snapshots; one that leaves a snapshot without room for 30 s is dropped too, which also ends that snapshot's read transaction |
 | declared-query scan bound | 512 MiB | named queries (`/q/{name}`) only: source bytes the plan may read, each Parquet scan charged the widest table it can reach, plus the hot and maintained rows copied for it. Checked on the connection that runs the statement, before it is evaluated. Over the cap, or a plan that can rescan (nested-loop or delim join, recursive CTE), answers `422` |
 
+**Narrowing `/mcp`.** A mount's `/mcp` runs each tool as a request to that mount's own routes, past any
+proxy in front of it. `NUTHATCH_MCP_TOOLS`, a comma-separated list of tool names, limits `tools/list`,
+`tools/call` and the prompts that name a tool to those. Unset offers every tool; set but empty offers
+none. It applies to every mount of the process; `deploy/public-nests` uses it ([public-nests.md](public-nests.md)).
+
 **Lowering the guards.** The statement timeout, row, result-byte, unsealed-row, unsealed-byte,
 declared-query and queue limits above are each the ceiling, and each can be lowered for the whole
 process by env: `NUTHATCH_SQL_TIMEOUT_MS`, `NUTHATCH_SQL_MAX_ROWS`, `NUTHATCH_SQL_MAX_RESULT_BYTES`,

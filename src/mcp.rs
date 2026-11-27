@@ -313,12 +313,34 @@ pub async fn serve(
 /// 2025-03-26, and every one of these is answered as [`PROTOCOL_VERSION`] is.
 const HTTP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", PROTOCOL_VERSION, "2025-11-25"];
 
+/// Names the tools a mount's `/mcp` offers, comma separated: the routes a public proxy allows, since
+/// each tool calls its route in process and nginx never sees that call (#3138). Unset offers every
+/// tool; set but empty offers none.
+pub(crate) const ENV_TOOLS: &str = "NUTHATCH_MCP_TOOLS";
+
+/// The tools [`ENV_TOOLS`] names, `None` when it is unset.
+pub(crate) fn allowed_tools_from_env() -> Option<std::sync::Arc<[String]>> {
+    parse_allowed_tools(std::env::var(ENV_TOOLS).ok().as_deref())
+}
+
+fn parse_allowed_tools(raw: Option<&str>) -> Option<std::sync::Arc<[String]>> {
+    raw.map(|v| {
+        v.split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect()
+    })
+}
+
 /// `/mcp` on a mount: MCP's Streamable HTTP transport, one JSON-RPC message per POST, answered with
 /// one JSON object by the same [`handle`] the stdio server runs. `routes` is the mount's own router,
 /// so every tool call is a request to it. Stateless: no session id, no SSE stream (GET is 405), and
-/// never the authoring tools, which start processes on the host.
+/// never the authoring tools, which start processes on the host. With `allowed` set, only those tools
+/// are listed or run.
 pub(crate) async fn http(
     routes: axum::Router,
+    allowed: Option<std::sync::Arc<[String]>>,
     method: axum::http::Method,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -387,7 +409,8 @@ pub(crate) async fn http(
     } else {
         crate::audit_log::mcp(method, None, None);
     }
-    match handle(&req, &Session::new(&routes, "")).await {
+    let session = Session::new(&routes, "").with_allowed(allowed.as_deref());
+    match handle(&req, &session).await {
         None => StatusCode::ACCEPTED.into_response(),
         Some(resp) if resp["result"]["isError"] == Value::Bool(true) => {
             crate::audit_log::tool_error();
@@ -501,6 +524,7 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
             if let Value::Array(query) = tool_specs(&fetch_shape(session).await) {
                 tools.extend(query);
             }
+            tools.retain(|t| t["name"].as_str().is_some_and(|n| session.permits(n)));
             Some(ok(id, json!({ "tools": tools })))
         }
         "tools/call" => {
@@ -509,6 +533,7 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
             let name = params["name"].as_str().unwrap_or_default().to_string();
             let mut is_error = false;
             let answer = match session.authoring {
+                _ if !session.permits(&name) => Err(anyhow!("unknown tool `{name}`")),
                 Some(a) if authoring::is_tool(&name) => a.call(&name, &params["arguments"]).await,
                 // Offered only on an address-history nest, so accepted only there.
                 _ if wallet::is_tool(&name) => {
@@ -556,10 +581,17 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
             }
         }
         // Prompts (RFC-0016 §6): canned, argument-taking analysis flows that name real tools.
-        "prompts/list" => Some(ok(
-            id?,
-            json!({ "prompts": prompt_specs(&fetch_shape(session).await) }),
-        )),
+        "prompts/list" => {
+            let mut prompts = prompt_specs(&fetch_shape(session).await);
+            if let Value::Array(list) = &mut prompts {
+                list.retain(|p| {
+                    p["name"]
+                        .as_str()
+                        .is_some_and(|n| prompt_permitted(n, session))
+                });
+            }
+            Some(ok(id?, json!({ "prompts": prompts })))
+        }
         "prompts/get" => {
             let id = id?;
             let name = req
@@ -571,7 +603,7 @@ async fn handle(req: &Value, session: &Session<'_>) -> Option<Value> {
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let shape = fetch_shape(session).await;
-            match render_prompt(name, &args, &shape) {
+            match render_prompt(name, &args, &shape).filter(|_| prompt_permitted(name, session)) {
                 Some(result) => Some(ok(id, result)),
                 None => Some(err(id, -32602, &format!("unknown prompt `{name}`"))),
             }
@@ -603,6 +635,8 @@ struct Session<'a> {
     base: &'a str,
     root: std::sync::OnceLock<bool>,
     authoring: Option<&'a authoring::Authoring>,
+    /// The only tools offered and callable; `None` is every tool the nest has.
+    allowed: Option<&'a [String]>,
 }
 
 impl<'a> Session<'a> {
@@ -613,7 +647,17 @@ impl<'a> Session<'a> {
             base: base.trim_end_matches('/'),
             root: std::sync::OnceLock::new(),
             authoring: None,
+            allowed: None,
         }
+    }
+
+    fn with_allowed(mut self, allowed: Option<&'a [String]>) -> Self {
+        self.allowed = allowed;
+        self
+    }
+
+    fn permits(&self, tool: &str) -> bool {
+        self.allowed.is_none_or(|a| a.iter().any(|t| t == tool))
     }
 
     fn with_authoring(mut self, authoring: Option<&'a authoring::Authoring>) -> Self {
@@ -801,6 +845,18 @@ fn prompt_specs(shape: &Shape) -> Value {
           "arguments": [ { "name": "claim", "description": "The number/claim to verify.", "required": true } ] }));
     }
     Value::Array(prompts)
+}
+
+/// A prompt tells the agent to call tools, so it is offered only where each of them is.
+fn prompt_permitted(name: &str, session: &Session<'_>) -> bool {
+    let tools: &[&str] = match name {
+        "investigate-address" => &["balance", "exposure", "flags"],
+        "profile-contract" | "verify-a-number" => &["schema", "sql"],
+        "wallet-history" => &["coverage", "wallet_history"],
+        "coverage-gaps" => &["coverage"],
+        _ => &[],
+    };
+    tools.iter().all(|t| session.permits(t))
 }
 
 /// Render a prompt into MCP `prompts/get` result form (a list of user-role messages). Returns `None`
@@ -2670,6 +2726,184 @@ mod tests {
             "{read}"
         );
 
+        h.abort();
+    }
+
+    #[test]
+    fn the_tool_allowlist_is_unset_for_all_and_empty_for_none() {
+        assert!(parse_allowed_tools(None).is_none());
+        let some = parse_allowed_tools(Some(" sql, explain ,,status")).unwrap();
+        assert_eq!(&*some, ["sql", "explain", "status"]);
+        assert!(parse_allowed_tools(Some("")).unwrap().is_empty());
+    }
+
+    /// The public nests' env files name real tools and none of the four the proxy withholds.
+    #[test]
+    fn the_public_nest_env_files_allow_only_tools_that_exist_and_are_public() {
+        let offered: Vec<String> = query_tools(&Shape {
+            transfers: true,
+            compliance: true,
+            free_form: true,
+            queries: true,
+            runtime_root: false,
+            address_history: false,
+        })
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect();
+        for (file, env) in [
+            (
+                "arc-testnet",
+                include_str!("../deploy/public-nests/arc-testnet.env.example"),
+            ),
+            (
+                "base-usdc",
+                include_str!("../deploy/public-nests/base-usdc.env.example"),
+            ),
+        ] {
+            let line = env
+                .lines()
+                .find_map(|l| l.strip_prefix("NUTHATCH_MCP_TOOLS="))
+                .unwrap_or_else(|| panic!("{file}: no NUTHATCH_MCP_TOOLS"));
+            let tools = parse_allowed_tools(Some(line)).unwrap();
+            for t in tools.iter() {
+                assert!(offered.contains(t), "{file}: `{t}` is not a tool");
+                assert!(
+                    ![
+                        "entity",
+                        "diff",
+                        "at",
+                        "balance",
+                        "top_balances",
+                        "flags",
+                        "exposure"
+                    ]
+                    .contains(&t.as_str()),
+                    "{file}: `{t}` has no public route"
+                );
+            }
+            assert!(tools.iter().any(|t| t == "sql") && tools.iter().any(|t| t == "explain"));
+        }
+    }
+
+    /// #3138: a public proxy 404s `/entity`, `/diff`, `/balance` and `/at`, and a tool calls its route
+    /// in process, past the proxy, so the mount must neither list nor run what the proxy withholds.
+    #[tokio::test]
+    async fn an_allowlist_hides_and_refuses_the_tools_outside_it() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_serving_nest().await;
+        let allowed: Vec<String> = ["status", "schema", "tables", "table", "sql", "explain"]
+            .map(String::from)
+            .into();
+        let session = Session::new(&client, &base).with_allowed(Some(&allowed));
+
+        let list = handle(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let mut names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        names.sort_unstable();
+        let mut want: Vec<&str> = allowed.iter().map(String::as_str).collect();
+        want.sort_unstable();
+        assert_eq!(names, want);
+
+        for hidden in ["entity", "diff", "at", "balance", "top_balances"] {
+            let resp = handle(
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": { "name": hidden, "arguments": { "id": "x", "time": 1, "address": "0xabc" } } }),
+                &session,
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp["result"]["isError"], true, "{hidden} must be refused");
+            assert!(
+                tool_text(&resp).contains("unknown tool"),
+                "{hidden}: {}",
+                tool_text(&resp)
+            );
+        }
+
+        let ok_call = handle(
+            &json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                     "params": { "name": "schema", "arguments": {} } }),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_ne!(ok_call["result"]["isError"], true, "{ok_call}");
+
+        let prompts = handle(
+            &json!({ "jsonrpc": "2.0", "id": 4, "method": "prompts/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = prompts["result"]["prompts"].to_string();
+        assert!(!text.contains("investigate-address"), "{text}");
+        let get = handle(
+            &json!({ "jsonrpc": "2.0", "id": 5, "method": "prompts/get",
+                     "params": { "name": "investigate-address", "arguments": { "address": "0xabc" } } }),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(get["error"]["code"], -32602, "{get}");
+        h.abort();
+    }
+
+    /// Address-history prompts name wallet tools, so they must be hidden when those tools are not
+    /// on the allowlist.
+    #[tokio::test]
+    async fn an_allowlist_hides_address_history_prompts_that_name_withheld_tools() {
+        let client = reqwest::Client::new();
+        let (base, h) = fake_wallet_nest().await;
+        let allowed: Vec<String> = ["wallet_status", "diff"].map(String::from).into();
+        let session = Session::new(&client, &base).with_allowed(Some(&allowed));
+
+        let prompts = handle(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let text = prompts["result"]["prompts"].to_string();
+        assert!(!text.contains("wallet-history"), "{text}");
+        assert!(!text.contains("coverage-gaps"), "{text}");
+
+        for name in ["wallet-history", "coverage-gaps"] {
+            let get = handle(
+                &json!({ "jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+                         "params": { "name": name, "arguments": { "address": "0xabc" } } }),
+                &session,
+            )
+            .await
+            .unwrap();
+            assert_eq!(get["error"]["code"], -32602, "{name}: {get}");
+        }
+
+        // coverage alone is enough for coverage-gaps, but not for wallet-history
+        let coverage_only: Vec<String> = ["coverage"].map(String::from).into();
+        let session = Session::new(&client, &base).with_allowed(Some(&coverage_only));
+        let prompts = handle(
+            &json!({ "jsonrpc": "2.0", "id": 3, "method": "prompts/list" }),
+            &session,
+        )
+        .await
+        .unwrap();
+        let names: Vec<&str> = prompts["result"]["prompts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(names, ["coverage-gaps"], "{prompts}");
         h.abort();
     }
 
