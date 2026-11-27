@@ -10,6 +10,7 @@ scaled mode (parity · control plane · reconcile)
 the compose fleet comes up
 cargo-deny (vulns · licences · bans)
 point-read latency
+backfill throughput · tip lag
 per-cursor RAM budget (dense multi-nest)
 fuzz smoke (decode path)
 writer failover (two writers, one lease)
