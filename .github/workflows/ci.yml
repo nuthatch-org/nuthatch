@@ -1283,26 +1283,26 @@ jobs:
       # The lesson for whoever touches this next: the advisory DB is a live external input whose schema
       # moves. A scanner that hard-fails on an unknown CVSS version is one upstream change away from
       # blocking every release - so keep this current rather than pinned-and-forgotten.
-      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           command: check advisories licenses bans sources
       # RFC-0070 S1: nuthatch-timelapse is not a dependency of the binary, so the step above never
       # sees its tree.
-      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: timelapse/Cargo.toml
           command: check advisories licenses bans sources
       # #2617: the wasm engine every release attaches is two separate trees with their own lockfiles.
-      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: embed/Cargo.toml
           command: check advisories licenses bans sources
-      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: embed/plain/Cargo.toml
           command: check advisories licenses bans sources
       # #3094: the reference gateway is its own tree with its own lockfile, outside the binary.
-      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: tools/gateway/Cargo.toml
           command: check advisories licenses bans sources
