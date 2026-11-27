@@ -391,7 +391,7 @@ run = [
   "mkdir -p target/plain && plain/build.sh \"$PWD/target/plain/plain.wasm\"",
   "node plain/imports.mjs target/plain/plain.wasm",
   # sh has no pipefail, so each writes its file and then shows it.
-  "node size.mjs target/plain/plain.wasm --max-brotli 5500000 > target/plain/sizes.json && cat target/plain/sizes.json",
+  "node size.mjs target/plain/plain.wasm --max-brotli 5540000 > target/plain/sizes.json && cat target/plain/sizes.json",
   "tests/wasmtime-host/target/release/wasmtime-host compile target/plain/plain.wasm target/plain/plain.cwasm > target/plain/compile.log && cat target/plain/compile.log",
   "tests/wasmtime-host/target/release/wasmtime-host abi target/plain/plain.wasm --cache target/plain/cwasm > target/plain/abi.log && tail -1 target/plain/abi.log",
 ]

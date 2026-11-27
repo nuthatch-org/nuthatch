@@ -1,5 +1,5 @@
 // RFC-0075 S6: the module's size as a page downloads it, beside burrmill-wasm's 5.6 MB brotli.
-// RFC-0077 S5: with `--max-brotli <bytes>`, exit non-zero past it; CI holds the event build to 5.5 MB.
+// RFC-0077 S5: with `--max-brotli <bytes>`, exit non-zero past it; CI holds the plain event build to 5,540,000 bytes and the tab build to 5.5 MB.
 // Usage: node size.mjs <module.wasm> [--max-brotli <bytes>]
 import { readFileSync } from "node:fs";
 import { brotliCompressSync, gzipSync, constants } from "node:zlib";

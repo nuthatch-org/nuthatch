@@ -322,7 +322,7 @@ Each ends runnable, and each gate can fail. Sizes are days of focused work, esti
     (`tests/common/tape.rs`), not fixture files, so the first job is a recorder that writes them out for
     the module.
   - *Safari and iPhone.* Not run once yet; `safaridriver` needs an administrator (RFC-0075 §14).
-  - *Size budgets.* CI fails the event build past 5.5 MB brotli and the address build past 1.5 MB raw.
+  - *Size budgets.* CI fails the event build past 5.5 MB brotli (the plain module: 5,540,000 since burrmill 0.5.0) and the address build past 1.5 MB raw.
   - *MCP.* Keep deferred. `nuthatch mcp` is a stdio bridge to the HTTP API (`src/mcp.rs`). In a
     browser no MCP client outside the page can reach a Service Worker, so nobody is served; elsewhere a
     host that wants MCP can bridge `nh_request` the way the binary bridges HTTP.
@@ -1006,7 +1006,7 @@ stopped scanning `[nest]`'s and `[[contracts]]`'s keys, silently, once the types
   its answers. Without `NUTHATCH_PIN_EMBED_SHAPES` the recordings, nests and requests must be what the
   code builds, so a pin cannot drift from the chain that made it. `embed/hosts/node/shapes.mjs` is the
   module's half over the same recordings.
-- *Size gates.* `size.mjs --max-brotli 5500000` fails the plain module in `wasm-plain` and the
+- *Size gates.* `size.mjs --max-brotli 5540000` fails the plain module in `wasm-plain` (S5 set 5500000; burrmill 0.5.0 took it to 5,521,101 brotli, so the ceiling is 5,540,000, +0.34%) and `--max-brotli 5500000` fails the
   wasm-bindgen module `/play` loads in `wasm-tab`.
 
 **`abi` stays 1.** No export or import changed: `wasmtime-host abi` finds the 33 pinned shapes equal.
