@@ -1,7 +1,7 @@
 {
   "name": "nuthatch",
   "displayName": "nuthatch",
-  "version": "5.24.2",
+  "version": "5.24.3",
   "description": "Skills for indexing an EVM contract's events into a local SQL database with nuthatch, a self-hosted indexer, and for porting a subgraph to it. The bundled MCP server is a public read-only demo nest on Arc testnet; run nuthatch locally to index your own contracts.",
   "author": {
     "name": "nuthatch",
