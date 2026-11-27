@@ -292,11 +292,15 @@ Moved verbatim from `CLAUDE.md` on 2026-11-19 to keep the always-loaded standing
 
 Do not start slice N+1 while slice N has failing tests or an unmet budget.
 
-### `nuthatch audit chain` (#3096, PR #3105): proposed, awaiting Chief
+### `nuthatch audit chain` (#3096, PR #3105): accepted
 
 2026-11-24. A by-hand subcommand that re-reads a sealed range from one RPC endpoint and checks each
 block's header hash, parent link, transaction and receipt roots, logs bloom and the sealed event rows
 against the receipts. It is opt-in, makes no call unless an operator runs it, and nothing in the
-default path depends on it, so the deletion test holds. **It is a new public subcommand, so whether it
-ships is Chief's decision; this entry records the proposal, not an acceptance.** The first slice is
-over the ~400-line worker guideline (about 900 lines), flagged in the PR.
+default path depends on it, so the deletion test holds. The first slice is over the ~400-line worker
+guideline (about 900 lines), flagged in the PR.
+
+2026-11-27. **`nuthatch audit chain` is accepted, and this line is the record RFC-0044 §8 asks for.**
+Chief directed that v5.24.2 be cut from main, which already includes #3105 and the later Polygon
+state-sync / Arbitrum-by-name work in #3193. The subcommand stays opt-in; nothing in the default path
+depends on it.
