@@ -657,13 +657,6 @@ jobs:
           set -euo pipefail
           # As with the image's :latest, a patch to an older line must not move `latest` back to it.
           v="${GITHUB_REF_NAME#v}"
-          now=$(npm view nuthatch-indexer dist-tags.latest 2>/dev/null || true)
-          tag=latest
-          case "$v" in
-            *-*) tag=next ;;
-            *) if [ -n "$now" ] && [ "$(printf '%s\n%s\n' "$now" "$v" | sort -V | tail -1)" != "$v" ]; then
-                 tag="line-${v%.*}"
-               fi ;;
-          esac
-          echo "publishing $v as $tag (latest is ${now:-unset})"
+          tag=$(../scripts/npm-dist-tag.sh "$v")
+          echo "publishing $v as $tag"
           npm publish --provenance --access public --tag "$tag"
