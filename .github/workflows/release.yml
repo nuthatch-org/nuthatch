@@ -45,6 +45,9 @@ jobs:
     name: release notes
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -52,6 +55,7 @@ jobs:
       # #2741: a tag runs the workflow file of the commit it names, so a tag on an unmerged commit skips
       # main's required checks. A release is cut on main or its release branch (docs/releases/README.md).
       - name: refuse a tag off main and its release branch
+        id: where
         run: |
           set -euo pipefail
           line=$(echo "$GITHUB_REF_NAME" | sed -nE 's/^v([0-9]+\.[0-9]+)\..*/\1/p')
@@ -60,8 +64,35 @@ jobs:
           elif [ -n "$line" ] && git rev-parse -q --verify "origin/release/$line" >/dev/null \
             && git merge-base --is-ancestor "$GITHUB_SHA" "origin/release/$line"; then
             echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on release/$line"
+            echo "lts=true" >> "$GITHUB_OUTPUT"
           else
             echo "::error::$GITHUB_REF_NAME names $GITHUB_SHA, which is on neither main nor release/$line"
+            exit 1
+          fi
+      # #3147: a patch tagged off a release branch must have passed the slow tier (RAM budget,
+      # footprint, scaled parity) on this exact commit. ci.yml runs it on a push to `release/**` and
+      # on a PR into one. The check runs recorded on the SHA are read, the newest per name wins (a
+      # rerun supersedes the run before it), and `skipped` is a failure here, not a pass. A tag pushed
+      # before that run finishes fails; rerun this job once it is green.
+      - name: require a green slow tier on an LTS tag
+        if: steps.where.outputs.lts == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | [.name, (.conclusion // "pending"), .started_at] | @tsv' > runs
+          sort -t"$(printf '\t')" -k3,3 runs > runs.sorted
+          bad=0
+          for name in "build release" "footprint (RAM budget)" \
+            "scaled mode (parity · control plane · reconcile)" \
+            "per-cursor RAM budget (dense multi-nest)"; do
+            got=$(awk -F'\t' -v n="$name" '$1 == n { r = $2 } END { print r }' runs.sorted)
+            echo "$name: ${got:-no run}"
+            [ "$got" = success ] || bad=1
+          done
+          if [ "$bad" = 1 ]; then
+            echo "::error::$GITHUB_SHA has no green slow tier. It runs on a push to release/** (ci.yml); wait for it, or fix it, then rerun this job."
             exit 1
           fi
       - name: resolve release notes
