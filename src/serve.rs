@@ -12099,24 +12099,40 @@ mod tests {
             "(a) -> ".repeat(26)
         );
         let intervals = format!("SELECT {}1", "INTERVAL ".repeat(1000));
+        // Nested `INTERVAL CASE` behind syntax only DataFusion reads, alone and as a second
+        // statement after one every parser reads. The second reached a parse of the engine's that
+        // did not return, and kept its permit.
+        let explain = format!(
+            "EXPLAIN FORMAT indent SELECT {}1",
+            "INTERVAL CASE WHEN 1 THEN ".repeat(26)
+        );
+        let stacked = format!("SELECT 1; {explain}");
+        let parse = "cannot be parsed";
         let refused = [
-            casts(48),
-            casts(48),
-            format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
-            format!("SELECT {}1", "CAST(".repeat(40)),
-            lambdas.clone(),
-            lambdas,
-            intervals.clone(),
-            intervals,
+            (casts(48), parse),
+            (casts(48), parse),
+            (
+                format!("SELECT CAST(NULL AS INT{})", "[]".repeat(7000)),
+                parse,
+            ),
+            (format!("SELECT {}1", "CAST(".repeat(40)), parse),
+            (lambdas.clone(), parse),
+            (lambdas, parse),
+            (intervals.clone(), parse),
+            (intervals, parse),
+            (explain.clone(), parse),
+            (explain, parse),
+            (stacked.clone(), "single statement"),
+            (stacked, "single statement"),
         ];
-        for (i, q) in refused.iter().enumerate() {
+        for (i, (q, says)) in refused.iter().enumerate() {
             for route in ["/sql", "/explain"] {
                 let (resp, took) = post(route, q.clone()).await;
                 assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route} #{i}");
                 assert!(took < Duration::from_secs(1), "{route} #{i} took {took:?}");
                 let body = body_json(resp).await;
                 assert!(
-                    body["error"].as_str().unwrap().contains("cannot be parsed"),
+                    body["error"].as_str().unwrap().contains(says),
                     "{route} #{i}: {body}"
                 );
             }

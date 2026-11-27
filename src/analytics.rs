@@ -1641,6 +1641,9 @@ fn attempt(
              (to list tables: SELECT table_name FROM information_schema.tables)"
         );
     }
+    // Before Burrmill's bound below, which parses every statement in the text: a second one is
+    // refused here without being parsed. `sql_bounds::check` refuses the same text earlier still.
+    reject_statement_stacking(sql)?;
     // Before any walk. A long chain of operators overflows the planner, and the walk that names
     // tables recurses the same way. The engine repeats the bound when it plans.
     if let Err(e) = burrmill::df::check_expr_bounds(sql) {
@@ -1663,7 +1666,6 @@ fn attempt(
     // file the process can read (e.g. `nuthatch.toml`'s secrets). Burrmill implements none of them and
     // refuses table functions it does not know; this denylist does not rely on that.
     reject_with_prefixed_dml(sql)?;
-    reject_statement_stacking(sql)?;
     reject_file_access(sql)?;
     reject_replacement_scan(sql)?;
     let tenant = current_tenant();
@@ -4508,6 +4510,21 @@ mod tests {
             let (out, took) = run(sql);
             let e = out.unwrap_err();
             assert!(e.contains("cannot be parsed"), "{e}");
+            assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        }
+        // Nested `INTERVAL CASE` behind syntax only DataFusion reads, alone and as a second
+        // statement: both used to reach a parse of the engine's that did not return.
+        let explain = format!(
+            "EXPLAIN FORMAT indent SELECT {}1",
+            "INTERVAL CASE WHEN 1 THEN ".repeat(26)
+        );
+        for (sql, says) in [
+            (explain.clone(), "cannot be parsed"),
+            (format!("SELECT 1; {explain}"), "single statement"),
+        ] {
+            let (out, took) = run(sql);
+            let e = out.unwrap_err();
+            assert!(e.contains(says), "{e}");
             assert!(took < std::time::Duration::from_secs(1), "{took:?}");
         }
         let (out, _) = run("SELECT 1 AS one".into());

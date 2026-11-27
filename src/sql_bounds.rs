@@ -20,6 +20,10 @@
 //! [`check`] answers all three before any other parse sees the text, and costs one tokenizer pass
 //! plus at most three bounded parses:
 //!
+//! 0. Text with a token after a `;` is refused. The read-only surface accepts one statement and
+//!    refuses the rest later anyway, but the parses before that refusal (Burrmill's included) would
+//!    read every statement, while the bounded parses here can stop at the first one they do not
+//!    read, such as `EXPLAIN FORMAT indent`, and so never measure what follows.
 //! 1. A token scan refuses brackets nested deeper than [`MAX_NESTING`], a run of more than
 //!    [`MAX_SUBSCRIPTS`] `[]` suffixes and a run of more than [`MAX_INTERVAL_RUN`] `INTERVAL`s. The
 //!    tokenizer is iterative, so this cannot recurse.
@@ -38,9 +42,11 @@
 //!    two, so what follows it is measured only by those.
 //! 3. A statement that fails the engine's parse for an ordinary reason (a syntax error, or a
 //!    rewrite of Burrmill's that the tokens here do not mirror exactly) has not shown what every
-//!    later parser will spend on it, so it is held to [`MAX_KEYWORD_CALLS`] retrying forms, nested
-//!    keyword calls and `(a) ->` lambdas together, which keeps the worst retry cost to a few
-//!    milliseconds.
+//!    later parser will spend on it, so it is held to [`MAX_KEYWORD_CALLS`] retrying forms: keyword
+//!    calls, `CASE`s and `INTERVAL`s open inside one another, and `(a) ->` lambdas, together. That
+//!    keeps the worst retry cost to tens of milliseconds. A statement no parse here reads can still
+//!    be one the engine reads (`EXPLAIN FORMAT indent SELECT ...` is DataFusion's own syntax), so
+//!    this count is what bounds the engine's parse of it.
 //!
 //! None of this sits in the data path: it decides only whether a statement is parsed at all.
 
@@ -62,9 +68,10 @@ pub const MAX_NESTING: usize = 47;
 pub const MAX_SUBSCRIPTS: usize = 32;
 
 /// Retrying forms accepted in a statement that did not parse here: the most keyword calls
-/// (`CAST(`, `EXTRACT(`, ...) open at once, plus every `(a) ->` lambda, each of which the parser
-/// tries once as a lambda and once as a parenthesised expression. A failure at the bottom of twelve
-/// costs about 2^12 small parses: a few milliseconds.
+/// (`CAST(`, `EXTRACT(`, ...), `CASE`s and `INTERVAL`s open at once, plus every `(a) ->` lambda.
+/// The parser tries each of them a second way when the first fails: a keyword call or `CASE` as a
+/// plain name, an `INTERVAL` the same, a lambda as a parenthesised expression. A failure at the
+/// bottom of twelve costs about 2^12 small parses, which DataFusion's parser does in under 100 ms.
 pub const MAX_KEYWORD_CALLS: usize = 12;
 
 /// Most `INTERVAL`s accepted in a row, with nothing between them but unary operators. Each parses
@@ -75,6 +82,8 @@ pub const MAX_INTERVAL_RUN: usize = 2;
 /// Why a statement is not parsed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
+    /// A token follows a `;`: more than one statement.
+    Stacked,
     /// Brackets nest deeper than [`MAX_NESTING`].
     TooNested,
     /// More than [`MAX_SUBSCRIPTS`] `[]` suffixes in a row.
@@ -92,6 +101,11 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            // As `analytics::reject_statement_stacking` words it, which refuses the same text later.
+            Refusal::Stacked => write!(
+                f,
+                "the read-only SQL surface accepts a single statement; `;`-stacking is refused"
+            ),
             Refusal::TooNested => write!(
                 f,
                 "query nests parentheses, brackets or types more than {MAX_NESTING} deep \
@@ -105,8 +119,8 @@ impl std::fmt::Display for Refusal {
             Refusal::TooManyKeywordCalls => write!(
                 f,
                 "query does not parse, and holds more than {MAX_KEYWORD_CALLS} calls such as \
-                 CAST( nested inside one another or lambdas such as (a) ->, which cannot be \
-                 parsed within its budget"
+                 CAST(, CASE or INTERVAL nested inside one another or lambdas such as (a) ->, \
+                 which cannot be parsed within its budget"
             ),
             Refusal::TooManyIntervals => write!(
                 f,
@@ -133,6 +147,14 @@ pub fn check(sql: &str, deadline: Option<Instant>) -> Result<(), Refusal> {
         // Nothing past the tokenizer gets further on text it cannot tokenize.
         return Ok(());
     };
+    // A trailing `;`, with only whitespace or comments after it, ends the one statement.
+    let mut after_semicolon = tokens
+        .iter()
+        .skip_while(|t| t.token != Token::SemiColon)
+        .skip(1);
+    if after_semicolon.any(|t| !matches!(t.token, Token::Whitespace(_))) {
+        return Err(Refusal::Stacked);
+    }
     let scan = scan(&tokens)?;
     let rewritten = as_burrmill_reads(&tokens);
     // Whether the text parsed, or the refusal if the parse ran out of budget or time.
@@ -157,7 +179,7 @@ pub fn check(sql: &str, deadline: Option<Instant>) -> Result<(), Refusal> {
     if let Some(rewritten) = rewritten {
         engine_parsed = parse(true, rewritten)?;
     }
-    if !engine_parsed && scan.keyword_calls + scan.lambdas > MAX_KEYWORD_CALLS {
+    if !engine_parsed && scan.retrying + scan.lambdas > MAX_KEYWORD_CALLS {
         return Err(Refusal::TooManyKeywordCalls);
     }
     Ok(())
@@ -171,10 +193,17 @@ pub fn budget(tokens: usize) -> u64 {
 
 #[derive(Debug, Default)]
 struct Scan {
-    /// The most keyword calls open at once.
-    keyword_calls: usize,
+    /// The most retrying forms open at once: keyword calls, `CASE`s and `INTERVAL`s.
+    retrying: usize,
     /// `->` after a `)`: a lambda with its parameters in parentheses.
     lambdas: usize,
+}
+
+/// An open `(`, `[` or `CASE`, and how many retrying forms it holds open.
+struct Open {
+    /// A `(` or `[`, closed by its bracket; otherwise a `CASE`, closed by `END`.
+    bracket: bool,
+    retrying: usize,
 }
 
 fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
@@ -184,9 +213,8 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
         }
         _ => false,
     };
-    // One entry per open `(` or `[`: whether a keyword call opened it.
-    let mut open: Vec<bool> = Vec::with_capacity(MAX_NESTING + 1);
-    let (mut keyword_calls, mut max_keyword_calls) = (0usize, 0usize);
+    let mut open: Vec<Open> = Vec::with_capacity(MAX_NESTING + 1);
+    let (mut brackets, mut retrying, mut max_retrying) = (0usize, 0usize, 0usize);
     // Open `ARRAY<`, `STRUCT<` and `MAP<`.
     let mut angles = 0usize;
     // `[]` / `[n]` / `[i]` groups in a row, and whether the open `[` is still one of those.
@@ -194,6 +222,10 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
     let mut simple_group = false;
     let mut previous: Option<&Token> = None;
     let (mut intervals, mut lambdas) = (0usize, 0usize);
+    // `INTERVAL`s whose value has not yet ended or opened a bracket or `CASE`. When it opens one,
+    // that one holds them open as well as itself: in `INTERVAL CAST(` nested, both are retried at
+    // every level.
+    let mut pending_intervals = 0usize;
     for token in tokens.iter().map(|t| &t.token) {
         if matches!(token, Token::Whitespace(_)) {
             continue;
@@ -211,22 +243,43 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
         if *token == Token::Arrow && previous == Some(&Token::RParen) {
             lambdas += 1;
         }
+        let case = is_keyword(Some(token), Some(&[Keyword::CASE]));
+        // A `(` or `[`, and whether a keyword opened it; or a `CASE`.
+        let opens = match token {
+            // `INTERVAL (` is one form, counted as the `INTERVAL` below.
+            Token::LParen => Some((
+                true,
+                is_keyword(previous, None) && !is_keyword(previous, Some(&[Keyword::INTERVAL])),
+            )),
+            Token::LBracket => Some((true, false)),
+            _ if case => Some((false, true)),
+            _ => None,
+        };
+        if let Some((bracket, retries)) = opens {
+            let held = usize::from(retries) + pending_intervals;
+            open.push(Open {
+                bracket,
+                retrying: held,
+            });
+            retrying += held;
+            max_retrying = max_retrying.max(retrying);
+        }
         match token {
             Token::LParen | Token::LBracket => {
-                let call = *token == Token::LParen && is_keyword(previous, None);
-                open.push(call);
-                if call {
-                    keyword_calls += 1;
-                    max_keyword_calls = max_keyword_calls.max(keyword_calls);
-                }
-                if open.len() + angles > MAX_NESTING {
+                brackets += 1;
+                if brackets + angles > MAX_NESTING {
                     return Err(Refusal::TooNested);
                 }
                 simple_group = *token == Token::LBracket;
             }
             Token::RParen | Token::RBracket => {
-                if open.pop() == Some(true) {
-                    keyword_calls -= 1;
+                // Closes any `CASE` left open inside it, then itself.
+                while let Some(o) = open.pop() {
+                    retrying -= o.retrying;
+                    if o.bracket {
+                        brackets -= 1;
+                        break;
+                    }
                 }
                 if *token == Token::RBracket && simple_group {
                     subscripts += 1;
@@ -238,6 +291,11 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
                 }
                 simple_group = false;
             }
+            _ if is_keyword(Some(token), Some(&[Keyword::END]))
+                && open.last().is_some_and(|o| !o.bracket) =>
+            {
+                retrying -= open.pop().map_or(0, |o| o.retrying);
+            }
             Token::Lt
                 if is_keyword(
                     previous,
@@ -245,7 +303,7 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
                 ) =>
             {
                 angles += 1;
-                if open.len() + angles > MAX_NESTING {
+                if brackets + angles > MAX_NESTING {
                     return Err(Refusal::TooNested);
                 }
             }
@@ -253,6 +311,17 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
             Token::ShiftRight => angles = angles.saturating_sub(2),
             _ => {}
         }
+        // An `INTERVAL`'s value goes on through unary operators and keywords (`CAST`, `ARRAY`,
+        // `NOT`, ...) until it opens something or ends.
+        pending_intervals = if is_keyword(Some(token), Some(&[Keyword::INTERVAL])) {
+            pending_intervals + 1
+        } else if opens.is_some() {
+            0
+        } else if is_unary(token) || is_keyword(Some(token), None) {
+            pending_intervals
+        } else {
+            0
+        };
         // A run is `[`, then at most one number or name, then `]`. Anything else ends it.
         let in_run = matches!(token, Token::LBracket | Token::RBracket)
             || (simple_group
@@ -265,7 +334,7 @@ fn scan(tokens: &[TokenWithSpan]) -> Result<Scan, Refusal> {
         previous = Some(token);
     }
     Ok(Scan {
-        keyword_calls: max_keyword_calls,
+        retrying: max_retrying,
         lambdas,
     })
 }
@@ -901,6 +970,85 @@ mod tests {
         );
     }
 
+    fn explain_cases(prefix: &str, n: usize) -> String {
+        format!("EXPLAIN FORMAT indent SELECT {}1", prefix.repeat(n))
+    }
+
+    #[test]
+    fn nested_case_and_interval_behind_syntax_no_parse_here_reads_are_refused_quickly() {
+        // `FORMAT indent` is DataFusion's syntax, so every parse here stops at it, and the levels
+        // after it are retried at each one by the engine's parse: 20 took about 4 s, and 24 did not
+        // return within 20 s.
+        for prefix in [
+            "INTERVAL CASE WHEN 1 THEN ",
+            "CASE WHEN 1 THEN ",
+            "INTERVAL NOT CASE WHEN 1 THEN ",
+            "INTERVAL - INTERVAL CASE WHEN 1 THEN ",
+            "INTERVAL CAST(",
+            "INTERVAL NOT CAST(",
+            "INTERVAL (",
+            "CAST(",
+        ] {
+            for n in [MAX_KEYWORD_CALLS + 1, 24, 26] {
+                let sql = explain_cases(prefix, n);
+                let (out, took) = on_small_stack(Duration::from_secs(5), move || check(&sql, None));
+                assert_eq!(out, Err(Refusal::TooManyKeywordCalls), "{prefix} x{n}");
+                assert!(took < Duration::from_secs(1), "{prefix} x{n}: {took:?}");
+            }
+            // The most levels accepted, which the engine's own bound reads in well under a second.
+            let most = (1..=MAX_KEYWORD_CALLS)
+                .take_while(|&n| check(&explain_cases(prefix, n), None).is_ok())
+                .last()
+                .unwrap_or(0);
+            assert!(most >= 4, "{prefix}: {most}");
+            let sql = explain_cases(prefix, most);
+            let (_, took) = on_small_stack(Duration::from_secs(10), move || {
+                burrmill::df::check_expr_bounds(&sql).is_ok()
+            });
+            assert!(took < Duration::from_secs(1), "{prefix} x{most}: {took:?}");
+        }
+        // Each `CASE` closed before the next opens is one level, however many there are.
+        let sql = format!(
+            "EXPLAIN FORMAT indent SELECT {}1",
+            "CASE WHEN 1 THEN INTERVAL CASE WHEN 2 THEN 3 END END, ".repeat(40)
+        );
+        assert_eq!(check(&sql, None), Ok(()));
+    }
+
+    #[test]
+    fn a_second_statement_is_refused_before_it_is_parsed() {
+        // A second statement no parse here reads, after a first one every parse reads.
+        for n in [24, 26] {
+            let sql = format!(
+                "SELECT 1; {}",
+                explain_cases("INTERVAL CASE WHEN 1 THEN ", n)
+            );
+            let (out, took) = on_small_stack(Duration::from_secs(5), move || {
+                (check(&sql, None), check("SELECT 1", None))
+            });
+            assert_eq!(out, (Err(Refusal::Stacked), Ok(())), "x{n}");
+            assert!(took < Duration::from_secs(1), "x{n}: {took:?}");
+        }
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT 1;;SELECT 2",
+            "SELECT ';'; SELECT 2",
+            "SELECT 1 /* ; */; SELECT 2",
+        ] {
+            assert_eq!(check(sql, None), Err(Refusal::Stacked), "{sql}");
+        }
+        for sql in [
+            "SELECT 1;",
+            "SELECT 1;  \n",
+            "SELECT 1; -- trailing comment",
+            "SELECT 1; /* trailing */",
+            "SELECT ';' AS s",
+            r#"SELECT 1 AS ";""#,
+        ] {
+            assert_eq!(check(sql, None), Ok(()), "{sql}");
+        }
+    }
+
     /// The tokens as Burrmill's dialect parses them.
     fn parse_burrmill(tokens: Vec<TokenWithSpan>) -> Result<Vec<Statement>, ParserError> {
         let bounded = Bounded {
@@ -1014,7 +1162,33 @@ mod tests {
                     assert!(parse_burrmill(rewritten).is_ok(), "{}", file.display());
                 }
             }
-            assert_eq!(check(&sql, None), Ok(()), "{}", file.display());
+            // A file of several views is several statements, which `check` refuses together; each
+            // on its own is accepted.
+            let mut statements = vec![String::new()];
+            for t in &tokens {
+                match t.token {
+                    Token::SemiColon => statements.push(String::new()),
+                    ref t => statements.last_mut().unwrap().push_str(&t.to_string()),
+                }
+            }
+            statements.retain(|s| {
+                Tokenizer::new(&DuckDbDialect {}, s)
+                    .tokenize()
+                    .unwrap()
+                    .iter()
+                    .any(|t| !matches!(t, Token::Whitespace(_)))
+            });
+            if statements.len() > 1 {
+                assert_eq!(
+                    check(&sql, None),
+                    Err(Refusal::Stacked),
+                    "{}",
+                    file.display()
+                );
+            }
+            for one in &statements {
+                assert_eq!(check(one, None), Ok(()), "{}: {one}", file.display());
+            }
             let tokens = Tokenizer::new(&DuckDbDialect {}, &sql)
                 .tokenize()
                 .unwrap()
