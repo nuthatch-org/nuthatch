@@ -97,9 +97,10 @@ nuthatch dev --backfill 300
 nuthatch dev
 ```
 
-From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv, `ps` and shell
-history. `--rpc https://your-endpoint.example` does the same job as an explicit flag, but it puts the
-URL on the command line.
+From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv and ordinary
+process-list output (`ps`). Typing `export NUTHATCH_RPC=...` at the prompt still goes into shell
+history, like any other command. `--rpc https://your-endpoint.example` does the same job as an
+explicit flag, but it also puts the URL on the command line.
 
 The URL can live in `nuthatch.toml` as `rpc_urls` instead. With a 10-block limit, nuthatch learns the
 limit from the error and keeps going. Against a proxy that rejected every range over 10 blocks (a simulation of that error, not the plan itself), a day of Ethereum took well over ten minutes, so start with `--backfill`.

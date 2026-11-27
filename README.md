@@ -91,9 +91,10 @@ nuthatch dev --backfill 300
 nuthatch dev
 ```
 
-From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv, `ps` and shell
-history. `--rpc https://your-endpoint.example` does the same job as an explicit flag, but it puts the
-URL on the command line.
+From 5.24.2 both `init` and `dev` read `NUTHATCH_RPC`, so the URL stays out of argv and ordinary
+process-list output (`ps`). Typing `export NUTHATCH_RPC=...` at the prompt still goes into shell
+history, like any other command. `--rpc https://your-endpoint.example` does the same job as an
+explicit flag, but it also puts the URL on the command line.
 
 The same URL can live in `nuthatch.toml` as `rpc_urls` instead. More, including how to
 probe an endpoint first, is under [Bring your own RPC endpoint](#bring-your-own-rpc-endpoint).
@@ -259,10 +260,12 @@ nuthatch doctor --rpc https://your-endpoint.example --address 0xADDR
 **Use your own endpoint for anything you care about** - your own node, or a paid provider:
 
 ```sh
-export NUTHATCH_RPC=https://your-endpoint.example/arbitrum   # read by init and dev from 5.24.2
+export NUTHATCH_RPC=https://your-endpoint.example/arbitrum
 nuthatch init 0xADDR --chain arbitrum-one
-nuthatch dev                                                # or set rpc_urls in nuthatch.toml
+nuthatch dev
 ```
+
+`init` and `dev` read `NUTHATCH_RPC` from 5.24.2. The same URL can live in `nuthatch.toml` as `rpc_urls` instead.
 
 The explicit flag still works, and puts the URL in `ps` and shell history:
 
