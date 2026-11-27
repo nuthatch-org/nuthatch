@@ -1,5 +1,9 @@
 # Backfilling Ethereum history from Xatu's public Parquet
 
+> **Unreleased.** `--history-source` and `--history-url` are on `main` only, after 5.24.1. The 5.24.x
+> releases (including the LTS line) reject both flags with an unknown-argument error. Nothing here
+> applies to a released binary until the release notes say "since".
+
 An opt-in history source for Ethereum mainnet. Instead of asking an RPC for `eth_getLogs` and for a
 block header per log-bearing block, `nuthatch dev` reads old logs and block timestamps from the
 public Parquet files [ethPandaOps](https://ethpandaops.io) publishes for their Xatu dataset, and
