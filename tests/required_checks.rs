@@ -10,7 +10,7 @@ fn names() -> Vec<String> {
 }
 
 #[test]
-fn required_checks_file_names_the_eleven_including_jules() {
+fn required_checks_file_names_the_twelve_including_jules() {
     let n = names();
     assert!(n.iter().any(|s| s == "fmt · clippy · test"), "{n:?}");
     assert!(
@@ -29,10 +29,14 @@ fn required_checks_file_names_the_eleven_including_jules() {
          line of text a party could type about themselves. Re-adding the context here without \
          re-adding the workflow leaves every PR blocked on a check that can never report: {n:?}"
     );
+    assert!(
+        n.iter().any(|s| s == "backfill throughput · tip lag"),
+        "tip lag's after-seen p50 fails the build and must be a required check: {n:?}"
+    );
     assert_eq!(
         n.len(),
-        11,
-        "eleven contexts on main, writer failover the newest: {n:?}"
+        12,
+        "twelve contexts on main, tip lag the newest: {n:?}"
     );
 }
 
