@@ -101,7 +101,14 @@ would otherwise be unreleasable.
    than the fix (a format change, a new config key, an API change), stop: the advisory says the line
    does not get this fix and names the release to upgrade to. A rewrite that cannot be reviewed with
    confidence is worse than an honest "upgrade".
-4. CI runs on the PR as on any other. `cargo deny` reads the live advisory database, so a new
+4. CI runs the slow tier on a PR into `release/<X.Y>` without the `full-ci` label, and again on the
+   push that merges it (RAM budget, footprint, scaled parity): the merge queue is `main`-only, so
+   nothing else would (#3147). `release.yml` refuses an LTS tag whose commit has no successful
+   `build release`, `footprint (RAM budget)`, `scaled mode` and dense per-cursor RAM check run; if the
+   tag outran the push run, rerun the `release notes` job when it is green. `pull_request` and `push`
+   read the workflow file on the branch itself, so a `release/<X.Y>` cut before #3147 must first take
+   `ci.yml` and `release.yml` from `main` (the CI exception under "What is backported"), or it still
+   runs the fast tier only. `cargo deny` reads the live advisory database, so a new
    RUSTSEC entry turns an LTS branch red months after the cut. That is a signal, not noise: triage it
    as a backport candidate (update the crate, or an `ignore` with its reason, as on `main`).
 5. The release gate is optional for a patch, as for any release; if run, pass

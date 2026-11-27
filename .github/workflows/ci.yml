@@ -6,7 +6,10 @@ on:
     # review - the review requirement was the jam, not the writing - and CI is what still
     # catches real breakage. It runs on GitHub's machines, so it costs no Claude allowance:
     # it is the one gate that is free, and therefore the one to keep.
-    branches: [main, 'sprint/**']
+    #
+    # `release/**` too (#3147): a push to an LTS branch is the only slow-tier run its merge commit
+    # gets, since the merge queue is default-branch only. `release.yml` looks for that run.
+    branches: [main, 'sprint/**', 'release/**']
   # No `branches:` filter here, deliberately - it filters on the PR's *base*, and a stacked PR
   # (head branch built on another feature branch, not `main`) matched neither the old
   # `[main]` list nor `[main, 'sprint/**']`: zero checks run, and the PR reads as green because
@@ -66,11 +69,14 @@ jobs:
   #   - merge_group (the merge queue): slow = full. A queue entry is slow whenever it changes any
   #     code; only a docs-only entry skips the slow tier, and it cannot move RSS or latency.
   #   - push (main, sprint/**): slow = full, so every landed commit runs the slow tier.
-  #   - pull_request: slow only with the `full-ci` label. A plain PR skips the slow tier.
+  #   - push (release/**): the same, and it is what `release.yml` requires before an LTS tag.
+  #   - pull_request: slow only with the `full-ci` label, or when its base is `release/*` (#3147: an
+  #     LTS patch is merged and tagged from there, with no queue entry). A plain PR skips the slow tier.
   # So on a plain PR, build release, footprint, point-read and backfill are skipped, and a skipped
   # job satisfies its required context. The merge queue is the gate for RAM and latency. Caveat: a
   # PR based on sprint/** is a pull_request too, so its RAM and latency gates are also skipped
-  # there and run only after the push lands.
+  # there and run only after the push lands. `pull_request` runs the workflow file on the PR's base,
+  # so a `release/X.Y` branch gets this only once it carries it (docs/releases/README.md).
   # Gated jobs test `!= 'false'`, so a failed `changes` (empty outputs) runs everything, not nothing.
   changes:
     name: changes (which tiers run)
@@ -90,6 +96,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
           full=true
@@ -114,11 +121,13 @@ jobs:
             done < changed
           fi
           slow=false
-          if [ "$full" = true ] && { [ "$EVENT" != pull_request ] || [ "$FULL_CI" = true ]; }; then
+          lts=false
+          case "$EVENT:$BASE_REF" in pull_request:release/*) lts=true ;; esac
+          if [ "$full" = true ] && { [ "$EVENT" != pull_request ] || [ "$FULL_CI" = true ] || [ "$lts" = true ]; }; then
             slow=true
           fi
           [ "$full" = true ] || echo "::notice::docs-only change: the default leg runs (it holds every doc test); the rest is skipped"
-          [ "$slow" = true ] || [ "$full" = false ] || echo "::notice::fast tier only. The slow tier runs in the merge queue, on main, or with the full-ci label"
+          [ "$slow" = true ] || [ "$full" = false ] || echo "::notice::fast tier only. The slow tier runs in the merge queue, on main, on release/**, or with the full-ci label"
           echo "full=$full slow=$slow"
           { echo "full=$full"; echo "slow=$slow"; } >> "$GITHUB_OUTPUT"
 

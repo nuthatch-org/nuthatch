@@ -2,7 +2,8 @@
 # One name per line. Comments and blanks ignored.
 # The live list is GitHub settings; this file is what the repo can disagree with (#715).
 # On an ordinary PR, scaled mode, the compose fleet, the dense multi-nest budget and writer failover
-# are the slow tier and report skipped; they gate for real only in the merge queue (ci.yml, `changes`).
+# are the slow tier and report skipped; they gate for real only in the merge queue, on a push to main, sprint/** or
+# release/**, and on a PR into release/* (ci.yml, `changes`).
 fmt · clippy · test
 footprint (RAM budget)
 build release
