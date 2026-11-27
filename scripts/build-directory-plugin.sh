@@ -24,7 +24,19 @@ release=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 # fixes for that refusal) is listed as 5.24.1 while Cargo.toml still says 5.24.0. Once a release passes
 # the floor its own version is used again. If a listing version is refused, raise the floor past it.
 listing_floor=5.24.1
-version=$(printf '%s\n%s\n' "$release" "$listing_floor" | sort -V | tail -1)
+# Python, not GNU sort -V: this script already needs python3, and stock macOS sort has no -V.
+version=$(python3 -I -c '
+import re, sys
+def key(v):
+    out = []
+    for p in re.split(r"([^0-9]+)", v):
+        if not p:
+            continue
+        out.append((0, int(p)) if p.isdigit() else (1, p))
+    return out
+a, b = sys.argv[1], sys.argv[2]
+print(a if key(a) >= key(b) else b)
+' "$release" "$listing_floor")
 
 rm -rf "$out"
 mkdir -p "$out/.claude-plugin"
@@ -68,10 +80,23 @@ open(p, "w").write(s.replace(old, new))
 PY
 
 # A package launcher runs one exact version, the release this edition was built from, not whatever
-# npm serves that day.
-while IFS= read -r f; do
-  sed -i "s/npx -y nuthatch-indexer\([^@A-Za-z0-9_-]\)/npx -y nuthatch-indexer@$release\1/g" "$f"
-done < <(grep -rl 'npx -y nuthatch-indexer' "$out/skills" | LC_ALL=C sort)
+# npm serves that day. Python, not sed -i: BSD sed requires a suffix after -i.
+python3 -I - "$out/skills" "$release" <<'PY'
+import os, re, sys
+root, release = sys.argv[1], sys.argv[2]
+pat = re.compile(r"npx -y nuthatch-indexer([^@A-Za-z0-9_-])")
+repl = rf"npx -y nuthatch-indexer@{release}\1"
+for dirpath, _, files in os.walk(root):
+    for name in files:
+        path = os.path.join(dirpath, name)
+        try:
+            text = open(path, encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        new, n = pat.subn(repl, text)
+        if n:
+            open(path, "w", encoding="utf-8").write(new)
+PY
 
 cat > "$out/.claude-plugin/plugin.json" <<JSON
 {
