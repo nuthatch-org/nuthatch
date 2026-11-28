@@ -45,7 +45,7 @@ proptest = { version = "1", default-features = false, features = ["std"] }
 size-of = { package = "feldera-size-of", version = "0.1.7" }
 # RFC-0075 S4: the engine the binary's `/sql` runs, at its pinned rev, and what the tab binds with it.
 sqlparser = { version = "0.62", features = ["visitor"] }
-burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "2cbc368ceb2a5b8192689fb98011946327af6bbe", default-features = false, features = ["datafusion"] }
+burrmill = { git = "https://github.com/nuthatch-org/burrmill", rev = "9b7882f710bb82a1709216128bc996ae013555ab", default-features = false, features = ["datafusion"] }
 object_store = { version = "0.13", default-features = false }
 arrow-array = { version = "=59.3.3", default-features = false }
 # RFC-0081 S1: `/sql` answered as an Arrow IPC stream, and another nest's answers attached from one.
