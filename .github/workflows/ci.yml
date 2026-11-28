@@ -230,6 +230,12 @@ jobs:
             echo "version unchanged at $version - nothing owed"
             exit 0
           fi
+          case "$version" in
+            *-dev)
+              echo "version $version is a -dev version, which is never tagged - no release notes owed"
+              exit 0
+              ;;
+          esac
           notes="docs/releases/v$version.md"
           echo "version $base -> $version, so $notes must exist"
           if [ ! -s "$notes" ]; then

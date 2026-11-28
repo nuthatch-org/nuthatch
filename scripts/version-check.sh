@@ -18,6 +18,11 @@ WANT=${1:-}
 [ -z "$WANT" ] && WANT=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 [ -z "$WANT" ] && { echo "could not read a version from Cargo.toml; pass one as an argument"; exit 2; }
 echo "current version: $WANT"
+# A -dev version has published nothing: image tags, the registry entry and the npm launcher keep
+# naming the last release, which server.json records (#3146). Cargo.toml itself is judged on WANT.
+ARTIFACT=$WANT
+case "$WANT" in *-dev) ARTIFACT=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' server.json | head -1) ;; esac
+[ "$ARTIFACT" != "$WANT" ] && echo "published artifacts are judged against the last release: $ARTIFACT"
 echo
 
 fail=0
@@ -41,7 +46,7 @@ while IFS= read -r hit; do
   tag=${tag#ghcr.io/nuthatch-org/nuthatch:}
   case "$tag" in *'{'*) ;; *) tag=${tag%\}} ;; esac
   while case "$tag" in *.|*-) true ;; *) false ;; esac; do tag=${tag%?}; done
-  want=$WANT
+  want=$ARTIFACT
   case "$file" in
     ./docs/releases/v[0-9]*.md) want=$(basename "$file" .md); want=${want#v} ;;
   esac
@@ -85,27 +90,27 @@ fi
 echo
 reg_version=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' server.json | head -1)
 reg_image=$(sed -n 's/.*ghcr.io\/nuthatch-org\/nuthatch:\([^"]*\)".*/\1/p' server.json | head -1)
-if [ "$reg_version" = "$WANT" ] && [ "$reg_image" = "$WANT" ]; then
+if [ "$reg_version" = "$ARTIFACT" ] && [ "$reg_image" = "$ARTIFACT" ]; then
   echo "server.json: OK ($reg_version)"
 else
-  echo "server.json: STALE (version $reg_version, image tag $reg_image, expected $WANT)"; fail=$((fail + 1))
+  echo "server.json: STALE (version $reg_version, image tag $reg_image, expected $ARTIFACT)"; fail=$((fail + 1))
 fi
 
 # The npm launcher downloads the release named by its own version, so a stale package.json hands
 # `npx` users an old binary. server.json's npm entry names the same version.
 npm_pkg=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' npm/package.json | head -1)
 reg_npm=$(sed -n '/"registryType": "npm"/,/"version"/s/^ *"version": "\([^"]*\)".*/\1/p' server.json | head -1)
-if [ "$npm_pkg" = "$WANT" ] && [ "$reg_npm" = "$WANT" ]; then
+if [ "$npm_pkg" = "$ARTIFACT" ] && [ "$reg_npm" = "$ARTIFACT" ]; then
   echo "npm/package.json: OK ($npm_pkg)"
 else
-  echo "npm/package.json: STALE (package $npm_pkg, server.json npm entry $reg_npm, expected $WANT)"; fail=$((fail + 1))
+  echo "npm/package.json: STALE (package $npm_pkg, server.json npm entry $reg_npm, expected $ARTIFACT)"; fail=$((fail + 1))
 fi
 
 # SECURITY.md said "currently the 0.1.x line" through twelve 3.x releases (#1541). Each release now
 # restates the policy for itself ("when 5.20.0 is released, 5.19 keeps ..."), so the section may name
 # only the current minor and the one before it; any other line it names is a regression.
 echo
-core=${WANT%%-*}  # a pre-release version has the release's minor
+core=${ARTIFACT%%-*}  # the last published release: SECURITY.md describes what shipped, not main
 current_minor=${core%.*}
 major=${current_minor%.*}
 minor=${current_minor#*.}

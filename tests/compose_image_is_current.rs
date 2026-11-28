@@ -9,7 +9,14 @@ const IMAGE: &str = "ghcr.io/nuthatch-org/nuthatch:";
 #[test]
 fn every_compose_default_image_is_this_release() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let version = env!("CARGO_PKG_VERSION");
+    // A -dev build has published no image, so the defaults keep naming the last release, which
+    // server.json records (#3146).
+    let server: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("server.json")).unwrap()).unwrap();
+    let version = match env!("CARGO_PKG_VERSION") {
+        dev if dev.ends_with("-dev") => server["version"].as_str().unwrap(),
+        released => released,
+    };
     let mut files: Vec<PathBuf> = std::fs::read_dir(&root)
         .unwrap()
         .flatten()

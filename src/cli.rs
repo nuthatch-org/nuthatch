@@ -927,7 +927,8 @@ pub enum AuditWhat {
     Verify(AuditVerifyArgs),
     /// Check sealed blocks against the chain: recompute each block's hash and its transactions,
     /// receipts and logs-bloom commitments from an RPC, and compare the sealed rows with the
-    /// receipts' logs. Two requests per block; reports, never repairs (#3096).
+    /// receipts' logs. Two requests per block; reports, never repairs (#3096). Unreleased: on main
+    /// only, so a 5.24.x binary rejects it.
     Chain(AuditChainArgs),
 }
 
@@ -1918,11 +1919,12 @@ pub struct DevArgs {
     /// calls (`xatu`: ethPandaOps' Parquet files, Ethereum mainnet only). The RPC still serves
     /// the tail, which the dataset lags by 9 to 13 hours, and anything the dataset cannot. Off
     /// unless named. A flag rather than config: where history is read from does not change what
-    /// the nest is.
+    /// the nest is. Unreleased: on main only, so a 5.24.x binary rejects it.
     #[arg(long = "history-source", value_enum, env = "NUTHATCH_HISTORY_SOURCE")]
     pub history_source: Option<HistorySource>,
 
     /// Where the dataset's files are served from, to use a mirror. Needs `--history-source`.
+    /// Unreleased: on main only, so a 5.24.x binary rejects it.
     #[arg(long = "history-url", value_name = "URL", requires = "history_source")]
     pub history_url: Option<String>,
 

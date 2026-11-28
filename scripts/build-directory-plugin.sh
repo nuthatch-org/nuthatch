@@ -19,6 +19,14 @@ check=0
 
 release=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)
 [ -n "$release" ] || { echo "no version in Cargo.toml" >&2; exit 2; }
+# A -dev version is published nowhere: npm has no such package, so an `npx` pin or a listing version
+# naming it would fail for a user. Until the release is cut, the edition names the last published
+# release, which server.json records (the same source scripts/version-check.sh uses).
+case "$release" in
+  *-dev)
+    release=$(sed -n 's/^  "version": "\([^"]*\)".*/\1/p' server.json | head -1)
+    [ -n "$release" ] || { echo "no version in server.json" >&2; exit 2; } ;;
+esac
 # The listing's version is the release's, but never below listing_floor. The directory refused the
 # 5.24.0 edition on 2026-11-27 and refuses the same version string again, so this edition (with the
 # fixes for that refusal) is listed as 5.24.1 while Cargo.toml still says 5.24.0. Once a release passes

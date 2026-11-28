@@ -3216,7 +3216,13 @@ mod tests {
     #[test]
     fn the_registry_entry_names_this_release() {
         let entry: Value = serde_json::from_str(include_str!("../server.json")).unwrap();
-        let v = env!("CARGO_PKG_VERSION");
+        // A -dev build has published nothing, so the entry keeps naming the last release (#3146).
+        let cargo = env!("CARGO_PKG_VERSION");
+        let v = if cargo.ends_with("-dev") {
+            entry["version"].as_str().unwrap()
+        } else {
+            cargo
+        };
         assert_eq!(entry["version"], v);
         assert_eq!(
             entry["packages"][0]["identifier"],
