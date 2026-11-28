@@ -1644,8 +1644,8 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "burrmill"
-version = "0.5.0"
-source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.0#2cbc368ceb2a5b8192689fb98011946327af6bbe"
+version = "0.5.1"
+source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.1#9b7882f710bb82a1709216128bc996ae013555ab"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.3",
@@ -1693,7 +1693,7 @@ dependencies = [
 [[package]]
 name = "burrmill-ingest"
 version = "0.0.1"
-source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.0#2cbc368ceb2a5b8192689fb98011946327af6bbe"
+source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.1#9b7882f710bb82a1709216128bc996ae013555ab"
 dependencies = [
  "arrow",
  "bytes",
@@ -1706,7 +1706,7 @@ dependencies = [
 [[package]]
 name = "burrmill-parquet-source"
 version = "55.3.0"
-source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.0#2cbc368ceb2a5b8192689fb98011946327af6bbe"
+source = "git+https://github.com/nuthatch-org/burrmill?tag=v0.5.1#9b7882f710bb82a1709216128bc996ae013555ab"
 dependencies = [
  "arrow",
  "arrow-schema 59.3.3",
@@ -3312,7 +3312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5932,7 +5932,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6459,7 +6459,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7253,7 +7253,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8158,7 +8158,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
