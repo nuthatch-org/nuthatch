@@ -1572,8 +1572,9 @@ jobs:
           path: point-read-report.json
           retention-days: 30
 
-  # Two tracked measurements on one runner, one after the other. Both are short, neither gates, and
-  # they share nothing but the binary; what they used to cost was a second job in the queue.
+  # Two measurements on one runner, one after the other. Both are short and they share nothing but
+  # the binary; what they used to cost was a second job in the queue. Backfill events/sec is tracked
+  # only; tip lag's after-seen p50 gates, and this job is a required check for that (#3148).
   backfill-throughput:
     name: backfill throughput · tip lag
     needs: [changes, build-release]
